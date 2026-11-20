@@ -40,6 +40,7 @@ fun SettingsScreen(onRestart: () -> Unit, onOpenLogs: () -> Unit, onOpenMitm: ()
     val cfg = state.config
     var showPingMethod by remember { mutableStateOf(false) }
     var showTheme by remember { mutableStateOf(false) }
+    var showDonate by remember { mutableStateOf(false) }
 
     Column(
         Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
@@ -168,9 +169,15 @@ fun SettingsScreen(onRestart: () -> Unit, onOpenLogs: () -> Unit, onOpenMitm: ()
         SectionHeader("关于")
         GroupCard {
             SettingsRow("版本", value = BuildConfig.VERSION_NAME)
-            SettingsRow("内核", value = "Rust / smoltcp")
+            SettingsRow("内核", value = "nanmen_core · 1.12.5")
             SettingsRow("代理协议", value = "SS · Trojan · VLESS")
             SettingsRow("DNS", value = "DoH · DoT · UDP")
+            SettingsRow(
+                "支持作者",
+                subtitle = "自愿打赏 · 不解锁任何功能",
+                chevron = true,
+                onClick = { showDonate = true },
+            )
             SettingsRow(
                 "当前配置",
                 value = cfg.remoteConfigName.ifBlank { "基础配置" },
@@ -206,5 +213,8 @@ fun SettingsScreen(onRestart: () -> Unit, onOpenLogs: () -> Unit, onOpenMitm: ()
             },
             onDismiss = { showPingMethod = false },
         )
+    }
+    if (showDonate) {
+        DonateDialog(onDismiss = { showDonate = false })
     }
 }

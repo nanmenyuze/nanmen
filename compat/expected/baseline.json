@@ -47,8 +47,8 @@
   },
   "apk": {
     "path": "app/build/outputs/apk/debug/app-debug.apk",
-    "bytes": 44314059,
-    "sha256": "8dcc54cdfe3cc9c88db8f83ae3c20e9c8f8f2a7df19318439f7d8ec22a229051",
+    "bytes": 44514292,
+    "sha256": "68cc9f197501a5d2b373cf28834fc8e45a0ba2088a2e7cb7411cd1e496d968aa",
     "versionCode": 80,
     "versionName": "2.3.6",
     "debug_cert_sha256": "d38a1dbd4cc02bfff2dee2aadba050c6d77a0092de74140c837c817924aa5c54"
@@ -56,13 +56,13 @@
   "clean_build": {
     "directory": "work/v134",
     "result": "BUILD SUCCESSFUL",
-    "gradle_time": "3m 24s",
-    "tasks_executed": 38,
+    "gradle_time": "4m 27s",
+    "tasks_executed": 54,
     "first_attempt": "清洁构建：停止 Gradle 后删除 app/build，verifyKernel + assembleDebug 全量执行",
     "fully_offline": false
   },
   "source": {
-    "code_source_sha256": "d8a7d27346ee05c22dd21edb300800076bf46bf55af2b41ff13eaecb4ff84861",
+    "code_source_sha256": "8a01ca438d5da6a2355a4c59e76f3cbf2405cb807108172106d13e1f19bd8428",
     "archive": "南门DNS-2.3.6-自研内核-完整源码.zip",
     "archive_sha256": "external (see delivery SHA256SUMS.txt)",
     "archive_name": "南门DNS-2.3.6-自研内核-完整源码.zip"
