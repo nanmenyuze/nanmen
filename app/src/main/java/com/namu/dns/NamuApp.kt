@@ -11,6 +11,7 @@ class NamuApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        CrashGuard.install(this)
         App.init(this)
         AutoConnect.install(this)
         SubscriptionUpdateWorker.schedule(this)

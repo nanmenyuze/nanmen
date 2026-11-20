@@ -8,6 +8,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import com.namu.dns.ConfigFileStore
 import com.namu.dns.ConfigStore
+import com.namu.dns.MigrationReportStore
 import com.namu.dns.NamuVpnService
 import com.namu.dns.core.repository.AndroidConfigFileGateway
 import com.namu.dns.core.repository.ConfigRepository
@@ -53,6 +54,7 @@ class AppContainer(val context: Context) {
         // 2.2：先迁移旧 .conf，再跑 ensureAssets。ensureAssets 里的 settings.update 会
         // 异步把当前配置写回 active .conf；若顺序反了，旧扁平文件可能先被整体覆盖。
         val migration = ConfigFileStore.migrateLegacy(context, settings.current())
+        MigrationReportStore.record(context, migration)
         // 迁移/恢复完成后，重新把 active .conf 套回内存，避免继续使用迁移前的 DataStore 快照。
         if (migration.migrated > 0 || migration.restored > 0 || migration.recovered > 0) {
             val active = ConfigFileStore.activeName(context)

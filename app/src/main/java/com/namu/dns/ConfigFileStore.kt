@@ -2,6 +2,7 @@ package com.namu.dns
 
 import android.content.Context
 import com.namu.dns.core.config.ConfigFile
+import org.json.JSONObject
 import java.io.File
 
 /**
@@ -132,6 +133,17 @@ object ConfigFileStore {
         file(context, sanitize(name)).readText()
     } catch (_: Exception) {
         null
+    }
+
+    /** 备份恢复专用：按原文件名写回，调用方必须先校验 JSON。 */
+    fun writeRaw(context: Context, name: String, text: String): Boolean = try {
+        JSONObject(text)
+        val f = file(context, sanitize(name))
+        f.parentFile?.mkdirs()
+        f.writeText(text)
+        f.exists() && f.length() > 0L && f.readText() == text
+    } catch (_: Exception) {
+        false
     }
 
     /** 设置变化时顺带刷新当前配置文件，避免设置改了但 .conf 还是旧的。 */

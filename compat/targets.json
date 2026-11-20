@@ -54,7 +54,7 @@
     "git_commit": null,
     "archive_name": "南门DNS-2.3.7-自研内核-完整源码.zip",
     "archive_sha256": "external (see delivery SHA256SUMS.txt)",
-    "code_source_sha256": "32ff20550cbf0720014684014ea78a5f3bdae9fe7cd041e8af70331ea66b3277",
+    "code_source_sha256": "67f55a8634424f165a21b953759657d2a7e49426b87525b63e459b7001687450",
     "code_source_digest_scope": "app/src, core/src, core/tests, gradle configs, compat/fixtures, compat/expected; excludes docs and build outputs"
   },
   "environment": {

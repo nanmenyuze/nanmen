@@ -19,15 +19,20 @@ import androidx.compose.material.icons.rounded.Speed
 import androidx.compose.material.icons.rounded.SwapVert
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.namu.dns.BuildConfig
+import com.namu.dns.CrashGuard
+import com.namu.dns.MigrationReportStore
+import com.namu.dns.NetworkStatus
 import com.namu.dns.UiPrefs
 import com.namu.dns.core.LocalAppContainer
 import com.namu.dns.ui.viewmodel.SettingsViewModel
@@ -41,6 +46,17 @@ fun SettingsScreen(onRestart: () -> Unit, onOpenLogs: () -> Unit, onOpenMitm: ()
     var showPingMethod by remember { mutableStateOf(false) }
     var showTheme by remember { mutableStateOf(false) }
     var showDonate by remember { mutableStateOf(false) }
+    var showBackup by remember { mutableStateOf(false) }
+    var showMigration by remember { mutableStateOf(false) }
+    var showPrivacy by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    var network by remember { mutableStateOf(NetworkStatus.current(context)) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            kotlinx.coroutines.delay(2500)
+            network = NetworkStatus.current(context)
+        }
+    }
 
     Column(
         Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
@@ -133,6 +149,12 @@ fun SettingsScreen(onRestart: () -> Unit, onOpenLogs: () -> Unit, onOpenMitm: ()
         SectionHeader("隧道")
         GroupCard {
             SettingsRow(
+                title = "当前网络",
+                subtitle = network.detail,
+                value = network.label,
+                icon = Icons.Rounded.Lan,
+            )
+            SettingsRow(
                 title = "隧道",
                 subtitle = "TUN 接管全部 DNS，MTU 1500",
                 value = if (cfg.fakeIp) "Fake-IP" else "直连",
@@ -163,6 +185,33 @@ fun SettingsScreen(onRestart: () -> Unit, onOpenLogs: () -> Unit, onOpenMitm: ()
                 value = "跟随规则",
                 icon = Icons.Rounded.Memory,
                 showDivider = false,
+            )
+        }
+
+        SectionHeader("维护")
+        GroupCard {
+            SettingsRow(
+                title = "备份与恢复",
+                subtitle = "导出节点、订阅、策略组和全部 .conf；恢复前会整包校验",
+                icon = Icons.Rounded.SwapVert,
+                chevron = true,
+                onClick = { showBackup = true },
+            )
+            SettingsRow(
+                title = "版本迁移与崩溃恢复",
+                subtitle = MigrationReportStore.summary(context),
+                value = if (CrashGuard.lastCrash(context) != null) "有崩溃记录" else null,
+                icon = Icons.Rounded.BugReport,
+                chevron = true,
+                onClick = { showMigration = true },
+            )
+            SettingsRow(
+                title = "隐私与系统限制",
+                subtitle = "本地数据、证书边界、Private DNS 和 Root/非 Root 说明",
+                icon = Icons.Rounded.Security,
+                chevron = true,
+                showDivider = false,
+                onClick = { showPrivacy = true },
             )
         }
 
@@ -216,5 +265,17 @@ fun SettingsScreen(onRestart: () -> Unit, onOpenLogs: () -> Unit, onOpenMitm: ()
     }
     if (showDonate) {
         DonateDialog(onDismiss = { showDonate = false })
+    }
+    if (showBackup) {
+        BackupRestoreDialog(onDismiss = { showBackup = false })
+    }
+    if (showMigration) {
+        MigrationReportDialog(onDismiss = { showMigration = false })
+    }
+    if (showPrivacy) {
+        PrivacyAndLimitsDialog(
+            onDismiss = { showPrivacy = false },
+            onOpenMitm = onOpenMitm,
+        )
     }
 }

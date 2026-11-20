@@ -118,6 +118,11 @@ fun MitmScreen() {
         SectionHeader("证书安装")
         GroupCard {
             SettingsRow(
+                title = "安装步骤",
+                subtitle = "① 生成系统信任模块 ② 在 KernelSU/Magisk 安装 ③ 重启设备 ④ 回到本页核对「已检测到」和 SHA-256 指纹",
+                showDivider = false,
+            )
+            SettingsRow(
                 title = "生成系统信任模块（KernelSU/Magisk）",
                 subtitle = "生成含本机 CA 的模块 zip 到「下载/NamuDNS」，用 KernelSU/Magisk 安装后重启，全 App 信任、重启不丢",
                 icon = Icons.Rounded.Shield,

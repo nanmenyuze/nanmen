@@ -25,12 +25,17 @@ object Actions {
 
 
     /** 把文本导出到「Download/NamuDNS」或应用外部目录，返回用户可见位置。 */
-    suspend fun exportText(context: android.content.Context, fileName: String, content: String): String =
+    suspend fun exportText(
+        context: android.content.Context,
+        fileName: String,
+        content: String,
+        mimeType: String = "text/plain",
+    ): String =
         withContext(Dispatchers.IO) {
             if (android.os.Build.VERSION.SDK_INT >= 29) {
                 val values = android.content.ContentValues().apply {
                     put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                    put(android.provider.MediaStore.MediaColumns.MIME_TYPE, "text/plain")
+                    put(android.provider.MediaStore.MediaColumns.MIME_TYPE, mimeType)
                     put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, "Download/NamuDNS")
                 }
                 val resolver = context.contentResolver

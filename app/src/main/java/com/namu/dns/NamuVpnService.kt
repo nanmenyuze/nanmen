@@ -82,6 +82,8 @@ class NamuVpnService : VpnService() {
     @Volatile private var currentNetwork: Network? = null
     @Volatile private var pendingNetworkRebuild = false
     @Volatile private var activeMode: String? = null
+    /** 最后一次成功下发给内核的 JSON，用于重载失败回滚。 */
+    @Volatile private var lastGoodJson: String? = null
     @Volatile private var reloading = false
     /** 重载进行中又来了新请求：结束后要再跑一遍，否则「保存了但内核还用旧设置」。 */
     @Volatile private var pendingReload = false
@@ -240,9 +242,15 @@ class NamuVpnService : VpnService() {
                     pfd.close()
                     return@Thread
                 }
+                val json = try {
+                    ConfigStore.buildNative(this, cfg)
+                } catch (t: Throwable) {
+                    pfd.close()
+                    throw t
+                }
                 val ok = synchronized(nativeLock) {
                     if (stopping) false
-                    else NativeCore.nativeStart(pfd.fd, ConfigStore.buildNative(this, cfg))
+                    else NativeCore.nativeStart(pfd.fd, json)
                 }
                 if (!ok) {
                     pfd.close()
@@ -253,6 +261,7 @@ class NamuVpnService : VpnService() {
                 }
                 tun = pfd
                 activeMode = cfg.mode
+                lastGoodJson = json
                 running = true
                 alive = true
                 runtime.markConnected(android.os.SystemClock.elapsedRealtime() - startedAt)
@@ -282,34 +291,71 @@ class NamuVpnService : VpnService() {
         }
         reloading = true
         Thread {
-            val json = ConfigStore.buildNative(this, cfg)
-            // 内核热重载现在会一并更新运行配置/节点/选中线路，
-            // 优先热重载（连接不中断）；失败才回退整核重启。
-            val ok = synchronized(nativeLock) {
-                if (stopping || !running) false
-                else try {
-                    if (NativeCore.nativeReloadRules(json)) {
-                        true
-                    } else {
-                        NativeCore.nativeStart(pfd.fd, json)
+            try {
+                val json = ConfigStore.buildNative(this, cfg)
+                // 内核热重载现在会一并更新运行配置/节点/选中线路，
+                // 优先热重载（连接不中断）；失败才回退整核重启。
+                val ok = synchronized(nativeLock) {
+                    if (stopping || !running) false
+                    else try {
+                        if (NativeCore.nativeReloadRules(json)) {
+                            true
+                        } else {
+                            NativeCore.nativeStart(pfd.fd, json)
+                        }
+                    } catch (_: Throwable) {
+                        false
                     }
-                } catch (_: Throwable) {
-                    false
+                }
+                if (ok) {
+                    lastGoodJson = json
+                    App.container.stats.resetSession()
+                    runtime.markConnected(0L)
+                    App.container.refreshRuntime()
+                } else {
+                    // 新配置没有生效：尽量把上一版成功配置重新下发，避免内核停在半套规则。
+                    val rolledBack = rollbackToLastGood(pfd, cfg.mode)
+                    if (rolledBack) {
+                        messages.show("新设置未生效，已回滚到上一版配置")
+                    } else {
+                        messages.show("设置应用失败，且上一版配置回滚失败，请手动重连")
+                    }
+                }
+            } catch (t: Throwable) {
+                val rolledBack = rollbackToLastGood(pfd, cfg.mode)
+                messages.show(
+                    if (rolledBack) "配置生成失败，已回滚到上一版配置"
+                    else "配置生成失败：${t.message ?: "未知错误"}，请手动重连",
+                )
+            } finally {
+                reloading = false
+                if (pendingReload) {
+                    pendingReload = false
+                    reloadConfig()
                 }
             }
-            reloading = false
+        }.start()
+    }
+
+    /** 在 nativeLock 内把上一版成功 JSON 重新下发；模式已变化时交给 rebuildTunnel。 */
+    private fun rollbackToLastGood(pfd: ParcelFileDescriptor, failedMode: String): Boolean {
+        val prev = lastGoodJson ?: return false
+        if (activeMode != failedMode) return false
+        return synchronized(nativeLock) {
+            if (stopping || !running) return@synchronized false
+            try {
+                if (NativeCore.nativeReloadRules(prev)) true
+                else NativeCore.nativeStart(pfd.fd, prev)
+            } catch (_: Throwable) {
+                false
+            }
+        }.also { ok ->
             if (ok) {
                 App.container.stats.resetSession()
                 runtime.markConnected(0L)
                 App.container.refreshRuntime()
-            } else {
-                messages.show("设置应用失败，请手动重连")
             }
-            if (pendingReload) {
-                pendingReload = false
-                reloadConfig()
-            }
-        }.start()
+        }
     }
 
     private fun establishTun(cfg: AppConfig): ParcelFileDescriptor? {
@@ -436,15 +482,21 @@ class NamuVpnService : VpnService() {
                     if (!running || stopping) return@synchronized
                     val pfd = establishTun(cfg)
                     if (pfd != null) {
+                        val rebuiltJson = try {
+                            ConfigStore.buildNative(this, cfg)
+                        } catch (_: Throwable) {
+                            null
+                        }
                         val ok = try {
-                            if (stopping || !running) false
-                            else NativeCore.nativeStart(pfd.fd, ConfigStore.buildNative(this, cfg))
+                            if (stopping || !running || rebuiltJson == null) false
+                            else NativeCore.nativeStart(pfd.fd, rebuiltJson)
                         } catch (_: Throwable) {
                             false
                         }
-                        if (ok && running && !stopping) {
+                        if (ok && rebuiltJson != null && running && !stopping) {
                             tun = pfd
                             activeMode = cfg.mode
+                            lastGoodJson = rebuiltJson
                             success = true
                         } else {
                             try { NativeCore.nativeStop() } catch (_: Throwable) {}

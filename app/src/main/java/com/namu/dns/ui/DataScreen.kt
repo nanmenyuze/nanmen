@@ -41,6 +41,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.namu.dns.Diagnostics
 import com.namu.dns.NamuVpnService
+import com.namu.dns.NetworkStatus
 import com.namu.dns.PrivateDnsController
 import com.namu.dns.core.LocalAppContainer
 import com.namu.dns.ui.viewmodel.DataViewModel
@@ -61,6 +62,8 @@ fun DataScreen(
     val runtime = state.runtime
     val clipboard = LocalClipboardManager.current
     var confirmDeleteAll by remember { mutableStateOf(false) }
+    var showLive by remember { mutableStateOf(false) }
+    var showRuleTest by remember { mutableStateOf(false) }
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -198,6 +201,12 @@ fun DataScreen(
         SectionHeader("诊断")
         GroupCard {
             SettingsRow(
+                title = "命中诊断",
+                subtitle = "输入域名或 IPv4，按当前配置和模块规则展示命中结果",
+                chevron = true,
+                onClick = { showRuleTest = true },
+            )
+            SettingsRow(
                 title = "同步规则源",
                 subtitle = if (cfg.rulesUrl.isBlank()) {
                     "当前配置没有设置 rulesUrl"
@@ -236,6 +245,19 @@ fun DataScreen(
 
         SectionHeader("连接")
         GroupCard {
+            val net = NetworkStatus.current(ctx)
+            SettingsRow(
+                title = "实时连接",
+                subtitle = "聚合连接数、当前节点、底层网络和最近连接日志",
+                value = "${stats.activeConns} 活跃",
+                chevron = true,
+                onClick = { showLive = true },
+            )
+            SettingsRow(
+                title = "当前网络",
+                subtitle = net.detail,
+                value = net.label,
+            )
             SettingsRow(
                 title = "状态",
                 value = when {
@@ -337,6 +359,18 @@ fun DataScreen(
         Spacer(Modifier.height(LocalDockClearance.current + 34.dp))
     }
 
+    if (showLive) {
+        LiveConnectionsDialog(
+            stats = stats,
+            cfg = cfg,
+            runtimeState = runtime,
+            logs = state.logs.runtime,
+            onDismiss = { showLive = false },
+        )
+    }
+    if (showRuleTest) {
+        RuleTestDialog(onDismiss = { showRuleTest = false })
+    }
     if (confirmDeleteAll) {
         AlertDialog(
             onDismissRequest = { confirmDeleteAll = false },
