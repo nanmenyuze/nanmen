@@ -1686,3 +1686,64 @@ async fn mitm_loon_h2_request_mock_rewrites_content_type_and_length() {
     assert_eq!(v["body"], "mock-body");
     let _ = std::fs::remove_file(&ca_path);
 }
+
+
+#[derive(Debug)]
+struct IdleNoVerify(Arc<rustls::crypto::CryptoProvider>);
+impl rustls::client::danger::ServerCertVerifier for IdleNoVerify {
+    fn verify_server_cert(&self, _e: &rustls::pki_types::CertificateDer<'_>, _i: &[rustls::pki_types::CertificateDer<'_>], _s: &rustls::pki_types::ServerName<'_>, _o: &[u8], _n: rustls::pki_types::UnixTime) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// 空闲/备用连接：客户端完成 TLS（ALPN h2）但不发 h2 preface。
+/// 应按空闲连接安静回收（Ok），而不是当成错误 warn。回归「h2 服务端握手超时」噪声。
+#[tokio::test]
+async fn h2_idle_client_preface_is_reclaimed_quietly() {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let params = rcgen::CertificateParams::new(vec!["idle.test.local".to_string()]).unwrap();
+    let cert = params.self_signed(&key).unwrap();
+    let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der());
+    let mut scfg = rustls::ServerConfig::builder().with_no_client_auth()
+        .with_single_cert(vec![cert.der().clone()], key_der.into()).unwrap();
+    scfg.alpn_protocols = vec![b"h2".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(scfg));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        acceptor.accept(sock).await.unwrap()
+    });
+
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let ccfg = rustls::ClientConfig::builder()
+        .dangerous().with_custom_certificate_verifier(Arc::new(IdleNoVerify(provider)))
+        .with_no_client_auth();
+    let mut ccfg = ccfg;
+    ccfg.alpn_protocols = vec![b"h2".to_vec()];
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(ccfg));
+    let sock = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("idle.test.local").unwrap();
+    let _client_tls = connector.connect(name, sock).await.unwrap();
+    let server_tls = server.await.unwrap();
+    // 客户端保持连接但永不发 preface。
+
+    let state = Arc::new(MitmState::build(&MitmConfig::default()));
+    let stats = Arc::new(nanmen_core::stats::Stats::default());
+    let ctx = test_ctx(state.clone(), stats);
+    let target = Target { ip: "127.0.0.1".parse().unwrap(), port: 443, domain: Some("idle.test.local".into()) };
+    let res = nanmen_core::mitm::h2::serve_with_preface_timeout(
+        server_tls, "idle.test.local".into(), target, Action::Direct, ctx, state, 1,
+        std::time::Duration::from_millis(200),
+    ).await;
+    assert!(res.is_ok(), "空闲连接应安静回收，实际: {:?}", res.err());
+}

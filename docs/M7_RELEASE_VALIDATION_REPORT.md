@@ -123,9 +123,9 @@ M7 的壳层缺口已补齐，内核与协议能力沿用 M3–M6，不在本里
 | 新增 `M7BackupTest` / `RuleSetCompatTest` | M7 备份 3 项；规则集 5 项 |
 | `:app:lintDebug` | 0 error；38 warning、3 information（lint XML 共 41 issue） |
 | `:app:verifyKernel` | 通过（内核 stamp 未改） |
-| 清洁构建 `assembleDebug` | **BUILD SUCCESSFUL in 3m 17s，39 tasks 全执行** |
+| 清洁构建 `assembleDebug` | **BUILD SUCCESSFUL in 3m 3s，39 tasks 全执行** |
 | APK 版本 | `versionCode=82 versionName=2.3.8` |
-| APK 内 `.so` | `arm64-v8a` 7,856,456 B / `armeabi-v7a` 5,314,324 B，版本 1.12.5 |
+| APK 内 `.so` | `arm64-v8a` 7,856,992 B / `armeabi-v7a` 5,315,364 B，版本 1.12.5 |
 
 > 单测总数含本轮新增 3 项；Lint 无新增 error。warning 为项目既有（deprecated `stopForeground`、`allNetworks`、SDK 版本提示等）。
 
@@ -200,17 +200,25 @@ $ emulator -list-avds
 - `DOMAIN-SET` 支持 `.x` 后缀（含 apex）、`*.x` 通配子域、裸域名精确匹配。
 - `PROTOCOL,TCP|UDP` 由内核按连接类型匹配；其他值加载期拒绝并告警。
 - 纯规则集模块可导入；拉取失败保留旧缓存，未缓存时不生效。
-- Rust 184/184、Kotlin 118/118（24 suites）、Lint 0 error / 38 warning / 3 information。
+- Rust 185/185、Kotlin 118/118（24 suites）、Lint 0 error / 38 warning / 3 information。
 - 详见 `docs/RULESET_PROTOCOL.md`。
+
+## 12.2 2.3.8 增量：h2 空闲连接握手超时修复
+
+- 问题：`h2 服务端握手超时` 成片出现，目标含 `app/api/api.live.bilibili.com`，每条约 10 秒。
+- 根因：`h2::serve` 把上游连接的 10 秒超时误用于等待客户端 h2 preface；cronet 预热的备用 TLS 连接 10 秒内不发 preface 就被当成错误。
+- 修复：客户端 preface 等待改为 60 秒，超时按空闲连接安静回收（info 日志 + `Ok`）；上游连接仍 10 秒。
+- 回归：新增 `h2_idle_client_preface_is_reclaimed_quietly`；Rust 185/185。
+- 详见 `docs/H2_IDLE_TIMEOUT.md`。
 
 ## 13. 交付物
 
 | 文件 | 大小 | SHA-256 |
 |---|---|---|
-| `南门DNS-2.3.8-自研内核.apk` | 44,652,317 B | `b92a15b97908418b6b4519b66d43cbde8f4a8edd1e38b79b027a3758ec8bcd6f` |
+| `南门DNS-2.3.8-自研内核.apk` | 44,652,317 B | `d3756d82953b87a211f037911a91af71e5a24b61240b1da108186b11a26e2fc6` |
 | `南门DNS-2.3.8-自研内核-完整源码.zip` | 见交付时文件列表 | 见根目录 `SHA256SUMS.txt`（避免报告自引用导致 hash 变化） |
 
 - APK 版本：`versionCode=82`、`versionName=2.3.8`。
 - 源码 zip 的最终 SHA-256 以根目录 `SHA256SUMS.txt` 为准；报告不内嵌自身压缩包的 hash，避免自引用。
 - 源码包从 `work/v134` 根打包，排除 `build/`、`app/build/`、`core/target/`、`.gradle/`、`.kotlin/`、`.git/`、`local.properties`、`keystore/`、`*.apk`、`*.zip`、`*.log`。
-- 源码包内 `scripts/m0_validate.py` 校验结果：`versionName=2.3.8`、`versionCode=82`、`code_source_sha256=10e04e1219859487b9d1546206ebd31b1dcc8f421834ccc2132ca352ec7fb5c3`、`errors: []`。
+- 源码包内 `scripts/m0_validate.py` 校验结果：`versionName=2.3.8`、`versionCode=82`、`code_source_sha256=84d57b1db3186209e81a4505528bc0022c33c02bdbe1126fbaa031e94f0e2dd0`、`errors: []`。

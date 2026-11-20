@@ -23,6 +23,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::server::TlsStream;
 
 const H2_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// 客户端 h2 preface 等待：App 连接池常预热多条 TLS 但延迟启用，给足空闲窗口（真实服务器 60s+）。
+const H2_CLIENT_PREFACE_TIMEOUT: Duration = Duration::from_secs(60);
 const H2_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
 const H2_SEND_CHUNK: usize = 16 * 1024;
 
@@ -236,10 +238,33 @@ pub async fn serve<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut conn = tokio::time::timeout(H2_CONNECT_TIMEOUT, ::h2::server::handshake(tls))
-        .await
-        .map_err(|_| outbound::io_err("h2 服务端握手超时"))?
-        .map_err(|e| outbound::io_err(format!("h2 服务端握手失败: {}", e)))?;
+    serve_with_preface_timeout(tls, host, target, action, ctx, state, conn_id, H2_CLIENT_PREFACE_TIMEOUT).await
+}
+
+/// 可指定客户端 preface 等待时长的入口（测试用短超时；生产 serve 用 60s）。
+pub async fn serve_with_preface_timeout<S>(
+    tls: TlsStream<S>,
+    host: String,
+    target: Target,
+    action: Action,
+    ctx: Arc<Ctx>,
+    state: Arc<MitmState>,
+    conn_id: u64,
+    preface_timeout: Duration,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut conn = match tokio::time::timeout(preface_timeout, ::h2::server::handshake(tls)).await {
+        Ok(Ok(conn)) => conn,
+        Ok(Err(e)) => return Err(outbound::io_err(format!("h2 服务端握手失败: {}", e))),
+        Err(_) => {
+            // 客户端完成 TLS 但迟迟未发 h2 preface：多为连接池预热/备用连接。
+            // 按空闲连接安静回收，不当错误 warn（避免日志噪声与误报）。
+            logging::info("mitm", format!("#{} {} h2 空闲连接未启用，回收", conn_id, host));
+            return Ok(());
+        }
+    };
 
     let upstream = Arc::new(UpstreamHandle::new(target, action));
 

@@ -10,22 +10,22 @@
     "compileSdk": 36
   },
   "kernel": {
-    "source_hash": "839b21d1b4221e8b9222da6275f896f8f48d42967d292ecba50a2405624cdad6",
+    "source_hash": "5aca268d6a3677f229a4f3289a3b6be4c50152d08d25614a61a7741541c8d90c",
     "cargo_hash": "7dcbb2870f1e838c1757ad08d7235fa76a4a77b3af7b458ecf806a75a2226f6a",
-    "arm64_so_sha256": "88e2fd4c20a6c00e94958dd2fc73749250c4e2531660017b9c9f2fa3a024b602",
-    "armv7_so_sha256": "c41ed924bd41dc6cc8827043aa4529ee1828ae87ec31ae6a460fdde1d22b252b"
+    "arm64_so_sha256": "c3b8988e413f103bf6bd10028403123264b9dd77e02a0ea85d2f576e69770f89",
+    "armv7_so_sha256": "8cf8887fb5ccf0cf7988256eff79f5612f44eee669de2711f2be3887d63bb271"
   },
   "tests": {
     "rust": {
-      "total": 184,
-      "passed": 184,
+      "total": 185,
+      "passed": 185,
       "suites": {
         "lib": 107,
         "cert_name_probe": 1,
         "compat_fixtures": 13,
         "compat_rules": 1,
         "core_test": 32,
-        "mitm_test": 20,
+        "mitm_test": 21,
         "protocol_e2e": 4,
         "script_acceptance": 5,
         "binary_frame": 1
@@ -48,7 +48,7 @@
   "apk": {
     "path": "app/build/outputs/apk/debug/app-debug.apk",
     "bytes": 44652317,
-    "sha256": "b92a15b97908418b6b4519b66d43cbde8f4a8edd1e38b79b027a3758ec8bcd6f",
+    "sha256": "d3756d82953b87a211f037911a91af71e5a24b61240b1da108186b11a26e2fc6",
     "versionCode": 82,
     "versionName": "2.3.8",
     "debug_cert_sha256": "d38a1dbd4cc02bfff2dee2aadba050c6d77a0092de74140c837c817924aa5c54"
@@ -56,13 +56,13 @@
   "clean_build": {
     "directory": "work/v134",
     "result": "BUILD SUCCESSFUL",
-    "gradle_time": "3m 17s",
+    "gradle_time": "3m 3s",
     "tasks_executed": 39,
     "first_attempt": "清洁构建：停止 Gradle 后删除 app/build，verifyKernel + assembleDebug 全量执行",
     "fully_offline": false
   },
   "source": {
-    "code_source_sha256": "10e04e1219859487b9d1546206ebd31b1dcc8f421834ccc2132ca352ec7fb5c3",
+    "code_source_sha256": "84d57b1db3186209e81a4505528bc0022c33c02bdbe1126fbaa031e94f0e2dd0",
     "archive": "南门DNS-2.3.8-自研内核-完整源码.zip",
     "archive_sha256": "external (see delivery SHA256SUMS.txt)",
     "archive_name": "南门DNS-2.3.8-自研内核-完整源码.zip"
@@ -237,8 +237,15 @@
     "domain_set_forms": [".x suffix incl. apex", "*.x wildcard subdomains", "bare exact"],
     "protocol_values": ["TCP", "UDP"],
     "unsupported": ["USER-AGENT", "IP-ASN", "full GEOIP", "logical rules"],
-    "rust_tests": 184,
+    "rust_tests": 185,
     "kotlin_tests": 118,
+    "device_test": "blocked: no Android device or AVD"
+  },
+  "h2_idle_preface": {
+    "client_preface_timeout_seconds": 60,
+    "upstream_connect_timeout_seconds": 10,
+    "timeout_result": "Ok + info log (quiet reclaim)",
+    "regression_test": "h2_idle_client_preface_is_reclaimed_quietly",
     "device_test": "blocked: no Android device or AVD"
   },
   "dns": {
