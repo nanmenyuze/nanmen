@@ -1,0 +1,13 @@
+#!name=示例 App 模块
+#!app=com.example.app
+#!desc=复制这个文件，把域名换成目标 App 的广告/统计域名，然后放到你的服务器上用 URL 导入。
+
+[Rule]
+# Shadowrocket 风格规则：REJECT 会在 DNS 层拦截，DIRECT/PROXY 会进入分流规则。
+DOMAIN-SUFFIX,ads.example.com,REJECT
+DOMAIN,track.example.com,REJECT
+# IP-CIDR,203.0.113.0/24,REJECT
+
+[Filter]
+# 也可以直接写 adblock 域名规则；模块会合并成一个本地过滤文件。
+||banner.example.com^

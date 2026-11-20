@@ -1,0 +1,885 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-19",
+  "definition": {
+    "parse_assertion": "测试读取 fixture 并断言导入/解析结果",
+    "runtime_assertion": "测试调用运行时组件并断言命中/出站/改写结果",
+    "consumed": "该 case 是否被至少一个测试直接覆盖",
+    "runtime_behavior_covered": "有等价行为测试，但测试没有消费该 case/fixture"
+  },
+  "summary": {
+    "total": 52,
+    "consumed": 35,
+    "not_consumed": 17,
+    "parse_assertions": 29,
+    "runtime_assertions": 6,
+    "runtime_behavior_covered_but_not_case_consumed": 5,
+    "by_category": {
+      "node": {
+        "total": 17,
+        "consumed": 17
+      },
+      "subscription": {
+        "total": 8,
+        "consumed": 8
+      },
+      "rule": {
+        "total": 10,
+        "consumed": 6
+      },
+      "rewrite": {
+        "total": 10,
+        "consumed": 0
+      },
+      "script": {
+        "total": 3,
+        "consumed": 0
+      },
+      "config": {
+        "total": 4,
+        "consumed": 4
+      }
+    }
+  },
+  "cases": [
+    {
+      "case_id": "N01",
+      "category": "node",
+      "fixture": "nodes/ss-sip002.txt",
+      "expected_status": "supported",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::ss_sip002_imports"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "N02",
+      "category": "node",
+      "fixture": "nodes/ss-legacy.txt",
+      "expected_status": "supported",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::ss_legacy_imports"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "N03",
+      "category": "node",
+      "fixture": "nodes/ssr.txt",
+      "expected_status": "empty",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::ssr_and_wireguard_are_silently_dropped"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "静默丢弃基线",
+      "blocker": null
+    },
+    {
+      "case_id": "N04",
+      "category": "node",
+      "fixture": "nodes/vmess.txt",
+      "expected_status": "unsupported",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::vmess_and_hysteria_are_counted_unsupported"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "N05",
+      "category": "node",
+      "fixture": "nodes/vless-tcp.txt",
+      "expected_status": "supported",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::vless_tcp_ws_trojan_and_socks_import"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "N06",
+      "category": "node",
+      "fixture": "nodes/vless-ws.txt",
+      "expected_status": "supported",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::vless_tcp_ws_trojan_and_socks_import"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "N07",
+      "category": "node",
+      "fixture": "nodes/vless-reality.txt",
+      "expected_status": "unsupported",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::vless_reality_and_grpc_are_rejected_with_warning"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "N08",
+      "category": "node",
+      "fixture": "nodes/vless-grpc.txt",
+      "expected_status": "unsupported",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::vless_reality_and_grpc_are_rejected_with_warning"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "N09",
+      "category": "node",
+      "fixture": "nodes/trojan-tcp.txt",
+      "expected_status": "supported",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::vless_tcp_ws_trojan_and_socks_import"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "N10",
+      "category": "node",
+      "fixture": "nodes/trojan-ws.txt",
+      "expected_status": "supported",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::vless_tcp_ws_trojan_and_socks_import"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "N11",
+      "category": "node",
+      "fixture": "nodes/hysteria2.txt",
+      "expected_status": "unsupported",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::vmess_and_hysteria_are_counted_unsupported"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "N12",
+      "category": "node",
+      "fixture": "nodes/tuic.txt",
+      "expected_status": "unsupported",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::tuic_and_anytls_are_silently_dropped"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "N13",
+      "category": "node",
+      "fixture": "nodes/wireguard.txt",
+      "expected_status": "empty",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::ssr_and_wireguard_are_silently_dropped"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "静默丢弃基线",
+      "blocker": null
+    },
+    {
+      "case_id": "N14",
+      "category": "node",
+      "fixture": "nodes/socks5.txt",
+      "expected_status": "supported",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::vless_tcp_ws_trojan_and_socks_import"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "N15",
+      "category": "node",
+      "fixture": "nodes/http.txt",
+      "expected_status": "supported",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::http_and_https_proxy_import"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "N16",
+      "category": "node",
+      "fixture": "nodes/https.txt",
+      "expected_status": "needs_verification",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::http_and_https_proxy_import"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "N17",
+      "category": "node",
+      "fixture": "nodes/anytls.txt",
+      "expected_status": "empty",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::tuic_and_anytls_are_silently_dropped"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "S01",
+      "category": "subscription",
+      "fixture": "subscriptions/base64-list.txt",
+      "expected_status": "supported",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::base64_subscription_decodes_uris"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "S02",
+      "category": "subscription",
+      "fixture": "subscriptions/clash-basic.yaml",
+      "expected_status": "partial",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::clash_subscription_imports_nodes_rules_groups"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "S03",
+      "category": "subscription",
+      "fixture": "subscriptions/loon-main.conf",
+      "expected_status": "empty",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::loon_and_shadowrocket_conf_are_not_subscription_formats"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "S04",
+      "category": "subscription",
+      "fixture": "subscriptions/shadowrocket.conf",
+      "expected_status": "empty",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::loon_and_shadowrocket_conf_are_not_subscription_formats"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "S05",
+      "category": "subscription",
+      "fixture": "modules/loon-demo.plugin",
+      "expected_status": "partial",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "app:CompatFixtureTest::loon plugin is parsed as partial module"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "S06",
+      "category": "subscription",
+      "fixture": "modules/surge-demo.sgmodule",
+      "expected_status": "partial",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "app:CompatFixtureTest::surge module parses only supported subset"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "S07",
+      "category": "subscription",
+      "fixture": "headers/subscription-userinfo.txt",
+      "expected_status": "supported",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "app:CompatFixtureTest::subscription userinfo fixture is parsed"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "S08",
+      "category": "subscription",
+      "fixture": "rulesets/ads.txt",
+      "expected_status": "partial",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "app:CompatFixtureTest::adblock fixture parses supported line forms"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "R01",
+      "category": "rule",
+      "fixture": "modules/surge-demo.sgmodule",
+      "expected_status": "supported",
+      "consumed": true,
+      "assertion_types": [
+        "runtime"
+      ],
+      "consumed_by": [
+        "compat_rules::rule_runtime_matrix"
+      ],
+      "runtime_behavior_covered": true,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "R02",
+      "category": "rule",
+      "fixture": "modules/surge-demo.sgmodule",
+      "expected_status": "supported",
+      "consumed": true,
+      "assertion_types": [
+        "runtime"
+      ],
+      "consumed_by": [
+        "compat_rules::rule_runtime_matrix"
+      ],
+      "runtime_behavior_covered": true,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "R03",
+      "category": "rule",
+      "fixture": "modules/surge-demo.sgmodule",
+      "expected_status": "supported",
+      "consumed": true,
+      "assertion_types": [
+        "runtime"
+      ],
+      "consumed_by": [
+        "compat_rules::rule_runtime_matrix"
+      ],
+      "runtime_behavior_covered": true,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "R04",
+      "category": "rule",
+      "fixture": "modules/surge-demo.sgmodule",
+      "expected_status": "partial",
+      "consumed": true,
+      "assertion_types": [
+        "runtime"
+      ],
+      "consumed_by": [
+        "compat_rules::rule_runtime_matrix"
+      ],
+      "runtime_behavior_covered": true,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "R05",
+      "category": "rule",
+      "fixture": "modules/surge-demo.sgmodule",
+      "expected_status": "unsupported",
+      "consumed": false,
+      "assertion_types": [],
+      "consumed_by": [],
+      "runtime_behavior_covered": false,
+      "related_tests": [
+        "app:CompatFixtureTest::surge module parses only supported subset"
+      ],
+      "note": "S06 只断言 ignored 总数，未逐条断言；R05-R08 只有解析聚合证据，没有运行断言",
+      "blocker": "no_case_assertion"
+    },
+    {
+      "case_id": "R06",
+      "category": "rule",
+      "fixture": "modules/surge-demo.sgmodule",
+      "expected_status": "unsupported",
+      "consumed": false,
+      "assertion_types": [],
+      "consumed_by": [],
+      "runtime_behavior_covered": false,
+      "related_tests": [
+        "app:CompatFixtureTest::surge module parses only supported subset"
+      ],
+      "note": "S06 只断言 ignored 总数，未逐条断言；R05-R08 只有解析聚合证据，没有运行断言",
+      "blocker": "no_case_assertion"
+    },
+    {
+      "case_id": "R07",
+      "category": "rule",
+      "fixture": "modules/surge-demo.sgmodule",
+      "expected_status": "unsupported",
+      "consumed": false,
+      "assertion_types": [],
+      "consumed_by": [],
+      "runtime_behavior_covered": false,
+      "related_tests": [
+        "app:CompatFixtureTest::surge module parses only supported subset"
+      ],
+      "note": "S06 只断言 ignored 总数，未逐条断言；R05-R08 只有解析聚合证据，没有运行断言",
+      "blocker": "no_case_assertion"
+    },
+    {
+      "case_id": "R08",
+      "category": "rule",
+      "fixture": "modules/surge-demo.sgmodule",
+      "expected_status": "unsupported",
+      "consumed": false,
+      "assertion_types": [],
+      "consumed_by": [],
+      "runtime_behavior_covered": false,
+      "related_tests": [
+        "app:CompatFixtureTest::surge module parses only supported subset"
+      ],
+      "note": "S06 只断言 ignored 总数，未逐条断言；R05-R08 只有解析聚合证据，没有运行断言",
+      "blocker": "no_case_assertion"
+    },
+    {
+      "case_id": "R09",
+      "category": "rule",
+      "fixture": "configs/app-config.json",
+      "expected_status": "partial",
+      "consumed": true,
+      "assertion_types": [
+        "runtime"
+      ],
+      "consumed_by": [
+        "compat_rules::rule_runtime_matrix"
+      ],
+      "runtime_behavior_covered": true,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "R10",
+      "category": "rule",
+      "fixture": "modules/surge-demo.sgmodule",
+      "expected_status": "supported",
+      "consumed": true,
+      "assertion_types": [
+        "runtime"
+      ],
+      "consumed_by": [
+        "compat_rules::rule_runtime_matrix"
+      ],
+      "runtime_behavior_covered": true,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "W01",
+      "category": "rewrite",
+      "fixture": "modules/surge-demo.sgmodule",
+      "expected_status": "partial",
+      "consumed": false,
+      "assertion_types": [],
+      "consumed_by": [],
+      "runtime_behavior_covered": true,
+      "related_tests": [
+        "mitm_test::mitm_h2_response_body_rewrite_decodes_gzip"
+      ],
+      "note": "已有行为测试，未消费 W01 case/fixture",
+      "blocker": null
+    },
+    {
+      "case_id": "W02",
+      "category": "rewrite",
+      "fixture": "modules/surge-demo.sgmodule",
+      "expected_status": "supported",
+      "consumed": false,
+      "assertion_types": [],
+      "consumed_by": [],
+      "runtime_behavior_covered": false,
+      "related_tests": [
+        "核心 rewrite 解析器测试覆盖 header 字段"
+      ],
+      "note": "无请求头端到端断言",
+      "blocker": "no_runtime_assertion"
+    },
+    {
+      "case_id": "W03",
+      "category": "rewrite",
+      "fixture": "modules/surge-demo.sgmodule",
+      "expected_status": "unsupported",
+      "consumed": false,
+      "assertion_types": [],
+      "consumed_by": [],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "未支持动作；无逐 case 断言",
+      "blocker": "unsupported_action"
+    },
+    {
+      "case_id": "W04",
+      "category": "rewrite",
+      "fixture": "modules/surge-demo.sgmodule",
+      "expected_status": "unsupported",
+      "consumed": false,
+      "assertion_types": [],
+      "consumed_by": [],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "未支持动作；无逐 case 断言",
+      "blocker": "unsupported_action"
+    },
+    {
+      "case_id": "W05",
+      "category": "rewrite",
+      "fixture": "modules/surge-demo.sgmodule",
+      "expected_status": "unsupported",
+      "consumed": false,
+      "assertion_types": [],
+      "consumed_by": [],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "未支持动作；无逐 case 断言",
+      "blocker": "unsupported_action"
+    },
+    {
+      "case_id": "W06",
+      "category": "rewrite",
+      "fixture": "modules/loon-demo.plugin",
+      "expected_status": "unsupported",
+      "consumed": false,
+      "assertion_types": [],
+      "consumed_by": [],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "未支持动作；无逐 case 断言",
+      "blocker": "unsupported_action"
+    },
+    {
+      "case_id": "W07",
+      "category": "rewrite",
+      "fixture": "modules/surge-demo.sgmodule",
+      "expected_status": "unsupported",
+      "consumed": false,
+      "assertion_types": [],
+      "consumed_by": [],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "未支持动作；无逐 case 断言",
+      "blocker": "unsupported_action"
+    },
+    {
+      "case_id": "W08",
+      "category": "rewrite",
+      "fixture": "modules/loon-demo.plugin",
+      "expected_status": "unsupported",
+      "consumed": false,
+      "assertion_types": [],
+      "consumed_by": [],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "未支持动作；无逐 case 断言",
+      "blocker": "unsupported_action"
+    },
+    {
+      "case_id": "W09",
+      "category": "rewrite",
+      "fixture": "modules/loon-demo.plugin",
+      "expected_status": "unsupported",
+      "consumed": false,
+      "assertion_types": [],
+      "consumed_by": [],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "未支持动作；无逐 case 断言",
+      "blocker": "unsupported_action"
+    },
+    {
+      "case_id": "W10",
+      "category": "rewrite",
+      "fixture": "n/a",
+      "expected_status": "supported",
+      "consumed": false,
+      "assertion_types": [],
+      "consumed_by": [],
+      "runtime_behavior_covered": true,
+      "related_tests": [
+        "mitm_test::mitm_h2_grpc_body_rewrites_protobuf_fields"
+      ],
+      "note": "已有 gRPC 行为测试，未消费 W10 case/fixture",
+      "blocker": null
+    },
+    {
+      "case_id": "X01",
+      "category": "script",
+      "fixture": "scripts/request.js",
+      "expected_status": "supported",
+      "consumed": false,
+      "assertion_types": [],
+      "consumed_by": [],
+      "runtime_behavior_covered": true,
+      "related_tests": [
+        "script_acceptance::request_phase_script_rewrites_method_headers_body",
+        "script::direct_request_object_mutation_is_read_back"
+      ],
+      "note": "无逐 case 断言；由脚本验收与单测覆盖同类行为",
+      "blocker": ""
+    },
+    {
+      "case_id": "X02",
+      "category": "script",
+      "fixture": "scripts/response.js",
+      "expected_status": "supported",
+      "consumed": false,
+      "assertion_types": [],
+      "consumed_by": [],
+      "runtime_behavior_covered": true,
+      "related_tests": [
+        "script::done_body_mutates_response_and_multiple_done_is_first_wins"
+      ],
+      "note": "无逐 case 断言；由脚本单测覆盖同类行为",
+      "blocker": ""
+    },
+    {
+      "case_id": "X03",
+      "category": "script",
+      "fixture": "scripts/script-api.js",
+      "expected_status": "partial",
+      "consumed": false,
+      "assertion_types": [],
+      "consumed_by": [],
+      "runtime_behavior_covered": true,
+      "related_tests": [
+        "script::http_client_fetches_local_test_server",
+        "script::persistent_store_roundtrips",
+        "script::notification_and_console_are_recorded"
+      ],
+      "note": "无逐 case 断言；$httpClient 回调同步、通知只记录",
+      "blocker": "http_callback_sync,notification_not_system_toast"
+    },
+    {
+      "case_id": "C01",
+      "category": "config",
+      "fixture": "configs/app-config.json",
+      "expected_status": "supported",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "app:CompatFixtureTest::app config fixtures parse as expected"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "C02",
+      "category": "config",
+      "fixture": "configs/legacy-flat.json",
+      "expected_status": "supported",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "app:CompatFixtureTest::app config fixtures parse as expected"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "C03",
+      "category": "config",
+      "fixture": "subscriptions/loon-main.conf",
+      "expected_status": "unsupported",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::loon_and_shadowrocket_conf_are_not_subscription_formats"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    },
+    {
+      "case_id": "C04",
+      "category": "config",
+      "fixture": "subscriptions/shadowrocket.conf",
+      "expected_status": "unsupported",
+      "consumed": true,
+      "assertion_types": [
+        "parse"
+      ],
+      "consumed_by": [
+        "compat_fixtures::loon_and_shadowrocket_conf_are_not_subscription_formats"
+      ],
+      "runtime_behavior_covered": false,
+      "related_tests": [],
+      "note": "",
+      "blocker": null
+    }
+  ]
+}

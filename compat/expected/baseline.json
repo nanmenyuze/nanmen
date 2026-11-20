@@ -1,0 +1,215 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-11-20",
+  "app": {
+    "versionName": "2.3.6",
+    "versionCode": 80,
+    "kernel_version": "1.12.5",
+    "minSdk": 31,
+    "targetSdk": 36,
+    "compileSdk": 36
+  },
+  "kernel": {
+    "source_hash": "afb2a2ac7e2c5f644be0345cb387a4ad9b554c51d1a5b09fa792cbca8b64f012",
+    "cargo_hash": "7dcbb2870f1e838c1757ad08d7235fa76a4a77b3af7b458ecf806a75a2226f6a",
+    "arm64_so_sha256": "ff4906c17e23f64be3282fc8b449a8c3357782cc728333d1516a9511b7ecd2ec",
+    "armv7_so_sha256": "9ef953203298fe8e30425ba231fb996c8a32e65cd0c789cdf46a93ed13331015"
+  },
+  "tests": {
+    "rust": {
+      "total": 182,
+      "passed": 182,
+      "suites": {
+        "lib": 107,
+        "cert_name_probe": 1,
+        "compat_fixtures": 13,
+        "compat_rules": 1,
+        "core_test": 30,
+        "mitm_test": 20,
+        "protocol_e2e": 4,
+        "script_acceptance": 5,
+        "binary_frame": 1
+      }
+    },
+    "kotlin": {
+      "total": 106,
+      "passed": 106,
+      "suites": 21,
+      "failures": 0,
+      "errors": 0,
+      "skipped": 0
+    },
+    "lint": {
+      "errors": 0,
+      "warnings": 38
+    },
+    "verifyKernel": "passed"
+  },
+  "apk": {
+    "path": "app/build/outputs/apk/debug/app-debug.apk",
+    "bytes": 44314059,
+    "sha256": "8dcc54cdfe3cc9c88db8f83ae3c20e9c8f8f2a7df19318439f7d8ec22a229051",
+    "versionCode": 80,
+    "versionName": "2.3.6",
+    "debug_cert_sha256": "d38a1dbd4cc02bfff2dee2aadba050c6d77a0092de74140c837c817924aa5c54"
+  },
+  "clean_build": {
+    "directory": "work/v134",
+    "result": "BUILD SUCCESSFUL",
+    "gradle_time": "3m 24s",
+    "tasks_executed": 38,
+    "first_attempt": "清洁构建：停止 Gradle 后删除 app/build，verifyKernel + assembleDebug 全量执行",
+    "fully_offline": false
+  },
+  "source": {
+    "code_source_sha256": "d8a7d27346ee05c22dd21edb300800076bf46bf55af2b41ff13eaecb4ff84861",
+    "archive": "南门DNS-2.3.6-自研内核-完整源码.zip",
+    "archive_sha256": "external (see delivery SHA256SUMS.txt)",
+    "archive_name": "南门DNS-2.3.6-自研内核-完整源码.zip"
+  },
+  "compat": {
+    "targets": "compat/targets.json",
+    "matrix": "compat/matrix.json",
+    "cases": "compat/expected/cases.json",
+    "coverage": "compat/expected/coverage.json",
+    "fixtures": 48,
+    "cases_count": 52,
+    "matrix_rows": 99,
+    "directly_consumed_cases": 35,
+    "not_consumed_cases": 17,
+    "parse_assertions": 29,
+    "runtime_assertions": 6,
+    "matrix_status": {
+      "supported": 40,
+      "partial": 26,
+      "unsupported": 32,
+      "needs_verification": 1
+    }
+  },
+  "blockers": [
+    "no Android device",
+    "no iOS device / no Loon or Shadowrocket installation",
+    "no real proxy/server",
+    "Shadowrocket exact version secondary source",
+    "Snell/ShadowTLS fixtures missing"
+  ],
+  "shell": {
+    "variant": "Android 12+",
+    "minSdk": 31,
+    "dock": "RenderEffect hardware blur + LocalDockClearance",
+    "versionName": "2.3.6",
+    "versionCode": 80
+  },
+  "m3": {
+    "config_version": 3,
+    "matrix_rows": 88,
+    "matrix_status": {
+      "supported": 24,
+      "unsupported": 44,
+      "partial": 19,
+      "needs_verification": 1
+    },
+    "strategy_tests": 10,
+    "rule_test_transport_test": 1,
+    "blockers": [
+      "no Android device",
+      "no real proxy/server or speed-test endpoint",
+      "no real UDP probe",
+      "Clash/Loon proxy-groups not imported"
+    ]
+  },
+  "m4": {
+    "config_version": 3,
+    "matrix_rows": 88,
+    "matrix_status": {
+      "supported": 26,
+      "partial": 21,
+      "unsupported": 40,
+      "needs_verification": 1
+    },
+    "rust_tests": 139,
+    "kotlin_tests": 95,
+    "protocol_e2e": 4,
+    "notes": [
+      "Loon/小火箭节点/组/规则/DNS 导入",
+      "Clash 组目标保留",
+      "规则源 304/ETag 缓存回退",
+      "DOMAIN-WILDCARD/GEOIP(CN)"
+    ]
+  },
+  "m5": {
+    "loon_plugin_sections": 10,
+    "rewrite_old": "URL 替换、302/307、reject-*、头/体/JSON、inline mock",
+    "rewrite_new": "url.replace、redirect、request/response header/body/json",
+    "http1": true,
+    "http2": true,
+    "script_gap": "M6 已接入执行；未缓存和旧式 script(...) 仍按缺口展示；binary-body-mode 已支持",
+    "local_import": [
+      "module",
+      "config"
+    ],
+    "rust_tests": 148,
+    "kotlin_tests": 96,
+    "notes": [
+      "[Rewrite] 与 Surge [URL Rewrite] 分开解析",
+      "2MiB 正文预算与超限回退",
+      "reject 直接断开/RST_STREAM",
+      "模块与配置文件均支持本地文件导入"
+    ]
+  },
+  "m6": {
+    "worker_threads": 4,
+    "runtime": "QuickJS rquickjs 0.12.2",
+    "memory_limit_mib": 32,
+    "stack_kib": 512,
+    "timeout_default_ms": 5000,
+    "timeout_max_ms": 10000,
+    "eval_disabled": true,
+    "rust_tests": 182,
+    "kotlin_tests": 106,
+    "apis": [
+      "$request",
+      "$response",
+      "$done",
+      "$httpClient",
+      "$persistentStore",
+      "$argument",
+      "$notification",
+      "console",
+      "setTimeout",
+      "Promise/async 微任务",
+      "binary-body-mode/Uint8Array",
+      "异步 $httpClient timeout/headers 数组"
+    ],
+    "blockers": [
+      "no_android_device",
+      "no_ios_device",
+      "no_real_authorized_script_corpus"
+    ],
+    "notes": [
+      "专用脚本线程池",
+      "失败/超时/跳过计数入诊断",
+      "Promise/async 微任务驱动",
+      "二进制 Uint8Array 与 gRPC 回写",
+      "异步 $httpClient 独立 runtime",
+      "导入预览橙色警示（无模块脚本开关）",
+      "不承诺全生态兼容"
+    ]
+  },
+  "synthetic_module_compat": {
+    "fixtures": 17,
+    "kotlin_tests": 6,
+    "parser_fixes": [
+      "%APPEND% MITM hostname",
+      "mid-wildcard hostname glob",
+      "URL-REGEX REJECT -> MITM rewrite",
+      "Loon 具名脚本 `名称 = type=...` 保留 tag",
+      "5 条脚本（含 binary-body-mode 二进制样本）全部解析"
+    ],
+    "notes": [
+      "scriptEnabled 与远程来源确认已按用户要求移除",
+      "二进制样本按 Uint8Array 运行并回写 gRPC 帧",
+      "17 个模块全部为南门DNS 自写合成样本"
+    ]
+  }
+}

@@ -1,0 +1,19 @@
+#!name=南门DNS music 合成模块
+#!desc=南门DNS 自写测试样本，仅使用 example.com 合成域名，不含第三方规则或脚本。
+#!author=南门DNS
+#!category=测试
+#!date=2026-11-20
+
+[Rule]
+DOMAIN-SUFFIX,ads.music.example.com,REJECT
+DOMAIN,cdn.music.example.com,DIRECT
+IP-CIDR,203.0.113.0/24,PROXY
+PORT,8443,PROXY
+GEOIP,CN,DIRECT
+
+[URL Rewrite]
+^https?:\/\/ads\.music\.example\.com\/banner - reject
+^https?:\/\/api\.music\.example\.com\/sponsor - reject-dict
+
+[MITM]
+hostname = %APPEND% app.music.example.com, api.music.example.com

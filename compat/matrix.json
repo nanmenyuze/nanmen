@@ -1,0 +1,2239 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-20",
+  "source": "docs/LOON_COMPAT_BASELINE.md",
+  "targets_file": "compat/targets.json",
+  "status_legend": {
+    "supported": "当前实现+固定样本/单测",
+    "partial": "子集或需真机/CA/Root",
+    "unsupported": "未实现或忽略",
+    "needs_verification": "代码存在，缺真机/真实服务",
+    "n/a": "不适用"
+  },
+  "summary": {
+    "rows": 99,
+    "by_status": {
+      "supported": 34,
+      "unsupported": 40,
+      "partial": 24,
+      "needs_verification": 1
+    }
+  },
+  "rows": [
+    {
+      "id": "NODE-SS",
+      "area": "node",
+      "capability": "Shadowsocks SIP002 / 旧版 Base64",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "SIP002 + legacy Base64",
+      "status": "supported",
+      "evidence": "core/src/subscribe.rs::parse_ss",
+      "fixtures": [
+        "N01",
+        "N02"
+      ],
+      "tests": [
+        "compat_fixtures::ss_sip002_imports",
+        "compat_fixtures::ss_legacy_imports"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [],
+      "note": ""
+    },
+    {
+      "id": "NODE-SSR",
+      "area": "node",
+      "capability": "ShadowsocksR",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "partial"
+      },
+      "current": "协议未实现；导入时输出逐项诊断",
+      "status": "unsupported",
+      "evidence": "core/src/subscribe.rs::parse_uri_list",
+      "fixtures": [
+        "N03"
+      ],
+      "tests": [
+        "compat_fixtures::ssr_and_wireguard_are_diagnosed"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [
+        "protocol_not_implemented"
+      ],
+      "note": "M1：不再静默丢弃，计为 unsupported_protocol"
+    },
+    {
+      "id": "NODE-VMESS",
+      "area": "node",
+      "capability": "VMess + TCP/WS/TLS",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "精确拒绝；未引入 VMess 实现",
+      "status": "unsupported",
+      "evidence": "core/src/subscribe.rs::diagnose_uri；docs/M4_PROTOCOL_CAPABILITY_MATRIX.md",
+      "fixtures": [
+        "N04"
+      ],
+      "tests": [
+        "compat_fixtures::vmess_and_hysteria_are_counted_unsupported"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [],
+      "note": "能力矩阵评估见 M4 文档"
+    },
+    {
+      "id": "NODE-VLESS-TCP",
+      "area": "node",
+      "capability": "VLESS TCP + TLS",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "支持 TCP/TLS 子集",
+      "status": "partial",
+      "evidence": "core/src/subscribe.rs::parse_vless",
+      "fixtures": [
+        "N05"
+      ],
+      "tests": [
+        "compat_fixtures::vless_tcp_ws_trojan_and_socks_import"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [
+        "transport_subset"
+      ],
+      "note": ""
+    },
+    {
+      "id": "NODE-VLESS-WS",
+      "area": "node",
+      "capability": "VLESS WS + TLS",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "支持 WS/TLS 子集",
+      "status": "partial",
+      "evidence": "core/src/subscribe.rs::parse_vless",
+      "fixtures": [
+        "N06"
+      ],
+      "tests": [
+        "compat_fixtures::vless_tcp_ws_trojan_and_socks_import"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [
+        "transport_subset"
+      ],
+      "note": ""
+    },
+    {
+      "id": "NODE-VLESS-REALITY",
+      "area": "node",
+      "capability": "VLESS Reality / XTLS Vision",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "partial"
+      },
+      "current": "Reality / 非空 flow / gRPC 精确拒绝",
+      "status": "unsupported",
+      "evidence": "core/src/subscribe.rs::classify_uri_failure",
+      "fixtures": [
+        "N07"
+      ],
+      "tests": [
+        "core_test::vless_reality_and_vision_rejected_with_warning",
+        "compat_fixtures::vless_reality_and_grpc_are_rejected_with_diagnosis"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [],
+      "note": "需 uTLS/Reality 传输栈，M4 不自行实现"
+    },
+    {
+      "id": "NODE-VLESS-GRPC",
+      "area": "node",
+      "capability": "VLESS gRPC transport",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "partial"
+      },
+      "current": "明确拒绝",
+      "status": "unsupported",
+      "evidence": "core/src/subscribe.rs::parse_vless",
+      "fixtures": [
+        "N08"
+      ],
+      "tests": [
+        "compat_fixtures::vless_reality_and_grpc_are_rejected_with_warning"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [],
+      "note": ""
+    },
+    {
+      "id": "NODE-TROJAN",
+      "area": "node",
+      "capability": "Trojan TCP/WS + TLS",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "支持 TCP/WS 子集",
+      "status": "partial",
+      "evidence": "core/src/subscribe.rs::parse_trojan",
+      "fixtures": [
+        "N09",
+        "N10"
+      ],
+      "tests": [
+        "compat_fixtures::vless_tcp_ws_trojan_and_socks_import"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [
+        "transport_subset"
+      ],
+      "note": ""
+    },
+    {
+      "id": "NODE-HTTP",
+      "area": "node",
+      "capability": "HTTP CONNECT proxy",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "支持",
+      "status": "supported",
+      "evidence": "core/src/subscribe.rs::parse_http",
+      "fixtures": [
+        "N15"
+      ],
+      "tests": [
+        "compat_fixtures::http_and_https_proxy_import"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [],
+      "note": ""
+    },
+    {
+      "id": "NODE-HTTPS",
+      "area": "node",
+      "capability": "HTTPS CONNECT proxy",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "解析并置 tls=true；本地 TLS 测试代理验证通过",
+      "status": "supported",
+      "evidence": "core/src/subscribe.rs::parse_http",
+      "fixtures": [
+        "N16"
+      ],
+      "tests": [
+        "compat_fixtures::http_and_https_proxy_import",
+        "core_test::https_proxy_connects_with_tls_before_connect"
+      ],
+      "assertion": "parse",
+      "runtime_verified": true,
+      "blockers": [],
+      "note": "M1：验证 TLS 握手先于 CONNECT，未把 HTTPS 当明文 HTTP"
+    },
+    {
+      "id": "NODE-SOCKS5",
+      "area": "node",
+      "capability": "SOCKS5 + auth + UDP",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "支持 TCP/UDP ASSOCIATE",
+      "status": "supported",
+      "evidence": "core/src/proto/socks.rs",
+      "fixtures": [
+        "N14"
+      ],
+      "tests": [
+        "compat_fixtures::vless_tcp_ws_trojan_and_socks_import"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [],
+      "note": ""
+    },
+    {
+      "id": "NODE-HY2",
+      "area": "node",
+      "capability": "Hysteria2",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "Hysteria2 精确拒绝",
+      "status": "unsupported",
+      "evidence": "core/src/subscribe.rs::diagnose_uri",
+      "fixtures": [
+        "N11"
+      ],
+      "tests": [
+        "compat_fixtures::vmess_and_hysteria_are_counted_unsupported"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [],
+      "note": "QUIC 依赖评估见 M4 文档"
+    },
+    {
+      "id": "NODE-TUIC",
+      "area": "node",
+      "capability": "TUIC",
+      "target": {
+        "loon": "unknown",
+        "shadowrocket": "partial"
+      },
+      "current": "TUIC 精确拒绝",
+      "status": "unsupported",
+      "evidence": "core/src/subscribe.rs::diagnose_uri",
+      "fixtures": [
+        "N12"
+      ],
+      "tests": [],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [],
+      "note": "QUIC 依赖评估见 M4 文档"
+    },
+    {
+      "id": "NODE-WG",
+      "area": "node",
+      "capability": "WireGuard",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "协议未实现；导入时输出逐项诊断",
+      "status": "unsupported",
+      "evidence": "core/src/subscribe.rs::parse_uri_list",
+      "fixtures": [
+        "N13"
+      ],
+      "tests": [
+        "compat_fixtures::ssr_and_wireguard_are_diagnosed"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [
+        "protocol_not_implemented"
+      ],
+      "note": "M1：不再静默丢弃，计为 unsupported_protocol"
+    },
+    {
+      "id": "NODE-ANYTLS",
+      "area": "node",
+      "capability": "AnyTLS",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "partial"
+      },
+      "current": "协议未实现；导入时输出逐项诊断",
+      "status": "unsupported",
+      "evidence": "core/src/subscribe.rs::parse_uri_list",
+      "fixtures": [
+        "N17"
+      ],
+      "tests": [
+        "compat_fixtures::tuic_and_anytls_are_diagnosed"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [
+        "protocol_not_implemented"
+      ],
+      "note": "M1：不再静默丢弃，计为 unsupported_protocol"
+    },
+    {
+      "id": "NODE-SNELL",
+      "area": "node",
+      "capability": "Snell",
+      "target": {
+        "loon": "no",
+        "shadowrocket": "yes"
+      },
+      "current": "协议未实现；已输出 unsupported_protocol 诊断",
+      "status": "unsupported",
+      "evidence": "core/src/subscribe.rs::parse_uri_list",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [
+        "protocol_not_implemented"
+      ],
+      "note": "M1：unknown/known-unsupported scheme 逐项诊断"
+    },
+    {
+      "id": "NODE-SHADOWTLS",
+      "area": "node",
+      "capability": "ShadowTLS",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "协议未实现；已输出 unsupported_protocol 诊断",
+      "status": "unsupported",
+      "evidence": "core/src/subscribe.rs::parse_uri_list",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [
+        "protocol_not_implemented"
+      ],
+      "note": "M1：unknown/known-unsupported scheme 逐项诊断"
+    },
+    {
+      "id": "NODE-CUSTOM-JS",
+      "area": "node",
+      "capability": "Loon Custom by JS",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "no"
+      },
+      "current": "无脚本运行时",
+      "status": "unsupported",
+      "evidence": "core/src/subscribe.rs::parse_uri_list",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [
+        "no_script_runtime"
+      ],
+      "note": ""
+    },
+    {
+      "id": "CFG-URI",
+      "area": "config",
+      "capability": "URI 节点列表",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "SS/Trojan/VLESS/SOCKS/HTTP 子集",
+      "status": "partial",
+      "evidence": "core/src/subscribe.rs::parse_uri_list",
+      "fixtures": [
+        "N01",
+        "N02",
+        "N05",
+        "N09",
+        "N14",
+        "N15"
+      ],
+      "tests": [
+        "compat_fixtures::ss_sip002_imports"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [],
+      "note": "M1：未知 scheme/协议/参数逐项诊断，混合列表不少算"
+    },
+    {
+      "id": "CFG-BASE64",
+      "area": "config",
+      "capability": "Base64 订阅",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "支持",
+      "status": "supported",
+      "evidence": "core/src/subscribe.rs::parse_subscription",
+      "fixtures": [
+        "S01"
+      ],
+      "tests": [
+        "compat_fixtures::base64_subscription_decodes_uris"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [],
+      "note": ""
+    },
+    {
+      "id": "CFG-CLASH",
+      "area": "config",
+      "capability": "Clash YAML",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "规则/策略组可导入；proxies 仍走订阅",
+      "status": "partial",
+      "evidence": "app/src/main/java/com/namu/dns/core/config/ConfigSource.kt::ClashConfigParser；core/src/subscribe.rs::parse_clash",
+      "fixtures": [
+        "S02"
+      ],
+      "tests": [
+        "ConfigSourceTest::valid clash rules can import but keep nodes out of config file",
+        "core_test::clash_yaml_parse",
+        "compat_fixtures::clash_subscription_imports_nodes_rules_groups"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [
+        "proxy_group_semantics"
+      ],
+      "note": "组名保留为动作；节点不写入 .conf"
+    },
+    {
+      "id": "CFG-USERINFO",
+      "area": "config",
+      "capability": "Subscription-Userinfo",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "支持",
+      "status": "supported",
+      "evidence": "app/src/main/java/com/namu/dns/Actions.kt::parseSubscriptionUserInfo",
+      "fixtures": [
+        "S07"
+      ],
+      "tests": [
+        "app:CompatFixtureTest::subscription userinfo"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [],
+      "note": ""
+    },
+    {
+      "id": "CFG-APPJSON",
+      "area": "config",
+      "capability": "南门 DNS 2.x nested JSON",
+      "target": {
+        "loon": "n/a",
+        "shadowrocket": "n/a"
+      },
+      "current": "v2 版本化模型；未知根字段保留",
+      "status": "supported",
+      "evidence": "app/src/main/java/com/namu/dns/core/config/ConfigFile.kt",
+      "fixtures": [
+        "C01"
+      ],
+      "tests": [
+        "app:CompatFixtureTest::app config fixtures",
+        "app:ConfigFileTest"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [],
+      "note": "M2：version 2；旧扁平 JSON 自动迁移"
+    },
+    {
+      "id": "CFG-LEGACYJSON",
+      "area": "config",
+      "capability": "旧版扁平 AppConfig JSON",
+      "target": {
+        "loon": "n/a",
+        "shadowrocket": "n/a"
+      },
+      "current": "支持迁移",
+      "status": "supported",
+      "evidence": "ConfigFile.fromLegacyJson",
+      "fixtures": [
+        "C02"
+      ],
+      "tests": [
+        "app:CompatFixtureTest::app config fixtures"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [],
+      "note": ""
+    },
+    {
+      "id": "CFG-LOONCONF",
+      "area": "config",
+      "capability": "Loon .conf",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "no"
+      },
+      "current": "节点/策略组/常用规则/DNS 可导入；Rewrite/Script 仅识别",
+      "status": "partial",
+      "evidence": "ConfigSource.kt::parseSectionConfig",
+      "fixtures": [
+        "S03",
+        "C03"
+      ],
+      "tests": [
+        "ConfigSourceTest::loon imports nodes groups rules and dns",
+        "ConfigSourceTest::loon rejects process and uid rules instead of guessing"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [
+        "not_activated"
+      ],
+      "note": "未知段落写入 sourceUnknownSections；应用/UID 规则拒绝"
+    },
+    {
+      "id": "CFG-SR-CONF",
+      "area": "config",
+      "capability": "Shadowrocket .conf",
+      "target": {
+        "loon": "no",
+        "shadowrocket": "yes"
+      },
+      "current": "节点/策略组/常用规则/DNS 可导入；URL Rewrite 仅识别",
+      "status": "partial",
+      "evidence": "ConfigSource.kt::parseSectionConfig",
+      "fixtures": [
+        "S04",
+        "C04"
+      ],
+      "tests": [
+        "ConfigSourceTest::shadowrocket imports its supported subset"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [
+        "not_activated"
+      ],
+      "note": "与 Loon 共用 section 解析，未知段落保留"
+    },
+    {
+      "id": "CFG-SGMODULE",
+      "area": "config",
+      "capability": "Surge .sgmodule",
+      "target": {
+        "loon": "partial",
+        "shadowrocket": "partial"
+      },
+      "current": "Rule/MITM/URL/Header 子集",
+      "status": "partial",
+      "evidence": "app/src/main/java/com/namu/dns/ModuleParser.kt",
+      "fixtures": [
+        "S06"
+      ],
+      "tests": [
+        "app:CompatFixtureTest::surge module"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [
+        "script_host_body"
+      ],
+      "note": ""
+    },
+    {
+      "id": "CFG-LOONPLUGIN",
+      "area": "config",
+      "capability": "Loon .plugin",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "no"
+      },
+      "current": "Rule/Mitm 子集",
+      "status": "partial",
+      "evidence": "ModuleParser.kt",
+      "fixtures": [
+        "S05"
+      ],
+      "tests": [
+        "app:CompatFixtureTest::loon plugin"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [
+        "argument_general_rewrite_host_script"
+      ],
+      "note": ""
+    },
+    {
+      "id": "CFG-RULESET",
+      "area": "config",
+      "capability": "远程规则集",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "条件请求 304/ETag/Last-Modified、.bak 回退、失败保留旧缓存",
+      "status": "partial",
+      "evidence": "Actions.kt::syncRuleSources；ConfigStore.kt::ensureAssets",
+      "fixtures": [
+        "S08"
+      ],
+      "tests": [
+        "Actions 规则源条件请求（代码审查）"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [
+        "ip_port_conditions"
+      ],
+      "note": "无真实远端规则源做在线 304 验收"
+    },
+    {
+      "id": "CFG-GROUP",
+      "area": "config",
+      "capability": "代理组 select/url-test/fallback",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "Clash proxy-groups 与 Loon 组导入为设备策略组",
+      "status": "supported",
+      "evidence": "core/src/subscribe.rs::parse_clash；ConfigSource.kt::parseSectionConfig；Actions.kt::importSubscription",
+      "fixtures": [
+        "S02"
+      ],
+      "tests": [
+        "core_test::clash_yaml_parse",
+        "ConfigSourceTest::loon imports nodes groups rules and dns"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": false,
+      "blockers": [
+        "no_device",
+        "no_real_proxy"
+      ],
+      "note": "组选择仍设备侧持久化"
+    },
+    {
+      "id": "RULE-DOMAIN",
+      "area": "rule",
+      "capability": "DOMAIN",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "支持",
+      "status": "supported",
+      "evidence": "core/src/engine.rs",
+      "fixtures": [
+        "R01"
+      ],
+      "tests": [
+        "compat_rules::rule_runtime_matrix"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [],
+      "note": ""
+    },
+    {
+      "id": "RULE-SUFFIX",
+      "area": "rule",
+      "capability": "DOMAIN-SUFFIX",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "支持",
+      "status": "supported",
+      "evidence": "core/src/engine.rs",
+      "fixtures": [
+        "R01"
+      ],
+      "tests": [
+        "compat_rules::rule_runtime_matrix"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [],
+      "note": ""
+    },
+    {
+      "id": "RULE-KEYWORD",
+      "area": "rule",
+      "capability": "DOMAIN-KEYWORD",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "支持",
+      "status": "supported",
+      "evidence": "core/src/engine.rs",
+      "fixtures": [
+        "R02"
+      ],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_case"
+      ],
+      "note": ""
+    },
+    {
+      "id": "RULE-REGEX",
+      "area": "rule",
+      "capability": "DOMAIN-REGEX",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "内核、模块解析器、手动 UI 均支持；非法正则拒绝",
+      "status": "supported",
+      "evidence": "core/src/engine.rs",
+      "fixtures": [
+        "R09"
+      ],
+      "tests": [
+        "compat_rules::rule_runtime_matrix",
+        "core_test::domain_regex_and_port_rules_execute",
+        "app:CompatFixtureTest::domain regex and port are validated"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [],
+      "note": "M1 打通导入→持久化→引擎执行"
+    },
+    {
+      "id": "RULE-WILDCARD",
+      "area": "rule",
+      "capability": "DOMAIN-WILDCARD",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "DOMAIN-WILDCARD glob（大小写不敏感）",
+      "status": "supported",
+      "evidence": "core/src/engine.rs::wildcard_regex",
+      "fixtures": [
+        "R08"
+      ],
+      "tests": [
+        "core_test::wildcard_and_geoip_rules_match_common_clash_syntax"
+      ],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_rule_impl"
+      ],
+      "note": "* 匹配任意字符；? 匹配单字符"
+    },
+    {
+      "id": "RULE-IP",
+      "area": "rule",
+      "capability": "IP-CIDR / IP-CIDR6",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "支持",
+      "status": "supported",
+      "evidence": "core/src/engine.rs",
+      "fixtures": [
+        "R03"
+      ],
+      "tests": [
+        "compat_rules::rule_runtime_matrix"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [],
+      "note": ""
+    },
+    {
+      "id": "RULE-PORT",
+      "area": "rule",
+      "capability": "PORT",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "内核、模块解析器、手动 UI 均支持；端口限 1–65535",
+      "status": "supported",
+      "evidence": "core/src/engine.rs",
+      "fixtures": [
+        "R04"
+      ],
+      "tests": [
+        "compat_rules::rule_runtime_matrix",
+        "core_test::domain_regex_and_port_rules_execute",
+        "app:CompatFixtureTest::domain regex and port are validated"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [],
+      "note": "M1 打通导入→持久化→引擎执行"
+    },
+    {
+      "id": "RULE-GEOIP",
+      "area": "rule",
+      "capability": "GEOIP",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "GEOIP(CN) 使用内置 CN IP 库；其他地区明确跳过",
+      "status": "partial",
+      "evidence": "core/src/engine.rs::RuleKind::GeoIp",
+      "fixtures": [
+        "R05"
+      ],
+      "tests": [
+        "core_test::wildcard_and_geoip_rules_match_common_clash_syntax"
+      ],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_rule_impl"
+      ],
+      "note": "无 GeoLite 数据库，非 CN 不猜测"
+    },
+    {
+      "id": "RULE-ASN",
+      "area": "rule",
+      "capability": "IP-ASN",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "core/src/engine.rs",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_rule_impl"
+      ],
+      "note": ""
+    },
+    {
+      "id": "RULE-UA",
+      "area": "rule",
+      "capability": "USER-AGENT",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "core/src/engine.rs",
+      "fixtures": [
+        "R06"
+      ],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_rule_impl"
+      ],
+      "note": "S06 ignored 聚合"
+    },
+    {
+      "id": "RULE-URLREGEX",
+      "area": "rule",
+      "capability": "URL-REGEX",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "core/src/engine.rs",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_rule_impl"
+      ],
+      "note": ""
+    },
+    {
+      "id": "RULE-PROCESS",
+      "area": "rule",
+      "capability": "PROCESS-NAME",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "core/src/engine.rs",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_rule_impl"
+      ],
+      "note": ""
+    },
+    {
+      "id": "RULE-PROTOCOL",
+      "area": "rule",
+      "capability": "PROTOCOL",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "core/src/engine.rs",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_rule_impl"
+      ],
+      "note": ""
+    },
+    {
+      "id": "RULE-SRC",
+      "area": "rule",
+      "capability": "SRC-IP / SRC-PORT",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "core/src/engine.rs",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_rule_impl"
+      ],
+      "note": ""
+    },
+    {
+      "id": "RULE-LOGIC",
+      "area": "rule",
+      "capability": "AND / OR / NOT",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "core/src/engine.rs",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_rule_impl"
+      ],
+      "note": ""
+    },
+    {
+      "id": "RULE-RULESET",
+      "area": "rule",
+      "capability": "RULE-SET / DOMAIN-SET",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "core/src/engine.rs",
+      "fixtures": [
+        "R07"
+      ],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_rule_impl"
+      ],
+      "note": "S06 ignored 聚合"
+    },
+    {
+      "id": "RULE-FINAL",
+      "area": "rule",
+      "capability": "FINAL / MATCH",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "支持",
+      "status": "supported",
+      "evidence": "core/src/engine.rs",
+      "fixtures": [
+        "R10"
+      ],
+      "tests": [
+        "compat_rules::rule_runtime_matrix"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [],
+      "note": ""
+    },
+    {
+      "id": "RW-URL",
+      "area": "rewrite",
+      "capability": "URL 替换",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "core/src/mitm/rewrite.rs",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_action"
+      ],
+      "note": ""
+    },
+    {
+      "id": "RW-302",
+      "area": "rewrite",
+      "capability": "302 / 307",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "core/src/mitm/rewrite.rs",
+      "fixtures": [
+        "W04"
+      ],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_action"
+      ],
+      "note": "S06 ignored 聚合"
+    },
+    {
+      "id": "RW-REJECT",
+      "area": "rewrite",
+      "capability": "reject / reject-drop",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "返回 204，非断连",
+      "status": "partial",
+      "evidence": "core/src/mitm/rewrite.rs",
+      "fixtures": [],
+      "tests": [
+        "mitm_test::mitm_reject_rewrite_passthrough_keepalive"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [
+        "semantics"
+      ],
+      "note": ""
+    },
+    {
+      "id": "RW-REJECT200",
+      "area": "rewrite",
+      "capability": "reject-200",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "支持",
+      "status": "supported",
+      "evidence": "core/src/mitm/rewrite.rs",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [],
+      "note": ""
+    },
+    {
+      "id": "RW-REJECTIMG",
+      "area": "rewrite",
+      "capability": "reject-img / reject-tinygif",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "支持",
+      "status": "supported",
+      "evidence": "core/src/mitm/rewrite.rs",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [],
+      "note": ""
+    },
+    {
+      "id": "RW-REQHDR",
+      "area": "rewrite",
+      "capability": "请求头 add/replace",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "支持",
+      "status": "supported",
+      "evidence": "core/src/mitm/rewrite.rs",
+      "fixtures": [
+        "W02"
+      ],
+      "tests": [],
+      "assertion": "runtime",
+      "runtime_verified": false,
+      "blockers": [
+        "no_case_assertion"
+      ],
+      "note": "解析器测试覆盖字段，无端到端断言"
+    },
+    {
+      "id": "RW-REQHDRDEL",
+      "area": "rewrite",
+      "capability": "请求头 del/regex",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "core/src/mitm/rewrite.rs",
+      "fixtures": [
+        "W03"
+      ],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_action"
+      ],
+      "note": ""
+    },
+    {
+      "id": "RW-RESPHDR",
+      "area": "rewrite",
+      "capability": "响应头改写",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "core/src/mitm/rewrite.rs",
+      "fixtures": [
+        "W06"
+      ],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_action"
+      ],
+      "note": ""
+    },
+    {
+      "id": "RW-REQBODY",
+      "area": "rewrite",
+      "capability": "请求体正则/JSON",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "core/src/mitm/rewrite.rs",
+      "fixtures": [
+        "W07"
+      ],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_action"
+      ],
+      "note": ""
+    },
+    {
+      "id": "RW-RESPBODY",
+      "area": "rewrite",
+      "capability": "响应体正则",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "HTTP/1.1 + h2，2 MiB 上限",
+      "status": "partial",
+      "evidence": "core/src/mitm/rewrite.rs",
+      "fixtures": [
+        "W01"
+      ],
+      "tests": [
+        "mitm_test::mitm_h2_response_body_rewrite_decodes_gzip"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [
+        "body_limit"
+      ],
+      "note": ""
+    },
+    {
+      "id": "RW-JSON",
+      "area": "rewrite",
+      "capability": "JSON add/replace/del/jq",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "core/src/mitm/rewrite.rs",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_action"
+      ],
+      "note": ""
+    },
+    {
+      "id": "RW-MOCK",
+      "area": "rewrite",
+      "capability": "Mock",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "core/src/mitm/rewrite.rs",
+      "fixtures": [
+        "W05"
+      ],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_action"
+      ],
+      "note": ""
+    },
+    {
+      "id": "RW-MAP",
+      "area": "rewrite",
+      "capability": "Map Local / Remote",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "core/src/mitm/rewrite.rs",
+      "fixtures": [
+        "W08"
+      ],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_action"
+      ],
+      "note": ""
+    },
+    {
+      "id": "RW-SCRIPT",
+      "area": "rewrite",
+      "capability": "Script rewrite",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "core/src/mitm/rewrite.rs",
+      "fixtures": [
+        "W09"
+      ],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_script_runtime"
+      ],
+      "note": ""
+    },
+    {
+      "id": "RW-GRPC",
+      "area": "rewrite",
+      "capability": "gRPC protobuf 字段级改写",
+      "target": {
+        "loon": "no",
+        "shadowrocket": "no"
+      },
+      "current": "支持（自研扩展）",
+      "status": "supported",
+      "evidence": "core/src/mitm/grpc.rs",
+      "fixtures": [
+        "W10"
+      ],
+      "tests": [
+        "mitm_test::mitm_h2_grpc_body_rewrites_protobuf_fields"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [],
+      "note": ""
+    },
+    {
+      "id": "RW-H2",
+      "area": "rewrite",
+      "capability": "h2 透明桥接 / ALPN",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "已接入，缺真机",
+      "status": "needs_verification",
+      "evidence": "core/src/mitm/h2.rs",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "runtime",
+      "runtime_verified": false,
+      "blockers": [
+        "no_device"
+      ],
+      "note": ""
+    },
+    {
+      "id": "RW-WS",
+      "area": "rewrite",
+      "capability": "WebSocket 改写",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "core/src/mitm/h2.rs",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_websocket"
+      ],
+      "note": ""
+    },
+    {
+      "id": "SCRIPT-SECTION",
+      "area": "script",
+      "capability": "[Script] 段",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "[Script] 段结构化解析并进入 QuickJS 专用线程执行",
+      "status": "supported",
+      "evidence": "app/src/main/java/com/namu/dns/ModuleParser.kt",
+      "fixtures": [
+        "X01",
+        "X02",
+        "X03"
+      ],
+      "tests": [
+        "script::script_engine_compiles_filters_and_reports_gaps"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [
+        "no_android_device",
+        "no_real_authorized_script_corpus"
+      ],
+      "note": "旧式 script(...) 与缺少 script-path 的行仍报缺口"
+    },
+    {
+      "id": "SCRIPT-REQ",
+      "area": "script",
+      "capability": "$request",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "$request 可读写方法/URL/头/文本正文",
+      "status": "supported",
+      "evidence": "core/src/script.rs::run_script_with_runtime",
+      "fixtures": [],
+      "tests": [
+        "script::direct_request_object_mutation_is_read_back",
+        "script_acceptance::request_phase_script_rewrites_method_headers_body"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [
+        "no_android_device"
+      ],
+      "note": "跨域 URL 改写拒绝；二进制正文不支持"
+    },
+    {
+      "id": "SCRIPT-RESP",
+      "area": "script",
+      "capability": "$response",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "$response 可读写状态/头/文本正文",
+      "status": "supported",
+      "evidence": "core/src/script.rs::run_script_with_runtime",
+      "fixtures": [],
+      "tests": [
+        "script::done_body_mutates_response_and_multiple_done_is_first_wins"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [
+        "no_android_device"
+      ],
+      "note": "gRPC/二进制不跑文本脚本"
+    },
+    {
+      "id": "SCRIPT-DONE",
+      "area": "script",
+      "capability": "$done",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "$done 首次生效，多次只计数；请求阶段可本地短路",
+      "status": "supported",
+      "evidence": "core/src/script.rs::run_script_with_runtime",
+      "fixtures": [],
+      "tests": [
+        "script::done_body_mutates_response_and_multiple_done_is_first_wins",
+        "script_acceptance::request_short_circuit_generates_local_response"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [
+        "no_android_device"
+      ],
+      "note": "$done() 无参数按完成但不修改处理"
+    },
+    {
+      "id": "SCRIPT-HTTP",
+      "area": "script",
+      "capability": "$httpClient",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "7 个 HTTP 方法；1 MiB/32 次/4 s；回调同步触发",
+      "status": "partial",
+      "evidence": "core/src/script.rs::run_script_with_runtime",
+      "fixtures": [],
+      "tests": [
+        "script::http_client_fetches_local_test_server",
+        "script_acceptance::async_await_http_client_fetches_and_completes"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [
+        "http_callback_sync",
+        "no_android_device"
+      ],
+      "note": "Promise/async 续体可完成，但网络回调不是真正异步并发"
+    },
+    {
+      "id": "SCRIPT-STORE",
+      "area": "script",
+      "capability": "$persistentStore",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "$persistentStore 读写删清空；1 MiB/256 键",
+      "status": "supported",
+      "evidence": "core/src/script.rs::run_script_with_runtime",
+      "fixtures": [],
+      "tests": [
+        "script::persistent_store_roundtrips",
+        "script_acceptance::persistent_store_roundtrip_across_runs"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [
+        "no_android_device"
+      ],
+      "note": "整文件快照写入"
+    },
+    {
+      "id": "SCRIPT-NOTIFY",
+      "area": "script",
+      "capability": "$notification",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "$notification 记录到运行结果/日志",
+      "status": "partial",
+      "evidence": "core/src/script.rs::run_script_with_runtime",
+      "fixtures": [],
+      "tests": [
+        "script::notification_and_console_are_recorded"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [
+        "notification_not_system_toast"
+      ],
+      "note": "不弹 Android 系统通知"
+    },
+    {
+      "id": "SCRIPT-ARG",
+      "area": "script",
+      "capability": "$argument",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "$argument 支持字符串与 [Argument] 对象",
+      "status": "supported",
+      "evidence": "core/src/script.rs::run_script_with_runtime",
+      "fixtures": [],
+      "tests": [
+        "script::argument_object_is_available",
+        "script::argument_text_is_passed_as_a_string"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [
+        "no_android_device"
+      ],
+      "note": "${argument} 展开仍未实现"
+    },
+    {
+      "id": "MITM-CA",
+      "area": "mitm",
+      "capability": "CA 生成/指纹",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "支持",
+      "status": "supported",
+      "evidence": "core/src/mitm/ca.rs",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [],
+      "note": ""
+    },
+    {
+      "id": "MITM-ROOT",
+      "area": "mitm",
+      "capability": "Root 系统信任安装",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "仅 KernelSU/Magisk 路径，未真机",
+      "status": "partial",
+      "evidence": "app/src/main/java/com/namu/dns/MitmManager.kt",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_device"
+      ],
+      "note": ""
+    },
+    {
+      "id": "MITM-HOST",
+      "area": "mitm",
+      "capability": "hostname / skip hostname",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "支持",
+      "status": "supported",
+      "evidence": "core/src/mitm/rewrite.rs::HostMatcher",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [],
+      "note": ""
+    },
+    {
+      "id": "MITM-H2BODY",
+      "area": "mitm",
+      "capability": "h2 响应体改写",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "实现有测试，缺真机并发",
+      "status": "partial",
+      "evidence": "core/src/mitm/h2.rs",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_device"
+      ],
+      "note": ""
+    },
+    {
+      "id": "MITM-GRPC",
+      "area": "mitm",
+      "capability": "gRPC 拒绝/字段改写",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "实现有测试，缺真机",
+      "status": "partial",
+      "evidence": "core/src/mitm/grpc.rs",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_device"
+      ],
+      "note": ""
+    },
+    {
+      "id": "MITM-WS",
+      "area": "mitm",
+      "capability": "WebSocket MITM",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "core/src/mitm/h2.rs",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_websocket"
+      ],
+      "note": ""
+    },
+    {
+      "id": "MITM-HOSTMAP",
+      "area": "mitm",
+      "capability": "[Host] 映射",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "app/src/main/java/com/namu/dns/ModuleParser.kt",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_action"
+      ],
+      "note": ""
+    },
+    {
+      "id": "MITM-GENERAL",
+      "area": "mitm",
+      "capability": "[General] 插件参数",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "无",
+      "status": "unsupported",
+      "evidence": "ModuleParser.kt",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_action"
+      ],
+      "note": ""
+    },
+    {
+      "id": "GROUP-SELECT",
+      "area": "strategy",
+      "capability": "select 手动选择与持久化",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "持久化 AppConfig.groupSelections；缺省首成员；选择不在组内时显式禁用",
+      "status": "supported",
+      "evidence": "core/src/strategy.rs; app/src/main/java/com/namu/dns/core/config/ConfigFile.kt",
+      "fixtures": [],
+      "tests": [
+        "strategy::tests::select_group_uses_persisted_selection",
+        "strategy::tests::select_group_without_selection_uses_first_member",
+        "strategy::tests::stale_selection_is_explicit_error"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": false,
+      "blockers": [],
+      "note": "组选择不写入 .conf；重启/切换配置由设备侧 DataStore 快照保留。"
+    },
+    {
+      "id": "GROUP-NESTED",
+      "area": "strategy",
+      "capability": "策略组嵌套与解析链",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "递归展开组，链从顶层到叶子；自引用/循环/禁用传播全部阻断",
+      "status": "supported",
+      "evidence": "core/src/strategy.rs::resolve_group",
+      "fixtures": [],
+      "tests": [
+        "strategy::tests::nested_groups_resolve_through_chain",
+        "strategy::tests::cycle_is_reported_and_cannot_be_enabled"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": false,
+      "blockers": [],
+      "note": "UI 编辑前用 wouldCreateCycle 阻断环。"
+    },
+    {
+      "id": "GROUP-URLTEST",
+      "area": "strategy",
+      "capability": "url-test 延迟选择与容差",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "按健康延迟选最低；当前选择在 best+tolerance 内保持；无可用成员按组策略",
+      "status": "partial",
+      "evidence": "core/src/strategy.rs::resolve_url_test; core/src/outbound.rs::probe_node",
+      "fixtures": [],
+      "tests": [
+        "strategy::tests::url_test_picks_lowest_latency_and_respects_tolerance"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": false,
+      "blockers": [
+        "no_device",
+        "no_real_proxy"
+      ],
+      "note": "算法有单测；真实测速 URL/节点与后台循环未端到端验证。自动结果不写回 groupSelections。"
+    },
+    {
+      "id": "GROUP-FALLBACK",
+      "area": "strategy",
+      "capability": "fallback 故障切换与恢复",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "按顺序取首个未标记不健康成员；失败/恢复阈值来自组配置",
+      "status": "partial",
+      "evidence": "core/src/strategy.rs::resolve_fallback; core/src/strategy.rs::HealthRegistry",
+      "fixtures": [],
+      "tests": [
+        "strategy::tests::fallback_switches_after_failure_threshold_and_recovers"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": false,
+      "blockers": [
+        "no_device",
+        "no_real_proxy"
+      ],
+      "note": "阈值/切换逻辑有单测；没有真实节点故障与恢复演练。"
+    },
+    {
+      "id": "GROUP-HEALTH",
+      "area": "strategy",
+      "capability": "健康检查 URL/间隔/超时/阈值",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "组级 test_url/interval/timeout/failure_threshold/recovery_threshold；仅 url-test/fallback 主动探测",
+      "status": "partial",
+      "evidence": "core/src/strategy.rs::run_health_loop; core/src/outbound.rs::probe_node",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_device",
+        "no_real_proxy"
+      ],
+      "note": "TCP/HTTP GET 探测接受 2xx/3xx；没有真实外部测速端点。"
+    },
+    {
+      "id": "GROUP-UDP",
+      "area": "strategy",
+      "capability": "TCP/UDP 分离策略与节点能力",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "SS / SOCKS5 UDP；Trojan/VLESS/HTTP 不支持 UDP",
+      "status": "partial",
+      "evidence": "core/src/strategy.rs::supports_udp；core/tests/protocol_e2e.rs",
+      "fixtures": [],
+      "tests": [
+        "core_test::ss_udp_roundtrip",
+        "protocol_e2e::socks5_udp_associate_is_separate_and_roundtrips"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": false,
+      "blockers": [
+        "no_device",
+        "no_real_proxy"
+      ],
+      "note": "TCP 健康不背书 UDP；UDP 单独测试"
+    },
+    {
+      "id": "GROUP-VALIDATION",
+      "area": "strategy",
+      "capability": "空组/缺失引用/重复节点/失效选择诊断",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "内核与壳层双校验，按路径定位；禁用组依赖传播",
+      "status": "supported",
+      "evidence": "core/src/strategy.rs::StrategySet::from_config; app/src/main/java/com/namu/dns/core/config/ProxyGroupValidation.kt",
+      "fixtures": [],
+      "tests": [
+        "strategy::tests::empty_group_missing_reference_and_duplicate_node_are_detected",
+        "strategy::tests::stale_selection_is_explicit_error"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [],
+      "note": "节点更新删除成员后，旧选择会明确报错并禁用该组，不静默回落。"
+    },
+    {
+      "id": "GROUP-RELOAD",
+      "area": "strategy",
+      "capability": "热更新期间连接行为",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "新连接使用新 StrategySet 快照；已有连接保留旧解析节点/旧 UdpMode",
+      "status": "partial",
+      "evidence": "core/src/lib.rs::nativeReloadRules; core/src/netstack.rs::decide_action",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "none",
+      "runtime_verified": false,
+      "blockers": [
+        "no_device"
+      ],
+      "note": "实现有快照替换；没有真机热更并发验收，行为已写入 M3 报告。"
+    },
+    {
+      "id": "PLUGIN-SECTIONS",
+      "area": "module",
+      "capability": "Loon .plugin 段落逐段状态",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "n/a"
+      },
+      "current": "Argument/General/Rule/Rewrite/Host/Script/MITM 逐段行数、可用行数与状态",
+      "status": "partial",
+      "evidence": "ModuleParser.kt::parseSectionStatus",
+      "fixtures": [],
+      "tests": [
+        "app:CompatFixtureTest::loon plugin is parsed as partial module",
+        "app:CompatFixtureTest::loon rewrite separates supported actions from gaps"
+      ],
+      "assertion": "parse",
+      "runtime_verified": false,
+      "blockers": [
+        "script_engine_missing",
+        "runtime_argument_not_expanded",
+        "host_mapping_not_executed"
+      ],
+      "note": "脚本/参数/Host/General 只记录并展示缺口"
+    },
+    {
+      "id": "REWRITE-OLD",
+      "area": "mitm-rewrite",
+      "capability": "Loon 旧版 [Rewrite] 空格语法",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "no"
+      },
+      "current": "URL 替换、302/307、reject-*、头/体/JSON、inline mock",
+      "status": "supported",
+      "evidence": "core/src/mitm/loon.rs::parse_old",
+      "fixtures": [],
+      "tests": [
+        "mitm::loon::parses_old_common_actions",
+        "mitm_test::mitm_loon_old_rewrite_http1_headers_body_redirect_mock_request_json"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [],
+      "note": "jq/data-path/脚本/复杂条件明确不支持"
+    },
+    {
+      "id": "REWRITE-NEW",
+      "area": "mitm-rewrite",
+      "capability": "Loon 新版 request/response if 语法",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "no"
+      },
+      "current": "url.replace、redirect、头、体、JSON 动作",
+      "status": "supported",
+      "evidence": "core/src/mitm/loon.rs::parse_new",
+      "fixtures": [],
+      "tests": [
+        "mitm::loon::parses_new_syntax",
+        "mitm_test::mitm_loon_new_syntax_h2_response_json_headers_and_request_json"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [],
+      "note": "仅单条 ${url} ~= /regex/ 条件"
+    },
+    {
+      "id": "REWRITE-H1",
+      "area": "mitm-rewrite",
+      "capability": "HTTP/1.1 Loon 重写接入",
+      "target": {
+        "loon": "n/a",
+        "shadowrocket": "n/a"
+      },
+      "current": "请求/响应头、体、JSON、mock、reject、redirect、URL 替换",
+      "status": "supported",
+      "evidence": "core/src/mitm/mod.rs::plan_loon_request",
+      "fixtures": [],
+      "tests": [
+        "mitm_test::mitm_loon_old_rewrite_http1_headers_body_redirect_mock_request_json",
+        "mitm_test::mitm_loon_response_over_limit_passthrough"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [],
+      "note": "2 MiB 正文预算；超限/压缩跳过并透传"
+    },
+    {
+      "id": "REWRITE-H2",
+      "area": "mitm-rewrite",
+      "capability": "HTTP/2 Loon 重写接入",
+      "target": {
+        "loon": "n/a",
+        "shadowrocket": "n/a"
+      },
+      "current": "请求/响应头、体、JSON、mock、reject、redirect、跨域目标",
+      "status": "supported",
+      "evidence": "core/src/mitm/h2.rs::handle_stream",
+      "fixtures": [],
+      "tests": [
+        "mitm_test::mitm_loon_new_syntax_h2_response_json_headers_and_request_json",
+        "mitm_test::mitm_loon_h2_request_mock_rewrites_content_type_and_length"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [],
+      "note": "gRPC 只接受 Surge protobuf 字段改写"
+    },
+    {
+      "id": "LOCAL-MODULE-IMPORT",
+      "area": "ui",
+      "capability": "模块从本地文件导入",
+      "target": {
+        "loon": "n/a",
+        "shadowrocket": "n/a"
+      },
+      "current": "OpenDocument 读取、预览、确认落盘、local:// 来源标记",
+      "status": "supported",
+      "evidence": "ModulesScreen.kt::AddModuleDialog；Actions.kt::previewModuleText",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "manual",
+      "runtime_verified": false,
+      "blockers": [
+        "no_android_device"
+      ],
+      "note": "需真机复核 content provider 兼容性"
+    },
+    {
+      "id": "LOCAL-CONFIG-IMPORT",
+      "area": "ui",
+      "capability": "配置文件从本地文件导入",
+      "target": {
+        "loon": "n/a",
+        "shadowrocket": "n/a"
+      },
+      "current": "OpenDocument 读取 JSON/Clash/Loon/小火箭配置并走原预览",
+      "status": "supported",
+      "evidence": "Dialogs.kt::ConfigImportDialog",
+      "fixtures": [],
+      "tests": [],
+      "assertion": "manual",
+      "runtime_verified": false,
+      "blockers": [
+        "no_android_device"
+      ],
+      "note": "2 MiB 上限；需真机复核"
+    },
+    {
+      "id": "SCRIPT-GAP",
+      "area": "module",
+      "capability": "插件 [Script] 运行时（QuickJS）",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "partial"
+      },
+      "current": "结构化 [Script] 进入 QuickJS 专用线程执行；旧式 script(...) 或缺少 script-path 的行报缺口",
+      "status": "partial",
+      "evidence": "core/src/script.rs::ScriptWorkerPool + core/src/mitm/mod.rs::run_scripts",
+      "fixtures": [],
+      "tests": [
+        "mitm_test::mitm_scripts_mutate_request_response_and_short_circuit",
+        "mitm_test::mitm_h2_scripts_mutate_request_and_response",
+        "script::worker_pool_recovers_after_timeout"
+      ],
+      "assertion": "parse",
+      "runtime_verified": true,
+      "blockers": [
+        "no_android_device",
+        "no_real_authorized_script_corpus"
+      ],
+      "note": "M6：HTTP/1.1 与 h2 已接入；不承诺 Loon/Surge/Shadowrocket 全生态兼容"
+    },
+    {
+      "id": "SCRIPT-REQ-RESP-DONE",
+      "area": "script",
+      "capability": "$request / $response / $done 请求响应脚本",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "yes"
+      },
+      "current": "请求/响应对象可改方法/URL/状态/头/正文；$done 首次生效，请求阶段可本地短路",
+      "status": "supported",
+      "evidence": "core/src/script.rs::run_script_with_runtime + core/src/mitm/h2.rs",
+      "fixtures": [],
+      "tests": [
+        "mitm_test::mitm_scripts_mutate_request_response_and_short_circuit",
+        "mitm_test::mitm_h2_scripts_mutate_request_and_response"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [],
+      "note": "HTTP/1.1 与 h2 端到端覆盖"
+    },
+    {
+      "id": "SCRIPT-API-HTTP-STORE",
+      "area": "script",
+      "capability": "$httpClient / $persistentStore / $argument / $notification",
+      "target": {
+        "loon": "yes",
+        "shadowrocket": "partial"
+      },
+      "current": "7 个 HTTP 方法、1 MiB 响应/32 次调用；持久化 1 MiB/256 键；通知只记录",
+      "status": "partial",
+      "evidence": "core/src/script.rs::make_http_function + ScriptStore",
+      "fixtures": [],
+      "tests": [
+        "script::http_client_fetches_local_test_server",
+        "script::persistent_store_survives_process_restart_when_file_is_configured"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [
+        "notification_not_system_toast",
+        "no_real_authorized_script_corpus"
+      ],
+      "note": "$httpClient 回调同步；$notification 不弹 Android 通知"
+    },
+    {
+      "id": "SCRIPT-WORKER-SANDBOX",
+      "area": "script",
+      "capability": "专用脚本线程、沙箱与资源上限",
+      "target": {
+        "loon": "n/a",
+        "shadowrocket": "n/a"
+      },
+      "current": "4 个专用线程各持 Runtime；32 MiB/线程、512 KiB 栈、5–10 s 超时；禁用 eval/Function 与宿主 fs/net",
+      "status": "supported",
+      "evidence": "core/src/script.rs::ScriptWorkerPool",
+      "fixtures": [],
+      "tests": [
+        "script::worker_pool_recovers_after_timeout",
+        "script::memory_limit_fails_gracefully",
+        "script::sandbox_exposes_only_whitelisted_host_capabilities"
+      ],
+      "assertion": "runtime",
+      "runtime_verified": true,
+      "blockers": [],
+      "note": "完成/失败/超时/跳过计数写入诊断日志"
+    }
+  ],
+  "m5": {
+    "plugin_sections": 10,
+    "rewrite_actions": 18,
+    "rust_tests": 148,
+    "kotlin_tests": 96,
+    "local_import": 2
+  },
+  "m6": {
+    "runtime": "QuickJS rquickjs 0.12.2",
+    "worker_threads": 4,
+    "memory_limit_mib": 32,
+    "stack_kib": 512,
+    "timeout_default_ms": 5000,
+    "timeout_max_ms": 10000,
+    "apis": [
+      "$request",
+      "$response",
+      "$done",
+      "$httpClient",
+      "$persistentStore",
+      "$argument",
+      "$notification",
+      "console",
+      "setTimeout"
+    ],
+    "rust_tests": 166,
+    "kotlin_tests": 100,
+    "eval_disabled": true,
+    "note": "不承诺全生态兼容"
+  }
+}

@@ -1,0 +1,37 @@
+proxies:
+  - name: SS-Demo
+    type: ss
+    server: ss.example.com
+    port: 8388
+    cipher: aes-128-gcm
+    password: demo-pass
+  - name: Trojan-Demo
+    type: trojan
+    server: trojan.example.com
+    port: 443
+    password: demo-pass
+    sni: trojan.example.com
+    skip-cert-verify: true
+  - name: VLESS-Demo
+    type: vless
+    server: vless.example.com
+    port: 443
+    uuid: 11111111-1111-4111-8111-111111111111
+    tls: true
+    servername: vless.example.com
+    network: ws
+    ws-opts:
+      path: /ws
+      headers:
+        Host: cdn.example.com
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies:
+      - SS-Demo
+      - Trojan-Demo
+rules:
+  - DOMAIN-SUFFIX,ads.example.com,REJECT
+  - DOMAIN,cdn.example.net,DIRECT
+  - IP-CIDR,203.0.113.0/24,Proxy
+  - MATCH,Proxy

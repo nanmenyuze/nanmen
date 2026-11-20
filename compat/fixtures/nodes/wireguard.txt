@@ -1,0 +1,1 @@
+wireguard://demo-private-key@wg.example.com:51820?public-key=demo-public-key&address=10.0.0.2/32#WireGuard-Demo

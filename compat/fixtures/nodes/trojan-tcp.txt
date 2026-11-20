@@ -1,0 +1,1 @@
+trojan://demo-pass@trojan.example.com:443?security=tls&sni=trojan.example.com#Trojan-TCP

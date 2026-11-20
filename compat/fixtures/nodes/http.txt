@@ -1,0 +1,1 @@
+http://demo-user:demo-pass@proxy.example.com:8080#HTTP-Demo

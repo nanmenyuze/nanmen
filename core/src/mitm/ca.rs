@@ -1,0 +1,318 @@
+//! MITM CA：生成/加载自签根证书，按域名动态签发叶子证书。
+//!
+//! CA 以「证书 PEM + PKCS8 私钥 PEM」拼接落盘（ca_file），重启/热重载复用同一 CA，
+//! 用户只需安装一次证书。叶子证书带 128 条上限的 FIFO ServerConfig 缓存。
+//! 链里始终携带磁盘上的原始 CA DER，保证与用户已安装的证书完全一致。
+
+use rcgen::{
+    date_time_ymd, BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose,
+};
+use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use std::collections::{HashMap, VecDeque};
+use std::io;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
+const CERT_MARK: &str = "-----BEGIN CERTIFICATE-----";
+const CERT_END: &str = "-----END CERTIFICATE-----";
+const KEY_MARK: &str = "-----BEGIN PRIVATE KEY-----";
+const KEY_END: &str = "-----END PRIVATE KEY-----";
+
+fn io_err(msg: impl std::fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, msg.to_string())
+}
+
+fn pem_section(pem: &str, begin: &str, end: &str) -> Option<String> {
+    let s = pem.find(begin)?;
+    let e = pem.find(end)? + end.len();
+    Some(pem[s..e].to_string())
+}
+
+fn pem_to_der(pem: &str) -> io::Result<Vec<u8>> {
+    use base64::Engine;
+    let body: String = pem
+        .lines()
+        .filter(|l| !l.starts_with("-----"))
+        .collect::<Vec<_>>()
+        .join("");
+    base64::engine::general_purpose::STANDARD
+        .decode(body.trim())
+        .map_err(|e| io_err(format!("PEM 解码失败: {}", e)))
+}
+
+fn der_to_pem(der: &[u8]) -> String {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let mut out = String::from(CERT_MARK);
+    out.push('\n');
+    for chunk in b64.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+        out.push('\n');
+    }
+    out.push_str(CERT_END);
+    out.push('\n');
+    out
+}
+
+pub struct MitmCa {
+    key: KeyPair,
+    /// 用落盘 CA 参数重建的签发者对象（仅用于 signed_by 的 subject/key）。
+    issuer: rcgen::Certificate,
+    /// 磁盘上的原始 CA DER：进证书链、导出安装都用它。
+    ca_der: CertificateDer<'static>,
+    cache: Mutex<LeafCache>,
+}
+
+/// 叶子证书缓存：HashMap + FIFO 淘汰队列。满 128 条只淘汰最老的一条，
+/// 不再整表清空，避免热门域名在同一时刻全部重新签发。
+struct LeafCache {
+    map: HashMap<String, Arc<rustls::ServerConfig>>,
+    order: VecDeque<String>,
+}
+
+impl LeafCache {
+    fn new() -> Self {
+        Self { map: HashMap::new(), order: VecDeque::new() }
+    }
+
+    fn get(&self, host: &str) -> Option<Arc<rustls::ServerConfig>> {
+        self.map.get(host).cloned()
+    }
+
+    fn insert(&mut self, host: String, cfg: Arc<rustls::ServerConfig>) {
+        if self.map.contains_key(&host) {
+            self.map.insert(host, cfg);
+            return;
+        }
+        while self.order.len() >= 128 {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(host.clone());
+        self.map.insert(host, cfg);
+    }
+}
+
+impl MitmCa {
+    pub fn load_or_generate(path: &str) -> io::Result<Self> {
+        if path.trim().is_empty() {
+            return Err(io_err("未配置 CA 文件路径"));
+        }
+        if Path::new(path).exists() {
+            let pem = std::fs::read_to_string(path)?;
+            let cert_pem = pem_section(&pem, CERT_MARK, CERT_END)
+                .ok_or_else(|| io_err("CA 文件缺少证书段"))?;
+            let key_pem = pem_section(&pem, KEY_MARK, KEY_END)
+                .ok_or_else(|| io_err("CA 文件缺少私钥段"))?;
+            let key = KeyPair::from_pem(&key_pem)
+                .map_err(|e| io_err(format!("CA 私钥解析失败: {}", e)))?;
+            let params = CertificateParams::from_ca_cert_pem(&cert_pem)
+                .map_err(|e| io_err(format!("CA 证书解析失败: {}", e)))?;
+            let issuer = params
+                .self_signed(&key)
+                .map_err(|e| io_err(format!("CA 重建失败: {}", e)))?;
+            let ca_der = CertificateDer::from(pem_to_der(&cert_pem)?);
+            return Ok(Self { key, issuer, ca_der, cache: Mutex::new(LeafCache::new()) });
+        }
+        let key = KeyPair::generate().map_err(|e| io_err(format!("生成 CA 私钥失败: {}", e)))?;
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+            KeyUsagePurpose::DigitalSignature,
+        ];
+        params.distinguished_name.push(DnType::CommonName, "Namu DNS MITM CA");
+        params.distinguished_name.push(DnType::OrganizationName, "Namu DNS");
+        params.not_before = date_time_ymd(2024, 1, 1);
+        params.not_after = date_time_ymd(2044, 1, 1);
+        let cert = params
+            .self_signed(&key)
+            .map_err(|e| io_err(format!("自签 CA 失败: {}", e)))?;
+        let ca_der = cert.der().clone();
+        if let Some(parent) = Path::new(path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut blob = cert.pem();
+        blob.push_str(&key.serialize_pem());
+        // 私钥文件权限收紧（Android 应用私有目录本身已隔离，这里再兜底一层）
+        std::fs::write(path, blob)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(Self { key, issuer: cert, ca_der, cache: Mutex::new(LeafCache::new()) })
+    }
+
+    pub fn ca_der(&self) -> &[u8] {
+        &self.ca_der
+    }
+
+    pub fn ca_pem(&self) -> String {
+        der_to_pem(&self.ca_der)
+    }
+
+    /// 为指定域名构建服务端 TLS 配置（叶子证书 + 原始 CA 链，ALPN 仅 http/1.1）。
+    pub fn server_config(&self, host: &str) -> io::Result<Arc<rustls::ServerConfig>> {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        {
+            let g = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(c) = g.get(&host) {
+                return Ok(c);
+            }
+        }
+        let leaf_key =
+            KeyPair::generate().map_err(|e| io_err(format!("生成叶子私钥失败: {}", e)))?;
+        let mut params = CertificateParams::new(vec![host.clone()])
+            .map_err(|e| io_err(format!("非法域名 {}: {}", host, e)))?;
+        params.distinguished_name.push(DnType::CommonName, &host);
+        params.not_before = date_time_ymd(2024, 1, 1);
+        params.not_after = date_time_ymd(2040, 1, 1);
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let leaf = params
+            .signed_by(&leaf_key, &self.issuer, &self.key)
+            .map_err(|e| io_err(format!("签发 {} 证书失败: {}", host, e)))?;
+        let chain = vec![leaf.der().clone(), self.ca_der.clone()];
+        let key_der = PrivatePkcs8KeyDer::from(leaf_key.serialize_der());
+        let mut cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(chain, key_der.into())
+            .map_err(|e| io_err(format!("TLS 服务端配置失败: {}", e)))?;
+        // 先 h2 再 http/1.1：客户端按顺序协商，gRPC 等 HTTP/2 请求
+        // 不再被降级成 HTTP/1.1；不支持 h2 的客户端仍回落到 HTTP/1.1。
+        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let cfg = Arc::new(cfg);
+        let mut g = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        g.insert(host, cfg.clone());
+        Ok(cfg)
+    }
+}
+
+/// Android 系统证书区文件名：<subject_hash_old>.0。
+/// 算法 = 证书 subject DER 的 MD5 前 4 字节小端。本 CA 的 subject 全部为
+/// PrintableString 且无多余空白，与 OpenSSL 规范化编码一致。
+pub fn system_cert_name(ca_file: &str) -> Result<String, String> {
+    let ca = MitmCa::load_or_generate(ca_file).map_err(|e| e.to_string())?;
+    let (_, cert) = x509_parser::parse_x509_certificate(ca.ca_der())
+        .map_err(|e| format!("解析 CA 证书失败: {}", e))?;
+    use md5::{Digest, Md5};
+    let digest = Md5::digest(cert.subject.as_raw());
+    let hash = u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]);
+    Ok(format!("{:08x}.0", hash))
+}
+
+/// 导出 CA 供安装：out_dir 下写 namu-ca.pem（证书）与 namu-ca.crt（DER），
+/// 并返回系统证书区文件名。独立于运行中的引擎，未连接时也能生成/导出。
+pub fn export_ca(ca_file: &str, out_dir: &str) -> Result<(String, String, String), String> {
+    let ca = MitmCa::load_or_generate(ca_file).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+    let pem_path = Path::new(out_dir).join("namu-ca.pem");
+    let der_path = Path::new(out_dir).join("namu-ca.crt");
+    std::fs::write(&pem_path, ca.ca_pem()).map_err(|e| e.to_string())?;
+    std::fs::write(&der_path, ca.ca_der()).map_err(|e| e.to_string())?;
+    let name = system_cert_name(ca_file)?;
+    Ok((
+        pem_path.to_string_lossy().to_string(),
+        der_path.to_string_lossy().to_string(),
+        name,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_path(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("namu_mitm_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(name).to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn generate_reload_same_ca() {
+        let path = tmp_path("ca.pem");
+        let _ = std::fs::remove_file(&path);
+        let ca1 = MitmCa::load_or_generate(&path).unwrap();
+        let der1 = ca1.ca_der().to_vec();
+        let ca2 = MitmCa::load_or_generate(&path).unwrap();
+        assert_eq!(der1, ca2.ca_der(), "重载必须复用同一 CA");
+        // 两个实例签出的叶子证书都能被原始 CA 验证（同 key）
+        let _c1 = ca1.server_config("a.example.com").unwrap();
+        let _c2 = ca2.server_config("a.example.com").unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn leaf_cache_evicts_oldest_instead_of_clearing_whole_table() {
+        let path = tmp_path("ca_fifo.pem");
+        let _ = std::fs::remove_file(&path);
+        let ca = MitmCa::load_or_generate(&path).unwrap();
+        let seed = ca.server_config("seed.example.com").unwrap();
+        {
+            let mut g = ca.cache.lock().unwrap();
+            for i in 0..129 {
+                g.insert(format!("h{i}.example.com"), seed.clone());
+            }
+            assert_eq!(g.map.len(), 128);
+            assert!(!g.map.contains_key("h0.example.com"));
+            assert!(g.map.contains_key("h1.example.com"));
+            assert!(g.map.contains_key("h128.example.com"));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn leaf_cert_verifies_against_ca() {
+        use rustls::client::danger::ServerCertVerifier;
+        let path = tmp_path("ca_verify.pem");
+        let _ = std::fs::remove_file(&path);
+        let ca = MitmCa::load_or_generate(&path).unwrap();
+        let cfg = ca.server_config("test.example.com").unwrap();
+        // 从 ServerConfig 拿不到链，直接用签发参数再签一张做 webpki 验证
+        let leaf_key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["test.example.com".to_string()]).unwrap();
+        params.not_before = date_time_ymd(2024, 1, 1);
+        params.not_after = date_time_ymd(2040, 1, 1);
+        let leaf = params.signed_by(&leaf_key, &ca.issuer, &ca.key).unwrap();
+        let anchors = vec![rustls::RootCertStore::empty()];
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.ca_der.clone()).unwrap();
+        let _ = anchors;
+        let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let now = rustls::pki_types::UnixTime::now();
+        let name = rustls::pki_types::ServerName::try_from("test.example.com").unwrap();
+        let result = verifier.verify_server_cert(
+            leaf.der(),
+            &[ca.ca_der.clone()],
+            &name,
+            &[],
+            now,
+        );
+        assert!(result.is_ok(), "叶子证书必须能通过 CA 验证: {:?}", result.err());
+        let _ = std::fs::remove_file(&path);
+        // cfg 构建成功即 ALPN/链装配无误
+        assert_eq!(
+            cfg.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+    }
+
+    #[test]
+    fn export_writes_pem_and_der() {
+        let path = tmp_path("ca_export.pem");
+        let out = tmp_path("export_out");
+        let _ = std::fs::remove_file(&path);
+        let (pem, der, name) = export_ca(&path, &out).unwrap();
+        assert!(std::fs::read_to_string(&pem).unwrap().contains(CERT_MARK));
+        assert!(!std::fs::read(&der).unwrap().is_empty());
+        assert!(name.ends_with(".0") && name.len() == 10);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+}

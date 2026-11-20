@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">南门DNS</string>
+    <string name="vpn_channel">南门DNS 运行状态</string>
+    <string name="vpn_title">南门DNS 正在保护本机</string>
+    <string name="vpn_stop">断开</string>
+</resources>

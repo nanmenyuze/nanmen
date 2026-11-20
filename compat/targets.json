@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-11-20",
+  "loon": {
+    "product": "Loon",
+    "app_store_id": "1373567447",
+    "target_version": "3.5.3",
+    "version_source": "https://apps.apple.com/cm/app/loon/id1373567447",
+    "version_confidence": "app_store_page",
+    "docs": [
+      "https://nsloon.app/en/docs/Node/",
+      "https://nsloon.app/en/docs/Node/subscription/",
+      "https://nsloon.app/en/docs/Rule/",
+      "https://nsloon.app/en/docs/Rewrite/",
+      "https://nsloon.app/en/docs/Script/",
+      "https://nsloon.app/en/docs/Script/script_api/",
+      "https://nsloon.app/en/docs/Plugin/"
+    ],
+    "docs_observed_at": "2026-11-19"
+  },
+  "shadowrocket": {
+    "product": "Shadowrocket",
+    "app_store_id": "932747118",
+    "target_version": "2.2.66",
+    "version_source": "https://www.aso100.com/app/version/appid/932747118/country/gh",
+    "official_app_store": "https://apps.apple.com/us/app/shadowrocket/id932747118",
+    "version_confidence": "secondary_source",
+    "blocked": "官方 App Store 页面未能在当前网络直接读取；版本号来自七麦版本记录，需在 iOS 设备上复核"
+  },
+  "samples": {
+    "source": "本项目自建合成样本",
+    "files": 31,
+    "contains_real_credentials": false,
+    "contains_third_party_assets": false,
+    "authorization": "合成数据，无第三方授权依赖；不包含真实订阅、节点、UUID、密码或账号",
+    "notes": "fixtures 全部为 example.com / 203.0.113.0/24 等保留域名/文档网段"
+  },
+  "devices": {
+    "android": {
+      "connected": false,
+      "adb": "not found / no devices"
+    },
+    "ios": {
+      "available": false,
+      "loon_installed": false,
+      "shadowrocket_installed": false
+    },
+    "runtime_comparison_blocked": true,
+    "blocker": "无 Android 设备、无 iOS/Loon/Shadowrocket 设备；只能做解析与单测级验证"
+  },
+  "source": {
+    "project": "南门DNS 2.3.6",
+    "worktree": "work/v134",
+    "git_commit": null,
+    "archive_name": "南门DNS-2.3.6-自研内核-完整源码.zip",
+    "archive_sha256": "external (see delivery SHA256SUMS.txt)",
+    "code_source_sha256": "96e8bfe70c7da4266591b5423a7384b47776758a65910fc94f4efb750aa9abbe",
+    "code_source_digest_scope": "app/src, core/src, core/tests, gradle configs, compat/fixtures, compat/expected; excludes docs and build outputs"
+  },
+  "environment": {
+    "os": "Ubuntu 22.04 (cloud host)",
+    "jdk": "Temurin 17.0.21",
+    "gradle": "8.14",
+    "rustc": "1.100.0",
+    "cargo": "1.100.0",
+    "android_sdk": "compileSdk 36; build-tools 34/36/37; minSdk 31",
+    "ndk": "28.2.13676358",
+    "device": "none (adb devices empty; no iOS devices)",
+    "clean_build": "work/v134",
+    "clean_build_result": "BUILD SUCCESSFUL; Rust 148/148; Kotlin 96/96; Lint 0 error/38 warning; 2.2.1 config import local-only",
+    "dependency_cache": "Gradle/Cargo/Android SDK cache shared; fully offline not tested"
+  },
+  "code_source_sha256": "09a91a7c7c09e8c3e5c7c3cfc841ceae66deecd56c0f56cc4e0b3c7ec0a74e9b"
+}

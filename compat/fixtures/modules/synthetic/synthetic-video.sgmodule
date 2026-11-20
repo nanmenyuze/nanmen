@@ -1,0 +1,23 @@
+#!name=南门DNS 视频合成模块
+#!desc=南门DNS 自写视频模块测试样本，覆盖 %APPEND%、5 条脚本和 binary-body-mode。
+#!author=南门DNS
+#!category=测试
+#!date=2026-11-20
+
+[Rule]
+DOMAIN-SUFFIX,ads.video.example.com,REJECT
+DOMAIN,cdn.video.example.com,DIRECT
+
+[URL Rewrite]
+^https?:\/\/ads\.video\.example\.com\/splash - reject
+^https?:\/\/api\.video\.example\.com\/sponsor - reject-dict
+
+[Script]
+合成开屏 = type=http-response, pattern=^https:\/\/app\.video\.example\.com\/splash, requires-body=1, max-size=0, timeout=60, script-path=https://modules.example.com/scripts/splash.js
+合成推荐流 = type=http-response, pattern=^https:\/\/app\.video\.example\.com\/feed, requires-body=1, max-size=0, timeout=60, script-path=https://modules.example.com/scripts/feed.js
+合成标签 = type=http-response, pattern=^https:\/\/app\.video\.example\.com\/tabs, requires-body=1, max-size=0, timeout=60, script-path=https://modules.example.com/scripts/tabs.js
+合成我的页 = type=http-response, pattern=^https:\/\/app\.video\.example\.com\/mine, requires-body=1, max-size=0, timeout=60, script-path=https://modules.example.com/scripts/mine.js
+合成播放页 = type=http-response, pattern=^https:\/\/grpc\.video\.example\.com\/demo\.View\/View$, requires-body=1, binary-body-mode=true, max-size=0, timeout=60, script-path=https://modules.example.com/scripts/binary-frame.js
+
+[MITM]
+hostname = %APPEND% app.video.example.com, api.video.example.com, grpc.video.example.com, static.video.example.com, live.video.example.com, game.video.example.com

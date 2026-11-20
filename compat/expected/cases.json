@@ -1,0 +1,803 @@
+{
+  "schema_version": 1,
+  "baseline": {
+    "app_version": "2.0",
+    "version_code": 69,
+    "kernel_version": "1.11.5",
+    "captured_at": "2026-11-19",
+    "worktree": "work/v134"
+  },
+  "status_legend": {
+    "supported": "当前代码有对应实现，且固定样本/单测验证通过",
+    "partial": "只覆盖子集，或需要 CA/Root/真实节点/特定协议才会生效",
+    "unsupported": "当前解析器忽略或明确拒绝，不产生目标行为",
+    "needs_verification": "代码路径存在，但本次基线没有真机/真实服务端验证",
+    "empty": "导入/解析不报错但结果为空，可能是格式不支持或静默丢弃"
+  },
+  "cases": [
+    {
+      "id": "N01",
+      "category": "node",
+      "fixture": "nodes/ss-sip002.txt",
+      "input": "Shadowsocks SIP002 URI",
+      "expected": {
+        "import": "success",
+        "matched_rule": null,
+        "outbound": "proxy",
+        "script_output": null,
+        "nodes": 1,
+        "node_type": "ss",
+        "status": "supported"
+      }
+    },
+    {
+      "id": "N02",
+      "category": "node",
+      "fixture": "nodes/ss-legacy.txt",
+      "input": "Shadowsocks 全 Base64 旧格式",
+      "expected": {
+        "import": "success",
+        "matched_rule": null,
+        "outbound": "proxy",
+        "script_output": null,
+        "nodes": 1,
+        "node_type": "ss",
+        "status": "supported"
+      }
+    },
+    {
+      "id": "N03",
+      "category": "node",
+      "fixture": "nodes/ssr.txt",
+      "input": "ShadowsocksR URI",
+      "expected": {
+        "import": "unsupported",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": null,
+        "nodes": 0,
+        "unsupported_count": 1,
+        "note": "M1 已输出逐项诊断（unsupported_protocol），不再静默丢弃",
+        "status": "unsupported"
+      }
+    },
+    {
+      "id": "N04",
+      "category": "node",
+      "fixture": "nodes/vmess.txt",
+      "input": "VMess + WS + TLS URI",
+      "expected": {
+        "import": "unsupported",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": null,
+        "nodes": 0,
+        "unsupported_count": 1,
+        "status": "unsupported"
+      }
+    },
+    {
+      "id": "N05",
+      "category": "node",
+      "fixture": "nodes/vless-tcp.txt",
+      "input": "VLESS TCP + TLS",
+      "expected": {
+        "import": "success",
+        "matched_rule": null,
+        "outbound": "proxy",
+        "script_output": null,
+        "nodes": 1,
+        "node_type": "vless",
+        "status": "supported"
+      }
+    },
+    {
+      "id": "N06",
+      "category": "node",
+      "fixture": "nodes/vless-ws.txt",
+      "input": "VLESS WS + TLS",
+      "expected": {
+        "import": "success",
+        "matched_rule": null,
+        "outbound": "proxy",
+        "script_output": null,
+        "nodes": 1,
+        "node_type": "vless",
+        "status": "supported"
+      }
+    },
+    {
+      "id": "N07",
+      "category": "node",
+      "fixture": "nodes/vless-reality.txt",
+      "input": "VLESS Reality",
+      "expected": {
+        "import": "unsupported",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": null,
+        "nodes": 0,
+        "unsupported_count": 1,
+        "note": "明确拒绝并给出 Reality/Vision 警告",
+        "status": "unsupported"
+      }
+    },
+    {
+      "id": "N08",
+      "category": "node",
+      "fixture": "nodes/vless-grpc.txt",
+      "input": "VLESS gRPC transport",
+      "expected": {
+        "import": "unsupported",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": null,
+        "nodes": 0,
+        "unsupported_count": 1,
+        "status": "unsupported"
+      }
+    },
+    {
+      "id": "N09",
+      "category": "node",
+      "fixture": "nodes/trojan-tcp.txt",
+      "input": "Trojan TCP + TLS",
+      "expected": {
+        "import": "success",
+        "matched_rule": null,
+        "outbound": "proxy",
+        "script_output": null,
+        "nodes": 1,
+        "node_type": "trojan",
+        "status": "supported"
+      }
+    },
+    {
+      "id": "N10",
+      "category": "node",
+      "fixture": "nodes/trojan-ws.txt",
+      "input": "Trojan WS + TLS",
+      "expected": {
+        "import": "success",
+        "matched_rule": null,
+        "outbound": "proxy",
+        "script_output": null,
+        "nodes": 1,
+        "node_type": "trojan",
+        "status": "supported"
+      }
+    },
+    {
+      "id": "N11",
+      "category": "node",
+      "fixture": "nodes/hysteria2.txt",
+      "input": "Hysteria2 URI",
+      "expected": {
+        "import": "unsupported",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": null,
+        "nodes": 0,
+        "unsupported_count": 1,
+        "status": "unsupported"
+      }
+    },
+    {
+      "id": "N12",
+      "category": "node",
+      "fixture": "nodes/tuic.txt",
+      "input": "TUIC URI",
+      "expected": {
+        "import": "unsupported",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": null,
+        "nodes": 0,
+        "unsupported_count": 1,
+        "status": "unsupported"
+      }
+    },
+    {
+      "id": "N13",
+      "category": "node",
+      "fixture": "nodes/wireguard.txt",
+      "input": "WireGuard URI",
+      "expected": {
+        "import": "unsupported",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": null,
+        "nodes": 0,
+        "unsupported_count": 1,
+        "note": "M1 已输出逐项诊断（unsupported_protocol），不再静默丢弃",
+        "status": "unsupported"
+      }
+    },
+    {
+      "id": "N14",
+      "category": "node",
+      "fixture": "nodes/socks5.txt",
+      "input": "SOCKS5 with auth",
+      "expected": {
+        "import": "success",
+        "matched_rule": null,
+        "outbound": "proxy",
+        "script_output": null,
+        "nodes": 1,
+        "node_type": "socks5",
+        "status": "supported"
+      }
+    },
+    {
+      "id": "N15",
+      "category": "node",
+      "fixture": "nodes/http.txt",
+      "input": "HTTP CONNECT proxy",
+      "expected": {
+        "import": "success",
+        "matched_rule": null,
+        "outbound": "proxy",
+        "script_output": null,
+        "nodes": 1,
+        "node_type": "http",
+        "status": "supported"
+      }
+    },
+    {
+      "id": "N16",
+      "category": "node",
+      "fixture": "nodes/https.txt",
+      "input": "HTTPS CONNECT proxy",
+      "expected": {
+        "import": "needs_verification",
+        "matched_rule": null,
+        "outbound": "proxy",
+        "script_output": null,
+        "nodes": 1,
+        "node_type": "http",
+        "note": "解析成功；TLS 到代理仍缺真实服务端验证",
+        "status": "needs_verification"
+      }
+    },
+    {
+      "id": "N17",
+      "category": "node",
+      "fixture": "nodes/anytls.txt",
+      "input": "AnyTLS URI",
+      "expected": {
+        "import": "unsupported",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": null,
+        "nodes": 0,
+        "unsupported_count": 1,
+        "note": "M1 已输出逐项诊断（unsupported_protocol），不再静默丢弃",
+        "status": "unsupported"
+      }
+    },
+    {
+      "id": "S01",
+      "category": "subscription",
+      "fixture": "subscriptions/base64-list.txt",
+      "input": "Base64 编码 URI 列表",
+      "expected": {
+        "import": "success",
+        "matched_rule": null,
+        "outbound": "proxy",
+        "script_output": null,
+        "nodes": 2,
+        "status": "supported"
+      }
+    },
+    {
+      "id": "S02",
+      "category": "subscription",
+      "fixture": "subscriptions/clash-basic.yaml",
+      "input": "Clash YAML：proxies/proxy-groups/rules",
+      "expected": {
+        "import": "partial",
+        "matched_rule": null,
+        "outbound": "proxy",
+        "script_output": null,
+        "nodes": 3,
+        "rules": 3,
+        "groups": 1,
+        "final_policy": "proxy",
+        "note": "只保留策略组名称，组选择/测速/故障转移未实现",
+        "status": "partial"
+      }
+    },
+    {
+      "id": "S03",
+      "category": "subscription",
+      "fixture": "subscriptions/loon-main.conf",
+      "input": "Loon 主配置 [Proxy]/[Rule]/[Rewrite]",
+      "expected": {
+        "import": "empty",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": null,
+        "nodes": 0,
+        "unsupported_count": 0,
+        "note": "不是 Clash/Base64/URI 订阅格式，导入为空",
+        "status": "empty"
+      }
+    },
+    {
+      "id": "S04",
+      "category": "subscription",
+      "fixture": "subscriptions/shadowrocket.conf",
+      "input": "Shadowrocket 配置",
+      "expected": {
+        "import": "empty",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": null,
+        "nodes": 0,
+        "status": "empty"
+      }
+    },
+    {
+      "id": "S05",
+      "category": "subscription",
+      "fixture": "modules/loon-demo.plugin",
+      "input": "Loon .plugin 插件",
+      "expected": {
+        "import": "partial",
+        "matched_rule": null,
+        "outbound": "proxy",
+        "script_output": null,
+        "route_rules": 3,
+        "block_rules": 1,
+        "mitm_hostnames": 1,
+        "ignored": 5,
+        "note": "[Argument]/[General]/[Rewrite]/[Host]/[Script] 被忽略",
+        "status": "partial"
+      }
+    },
+    {
+      "id": "S06",
+      "category": "subscription",
+      "fixture": "modules/surge-demo.sgmodule",
+      "input": "Surge/小火箭 .sgmodule",
+      "expected": {
+        "import": "partial",
+        "matched_rule": null,
+        "outbound": "proxy",
+        "script_output": null,
+        "route_rules": 4,
+        "block_rules": 1,
+        "mitm_hostnames": 2,
+        "url_rewrites": 4,
+        "header_rewrites": 3,
+        "ignored": 7,
+        "note": "不解析 [Body Rewrite]/[Script]/[Host]；URL Rewrite 中 302/mock 尚未执行",
+        "status": "partial"
+      }
+    },
+    {
+      "id": "S07",
+      "category": "subscription",
+      "fixture": "headers/subscription-userinfo.txt",
+      "input": "Subscription-Userinfo 响应头",
+      "expected": {
+        "import": "success",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": null,
+        "subscription_info": {
+          "upload": 100,
+          "download": 600,
+          "total": 1000,
+          "expire": 1700000000
+        },
+        "status": "supported"
+      }
+    },
+    {
+      "id": "S08",
+      "category": "subscription",
+      "fixture": "rulesets/ads.txt",
+      "input": "Adblock/hosts 域名列表",
+      "expected": {
+        "import": "success",
+        "matched_rule": null,
+        "outbound": "block",
+        "script_output": null,
+        "block_rules": 3,
+        "ignored": 0,
+        "note": "|exact.example.net| 单竖线精确域名已解析",
+        "status": "supported"
+      }
+    },
+    {
+      "id": "R01",
+      "category": "rule",
+      "fixture": "modules/surge-demo.sgmodule",
+      "input": "DOMAIN-SUFFIX ads.example.com",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": "DOMAIN-SUFFIX ads.example.com → block",
+        "outbound": "block",
+        "script_output": null,
+        "status": "supported",
+        "rule_status": "supported"
+      }
+    },
+    {
+      "id": "R02",
+      "category": "rule",
+      "fixture": "modules/surge-demo.sgmodule",
+      "input": "DOMAIN cdn.example.net",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": "DOMAIN cdn.example.net → direct",
+        "outbound": "direct",
+        "script_output": null,
+        "status": "supported",
+        "rule_status": "supported"
+      }
+    },
+    {
+      "id": "R03",
+      "category": "rule",
+      "fixture": "modules/surge-demo.sgmodule",
+      "input": "IP-CIDR 203.0.113.0/24",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": "IP-CIDR 203.0.113.0/24 → proxy",
+        "outbound": "proxy",
+        "script_output": null,
+        "status": "supported",
+        "rule_status": "supported"
+      }
+    },
+    {
+      "id": "R04",
+      "category": "rule",
+      "fixture": "modules/surge-demo.sgmodule",
+      "input": "PORT 8443",
+      "expected": {
+        "import": "success",
+        "matched_rule": "PORT 8443 → proxy",
+        "outbound": "proxy",
+        "script_output": null,
+        "note": "M1 已接入模块解析器、手动 UI、持久化和内核",
+        "status": "supported",
+        "rule_status": "supported"
+      }
+    },
+    {
+      "id": "R05",
+      "category": "rule",
+      "fixture": "modules/surge-demo.sgmodule",
+      "input": "GEOIP CN",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": null,
+        "outbound": "proxy",
+        "script_output": null,
+        "note": "被忽略，落到 FINAL",
+        "status": "unsupported",
+        "rule_status": "unsupported"
+      }
+    },
+    {
+      "id": "R06",
+      "category": "rule",
+      "fixture": "modules/surge-demo.sgmodule",
+      "input": "USER-AGENT AdBot*",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": null,
+        "outbound": "proxy",
+        "script_output": null,
+        "note": "被忽略，落到 FINAL",
+        "status": "unsupported",
+        "rule_status": "unsupported"
+      }
+    },
+    {
+      "id": "R07",
+      "category": "rule",
+      "fixture": "modules/surge-demo.sgmodule",
+      "input": "RULE-SET remote",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": null,
+        "outbound": "proxy",
+        "script_output": null,
+        "note": "被忽略，落到 FINAL",
+        "status": "unsupported",
+        "rule_status": "unsupported"
+      }
+    },
+    {
+      "id": "R08",
+      "category": "rule",
+      "fixture": "modules/surge-demo.sgmodule",
+      "input": "DOMAIN-WILDCARD *.wild.example.com",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": null,
+        "outbound": "proxy",
+        "script_output": null,
+        "note": "被忽略，落到 FINAL",
+        "status": "unsupported",
+        "rule_status": "unsupported"
+      }
+    },
+    {
+      "id": "R09",
+      "category": "rule",
+      "fixture": "configs/app-config.json",
+      "input": "DOMAIN-REGEX ^ad[0-9]+.example.com$",
+      "expected": {
+        "import": "success",
+        "matched_rule": "DOMAIN-REGEX → block",
+        "outbound": "block",
+        "script_output": null,
+        "note": "M1 已接入模块解析器、手动 UI、持久化和内核",
+        "status": "supported",
+        "rule_status": "supported"
+      }
+    },
+    {
+      "id": "R10",
+      "category": "rule",
+      "fixture": "modules/surge-demo.sgmodule",
+      "input": "未命中任何规则",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": "FINAL → proxy",
+        "outbound": "proxy",
+        "script_output": null,
+        "status": "supported",
+        "rule_status": "supported"
+      }
+    },
+    {
+      "id": "W01",
+      "category": "rewrite",
+      "fixture": "modules/surge-demo.sgmodule",
+      "input": "响应体正则 body ad-banner -> \"\"",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": "^https://api.example.com/ad body",
+        "outbound": "upstream",
+        "script_output": "n/a",
+        "note": "HTTP/1.1 与 h2 均可；受 body_limit 限制",
+        "status": "partial",
+        "rewrite_status": "partial"
+      }
+    },
+    {
+      "id": "W02",
+      "category": "rewrite",
+      "fixture": "modules/surge-demo.sgmodule",
+      "input": "请求头 header-add/header-replace",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": "header X-Test 1",
+        "outbound": "upstream",
+        "script_output": "n/a",
+        "status": "supported",
+        "rewrite_status": "supported"
+      }
+    },
+    {
+      "id": "W03",
+      "category": "rewrite",
+      "fixture": "modules/surge-demo.sgmodule",
+      "input": "请求头 header-del",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": null,
+        "outbound": "upstream",
+        "script_output": "n/a",
+        "status": "unsupported",
+        "rewrite_status": "unsupported"
+      }
+    },
+    {
+      "id": "W04",
+      "category": "rewrite",
+      "fixture": "modules/surge-demo.sgmodule",
+      "input": "302/307 重定向",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": "n/a",
+        "status": "unsupported",
+        "rewrite_status": "unsupported"
+      }
+    },
+    {
+      "id": "W05",
+      "category": "rewrite",
+      "fixture": "modules/surge-demo.sgmodule",
+      "input": "mock-response-body",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": "n/a",
+        "status": "unsupported",
+        "rewrite_status": "unsupported"
+      }
+    },
+    {
+      "id": "W06",
+      "category": "rewrite",
+      "fixture": "modules/loon-demo.plugin",
+      "input": "response-header-*",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": null,
+        "outbound": "upstream",
+        "script_output": "n/a",
+        "status": "unsupported",
+        "rewrite_status": "unsupported"
+      }
+    },
+    {
+      "id": "W07",
+      "category": "rewrite",
+      "fixture": "modules/surge-demo.sgmodule",
+      "input": "request-body-replace/JSON/jq",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": null,
+        "outbound": "upstream",
+        "script_output": "n/a",
+        "status": "unsupported",
+        "rewrite_status": "unsupported"
+      }
+    },
+    {
+      "id": "W08",
+      "category": "rewrite",
+      "fixture": "modules/loon-demo.plugin",
+      "input": "map-local / map-remote",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": "n/a",
+        "status": "unsupported",
+        "rewrite_status": "unsupported"
+      }
+    },
+    {
+      "id": "W09",
+      "category": "rewrite",
+      "fixture": "modules/loon-demo.plugin",
+      "input": "Rewrite 条件 + response.body.replace 新语法",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": null,
+        "outbound": "upstream",
+        "script_output": "n/a",
+        "note": "模块解析器不认识 [Rewrite] 新语法",
+        "status": "unsupported",
+        "rewrite_status": "unsupported"
+      }
+    },
+    {
+      "id": "W10",
+      "category": "rewrite",
+      "fixture": "n/a",
+      "input": "gRPC protobuf 字段值改写",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": "application/grpc + body 规则",
+        "outbound": "upstream",
+        "script_output": "n/a",
+        "note": "非 Loon 语法，为本项目内置能力",
+        "status": "supported",
+        "rewrite_status": "supported"
+      },
+      "source": "core/src/mitm/grpc.rs"
+    },
+    {
+      "id": "X01",
+      "category": "script",
+      "fixture": "scripts/request.js",
+      "input": "http-request $request/$done",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": "request mutated",
+        "status": "supported",
+        "script_status": "supported"
+      }
+    },
+    {
+      "id": "X02",
+      "category": "script",
+      "fixture": "scripts/response.js",
+      "input": "http-response $response/$done",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": "response mutated",
+        "status": "supported",
+        "script_status": "supported"
+      }
+    },
+    {
+      "id": "X03",
+      "category": "script",
+      "fixture": "scripts/script-api.js",
+      "input": "$httpClient/$persistentStore/$notification",
+      "expected": {
+        "import": "n/a",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": "$httpClient/$persistentStore/$notification",
+        "status": "partial",
+        "script_status": "partial"
+      }
+    },
+    {
+      "id": "C01",
+      "category": "config",
+      "fixture": "configs/app-config.json",
+      "input": "南门 DNS 2.x nested JSON",
+      "expected": {
+        "import": "success",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": "n/a",
+        "rules": 3,
+        "note": "DOMAIN-REGEX/PORT 内核可消费，但手动 UI/模块入口不完整",
+        "status": "supported"
+      }
+    },
+    {
+      "id": "C02",
+      "category": "config",
+      "fixture": "configs/legacy-flat.json",
+      "input": "旧版扁平 AppConfig JSON",
+      "expected": {
+        "import": "success",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": "n/a",
+        "rules": 1,
+        "status": "supported"
+      }
+    },
+    {
+      "id": "C03",
+      "category": "config",
+      "fixture": "subscriptions/loon-main.conf",
+      "input": "Loon 主配置导入",
+      "expected": {
+        "import": "unsupported",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": "n/a",
+        "note": "当前只接受应用 JSON；Loon .conf 不支持",
+        "status": "unsupported"
+      }
+    },
+    {
+      "id": "C04",
+      "category": "config",
+      "fixture": "subscriptions/shadowrocket.conf",
+      "input": "Shadowrocket 配置导入",
+      "expected": {
+        "import": "unsupported",
+        "matched_rule": null,
+        "outbound": "n/a",
+        "script_output": "n/a",
+        "status": "unsupported"
+      }
+    }
+  ],
+  "app_version": "2.1"
+}

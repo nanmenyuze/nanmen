@@ -1,0 +1,17 @@
+{
+  "general": {
+    "mode": "rule",
+    "dnsUpstream": "https://dns.alidns.com/dns-query",
+    "blockEnabled": true,
+    "finalPolicy": "proxy"
+  },
+  "rules": [
+    {"type": "DOMAIN-REGEX", "value": "^ad[0-9]+\\.example\\.com$", "action": "block"},
+    {"type": "PORT", "value": "8443", "action": "proxy"},
+    {"type": "IP-CIDR", "value": "203.0.113.0/24", "action": "proxy"}
+  ],
+  "ruleSources": [],
+  "modules": [],
+  "customAds": [],
+  "mitm": {"enabled": false, "hostnames": [], "skipHostnames": [], "urlRewrites": [], "headerRewrites": []}
+}

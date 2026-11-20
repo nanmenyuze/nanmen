@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "name": "Namu 自用 DNS",
+  "mode": "dns_only",
+  "dns": {
+    "upstream": "https://dns.example.com/dns-query",
+    "bootstrap": "203.0.113.10",
+    "fallback": "",
+    "fail_closed": true,
+    "cache_ttl": 600,
+    "query_log": true,
+    "header_name": "X-Namu-Token",
+    "header_value": "replace-with-your-token"
+  },
+  "routing": {
+    "cn_direct": true,
+    "final_policy": "direct"
+  },
+  "rule_sources": [
+    {
+      "id": "ads",
+      "url": "https://example.com/rules/ads.txt",
+      "format": "adblock",
+      "enabled": true
+    },
+    {
+      "id": "custom",
+      "url": "https://example.com/rules/custom.txt",
+      "format": "domain-list",
+      "enabled": true
+    }
+  ],
+  "update_interval": 21600
+}

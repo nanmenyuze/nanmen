@@ -1,0 +1,1 @@
+hysteria2://demo-pass@hy2.example.com:443?sni=hy2.example.com#Hysteria2-Demo

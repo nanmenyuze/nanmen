@@ -1,0 +1,28 @@
+#!name=Compat Loon Plugin
+#!desc=Synthetic Loon plugin for compatibility baseline
+#!author=Demo
+#!homepage=https://example.com
+#!icon=https://example.com/icon.png
+
+[Argument]
+region = select,"CN","US",tag=Region
+
+[General]
+bypass-tun = 192.168.0.0/16
+
+[Rule]
+DOMAIN-SUFFIX,ads.example.com,REJECT
+DOMAIN,cdn.example.net,DIRECT
+IP-CIDR,203.0.113.0/24,PROXY
+
+[Rewrite]
+response if ${url} ~= /^https:\/\/api\.example\.com\/ad/ then response.body.replace("ad-banner", "")
+
+[Host]
+example.com = 203.0.113.10
+
+[Script]
+response if ${url} ~= /^https:\/\/api\.example\.com/ then script("response.js")
+
+[Mitm]
+hostname = api.example.com

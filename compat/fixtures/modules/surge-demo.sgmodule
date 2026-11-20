@@ -1,0 +1,36 @@
+#!name=Compat Surge Demo
+#!desc=Synthetic module for compatibility baseline
+#!app=DemoApp
+
+[Rule]
+DOMAIN-SUFFIX,ads.example.com,REJECT
+DOMAIN,cdn.example.net,DIRECT
+IP-CIDR,203.0.113.0/24,PROXY
+PORT,8443,PROXY
+GEOIP,CN,DIRECT
+USER-AGENT,AdBot*,REJECT
+RULE-SET,https://example.com/rules.txt,PROXY
+DOMAIN-WILDCARD,*.wild.example.com,REJECT
+
+[MITM]
+hostname = api.example.com,*.example.org
+
+[URL Rewrite]
+^https:\/\/api\.example\.com\/ad body ad-banner ""
+^https:\/\/api\.example\.com\/redirect 302 https://example.com/
+^https:\/\/api\.example\.com\/header header X-Test 1 header
+^https:\/\/api\.example\.com\/mock mock-response-body data-type=json data="{}"
+
+[Header Rewrite]
+^https:\/\/api\.example\.com\/header header-replace X-Test 1
+^https:\/\/api\.example\.com\/header header-add X-Added 1
+^https:\/\/api\.example\.com\/header header-del X-Remove
+
+[Body Rewrite]
+^https:\/\/api\.example\.com\/ad ad-banner ""
+
+[Script]
+http-response ^https:\/\/api\.example\.com script-path=response.js,requires-body=true
+
+[Host]
+example.com = 203.0.113.10

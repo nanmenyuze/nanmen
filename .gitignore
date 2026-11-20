@@ -1,0 +1,21 @@
+# Gradle / Kotlin
+.gradle/
+.kotlin/
+.idea/
+build/
+app/build/
+core/target/
+
+# Local machine config and signing material
+local.properties
+keystore/
+keystore.properties
+*.keystore
+*.jks
+
+# Build outputs and archives
+*.apk
+*.aab
+*.zip
+*.log
+.DS_Store

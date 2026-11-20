@@ -1,0 +1,1051 @@
+//! Loon `[Rewrite]` 解析与执行。
+//!
+//! 同时支持两条语法线：
+//! - 旧版（Loon 3.5.1 之前）：`^https://... header-add X Y` 这种空格分隔写法；
+//! - 新版：`request if ${url} ~= /regex/i then request.header.add("X", "Y")`。
+//!
+//! 这里刻意不做“看起来像就执行”的猜测：无法安全实现的 jq、data-path 文件、
+//! 脚本、复杂条件会进入 `unsupported`，由界面展示成功能缺口。
+
+use regex::Regex;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoonPhase {
+    Request,
+    Response,
+}
+
+#[derive(Debug, Clone)]
+pub enum RejectKind {
+    Drop,
+    Status200,
+    TinyGif,
+    JsonObject,
+    JsonArray,
+}
+
+#[derive(Debug, Clone)]
+pub enum HeaderOp {
+    Add { name: String, value: String },
+    Del { name: String },
+    Replace { name: String, value: String },
+    ReplaceRegex { name: String, re: Regex, replacement: String },
+}
+
+#[derive(Debug, Clone)]
+pub enum JsonKind {
+    Add,
+    Replace,
+    Delete,
+}
+
+#[derive(Debug, Clone)]
+pub struct JsonOp {
+    pub kind: JsonKind,
+    pub path: String,
+    /// add/replace 的 JSON/字面量值；delete 为 None。
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum BodyOp {
+    ReplaceRegex { re: regex::bytes::Regex, replacement: String },
+    Json(JsonOp),
+}
+
+#[derive(Debug, Clone)]
+pub struct MockSpec {
+    pub status: u16,
+    pub content_type: String,
+    pub body: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub enum LoonAction {
+    UrlReplace(String),
+    Redirect { status: u16, url: String },
+    Reject(RejectKind),
+    RequestHeader(HeaderOp),
+    ResponseHeader(HeaderOp),
+    RequestBody(BodyOp),
+    ResponseBody(BodyOp),
+    RequestMock(MockSpec),
+    ResponseMock(MockSpec),
+}
+
+#[derive(Debug, Clone)]
+pub struct LoonRule {
+    pub phase: LoonPhase,
+    pub url: Regex,
+    pub action: LoonAction,
+    pub raw: String,
+}
+
+#[derive(Debug, Default)]
+pub struct LoonSet {
+    pub rules: Vec<LoonRule>,
+    pub unsupported: Vec<String>,
+}
+
+/// 与 http1::tokenize 同样的引号感知分词；这里复制一份避免模块反向依赖。
+pub fn tokenize(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut has = false;
+    let mut in_q = false;
+    let mut esc = false;
+    for c in line.chars() {
+        if esc {
+            // 引号内只把 \" 和 \\ 当转义；正则里的 \[ \] 必须留给 regex 引擎。
+            if c != '"' && c != '\\' {
+                cur.push('\\');
+            }
+            cur.push(c);
+            esc = false;
+            continue;
+        }
+        match c {
+            '\\' if in_q => {
+                esc = true;
+                has = true;
+            }
+            '"' => {
+                in_q = !in_q;
+                has = true;
+            }
+            c if c.is_whitespace() && !in_q => {
+                if has {
+                    out.push(std::mem::take(&mut cur));
+                    has = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                has = true;
+            }
+        }
+    }
+    if has {
+        out.push(cur);
+    }
+    out
+}
+
+fn ctype_for(data_type: &str) -> String {
+    match data_type.to_ascii_lowercase().as_str() {
+        "json" => "application/json",
+        "text" | "plain" => "text/plain",
+        "html" => "text/html",
+        "css" => "text/css",
+        "javascript" | "js" => "application/javascript",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "jpeg" | "jpg" => "image/jpeg",
+        "tiff" => "image/tiff",
+        "mp4" => "video/mp4",
+        "text-event-stream" => "text/event-stream",
+        "form-data" => "multipart/form-data",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+fn rejects(action: &str) -> Option<RejectKind> {
+    match action {
+        "reject" | "reject-drop" => Some(RejectKind::Drop),
+        "reject-200" => Some(RejectKind::Status200),
+        "reject-img" | "reject-tinygif" => Some(RejectKind::TinyGif),
+        "reject-dict" => Some(RejectKind::JsonObject),
+        "reject-array" => Some(RejectKind::JsonArray),
+        _ => None,
+    }
+}
+
+fn parse_mock(tokens: &[String], response: bool) -> Option<MockSpec> {
+    let mut data_type = "text".to_string();
+    let mut data = String::new();
+    let mut status = 200u16;
+    let mut base64_data = false;
+    let mut has_data = false;
+    let mut unsupported_file = false;
+    for t in tokens {
+        let Some((k, v)) = t.split_once('=') else { continue };
+        match k.to_ascii_lowercase().as_str() {
+            "data-type" => data_type = v.trim_matches('"').to_string(),
+            "data" => {
+                data = v.trim_matches('"').to_string();
+                has_data = true;
+            }
+            "status-code" if response => status = v.parse().unwrap_or(200),
+            "mock-data-is-base64" => base64_data = v.eq_ignore_ascii_case("true"),
+            "data-path" => unsupported_file = true,
+            _ => {}
+        }
+    }
+    if unsupported_file || !has_data {
+        return None;
+    }
+    let body = if base64_data {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.decode(data.as_bytes()).ok()?
+    } else {
+        data.into_bytes()
+    };
+    Some(MockSpec { status, content_type: ctype_for(&data_type), body })
+}
+
+fn header_ops(action: &str, params: &[String]) -> Option<(bool, Vec<HeaderOp>)> {
+    let response = action.starts_with("response-");
+    let is_request = action.starts_with("request-") || !response;
+    let base = action
+        .strip_prefix("request-")
+        .or_else(|| action.strip_prefix("response-"))
+        .unwrap_or(action);
+    let mut out = Vec::new();
+    match base {
+        "header-add" => {
+            if params.len() < 2 || params.len() % 2 != 0 {
+                return None;
+            }
+            for pair in params.chunks(2) {
+                out.push(HeaderOp::Add { name: pair[0].clone(), value: pair[1].clone() });
+            }
+        }
+        "header-del" => {
+            if params.is_empty() {
+                return None;
+            }
+            for name in params {
+                out.push(HeaderOp::Del { name: name.clone() });
+            }
+        }
+        "header-replace" => {
+            if params.len() < 2 || params.len() % 2 != 0 {
+                return None;
+            }
+            for pair in params.chunks(2) {
+                out.push(HeaderOp::Replace { name: pair[0].clone(), value: pair[1].clone() });
+            }
+        }
+        "header-replace-regex" => {
+            if params.len() < 3 || params.len() % 3 != 0 {
+                return None;
+            }
+            for triple in params.chunks(3) {
+                let re = Regex::new(&triple[1]).ok()?;
+                out.push(HeaderOp::ReplaceRegex {
+                    name: triple[0].clone(),
+                    re,
+                    replacement: triple[2].clone(),
+                });
+            }
+        }
+        _ => return None,
+    }
+    Some((is_request, out))
+}
+
+fn body_ops(action: &str, params: &[String]) -> Option<(bool, Vec<BodyOp>)> {
+    let response = action.starts_with("response-");
+    let is_request = action.starts_with("request-") || !response;
+    let base = action
+        .strip_prefix("request-")
+        .or_else(|| action.strip_prefix("response-"))
+        .unwrap_or(action);
+    let mut out = Vec::new();
+    match base {
+        "body-replace-regex" => {
+            if params.len() < 2 || params.len() % 2 != 0 {
+                return None;
+            }
+            for pair in params.chunks(2) {
+                let re = regex::bytes::Regex::new(&pair[0]).ok()?;
+                out.push(BodyOp::ReplaceRegex { re, replacement: pair[1].clone() });
+            }
+        }
+        "body-json-add" | "body-json-replace" => {
+            if params.len() < 2 || params.len() % 2 != 0 {
+                return None;
+            }
+            let kind = if base.ends_with("add") { JsonKind::Add } else { JsonKind::Replace };
+            for pair in params.chunks(2) {
+                out.push(BodyOp::Json(JsonOp {
+                    kind: kind.clone(),
+                    path: pair[0].clone(),
+                    value: Some(pair[1].clone()),
+                }));
+            }
+        }
+        "body-json-del" | "body-json-delete" => {
+            if params.is_empty() {
+                return None;
+            }
+            for path in params {
+                out.push(BodyOp::Json(JsonOp { kind: JsonKind::Delete, path: path.clone(), value: None }));
+            }
+        }
+        _ => return None,
+    }
+    Some((is_request, out))
+}
+
+/// 解析一条旧版 `[Rewrite]` 行。
+fn parse_old(line: &str) -> Option<Vec<LoonRule>> {
+    let t = tokenize(line);
+    if t.len() < 2 {
+        return None;
+    }
+    let url = Regex::new(&t[0]).ok()?;
+    let action = t[1].to_ascii_lowercase();
+    let params = &t[2..];
+    let req = |a: LoonAction| {
+        Some(vec![LoonRule { phase: LoonPhase::Request, url: url.clone(), action: a, raw: line.into() }])
+    };
+
+    if action == "header" {
+        return req(LoonAction::UrlReplace(params.first()?.clone()));
+    }
+    if action == "302" || action == "307" {
+        return req(LoonAction::Redirect {
+            status: action.parse().ok()?,
+            url: params.first()?.clone(),
+        });
+    }
+    if let Some(kind) = rejects(&action) {
+        return req(LoonAction::Reject(kind));
+    }
+    if action == "mock-request-body" {
+        return req(LoonAction::RequestMock(parse_mock(params, false)?));
+    }
+    if action == "mock-response-body" {
+        return req(LoonAction::ResponseMock(parse_mock(params, true)?));
+    }
+    if let Some((is_request, ops)) = header_ops(&action, params) {
+        let phase = if is_request { LoonPhase::Request } else { LoonPhase::Response };
+        return Some(ops.into_iter().map(|op| LoonRule {
+            phase,
+            url: url.clone(),
+            action: if is_request { LoonAction::RequestHeader(op) } else { LoonAction::ResponseHeader(op) },
+            raw: line.into(),
+        }).collect());
+    }
+    if let Some((is_request, ops)) = body_ops(&action, params) {
+        let phase = if is_request { LoonPhase::Request } else { LoonPhase::Response };
+        return Some(ops.into_iter().map(|op| LoonRule {
+            phase,
+            url: url.clone(),
+            action: if is_request { LoonAction::RequestBody(op) } else { LoonAction::ResponseBody(op) },
+            raw: line.into(),
+        }).collect());
+    }
+    None
+}
+
+// ---------------- 新版语法 ----------------
+
+fn split_args(s: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut has = false;
+    let mut in_str = false;
+    let mut in_re = false;
+    let mut depth = 0usize;
+    let mut esc = false;
+    for c in s.chars() {
+        if esc {
+            // 引号内只把 \" 和 \\ 当转义；正则里的 \[ \] 必须留给 regex 引擎。
+            if c != '"' && c != '\\' {
+                cur.push('\\');
+            }
+            cur.push(c);
+            esc = false;
+            continue;
+        }
+        match c {
+            '\\' if in_str || in_re => {
+                cur.push(c);
+                esc = true;
+            }
+            '"' if depth == 0 => {
+                in_str = !in_str;
+                has = true;
+            }
+            '/' if depth == 0 && !in_str => {
+                in_re = !in_re;
+                cur.push(c);
+                has = true;
+            }
+            '(' | '[' | '{' if !in_str && !in_re => {
+                depth += 1;
+                cur.push(c);
+                has = true;
+            }
+            ')' | ']' | '}' if !in_str && !in_re => {
+                depth = depth.saturating_sub(1);
+                cur.push(c);
+                has = true;
+            }
+            ',' if !in_str && !in_re && depth == 0 => {
+                if has {
+                    out.push(cur.trim().to_string());
+                    cur = String::new();
+                    has = false;
+                }
+            }
+            c if c.is_whitespace() && !in_str && !in_re && depth == 0 => {
+                if has {
+                    out.push(cur.trim().to_string());
+                    cur = String::new();
+                    has = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                has = true;
+            }
+        }
+    }
+    if in_str || in_re || depth != 0 {
+        return None;
+    }
+    if has {
+        out.push(cur.trim().to_string());
+    }
+    Some(out)
+}
+
+fn unquote(s: &str) -> String {
+    let t = s.trim();
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        t[1..t.len() - 1].replace("\\\"", "\"").replace("\\\\", "\\")
+    } else {
+        t.to_string()
+    }
+}
+
+fn parse_regex_literal(s: &str) -> Option<(Regex, bool)> {
+    let t = s.trim();
+    if !t.starts_with('/') {
+        return None;
+    }
+    let end = t.rfind('/')?;
+    if end == 0 {
+        return None;
+    }
+    let body = &t[1..end];
+    let flags = &t[end + 1..];
+    let mut pattern = body.to_string();
+    if flags.contains('i') {
+        pattern = format!("(?i){}", pattern);
+    }
+    Some((Regex::new(&pattern).ok()?, flags.contains('i')))
+}
+
+fn parse_bytes_regex_literal(s: &str) -> Option<regex::bytes::Regex> {
+    let t = s.trim();
+    if !t.starts_with('/') {
+        return None;
+    }
+    let end = t.rfind('/')?;
+    if end == 0 {
+        return None;
+    }
+    let body = &t[1..end];
+    let flags = &t[end + 1..];
+    let pattern = if flags.contains('i') { format!("(?i){}", body) } else { body.to_string() };
+    regex::bytes::Regex::new(&pattern).ok()
+}
+
+fn json_value_expr(s: &str) -> String {
+    let t = s.trim();
+    if t.starts_with('"') && t.ends_with('"') {
+        // 已经是 JSON 字符串，保留转义
+        return t.to_string();
+    }
+    if t == "true" || t == "false" || t == "null" || t.starts_with('{') || t.starts_with('[') || t.parse::<f64>().is_ok() {
+        return t.to_string();
+    }
+    serde_json::to_string(t).unwrap_or_else(|_| "\"\"".into())
+}
+
+/// 解析新版动作函数调用；返回 (phase, action)。
+fn parse_new_action(call: &str, default_phase: LoonPhase) -> Option<(LoonPhase, LoonAction)> {
+    let t = call.trim();
+    let open = t.find('(')?;
+    if !t.ends_with(')') {
+        return None;
+    }
+    let name = t[..open].trim().to_ascii_lowercase();
+    let args = split_args(&t[open + 1..t.len() - 1])?;
+    let _ = default_phase;
+    match name.as_str() {
+        "url.replace" | "url.rewrite" => {
+            Some((LoonPhase::Request, LoonAction::UrlReplace(unquote(args.first()?))))
+        }
+        "redirect" => {
+            let status: u16 = args.first()?.trim().parse().ok()?;
+            Some((LoonPhase::Request, LoonAction::Redirect { status, url: unquote(args.get(1)?) }))
+        }
+        "request.header.add" => Some((
+            LoonPhase::Request,
+            LoonAction::RequestHeader(HeaderOp::Add { name: unquote(args.first()?), value: unquote(args.get(1)?) }),
+        )),
+        "request.header.del" | "request.header.delete" => Some((
+            LoonPhase::Request,
+            LoonAction::RequestHeader(HeaderOp::Del { name: unquote(args.first()?) }),
+        )),
+        "request.header.replace" | "request.header.replace_regex" => {
+            if args.len() >= 3 {
+                let (re, _) = parse_regex_literal(&args[1])?;
+                Some((LoonPhase::Request, LoonAction::RequestHeader(HeaderOp::ReplaceRegex {
+                    name: unquote(&args[0]),
+                    re,
+                    replacement: unquote(&args[2]),
+                })))
+            } else {
+                Some((
+                    LoonPhase::Request,
+                    LoonAction::RequestHeader(HeaderOp::Replace {
+                        name: unquote(args.first()?),
+                        value: unquote(args.get(1)?),
+                    }),
+                ))
+            }
+        }
+        "response.header.add" => Some((
+            LoonPhase::Response,
+            LoonAction::ResponseHeader(HeaderOp::Add { name: unquote(args.first()?), value: unquote(args.get(1)?) }),
+        )),
+        "response.header.del" | "response.header.delete" => Some((
+            LoonPhase::Response,
+            LoonAction::ResponseHeader(HeaderOp::Del { name: unquote(args.first()?) }),
+        )),
+        "response.header.replace" | "response.header.replace_regex" => {
+            if args.len() >= 3 {
+                let (re, _) = parse_regex_literal(&args[1])?;
+                Some((LoonPhase::Response, LoonAction::ResponseHeader(HeaderOp::ReplaceRegex {
+                    name: unquote(&args[0]),
+                    re,
+                    replacement: unquote(&args[2]),
+                })))
+            } else {
+                Some((
+                    LoonPhase::Response,
+                    LoonAction::ResponseHeader(HeaderOp::Replace {
+                        name: unquote(args.first()?),
+                        value: unquote(args.get(1)?),
+                    }),
+                ))
+            }
+        }
+        "request.body.replace_regex" | "request.body.replace" => {
+            let first = args.first()?;
+            let re = if name.ends_with("replace") {
+                regex::bytes::Regex::new(&regex::escape(&unquote(first))).ok()?
+            } else {
+                parse_bytes_regex_literal(first)?
+            };
+            Some((LoonPhase::Request, LoonAction::RequestBody(BodyOp::ReplaceRegex {
+                re,
+                replacement: unquote(args.get(1)?),
+            })))
+        }
+        "response.body.replace_regex" | "response.body.replace" => {
+            let first = args.first()?;
+            let re = if name.ends_with("replace") {
+                regex::bytes::Regex::new(&regex::escape(&unquote(first))).ok()?
+            } else {
+                parse_bytes_regex_literal(first)?
+            };
+            Some((LoonPhase::Response, LoonAction::ResponseBody(BodyOp::ReplaceRegex {
+                re,
+                replacement: unquote(args.get(1)?),
+            })))
+        }
+        "request.json.add" | "response.json.add" => {
+            let is_req = name.starts_with("request");
+            Some((if is_req { LoonPhase::Request } else { LoonPhase::Response }, if is_req {
+                LoonAction::RequestBody(BodyOp::Json(JsonOp {
+                    kind: JsonKind::Add,
+                    path: unquote(args.first()?),
+                    value: Some(json_value_expr(args.get(1)?)),
+                }))
+            } else {
+                LoonAction::ResponseBody(BodyOp::Json(JsonOp {
+                    kind: JsonKind::Add,
+                    path: unquote(args.first()?),
+                    value: Some(json_value_expr(args.get(1)?)),
+                }))
+            }))
+        }
+        "request.json.replace" | "response.json.replace" => {
+            let is_req = name.starts_with("request");
+            Some((if is_req { LoonPhase::Request } else { LoonPhase::Response }, if is_req {
+                LoonAction::RequestBody(BodyOp::Json(JsonOp {
+                    kind: JsonKind::Replace,
+                    path: unquote(args.first()?),
+                    value: Some(json_value_expr(args.get(1)?)),
+                }))
+            } else {
+                LoonAction::ResponseBody(BodyOp::Json(JsonOp {
+                    kind: JsonKind::Replace,
+                    path: unquote(args.first()?),
+                    value: Some(json_value_expr(args.get(1)?)),
+                }))
+            }))
+        }
+        "request.json.delete" | "request.json.del" | "response.json.delete" | "response.json.del" => {
+            let is_req = name.starts_with("request");
+            Some((if is_req { LoonPhase::Request } else { LoonPhase::Response }, if is_req {
+                LoonAction::RequestBody(BodyOp::Json(JsonOp {
+                    kind: JsonKind::Delete,
+                    path: unquote(args.first()?),
+                    value: None,
+                }))
+            } else {
+                LoonAction::ResponseBody(BodyOp::Json(JsonOp {
+                    kind: JsonKind::Delete,
+                    path: unquote(args.first()?),
+                    value: None,
+                }))
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn parse_new(line: &str) -> Option<Vec<LoonRule>> {
+    let lower = line.to_ascii_lowercase();
+    let phase = if lower.starts_with("request if ") {
+        LoonPhase::Request
+    } else if lower.starts_with("response if ") {
+        LoonPhase::Response
+    } else {
+        return None;
+    };
+    let then = lower.find(" then ")?;
+    let condition = line[..then].trim();
+    let actions = line[then + 6..].trim();
+    let cond = condition
+        .strip_prefix("request if ")
+        .or_else(|| condition.strip_prefix("response if "))
+        .or_else(|| condition.strip_prefix("request IF "))
+        .unwrap_or(condition)
+        .trim();
+    // 只接受单条 ${url} ~= /regex/ 条件；&&、|| 与 header 变量不猜测执行。
+    if cond.starts_with("${url}") {
+        let rest = cond["${url}".len()..].trim();
+        if !rest.starts_with("~=") {
+            return None;
+        }
+        let literal = rest[2..].trim();
+        // `as urlMatch` 只是命名，不影响匹配。
+        if literal.contains("&&") || literal.contains("||") || literal.contains("${") {
+            return None;
+        }
+        let literal = literal.split(" as ").next().unwrap_or(literal).trim();
+        let (url, _) = parse_regex_literal(literal)?;
+        let mut rules = Vec::new();
+        for call in actions.split(';') {
+            let call = call.trim();
+            if call.is_empty() {
+                continue;
+            }
+            let (p, a) = parse_new_action(call, phase)?;
+            rules.push(LoonRule { phase: p, url: url.clone(), action: a, raw: line.into() });
+        }
+        if rules.is_empty() {
+            return None;
+        }
+        return Some(rules);
+    }
+    None
+}
+
+pub fn parse_loon_rewrites(lines: &[String]) -> LoonSet {
+    let mut set = LoonSet::default();
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with('!') || line.starts_with(';') {
+            continue;
+        }
+        let parsed = if line.to_ascii_lowercase().starts_with("request if ")
+            || line.to_ascii_lowercase().starts_with("response if ")
+        {
+            parse_new(line)
+        } else {
+            parse_old(line)
+        };
+        match parsed {
+            Some(mut rules) => set.rules.append(&mut rules),
+            None => set.unsupported.push(line.to_string()),
+        }
+    }
+    set
+}
+
+pub fn apply_header_ops(headers: &mut Vec<(String, String)>, ops: &[&HeaderOp]) {
+    for op in ops {
+        match op {
+            HeaderOp::Add { name, value } => {
+                headers.push((name.clone(), value.clone()));
+            }
+            HeaderOp::Del { name } => {
+                headers.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+            }
+            HeaderOp::Replace { name, value } => {
+                headers.retain(|(k, _)| !k.eq_ignore_ascii_case(name));
+                headers.push((name.clone(), value.clone()));
+            }
+            HeaderOp::ReplaceRegex { name, re, replacement } => {
+                for (k, v) in headers.iter_mut() {
+                    if k.eq_ignore_ascii_case(name) {
+                        *v = re.replace_all(v, replacement.as_str()).into_owned();
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn expand_url_template(template: &str, caps: &regex::Captures<'_>) -> String {
+    let mut out = String::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 1 < bytes.len() {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 1 {
+                if let Ok(n) = template[i + 1..j].parse::<usize>() {
+                    if let Some(m) = caps.get(n) {
+                        out.push_str(m.as_str());
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+            // ${urlMatch.N} / ${urlMatch.N} 形式
+            if template[i..].starts_with("${urlMatch.") {
+                if let Some(close) = template[i..].find('}') {
+                    let n = &template[i + 11..i + close];
+                    if let Ok(n) = n.parse::<usize>() {
+                        if let Some(m) = caps.get(n) {
+                            out.push_str(m.as_str());
+                            i += close + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// 把 JSON 路径拆成 key / index。支持 `data.apps[0].name`。
+fn json_path(path: &str) -> Option<Vec<PathSeg>> {
+    let mut segs = Vec::new();
+    for part in path.split('.') {
+        if part.is_empty() {
+            return None;
+        }
+        let mut rest = part;
+        while !rest.is_empty() {
+            if let Some(open) = rest.find('[') {
+                let key = &rest[..open];
+                if !key.is_empty() {
+                    segs.push(PathSeg::Key(key.to_string()));
+                }
+                let close = rest[open..].find(']')? + open;
+                let idx = &rest[open + 1..close];
+                if idx.is_empty() {
+                    // `[]` 追加语义太接近 jq，明确不支持
+                    return None;
+                }
+                segs.push(PathSeg::Index(idx.parse().ok()?));
+                rest = &rest[close + 1..];
+            } else {
+                segs.push(PathSeg::Key(rest.to_string()));
+                rest = "";
+            }
+        }
+    }
+    if segs.is_empty() {
+        None
+    } else {
+        Some(segs)
+    }
+}
+
+#[derive(Debug, Clone)]
+enum PathSeg {
+    Key(String),
+    Index(usize),
+}
+
+fn set_json(value: &mut serde_json::Value, path: &[PathSeg], new: serde_json::Value, add: bool) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let mut cur = value;
+    for (i, seg) in path.iter().enumerate() {
+        let last = i + 1 == path.len();
+        match seg {
+            PathSeg::Key(k) => {
+                if !cur.is_object() {
+                    if add {
+                        *cur = serde_json::Value::Object(Default::default());
+                    } else {
+                        return false;
+                    }
+                }
+                let obj = cur.as_object_mut().unwrap();
+                if last {
+                    if !add && !obj.contains_key(k) {
+                        return false;
+                    }
+                    obj.insert(k.clone(), new);
+                    return true;
+                }
+                if !obj.contains_key(k) {
+                    if !add {
+                        return false;
+                    }
+                    let next_is_index = matches!(path.get(i + 1), Some(PathSeg::Index(_)));
+                    obj.insert(
+                        k.clone(),
+                        if next_is_index { serde_json::Value::Array(Default::default()) } else { serde_json::Value::Object(Default::default()) },
+                    );
+                }
+                cur = obj.get_mut(k).unwrap();
+            }
+            PathSeg::Index(n) => {
+                if !cur.is_array() {
+                    if add {
+                        *cur = serde_json::Value::Array(Default::default());
+                    } else {
+                        return false;
+                    }
+                }
+                let arr = cur.as_array_mut().unwrap();
+                while arr.len() <= *n {
+                    if !add {
+                        return false;
+                    }
+                    arr.push(serde_json::Value::Null);
+                }
+                if last {
+                    arr[*n] = new;
+                    return true;
+                }
+                cur = &mut arr[*n];
+            }
+        }
+    }
+    false
+}
+
+fn del_json(value: &mut serde_json::Value, path: &[PathSeg]) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let mut cur = value;
+    for (i, seg) in path.iter().enumerate() {
+        let last = i + 1 == path.len();
+        match seg {
+            PathSeg::Key(k) => {
+                let Some(obj) = cur.as_object_mut() else { return false };
+                if last {
+                    return obj.remove(k).is_some();
+                }
+                let Some(next) = obj.get_mut(k) else { return false };
+                cur = next;
+            }
+            PathSeg::Index(n) => {
+                let Some(arr) = cur.as_array_mut() else { return false };
+                if *n >= arr.len() {
+                    return false;
+                }
+                if last {
+                    arr.remove(*n);
+                    return true;
+                }
+                cur = &mut arr[*n];
+            }
+        }
+    }
+    false
+}
+
+fn replace_limited(
+    re: &regex::bytes::Regex,
+    input: &[u8],
+    replacement: &[u8],
+    limit: usize,
+) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut last = 0usize;
+    for caps in re.captures_iter(input) {
+        let Some(m) = caps.get(0) else { continue };
+        let gap = &input[last..m.start()];
+        if out.len().saturating_add(gap.len()) > limit {
+            return None;
+        }
+        out.extend_from_slice(gap);
+        let mut repl = Vec::new();
+        caps.expand(replacement, &mut repl);
+        if out.len().saturating_add(repl.len()) > limit {
+            return None;
+        }
+        out.extend_from_slice(&repl);
+        last = m.end();
+    }
+    let tail = &input[last..];
+    if out.len().saturating_add(tail.len()) > limit {
+        return None;
+    }
+    out.extend_from_slice(tail);
+    Some(out)
+}
+
+/// 依次执行 Loon 正文动作；输出超过 limit 返回 None，调用方原样透传。
+pub fn apply_body_ops(body: &[u8], ops: &[&BodyOp], limit: usize) -> Option<(Vec<u8>, bool)> {
+    let mut cur = body.to_vec();
+    let mut changed = false;
+    for op in ops {
+        match op {
+            BodyOp::ReplaceRegex { re, replacement } => {
+                let out = replace_limited(re, &cur, replacement.as_bytes(), limit)?;
+                if out != cur {
+                    changed = true;
+                }
+                cur = out;
+            }
+            BodyOp::Json(j) => {
+                let Ok(mut v) = serde_json::from_slice::<serde_json::Value>(&cur) else { continue };
+                let Some(path) = json_path(&j.path) else { continue };
+                let did = match j.kind {
+                    JsonKind::Delete => del_json(&mut v, &path),
+                    JsonKind::Add | JsonKind::Replace => {
+                        let Some(raw) = &j.value else { continue };
+                        let parsed = serde_json::from_str::<serde_json::Value>(raw)
+                            .unwrap_or_else(|_| serde_json::Value::String(raw.clone()));
+                        set_json(&mut v, &path, parsed, matches!(j.kind, JsonKind::Add))
+                    }
+                };
+                if did {
+                    let out = serde_json::to_vec(&v).ok()?;
+                    if out.len() > limit {
+                        return None;
+                    }
+                    if out != cur {
+                        changed = true;
+                    }
+                    cur = out;
+                }
+            }
+        }
+    }
+    Some((cur, changed))
+}
+
+/// 按头部动作取 value；用于测试与 mock 组装。
+pub fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+}
+
+/// 预留：把 Loon 动作名映射成界面显示用的能力标签。
+pub fn action_label(action: &LoonAction) -> &'static str {
+    match action {
+        LoonAction::UrlReplace(_) => "URL 替换",
+        LoonAction::Redirect { .. } => "重定向",
+        LoonAction::Reject(_) => "拒绝",
+        LoonAction::RequestHeader(_) => "请求头",
+        LoonAction::ResponseHeader(_) => "响应头",
+        LoonAction::RequestBody(_) => "请求体/JSON",
+        LoonAction::ResponseBody(_) => "响应体/JSON",
+        LoonAction::RequestMock(_) => "请求体 mock",
+        LoonAction::ResponseMock(_) => "响应 mock",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_old_common_actions() {
+        let lines = vec![
+            r"^https://api\.x\.com/ad reject".to_string(),
+            r"^https://old\.x\.com/p header https://new.x.com/q".to_string(),
+            r"^https://api\.x\.com/a 302 https://x.com/new".to_string(),
+            r"^https://api\.x\.com/h header-add X-A 1 X-B 2".to_string(),
+            r"^https://api\.x\.com/h response-header-del Cookie Set-Cookie".to_string(),
+            r#"^https://api\.x\.com/feed response-body-replace-regex "ads":\[.*?\] ""#.to_string(),
+            r#"^https://api\.x\.com/j response-body-json-del data.ads "#.to_string(),
+            r#"^https://api\.x\.com/j response-body-json-add data.apps[0].name "x""#.to_string(),
+        ];
+        let set = parse_loon_rewrites(&lines);
+        assert_eq!(set.unsupported.len(), 0);
+        // header-add / header-del 的多组参数拆成独立动作，共 10 条。
+        assert_eq!(set.rules.len(), 10);
+        assert!(matches!(set.rules[0].action, LoonAction::Reject(RejectKind::Drop)));
+        assert!(matches!(set.rules[1].action, LoonAction::UrlReplace(_)));
+        assert!(matches!(set.rules[2].action, LoonAction::Redirect { status: 302, .. }));
+    }
+
+    #[test]
+    fn parses_new_syntax_and_rejects_complex_conditions() {
+        let lines = vec![
+            r#"request if ${url} ~= /^https:\/\/old\.x\.com\/(.*)$/i as urlMatch then url.replace("https://new.x.com/${urlMatch.1}")"#.to_string(),
+            r#"response if ${url} ~= /^https:\/\/api\.x\.com/ then response.body.replace("ad-banner", "")"#.to_string(),
+            r#"request if ${url} ~= /^https:\/\/api\.x\.com/ && ${enabled} then request.header.add("X", "1")"#.to_string(),
+        ];
+        let set = parse_loon_rewrites(&lines);
+        assert_eq!(set.rules.len(), 2);
+        assert_eq!(set.unsupported.len(), 1);
+        assert!(matches!(set.rules[0].action, LoonAction::UrlReplace(_)));
+        assert!(matches!(set.rules[1].action, LoonAction::ResponseBody(BodyOp::ReplaceRegex { .. })));
+    }
+
+    #[test]
+    fn json_add_replace_delete() {
+        let (json, _) = {
+            let mut ops = Vec::new();
+            ops.push(BodyOp::Json(JsonOp { kind: JsonKind::Delete, path: "data.ads".into(), value: None }));
+            ops.push(BodyOp::Json(JsonOp { kind: JsonKind::Add, path: "data.apps[0].name".into(), value: Some("\"x\"".into()) }));
+            ops.push(BodyOp::Json(JsonOp { kind: JsonKind::Replace, path: "data.price".into(), value: Some("1".into()) }));
+            let refs: Vec<&BodyOp> = ops.iter().collect();
+            apply_body_ops(br#"{"data":{"ads":[1],"price":9}}"#, &refs, 1 << 20).unwrap()
+        };
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert!(v["data"]["ads"].is_null());
+        assert_eq!(v["data"]["apps"][0]["name"], "x");
+        assert_eq!(v["data"]["price"], 1);
+    }
+
+    #[test]
+    fn url_template_expands_capture() {
+        let re = Regex::new(r"^https://old\.x\.com/(.*)$").unwrap();
+        let caps = re.captures("https://old.x.com/a/b").unwrap();
+        assert_eq!(expand_url_template("https://new.x.com/$1", &caps), "https://new.x.com/a/b");
+        assert_eq!(expand_url_template("https://new.x.com/${urlMatch.1}", &caps), "https://new.x.com/a/b");
+    }
+
+    #[test]
+    fn mock_inline_and_data_path() {
+        let t = tokenize(r#"mock-response-body data-type=json data="{\"ok\":1}" status-code=201"#);
+        let m = parse_mock(&t, true).unwrap();
+        assert_eq!(m.status, 201);
+        assert_eq!(m.content_type, "application/json");
+        assert_eq!(m.body, br#"{"ok":1}"#);
+        let t = tokenize(r#"mock-response-body data-type=json data-path=response_body.json"#);
+        assert!(parse_mock(&t, true).is_none());
+    }
+}

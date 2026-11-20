@@ -1,0 +1,8 @@
+{
+  "mode": "rule",
+  "blockEnabled": true,
+  "finalPolicy": "proxy",
+  "rules": [
+    {"type": "DOMAIN-SUFFIX", "value": "ads.example.com", "action": "block"}
+  ]
+}

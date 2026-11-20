@@ -1,0 +1,729 @@
+pub mod config;
+pub mod dns;
+pub mod dns_log;
+pub mod engine;
+pub mod logging;
+pub mod mitm;
+pub mod script;
+pub mod netstack;
+pub mod outbound;
+pub mod proto;
+pub mod stats;
+pub mod sniff;
+pub mod udp;
+pub mod subscribe;
+pub mod strategy;
+
+use crate::config::Config;
+use crate::dns::DnsEngine;
+use crate::engine::{build_filter, load_cn_ips, Action, ConnKind, FilterEngine, RuleEngine};
+use crate::netstack::Ctx;
+use crate::stats::Stats;
+use jni::objects::{JClass, JString};
+use jni::sys::{jboolean, jint, jlong, jstring};
+use jni::JNIEnv;
+use once_cell::sync::Lazy;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+struct Engine {
+    rt: tokio::runtime::Runtime,
+    shutdown: Arc<AtomicBool>,
+    stats: Arc<Stats>,
+    ctx: Arc<Ctx>,
+}
+
+static ENGINE: Lazy<Mutex<Option<Engine>>> = Lazy::new(|| Mutex::new(None));
+
+fn stop_engine() {
+    let mut guard = match ENGINE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(engine) = guard.take() {
+        logging::info("core", "正在停止：通知协议栈释放 TUN");
+        engine.shutdown.store(true, Ordering::Relaxed);
+        engine.ctx.dns.read().unwrap_or_else(|p| p.into_inner()).save_state();
+        // 冻结统计时点：停止后 nativeStats 仍返回本次会话的汇总，uptime 不再增长。
+        engine.stats.stopped_at.store(crate::stats::now_ms() as i64, Ordering::Relaxed);
+        ENGINE_STATS.lock().unwrap_or_else(|p| p.into_inner()).clone_from(&engine.stats);
+        engine.rt.shutdown_timeout(Duration::from_secs(3));
+        logging::info("core", "已停止：运行时与 TUN 资源已释放");
+    }
+}
+
+static ENGINE_STATS: Lazy<Mutex<Arc<Stats>>> = Lazy::new(|| Mutex::new(Arc::new(Stats::new())));
+
+fn read_string(env: &mut JNIEnv, s: &JString) -> Option<String> {
+    let js = env.get_string(s).ok()?;
+    Some(String::from(js))
+}
+
+/// fallback 污染复核用的 CN IP 段，与分流共用同一份 cnip.txt。
+fn cn_ips_for(cfg: &Config) -> Vec<(u32, u32)> {
+    cfg.cn_ip_file
+        .as_ref()
+        .map(|p| load_cn_ips(p))
+        .unwrap_or_default()
+}
+
+fn to_jstring(env: &mut JNIEnv, text: String) -> jstring {
+    match env.new_string(text) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStart<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    fd: jint,
+    config_json: JString<'local>,
+) -> jboolean {
+    let result = catch_unwind(AssertUnwindSafe(|| -> bool {
+        let json = match read_string(&mut env, &config_json) {
+            Some(s) => s,
+            None => return false,
+        };
+        let cfg: Config = match serde_json::from_str(&json) {
+            Ok(c) => c,
+            Err(e) => {
+                logging::error("core", format!("配置解析失败: {}", e));
+                return false;
+            }
+        };
+        if fd <= 0 {
+            logging::error("core", "无效的 TUN fd");
+            return false;
+        }
+        stop_engine();
+
+        let filter: Arc<FilterEngine> = Arc::new(build_filter(&cfg));
+        let rules: Arc<RuleEngine> = Arc::new(RuleEngine::from_config(&cfg));
+        let strategy = Arc::new(strategy::StrategySet::from_config(&cfg));
+        if strategy.has_errors() {
+            for issue in strategy.issues() {
+                logging::warn(
+                    "strategy",
+                    format!(
+                        "策略诊断 {}{}：{}",
+                        if issue.group.is_empty() { "全局".to_string() } else { issue.group.clone() },
+                        if issue.code.is_empty() { "".to_string() } else { format!("/{}", issue.code) },
+                        issue.message
+                    ),
+                );
+            }
+        }
+        let stats: Arc<Stats> = Arc::new(Stats::new());
+        stats.filter_rules.store(filter.rule_count() as u64, Ordering::Relaxed);
+        stats.filter_skipped.store(filter.skipped as u64, Ordering::Relaxed);
+        let mut dns = DnsEngine::new(
+            &cfg.dns,
+            filter.clone(),
+            stats.clone(),
+            &cfg.block_mode,
+            cfg.block_enabled,
+            cfg.fake_ip && cfg.mode != "dns_only",
+            cfg.dns.query_log,
+        );
+        dns.set_fake_path(if cfg.fake_ip && cfg.mode != "dns_only" {
+            cfg.fake_ip_file.clone()
+        } else {
+            None
+        });
+        dns.set_cache_path(if cfg.dns.cache_file.trim().is_empty() {
+            None
+        } else {
+            Some(cfg.dns.cache_file.clone())
+        });
+        dns.set_cn_ips(cn_ips_for(&cfg));
+        let dns: Arc<DnsEngine> = Arc::new(dns);
+        logging::info(
+            "core",
+            format!(
+                "启动 mode={} 广告规则={} 分流规则={} 节点={} DNS={}",
+                cfg.mode,
+                filter.rule_count(),
+                rules.rule_count,
+                cfg.nodes.len(),
+                cfg.dns.upstream
+            ),
+        );
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let nodes = cfg.nodes.clone();
+        let selected = cfg.selected.clone();
+        let health = Arc::new(strategy::HealthRegistry::new());
+        let mitm_state = Arc::new(std::sync::RwLock::new(Arc::new(mitm::MitmState::build(&cfg.mitm))));
+        let ctx = Arc::new(Ctx {
+            cfg: std::sync::RwLock::new(cfg),
+            filter,
+            rules: Arc::new(std::sync::RwLock::new(rules)),
+            dns: Arc::new(std::sync::RwLock::new(dns)),
+            stats: stats.clone(),
+            shutdown: shutdown.clone(),
+            nodes: Arc::new(std::sync::RwLock::new(Arc::new(nodes))),
+            selected: Arc::new(std::sync::RwLock::new(selected)),
+            strategy: Arc::new(std::sync::RwLock::new(strategy)),
+            health: health.clone(),
+            decision: Arc::new(std::sync::RwLock::new(())),
+            mitm: mitm_state,
+        });
+
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(3)
+            .enable_all()
+            .thread_name("namu-core")
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                logging::error("core", format!("运行时创建失败: {}", e));
+                return false;
+            }
+        };
+        let ctx2 = ctx.clone();
+        let health_ctx = ctx.clone();
+        netstack::STACK_READY.store(false, Ordering::Release);
+        rt.spawn(async move {
+            if let Err(e) = netstack::run(fd as i32, ctx2).await {
+                logging::error("tun", format!("协议栈异常退出: {}", e));
+            }
+        });
+        let hs = health_ctx.shutdown.clone();
+        let hstrat = health_ctx.strategy.clone();
+        let hnodes = health_ctx.nodes.clone();
+        let hhealth = health.clone();
+        rt.spawn(async move {
+            strategy::run_health_loop(hs, hstrat, hnodes, hhealth).await;
+        });
+        // 等协议栈真正就绪再返回 true，避免界面先显示「已连接」但流量还没人接。
+        let mut waited = 0u32;
+        while !netstack::STACK_READY.load(Ordering::Acquire) && waited < 300 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            waited += 10;
+        }
+        if waited >= 300 {
+            logging::warn("core", "协议栈 300ms 内未就绪，继续启动");
+        }
+        // Fake-IP 映射定期落盘（mihomo/sing-box cache_file 同款）
+        let ctx_flush = ctx.clone();
+        let shut_flush = shutdown.clone();
+        rt.spawn(async move {
+            // 30s 一落盘：重启用到的映射窗口从 60s 缩到 30s（停止/热重载另有即时落盘）。
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                if shut_flush.load(Ordering::Relaxed) {
+                    break;
+                }
+                ctx_flush.dns.read().unwrap_or_else(|p| p.into_inner()).save_state();
+            }
+        });
+
+        let mut guard = match ENGINE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *guard = Some(Engine {
+            rt,
+            shutdown,
+            stats: stats.clone(),
+            ctx: ctx.clone(),
+        });
+        *ENGINE_STATS.lock().unwrap_or_else(|p| p.into_inner()) = stats;
+        logging::info("core", "服务已启动");
+        true
+    }));
+    match result {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(_) => {
+            logging::error("core", "启动时发生内部错误");
+            0
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStop<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) {
+    let _ = catch_unwind(AssertUnwindSafe(|| stop_engine()));
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStats<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    let json = {
+        let guard = match ENGINE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        match guard.as_ref() {
+            Some(engine) => engine.stats.to_json(),
+            // 停止后返回本次会话的最终统计（uptime 已冻结），不再清空。
+            None => ENGINE_STATS.lock().unwrap_or_else(|p| p.into_inner()).to_json(),
+        }
+    };
+    to_jstring(&mut env, json)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeLogs<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    since: jlong,
+) -> jstring {
+    let json = logging::json_since(since.max(0) as u64);
+    to_jstring(&mut env, json)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeDnsLogs<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    since: jlong,
+) -> jstring {
+    let json = dns_log::json_since(since.max(0) as u64);
+    to_jstring(&mut env, json)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeClearDnsLogs<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) {
+    dns_log::clear();
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeClearLogs<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) {
+    logging::clear();
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeParseSubscription<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    text: JString<'local>,
+) -> jstring {
+    let json = catch_unwind(AssertUnwindSafe(|| {
+        let raw = read_string(&mut env, &text).unwrap_or_default();
+        subscribe::parse_to_json(&raw)
+    }))
+    .unwrap_or_else(|_| "{\"nodes\":[],\"rules\":[],\"groups\":[],\"unsupported\":0}".into());
+    to_jstring(&mut env, json)
+}
+
+/// 规则热重载（sing-box serviceReload 同款）：只换过滤/分流引擎，TUN 与连接不中断。
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeReloadRules<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    config_json: JString<'local>,
+) -> jboolean {
+    let result = catch_unwind(AssertUnwindSafe(|| -> bool {
+        let json = match read_string(&mut env, &config_json) {
+            Some(s) => s,
+            None => return false,
+        };
+        let cfg: Config = match serde_json::from_str(&json) {
+            Ok(c) => c,
+            Err(e) => {
+                logging::error("core", format!("热重载配置解析失败: {}", e));
+                return false;
+            }
+        };
+        let guard = match ENGINE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let Some(engine) = guard.as_ref() else { return false };
+        let filter = Arc::new(build_filter(&cfg));
+        let rules = Arc::new(RuleEngine::from_config(&cfg));
+        let strategy = Arc::new(strategy::StrategySet::from_config(&cfg));
+        if strategy.has_errors() {
+            for issue in strategy.issues() {
+                logging::warn(
+                    "strategy",
+                    format!("热重载策略诊断 {}：{}", issue.group, issue.message),
+                );
+            }
+        }
+        engine.stats.filter_rules.store(filter.rule_count() as u64, Ordering::Relaxed);
+        engine.stats.filter_skipped.store(filter.skipped as u64, Ordering::Relaxed);
+        // 旧引擎状态先落盘，新引擎从盘加载，Fake-IP 与缓存都不丢
+        engine.ctx.dns.read().unwrap_or_else(|p| p.into_inner()).save_state();
+        let mut new_dns = DnsEngine::new(
+            &cfg.dns,
+            filter.clone(),
+            engine.stats.clone(),
+            &cfg.block_mode,
+            cfg.block_enabled,
+            cfg.fake_ip && cfg.mode != "dns_only",
+            cfg.dns.query_log,
+        );
+        new_dns.set_fake_path(if cfg.fake_ip && cfg.mode != "dns_only" {
+            cfg.fake_ip_file.clone()
+        } else {
+            None
+        });
+        new_dns.set_cache_path(if cfg.dns.cache_file.trim().is_empty() {
+            None
+        } else {
+            Some(cfg.dns.cache_file.clone())
+        });
+        new_dns.set_cn_ips(cn_ips_for(&cfg));
+        // 与 netstack 的新连接决策读锁配对：新连接要么看到旧快照，要么看到新快照。
+        // 已有连接不参与该锁，热更新不会中断它们。
+        let _decision_guard = engine
+            .ctx
+            .decision
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Ok(mut d) = engine.ctx.dns.write() {
+            *d = Arc::new(new_dns);
+        }
+        if let Ok(mut r) = engine.ctx.rules.write() {
+            *r = rules;
+        }
+        if let Ok(mut st) = engine.ctx.strategy.write() {
+            *st = strategy;
+        }
+        // 运行配置/节点/选中线路一并热更：sniff、无节点策略、节点参数修改
+        // 都走热重载路径，只换 DNS/规则引擎会让这些改动静默失效。
+        if let Ok(mut n) = engine.ctx.nodes.write() {
+            *n = Arc::new(cfg.nodes.clone());
+        }
+        if let Ok(mut s) = engine.ctx.selected.write() {
+            *s = cfg.selected.clone();
+        }
+        // MITM 引擎与 CA 一并热更：规则/域名列表改动不中断现有连接。
+        if let Ok(mut m) = engine.ctx.mitm.write() {
+            *m = Arc::new(mitm::MitmState::build(&cfg.mitm));
+        }
+        if let Ok(mut c) = engine.ctx.cfg.write() {
+            *c = cfg;
+        }
+        logging::info("core", "配置热重载完成，TUN 与连接未中断");
+        true
+    }));
+    match result {
+        Ok(true) => 1,
+        _ => 0,
+    }
+}
+
+/// 规则测试：与运行时完全同一套判定（含模块合并规则、CN 直连、模式覆盖、
+/// 无节点策略），由内核算出结果，避免 Kotlin 侧另写一套匹配逻辑产生偏差。
+struct RuleTransportResult {
+    label: String,
+    node: String,
+    chain: Vec<String>,
+    note: String,
+}
+
+fn node_udp_supported(cfg: &Config, name: &str) -> Option<bool> {
+    cfg.nodes
+        .iter()
+        .find(|n| n.name == name)
+        .map(|n| matches!(n.kind.as_str(), "ss" | "socks5"))
+}
+
+/// 规则测试按传输层分别展开；TCP 的结果不会替 UDP 背书。
+fn resolve_rule_transport(
+    action: &Action,
+    transport: strategy::Transport,
+    cfg: &Config,
+    strategy: &strategy::StrategySet,
+    health: &strategy::HealthRegistry,
+    rules: &RuleEngine,
+) -> RuleTransportResult {
+    let mut action = action.clone();
+    let mut chain: Vec<String> = Vec::new();
+    let mut note = String::new();
+    if let Action::Group(name) = &action {
+        match strategy.resolve_group(name, transport, health) {
+            Ok(r) => {
+                chain = r.chain.clone();
+                note = format!("策略组解析：{} → {}", r.chain.join(" → "), r.node);
+                action = Action::Node(r.node);
+            }
+            Err(e) => {
+                chain = e.chain.clone();
+                let policy = e.policy.chosen(cfg.block_when_no_node);
+                let final_label = match policy {
+                    strategy::NoNodePolicy::Direct => "DIRECT",
+                    _ => "BLOCK",
+                };
+                note = format!(
+                    "策略组解析失败：{}（链：{}）；无可用节点 → {}",
+                    e.message,
+                    if e.chain.is_empty() { "无".to_string() } else { e.chain.join(" → ") },
+                    final_label
+                );
+                action = match policy {
+                    strategy::NoNodePolicy::Direct => Action::Direct,
+                    _ => Action::Block,
+                };
+            }
+        }
+    }
+    if let Action::Missing(name) = &action {
+        note = format!(
+            "引用失效：{} 不存在；运行时不回落到当前选中节点，按 BLOCK 处理",
+            name
+        );
+        chain.push(format!("MISSING:{}", name));
+        action = Action::Block;
+    }
+    if matches!(action, Action::Proxy) {
+        let selected = cfg
+            .selected
+            .as_ref()
+            .filter(|name| cfg.nodes.iter().any(|n| n.name == **name))
+            .cloned()
+            .or_else(|| cfg.nodes.first().map(|n| n.name.clone()));
+        match selected {
+            Some(node) => {
+                if transport == strategy::Transport::Udp
+                    && node_udp_supported(cfg, &node) == Some(false)
+                {
+                    let kind = cfg
+                        .nodes
+                        .iter()
+                        .find(|n| n.name == node)
+                        .map(|n| n.kind.as_str())
+                        .unwrap_or("unknown");
+                    note = format!("节点 {}（{}）不支持 UDP，UDP 流量不会发给它", node, kind);
+                    return RuleTransportResult {
+                        label: "UDP_UNSUPPORTED".to_string(),
+                        node,
+                        chain: vec![],
+                        note,
+                    };
+                }
+                action = Action::Node(node);
+            }
+            None => {
+                action = if cfg.block_when_no_node {
+                    Action::Block
+                } else {
+                    Action::Direct
+                };
+                note = if cfg.block_when_no_node {
+                    "没有可用节点，按无节点策略拦截".to_string()
+                } else {
+                    "没有可用节点，回落直连".to_string()
+                };
+            }
+        }
+    }
+    if let Action::Node(node) = &action {
+        if transport == strategy::Transport::Udp && node_udp_supported(cfg, node) == Some(false) {
+            let kind = cfg
+                .nodes
+                .iter()
+                .find(|n| n.name == *node)
+                .map(|n| n.kind.as_str())
+                .unwrap_or("unknown");
+            return RuleTransportResult {
+                label: "UDP_UNSUPPORTED".to_string(),
+                node: node.clone(),
+                chain,
+                note: format!("节点 {}（{}）不支持 UDP，UDP 流量不会发给它", node, kind),
+            };
+        }
+        if chain.is_empty() {
+            chain.push(node.clone());
+        }
+    }
+    RuleTransportResult {
+        label: rules.decision_label(&action),
+        node: match &action {
+            Action::Node(n) => n.clone(),
+            Action::Direct => "DIRECT".to_string(),
+            Action::Block => "BLOCK".to_string(),
+            Action::Proxy => cfg.selected.clone().unwrap_or_default(),
+            Action::Group(n) => format!("GROUP:{}", n),
+            Action::Missing(n) => format!("MISSING:{}", n),
+        },
+        chain,
+        note,
+    }
+}
+
+#[no_mangle]
+#[allow(non_snake_case)]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeTestRule<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    config_json: JString<'local>,
+    input: JString<'local>,
+) -> jstring {
+    let json = catch_unwind(AssertUnwindSafe(|| {
+        let (Some(cfg_text), Some(raw_input)) =
+            (read_string(&mut env, &config_json), read_string(&mut env, &input))
+        else {
+            return r#"{"action":"错误","detail":"读取参数失败"}"#.to_string();
+        };
+        let cfg: Config = match serde_json::from_str(&cfg_text) {
+            Ok(c) => c,
+            Err(e) => {
+                return serde_json::json!({"action": "错误", "detail": format!("配置解析失败: {}", e)}).to_string();
+            }
+        };
+        let input = raw_input.trim().to_ascii_lowercase();
+        if input.is_empty() {
+            return r#"{"action":"错误","detail":"输入为空"}"#.to_string();
+        }
+        let rules = RuleEngine::from_config(&cfg);
+        let strategy = strategy::StrategySet::from_config(&cfg);
+        let health = strategy::HealthRegistry::new();
+        let (domain, ip) = match input.parse::<std::net::IpAddr>() {
+            Ok(ip) => (None, ip),
+            Err(_) => (Some(input.as_str()), std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+        };
+        let (action, mut detail) = match cfg.mode.as_str() {
+            "global" => (Action::Proxy, "全局模式：全部走代理".to_string()),
+            "dns_only" => (Action::Direct, "仅 DNS 模式：全部直连".to_string()),
+            _ => rules.decide_detail(domain, ip, 0, ConnKind::Tcp),
+        };
+        let rule_action = rules.decision_label(&action);
+        let tcp = resolve_rule_transport(
+            &action,
+            strategy::Transport::Tcp,
+            &cfg,
+            &strategy,
+            &health,
+            &rules,
+        );
+        let udp = resolve_rule_transport(
+            &action,
+            strategy::Transport::Udp,
+            &cfg,
+            &strategy,
+            &health,
+            &rules,
+        );
+        if !tcp.note.is_empty() {
+            detail.push_str(&format!("\nTCP：{}", tcp.note));
+        }
+        if !udp.note.is_empty() {
+            detail.push_str(&format!("\nUDP：{}", udp.note));
+        }
+        let issues: Vec<String> = strategy
+            .issues()
+            .iter()
+            .filter(|i| {
+                i.group.is_empty()
+                    || tcp.chain.iter().any(|c| c == &i.group)
+                    || udp.chain.iter().any(|c| c == &i.group)
+            })
+            .map(|i| format!("{}：{}", if i.group.is_empty() { "全局" } else { i.group.as_str() }, i.message))
+            .collect();
+        serde_json::json!({
+            "action": tcp.label,
+            "ruleAction": rule_action,
+            "detail": detail,
+            "node": tcp.node,
+            "chain": tcp.chain,
+            "tcpAction": tcp.label,
+            "tcpNote": tcp.note,
+            "udpAction": udp.label,
+            "udpNode": udp.node,
+            "udpChain": udp.chain,
+            "udpNote": udp.note,
+            "issues": issues
+        })
+        .to_string()
+    }))
+    .unwrap_or_else(|_| r#"{"action":"错误","detail":"内部错误"}"#.to_string());
+    to_jstring(&mut env, json)
+}
+
+/// 导出 MITM CA 证书（未连接也可用）：生成/加载 ca_file，
+/// 在 out_dir 写 namu-ca.pem 与 namu-ca.crt（DER，供系统安装意图使用）。
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeMitmExportCa<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    ca_file: JString<'local>,
+    out_dir: JString<'local>,
+) -> jstring {
+    let json = catch_unwind(AssertUnwindSafe(|| {
+        let (Some(ca_path), Some(out)) =
+            (read_string(&mut env, &ca_file), read_string(&mut env, &out_dir))
+        else {
+            return r#"{"ok":false,"error":"读取参数失败"}"#.to_string();
+        };
+        match mitm::ca::export_ca(&ca_path, &out) {
+            Ok((pem, der, name)) => {
+                serde_json::json!({"ok": true, "pem": pem, "der": der, "system_name": name}).to_string()
+            }
+            Err(e) => serde_json::json!({"ok": false, "error": e}).to_string(),
+        }
+    }))
+    .unwrap_or_else(|_| r#"{"ok":false,"error":"内部错误"}"#.to_string());
+    to_jstring(&mut env, json)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeVersion<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jstring {
+    to_jstring(&mut env, "1.12.5".into())
+}
+
+#[cfg(test)]
+mod rule_test_transport_tests {
+    use super::*;
+
+    #[test]
+    fn rule_test_reports_udp_unsupported_without_claiming_tcp_node() {
+        let cfg: Config = serde_json::from_str(
+            r#"{
+                "nodes":[{"name":"仅TCP","type":"trojan"}],
+                "proxy_groups":[{
+                    "name":"分组","type":"fallback","members":["仅TCP"],
+                    "no_node_action":"block"
+                }]
+            }"#,
+        )
+        .unwrap();
+        let rules = RuleEngine::from_config(&cfg);
+        let strategy = strategy::StrategySet::from_config(&cfg);
+        let health = strategy::HealthRegistry::new();
+        let action = Action::Group("分组".to_string());
+        let tcp = resolve_rule_transport(
+            &action,
+            strategy::Transport::Tcp,
+            &cfg,
+            &strategy,
+            &health,
+            &rules,
+        );
+        let udp = resolve_rule_transport(
+            &action,
+            strategy::Transport::Udp,
+            &cfg,
+            &strategy,
+            &health,
+            &rules,
+        );
+        assert_eq!(tcp.label, "仅TCP");
+        assert!(tcp.chain.contains(&"仅TCP".to_string()));
+        assert_eq!(udp.label, "BLOCK");
+        assert!(udp.note.contains("不支持 UDP"));
+    }
+}

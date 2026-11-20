@@ -1,0 +1,4 @@
+# Synthetic adblock list
+||ads.example.com^
+|exact.example.net|
+0.0.0.0 hosts.example.org

@@ -1,0 +1,23 @@
+{
+  "mode": "dns_only",
+  "dnsUpstream": "https://dns.alidns.com/dns-query",
+  "dnsFallback": "223.5.5.5",
+  "allowDnsFallback": true,
+  "blockEnabled": true,
+  "blockMode": "nxdomain",
+  "cnDirect": true,
+  "finalPolicy": "direct",
+  "rules": [
+    { "type": "IP-CIDR", "value": "10.0.0.0/8", "action": "direct" },
+    { "type": "IP-CIDR", "value": "172.16.0.0/12", "action": "direct" },
+    { "type": "IP-CIDR", "value": "192.168.0.0/16", "action": "direct" }
+  ],
+  "customAds": [],
+  "ruleSources": [],
+  "moduleSources": [],
+  "remoteConfigUrl": "",
+  "remoteConfigName": "",
+  "dnsBootstrap": "",
+  "dnsHeaderName": "",
+  "dnsHeaderValue": ""
+}
