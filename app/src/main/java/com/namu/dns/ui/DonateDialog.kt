@@ -40,7 +40,7 @@ object DonateInfo {
     const val AFDIAN_URL = ""
 
     /** 收款码图片资源名（放 app/src/main/res/drawable/）。为 0 时显示占位框，编译不依赖图片。 */
-    val WECHAT_QR = 0   // 例如 R.drawable.donate_wechat
+    val WECHAT_QR = R.drawable.donate_wechat
     val ALIPAY_QR = R.drawable.donate_alipay
 }
 

@@ -1,8 +1,8 @@
-# 南门DNS（自研内核版）2.3.6
+# 南门DNS（自研内核版）2.3.7
 
 > 内核 crate / JNI：`nanmen_core` / `libnanmen_core.so`；许可证：**GPL-3.0-only**（见 `LICENSE`、`NOTICE`、`THIRD_PARTY_NOTICES.md`）。
 
-> 2.3.6 = Android 12+ 应用壳（`minSdk 31`）+ 自研 MITM 去广告内核（1.12.5），新增二进制正文脚本、异步 `$httpClient` 与三项 MITM 热路径优化。旧壳改动已被本壳替换；两个 ABI 均已重新编译，`kernel_version.txt` 记录版本/源码哈希/Cargo 哈希/.so 摘要，打包前由 Gradle 强制校验。
+> 2.3.7 = Android 12+ 应用壳（`minSdk 31`）+ 自研 MITM 去广告内核（1.12.5），在 2.3.6 基础上加入可选打赏入口与微信/支付宝收款码；内核未改。两个 ABI 均已重新编译，`kernel_version.txt` 记录版本/源码哈希/Cargo 哈希/.so 摘要，打包前由 Gradle 强制校验。
 
 ## 壳设计文档
 
@@ -24,7 +24,7 @@
 - 固定样本：`compat/fixtures/` 48 个，机器可读预期：`compat/expected/cases.json` 52 条
 - 机读矩阵：`compat/matrix.json` 99 行；逐 case 覆盖：`compat/expected/coverage.json` 52 条
 - 回归基线：`core/tests/compat_fixtures.rs` 13 项、`core/tests/compat_rules.rs` 1 项、`app/src/test/java/com/namu/dns/CompatFixtureTest.kt` 9 项
-- 2.3.6 基线：Rust 182/182（lib 107 + binary_frame 1 + 既有套件）、Kotlin 106/106（21 suites）、Lint 0 error / 38 warning、`verifyKernel` 通过；APK/源码 hash 见构建产物与 `SHA256SUMS.txt`
+- 2.3.7 基线：Rust 182/182（lib 107 + binary_frame 1 + 既有套件）、Kotlin 106/106（21 suites）、Lint 0 error / 38 warning、`verifyKernel` 通过；APK/源码 hash 见构建产物与 `SHA256SUMS.txt`
 - 状态：**IMPLEMENTED_WITH_BLOCKERS**；M6 代码/单测通过，脚本端到端仍未验收（无真机、无 iOS/Loon/Shadowrocket 对照设备、无真实授权脚本全集）
 - 结论：模块可解析 Loon `.plugin` 的 `[Argument]/[General]/[Rule]/[Rewrite]/[Host]/[Script]/[MITM]`，执行常用 `[Rewrite]` 与结构化 `[Script]`；参数替换、Host 映射、General 全局项仍只记录并展示功能缺口；应用/UID 规则、VMess/Reality/Hysteria2/TUIC 仍明确拒绝
 
@@ -583,4 +583,4 @@ Kotlin 壳 + 自研 Rust 内核（`core/`，crate `nanmen_core`，JNI `libnanmen
 - 本项目仅供学习与研究，**不提供任何代理服务、节点订阅或跨境网络服务**，打赏不会改变这一性质，也不产生任何服务义务；
 - 请量力而行，学生与经济尚未独立的朋友尤其不建议打赏。
 
-打赏入口：App「设置 → 关于 → 支持作者」。支付宝收款码见 `docs/donate/`；微信收款码尚未配置，弹窗内显示占位框。爱发电入口默认关闭，可在 `DonateDialog.kt` 的 `DonateInfo.AFDIAN_URL` 填写后显示。
+打赏入口：App「设置 → 关于 → 支持作者」。支付宝与微信收款码均已配置在 `docs/donate/` 对应的 drawable 资源中。爱发电入口默认关闭，可在 `DonateDialog.kt` 的 `DonateInfo.AFDIAN_URL` 填写后显示。

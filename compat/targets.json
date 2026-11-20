@@ -49,12 +49,12 @@
     "blocker": "无 Android 设备、无 iOS/Loon/Shadowrocket 设备；只能做解析与单测级验证"
   },
   "source": {
-    "project": "南门DNS 2.3.6",
+    "project": "南门DNS 2.3.7",
     "worktree": "work/v134",
     "git_commit": null,
-    "archive_name": "南门DNS-2.3.6-自研内核-完整源码.zip",
+    "archive_name": "南门DNS-2.3.7-自研内核-完整源码.zip",
     "archive_sha256": "external (see delivery SHA256SUMS.txt)",
-    "code_source_sha256": "96e8bfe70c7da4266591b5423a7384b47776758a65910fc94f4efb750aa9abbe",
+    "code_source_sha256": "32ff20550cbf0720014684014ea78a5f3bdae9fe7cd041e8af70331ea66b3277",
     "code_source_digest_scope": "app/src, core/src, core/tests, gradle configs, compat/fixtures, compat/expected; excludes docs and build outputs"
   },
   "environment": {
