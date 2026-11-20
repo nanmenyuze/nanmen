@@ -607,8 +607,8 @@ private fun parseSectionConfig(
             modelVersion = ConfigFile.CURRENT_VERSION,
             general = GeneralConfig(
                 mode = "rule",
-                dnsUpstream = dnsUpstream.ifBlank { "https://dns.alidns.com/dns-query" },
-                dnsFallback = dnsFallback.ifBlank { "223.5.5.5" },
+                dnsUpstream = dnsUpstream.ifBlank { "system" },
+                dnsFallback = dnsFallback.ifBlank { "system" },
                 blockAaaa = blockAaaa,
                 finalPolicy = finalPolicy,
             ),

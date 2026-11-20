@@ -1,10 +1,10 @@
 # M7 产品体验与发布验证报告
 
-版本：南门DNS 2.3.7 / versionCode 81 / 内核 1.12.5  
-日期：2026-11-20  
+版本：南门DNS 2.3.8 / versionCode 82 / 内核 1.12.5（M7 首版为 2.3.7 / 81）
+日期：2026-11-20
 范围：节点/订阅/策略组管理、插件预览与开关、实时连接、命中诊断、日志导出、备份恢复、网络切换、重载回滚、崩溃/迁移报告、证书安装引导、系统限制与隐私保护。
 
-> 本轮按用户要求**不更新版本号**，仍为 `2.3.7 / 81`；下一轮有功能改动时再统一升版本。
+> M7 首版按用户要求保持 `2.3.7 / 81`；本轮基础 DNS 默认变更按“下次和改动一起更新版本”升到 `2.3.8 / 82`，内核仍为 1.12.5。
 
 ## 1. 结论
 
@@ -119,12 +119,12 @@ M7 的壳层缺口已补齐，内核与协议能力沿用 M3–M6，不在本里
 | 检查 | 结果 |
 |---|---|
 | `:app:compileDebugKotlin` | 通过 |
-| `:app:testDebugUnitTest` | 22 个 suite、**109** 个测试，0 failure / 0 error / 0 skip |
+| `:app:testDebugUnitTest` | 23 个 suite、**113** 个测试，0 failure / 0 error / 0 skip |
 | 新增 `M7BackupTest` | 3 项：正常解析、schema 拒绝、坏 `.conf` 在写入前拒绝 |
 | `:app:lintDebug` | 0 error；38 warning、3 information（lint XML 共 41 issue） |
 | `:app:verifyKernel` | 通过（内核 stamp 未改） |
-| 清洁构建 `assembleDebug` | **BUILD SUCCESSFUL in 4m 51s，54 tasks 全执行** |
-| APK 版本 | `versionCode=81 versionName=2.3.7`（不升版） |
+| 清洁构建 `assembleDebug` | **BUILD SUCCESSFUL in 4m 45s，54 tasks 全执行** |
+| APK 版本 | `versionCode=82 versionName=2.3.8` |
 | APK 内 `.so` | `arm64-v8a` 7,859,592 B / `armeabi-v7a` 5,321,508 B，版本 1.12.5 |
 
 > 单测总数含本轮新增 3 项；Lint 无新增 error。warning 为项目既有（deprecated `stopForeground`、`allNetworks`、SDK 版本提示等）。
@@ -174,7 +174,7 @@ $ emulator -list-avds
 3. **无逐条规则开关**：当前是模块级开关；逐条规则开关会改变模块合并语义，未在本轮引入。
 4. **`lastGoodJson` 不持久化**：仅覆盖运行中的热重载回滚；冷启动失败仍按当前配置处理。
 5. **备份不含 CA 私钥**：换机恢复后需要重新生成/安装 CA。
-6. **版本号未升**：按用户要求保持 2.3.7 / 81；下一轮功能改动时统一升版本并更新 tag/Release。
+6. **版本号**：M7 首版按要求保持 2.3.7 / 81；2.3.8 是随后“基础 DNS 跟随系统”变更的版本，内核未变。
 
 ## 11. 交付检查
 
@@ -187,14 +187,21 @@ $ emulator -list-avds
 - [x] 新源码包内 `scripts/m0_validate.py` 通过（`errors: []`）
 - [ ] GitHub 提交/推送（本轮只做本地交付，未推送）
 
-## 12. 交付物
+## 12. 2.3.8 后续变更：基础 DNS 跟随系统
+
+- 基础配置 DNS 从阿里 DoH 改为 `system`，读取底层 Wi‑Fi/蜂窝/以太网 DNS；没有系统 DNS 时 fail-closed，不回落第三方。
+- 旧基础配置一次性迁移只匹配「阿里 DoH + 223.5.5.5 + 无 Header/Bootstrap/远端配置」；用户自定义配置不覆盖。
+- 设置页新增「跟随手机默认 DNS」选项，保留手动 DoH/DoT/UDP。
+- 详见 `docs/DNS_SYSTEM_DEFAULT.md`。
+
+## 13. 交付物
 
 | 文件 | 大小 | SHA-256 |
 |---|---|---|
-| `南门DNS-2.3.7-自研内核.apk` | 44,635,957 B | `5d357bbbe698fc0a8e9f93b050c59bed83002e84e39d3fea8cb60555171748c8` |
-| `南门DNS-2.3.7-自研内核-完整源码.zip` | 约 8.5 MB，531 文件 | 见根目录 `SHA256SUMS.txt`（避免报告自引用导致 hash 变化） |
+| `南门DNS-2.3.8-自研内核.apk` | 44,635,933 B | `b1919c8f4a9aeb2ac911600ccf8a0d1be0f0a3484ed4b1fe5aada4f3d63aa8bc` |
+| `南门DNS-2.3.8-自研内核-完整源码.zip` | 见交付时文件列表 | 见根目录 `SHA256SUMS.txt`（避免报告自引用导致 hash 变化） |
 
-- APK 版本：`versionCode=81`、`versionName=2.3.7`（按用户要求未升版）。
+- APK 版本：`versionCode=82`、`versionName=2.3.8`。
 - 源码 zip 的最终 SHA-256 以根目录 `SHA256SUMS.txt` 为准；报告不内嵌自身压缩包的 hash，避免自引用。
 - 源码包从 `work/v134` 根打包，排除 `build/`、`app/build/`、`core/target/`、`.gradle/`、`.kotlin/`、`.git/`、`local.properties`、`keystore/`、`*.apk`、`*.zip`、`*.log`。
-- 源码包内 `scripts/m0_validate.py` 校验结果：`versionName=2.3.7`、`versionCode=81`、`code_source_sha256=67f55a8634424f165a21b953759657d2a7e49426b87525b63e459b7001687450`、`errors: []`。
+- 源码包内 `scripts/m0_validate.py` 校验结果：`versionName=2.3.8`、`versionCode=82`、`code_source_sha256=1feb6cc7dc4f637d3e461de3f569fb2256783223b9746b36c49c966a00a29c2e`、`errors: []`。

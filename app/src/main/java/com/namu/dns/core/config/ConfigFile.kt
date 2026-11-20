@@ -160,8 +160,8 @@ data class ConfigFile(
 @Serializable
 data class GeneralConfig(
     val mode: String = "dns_only",
-    val dnsUpstream: String = "https://dns.alidns.com/dns-query",
-    val dnsFallback: String = "223.5.5.5",
+    val dnsUpstream: String = "system",
+    val dnsFallback: String = "system",
     val dnsBootstrap: String = "",
     val dnsHeaderName: String = "",
     val dnsHeaderValue: String = "",

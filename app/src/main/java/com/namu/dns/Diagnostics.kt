@@ -66,8 +66,8 @@ object Diagnostics {
         )
         sb.appendLine("模式：${cfg.mode}，final=${cfg.finalPolicy}")
         sb.appendLine(
-            "DNS：上游 ${cfg.dnsUpstream.ifBlank { "（空）" }}，回落 ${cfg.dnsFallback}，查询日志=" +
-                cfg.dnsQueryLog,
+            "DNS：上游 ${SystemDns.display(cfg.dnsUpstream, context)}，回落 " +
+                "${SystemDns.display(cfg.dnsFallback, context)}，查询日志=" + cfg.dnsQueryLog,
         )
         sb.appendLine(
             "过滤：enable=${cfg.blockEnabled}，mode=${cfg.blockMode}，cnDirect=${cfg.cnDirect}，" +

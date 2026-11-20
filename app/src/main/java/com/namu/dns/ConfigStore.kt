@@ -143,11 +143,23 @@ object ConfigStore {
         root.put("fake_ip_file", File(context.filesDir, "namu_fakeip.json").absolutePath)
         root.put("sniff", cfg.sniff)
         root.put("block_dot", true)
+        // 「system」表示手机当前底层网络的 DNS；下发前转成内核可用的 UDP 地址。
+        val sysDns = SystemDns.selection(context)
+        val effectiveUpstream = if (SystemDns.isFollow(cfg.dnsUpstream) || cfg.dnsUpstream.isBlank()) {
+            sysDns.primaryUpstream ?: SystemDns.FAIL_CLOSED
+        } else {
+            cfg.dnsUpstream
+        }
+        val effectiveFallback = if (SystemDns.isFollow(cfg.dnsFallback) || cfg.dnsFallback.isBlank()) {
+            sysDns.secondaryUpstream.orEmpty()
+        } else {
+            cfg.dnsFallback
+        }
         root.put(
             "dns",
             JSONObject().apply {
-                put("upstream", cfg.dnsUpstream)
-                put("fallback", if (cfg.allowDnsFallback) cfg.dnsFallback else "")
+                put("upstream", effectiveUpstream)
+                put("fallback", if (cfg.allowDnsFallback) effectiveFallback else "")
                 put("bootstrap", cfg.dnsBootstrap)
                 put("headers", JSONObject().apply {
                     if (cfg.dnsHeaderName.isNotBlank() && cfg.dnsHeaderValue.isNotBlank()) {

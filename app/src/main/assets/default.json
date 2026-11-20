@@ -1,7 +1,7 @@
 {
   "mode": "dns_only",
-  "dnsUpstream": "https://dns.alidns.com/dns-query",
-  "dnsFallback": "223.5.5.5",
+  "dnsUpstream": "system",
+  "dnsFallback": "system",
   "allowDnsFallback": true,
   "blockEnabled": true,
   "blockMode": "nxdomain",

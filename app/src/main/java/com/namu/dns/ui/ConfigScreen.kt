@@ -376,7 +376,7 @@ fun ConfigDetailScreen(onRestart: () -> Unit, onOpenModules: () -> Unit, onOpenM
         GroupCard {
             SettingsRow(
                 title = "DNS 上游",
-                subtitle = "纯递归服务器请填写 DoH / DoT 入口",
+                subtitle = "默认跟随手机 Wi‑Fi/蜂窝 DNS；也可选 DoH/DoT/UDP",
                 value = configDnsLabel(cfg.dnsUpstream),
                 chevron = true,
                 onClick = { showDns = true },
@@ -393,7 +393,7 @@ fun ConfigDetailScreen(onRestart: () -> Unit, onOpenModules: () -> Unit, onOpenM
             )
             SwitchRow(
                 title = "备用 DNS",
-                subtitle = "主 DNS 失败/熔断或触发复核时使用 ${cfg.dnsFallback.ifBlank { "未设置" }}；支持 udp://、tls://、https://，关闭即 fail-closed",
+                subtitle = "主 DNS 失败/熔断或触发复核时使用 ${configDnsLabel(cfg.dnsFallback)}；支持 udp://、tls://、https://，关闭即 fail-closed",
                 checked = cfg.allowDnsFallback,
             ) {
                 settings.update { current -> current.copy(allowDnsFallback = it) }
@@ -843,6 +843,7 @@ private fun actionColor(action: String): Color = when (action) {
 }
 
 private fun configDnsLabel(url: String): String = when {
+    url == "system" -> "系统默认"
     url.startsWith("https://") -> "DoH · ${hostOf(url)}"
     url.startsWith("tls://") -> "DoT · ${url.removePrefix("tls://")}"
     url.startsWith("udp://") -> "UDP · ${url.removePrefix("udp://")}"

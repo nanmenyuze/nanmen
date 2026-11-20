@@ -8,6 +8,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import com.namu.dns.ConfigFileStore
 import com.namu.dns.ConfigStore
+import com.namu.dns.DnsDefaultsMigration
 import com.namu.dns.MigrationReportStore
 import com.namu.dns.NamuVpnService
 import com.namu.dns.core.repository.AndroidConfigFileGateway
@@ -60,6 +61,7 @@ class AppContainer(val context: Context) {
             val active = ConfigFileStore.activeName(context)
             ConfigFileStore.loadInto(context, active, settings.current())?.let { settings.set(it) }
         }
+        DnsDefaultsMigration.apply(context, settings)
         ConfigStore.ensureAssets(context, settings)
     }
 

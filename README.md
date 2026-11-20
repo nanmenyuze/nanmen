@@ -1,8 +1,8 @@
-# 南门DNS（自研内核版）2.3.7
+# 南门DNS（自研内核版）2.3.8
 
 > 内核 crate / JNI：`nanmen_core` / `libnanmen_core.so`；许可证：**GPL-3.0-only**（见 `LICENSE`、`NOTICE`、`THIRD_PARTY_NOTICES.md`）。
 
-> 2.3.7 = Android 12+ 应用壳（`minSdk 31`）+ 自研 MITM 去广告内核（1.12.5），在 2.3.6 基础上加入可选打赏入口与微信/支付宝收款码；内核未改。两个 ABI 均已重新编译，`kernel_version.txt` 记录版本/源码哈希/Cargo 哈希/.so 摘要，打包前由 Gradle 强制校验。
+> 2.3.8 = Android 12+ 应用壳（`minSdk 31`）+ 自研 MITM 去广告内核（1.12.5）。在 2.3.7 基础上补齐 M7 备份/恢复、迁移与崩溃报告、实时连接/网络状态、重载失败回滚，并把基础配置 DNS 改为跟随手机底层网络；内核未改。
 
 ## 壳设计文档
 
@@ -20,11 +20,13 @@
 - M5 Loon 重写报告：`docs/M5_LOON_REWRITE_REPORT.md`（插件逐段解析、旧/新 [Rewrite]、HTTP/1.1 与 h2、本地导入）
 - M6 脚本引擎报告：`docs/M6_SCRIPT_ENGINE_REPORT.md`（QuickJS 选型、ABI/许可证、生命周期、资源限制、MITM 接入）
 - M6 脚本 API 矩阵：`docs/M6_SCRIPT_API_MATRIX.md`（`$request/$response/$done`、`$httpClient`、`$persistentStore`、Loon/小火箭差异）
+- M7 发布验证报告：`docs/M7_RELEASE_VALIDATION_REPORT.md`（备份恢复、迁移/崩溃报告、重载回滚、实时连接、证书/隐私/限制）
+- DNS 默认说明：`docs/DNS_SYSTEM_DEFAULT.md`（基础配置跟随手机 DNS、旧默认迁移、fail-closed）
 - M5 重写能力矩阵：`docs/M5_REWRITE_CAPABILITY_MATRIX.md`（逐动作支持/不支持边界）
 - 固定样本：`compat/fixtures/` 48 个，机器可读预期：`compat/expected/cases.json` 52 条
 - 机读矩阵：`compat/matrix.json` 99 行；逐 case 覆盖：`compat/expected/coverage.json` 52 条
 - 回归基线：`core/tests/compat_fixtures.rs` 13 项、`core/tests/compat_rules.rs` 1 项、`app/src/test/java/com/namu/dns/CompatFixtureTest.kt` 9 项
-- 2.3.7 基线：Rust 182/182（lib 107 + binary_frame 1 + 既有套件）、Kotlin 106/106（21 suites）、Lint 0 error / 38 warning、`verifyKernel` 通过；APK/源码 hash 见构建产物与 `SHA256SUMS.txt`
+- 2.3.8 基线：Rust 182/182（lib 107 + binary_frame 1 + 既有套件）、Kotlin 113/113（23 suites）、Lint 0 error / 38 warning、`verifyKernel` 通过；APK/源码 hash 见构建产物与 `SHA256SUMS.txt`
 - 状态：**IMPLEMENTED_WITH_BLOCKERS**；M6 代码/单测通过，脚本端到端仍未验收（无真机、无 iOS/Loon/Shadowrocket 对照设备、无真实授权脚本全集）
 - 结论：模块可解析 Loon `.plugin` 的 `[Argument]/[General]/[Rule]/[Rewrite]/[Host]/[Script]/[MITM]`，执行常用 `[Rewrite]` 与结构化 `[Script]`；参数替换、Host 映射、General 全局项仍只记录并展示功能缺口；应用/UID 规则、VMess/Reality/Hysteria2/TUIC 仍明确拒绝
 

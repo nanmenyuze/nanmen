@@ -686,6 +686,7 @@ fun AddRuleDialog(groups: List<String> = emptyList(), onDismiss: () -> Unit, onA
 fun DnsDialog(current: String, onDismiss: () -> Unit, onSelect: (String) -> Unit) {
     var text by remember { mutableStateOf(current) }
     val presets = listOf(
+        "跟随手机默认 DNS" to "system",
         "阿里 DoH" to "https://dns.alidns.com/dns-query",
         "DNSPod" to "https://doh.pub/dns-query",
         "Cloudflare" to "https://1.1.1.1/dns-query",
@@ -694,7 +695,7 @@ fun DnsDialog(current: String, onDismiss: () -> Unit, onSelect: (String) -> Unit
 
     NamuDialog(
         title = "DNS 上游",
-        message = "支持 DoH（https）、DoT（tls://）、UDP（udp://）",
+        message = "推荐「跟随手机默认 DNS」：使用当前 Wi‑Fi/蜂窝网络下发的 DNS，不经过第三方解析器；也可手填 DoH/DoT/UDP。",
         confirmText = "保存",
         confirmEnabled = text.isNotBlank(),
         onDismiss = onDismiss,
