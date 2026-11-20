@@ -267,6 +267,13 @@ object ConfigStore {
         return File(context.filesDir, "rules_$safe.txt")
     }
 
+    /** 规则集内容缓存：按 URL 哈希命名，拉取失败时保留旧内容继续展开。 */
+    fun ruleSetFile(context: Context, url: String): File {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(url.toByteArray()).joinToString("") { "%02x".format(it) }.take(16)
+        return File(context.filesDir, "ruleset_$digest.txt")
+    }
+
     fun moduleFile(context: Context, id: String): File {
         val safe = id.lowercase().replace(Regex("[^a-z0-9_-]"), "_").take(40)
             .ifBlank { "module" }
@@ -311,6 +318,16 @@ object ConfigStore {
             blocks.addAll(parsed.blockLines)
             allows.addAll(parsed.allowLines)
             routes.addAll(parsed.routeRules.map { it.copy(source = src.name.ifBlank { "模块" }) })
+            // 规则集：用已缓存内容展开；未缓存/为空时跳过（导入/同步阶段负责拉取）。
+            parsed.ruleSets.forEach { rs ->
+                val cache = ruleSetFile(context, rs.url)
+                if (cache.exists() && cache.length() > 0) {
+                    val content = runCatching { cache.readText() }.getOrDefault("")
+                    routes.addAll(
+                        RuleSetExpander.expand(rs.kind, content, rs.action, src.name.ifBlank { "模块" } + "·规则集")
+                    )
+                }
+            }
             mitmHosts.addAll(parsed.mitmHostnames)
             urlRewrites.addAll(parsed.urlRewrites)
             headerRewrites.addAll(parsed.headerRewrites)

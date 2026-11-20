@@ -52,6 +52,8 @@ data class ParsedModule(
     val ignoredReasons: Map<String, Int> = emptyMap(),
     /** [Rule] 中目标策略不支持（例如丢失了策略组名）的分流目标。 */
     val lostRouteTargets: List<String> = emptyList(),
+    /** [Rule] 中的 RULE-SET / DOMAIN-SET 引用（待拉取展开）。 */
+    val ruleSets: List<RuleSetRef> = emptyList(),
     /** Loon [Rewrite] 原始行（旧版/新版），由内核解析执行。 */
     val loonRewrites: List<String> = emptyList(),
     /** [Argument] 参数定义（仅记录，内核不执行运行时替换）。 */
@@ -73,7 +75,7 @@ data class ParsedModule(
 object ModuleParser {
     private val supportedRouteTypes = setOf(
         "DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DOMAIN-REGEX", "DOMAIN-WILDCARD",
-        "IP-CIDR", "IP-CIDR6", "GEOIP", "PORT",
+        "IP-CIDR", "IP-CIDR6", "GEOIP", "PORT", "PROTOCOL",
     )
 
     fun parse(rawText: String): ParsedModule {
@@ -91,6 +93,7 @@ object ModuleParser {
         val blocks = LinkedHashSet<String>()
         val allows = LinkedHashSet<String>()
         val routes = mutableListOf<RuleItem>()
+        val ruleSets = mutableListOf<RuleSetRef>()
         val lostTargets = LinkedHashSet<String>()
         val mitmHosts = LinkedHashSet<String>()
         val urlRewrites = mutableListOf<String>()
@@ -121,6 +124,7 @@ object ModuleParser {
                     acc(section).lines++
                     val parsed = parseRuleLine(line)
                     parsed.urlRewrite?.let { urlRewrites.add(it) }
+                    parsed.ruleSet?.let { ruleSets.add(it) }
                     if (parsed.block != null) blocks.add(parsed.block)
                     if (parsed.route != null) routes.add(parsed.route)
                     if (parsed.ignoredReason == null) acc(section).ok++
@@ -276,6 +280,7 @@ object ModuleParser {
             app = app,
             blockLines = blocks.toList(),
             routeRules = routes.distinctBy { "${it.type}|${it.value}|${it.action}" },
+            ruleSets = ruleSets.distinctBy { "${it.kind}|${it.url}" },
             ignored = ignoredReasons.values.sum(),
             mitmHostnames = mitmHosts.toList(),
             urlRewrites = urlRewrites.distinct(),
@@ -368,6 +373,7 @@ object ModuleParser {
         val ignoredReason: String? = null,
         val lostTarget: String? = null,
         val urlRewrite: String? = null,
+        val ruleSet: RuleSetRef? = null,
     )
 
     private data class BlockParse(
@@ -422,8 +428,8 @@ object ModuleParser {
         val parts = raw.split(',')
         if (parts.size < 3) return ParsedRule(ignoredReason = "invalid_rule")
         val type = parts[0].trim().uppercase()
-        if (type == "URL-REGEX") {
-            // 正则值可能含逗号：首段类型、末段动作，中间拼回完整模式。
+        if (type == "URL-REGEX" || type == "RULE-SET" || type == "DOMAIN-SET") {
+            // 值可能含逗号（正则/URL 查询串）：首段类型、末段动作，中间拼回完整值。
             val value = parts.subList(1, parts.size - 1).joinToString(",").trim().trim('"')
             return makeRule(type, value, parts.last().trim())
         }
@@ -440,6 +446,21 @@ object ModuleParser {
             }
             if (runCatching { Regex(value) }.isFailure) return ParsedRule(ignoredReason = "invalid_rule")
             return ParsedRule(urlRewrite = "$value reject")
+        }
+        if (type == "RULE-SET" || type == "DOMAIN-SET") {
+            // 规则集引用：壳层拉取 URL 内容后展开为普通规则，集合策略覆盖行内策略。
+            if (!value.startsWith("http://") && !value.startsWith("https://")) {
+                return ParsedRule(ignoredReason = "invalid_rule")
+            }
+            val a = rawAction.trim().uppercase()
+            val isReject = a == "REJECT" || a.startsWith("REJECT-") || a == "BLOCK"
+            val policy = when {
+                isReject -> "block"
+                a == "DIRECT" -> "direct"
+                a == "PROXY" -> "proxy"
+                else -> return ParsedRule(ignoredReason = "unsupported_rule_target", lostTarget = rawAction.trim())
+            }
+            return ParsedRule(ruleSet = RuleSetRef(type, value, policy))
         }
         if (type !in supportedRouteTypes) return ParsedRule(ignoredReason = "unsupported_rule_type")
         val action = rawAction.trim().uppercase()
@@ -479,6 +500,7 @@ object ModuleParser {
             "DOMAIN-WILDCARD" -> v.none { it.isWhitespace() } && ('*' in v || v.contains('?'))
             "GEOIP" -> v.equals("CN", ignoreCase = true)
             "PORT" -> v.toIntOrNull()?.let { it in 1..65535 } == true
+            "PROTOCOL" -> v.equals("TCP", ignoreCase = true) || v.equals("UDP", ignoreCase = true)
             "IP-CIDR" -> validCidr(v, ipv6 = false)
             "IP-CIDR6" -> validCidr(v, ipv6 = true)
             else -> false

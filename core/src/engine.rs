@@ -482,6 +482,8 @@ enum RuleKind {
     GeoIp(String),
     IpCidr(IpNet),
     Port(u16),
+    /// PROTOCOL：按连接类型匹配（TCP/UDP）。
+    Protocol(ConnKind),
     Final,
 }
 
@@ -493,7 +495,7 @@ struct RouteRule {
     source: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConnKind {
     Tcp,
     Udp,
@@ -554,6 +556,14 @@ impl RuleEngine {
                     Ok(p) => RuleKind::Port(p),
                     Err(_) => continue,
                 },
+                "PROTOCOL" => match rc.value.trim().to_ascii_uppercase().as_str() {
+                    "TCP" => RuleKind::Protocol(ConnKind::Tcp),
+                    "UDP" => RuleKind::Protocol(ConnKind::Udp),
+                    other => {
+                        logging::warn("rule", format!("拒绝 PROTOCOL 值 {}（仅支持 TCP/UDP）", other));
+                        continue;
+                    }
+                },
                 "FINAL" | "MATCH" => RuleKind::Final,
                 // 这些规则依赖 Android 进程/UID 数据源；未实现前明确拒绝，不能静默当成不匹配。
                 "PROCESS-NAME" | "PROCESS-PATH" | "UID" | "APP" | "APP-NAME" => {
@@ -575,6 +585,7 @@ impl RuleEngine {
                 RuleKind::Domain => normalize_domain(&rc.value),
                 RuleKind::DomainSuffix => rc.value.trim().trim_start_matches('.').to_ascii_lowercase(),
                 RuleKind::DomainKeyword => rc.value.trim().to_ascii_lowercase(),
+                RuleKind::Protocol(_) => rc.value.trim().to_ascii_uppercase(),
                 _ => rc.value.clone(),
             };
             rules.push(RouteRule {
@@ -671,6 +682,7 @@ impl RuleEngine {
                 }
                 RuleKind::IpCidr(net) => net.contains(&ip),
                 RuleKind::Port(p) => _port == *p,
+                RuleKind::Protocol(k) => _kind == *k,
                 RuleKind::Final => false,
             };
             if matched {
@@ -759,6 +771,7 @@ fn kind_name(kind: &RuleKind) -> &'static str {
         RuleKind::GeoIp(_) => "GEOIP",
         RuleKind::IpCidr(_) => "IP-CIDR",
         RuleKind::Port(_) => "PORT",
+        RuleKind::Protocol(_) => "PROTOCOL",
         RuleKind::Final => "FINAL",
     }
 }

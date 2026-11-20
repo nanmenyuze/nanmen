@@ -511,7 +511,7 @@ object Actions {
 
     /** 模块至少要产出一种能力：DNS 阻断/分流，或 MITM/URL/Header 重写。 */
     private fun hasUsableRules(parsed: ParsedModule): Boolean =
-        parsed.blockLines.isNotEmpty() || parsed.routeRules.isNotEmpty() ||
+        parsed.blockLines.isNotEmpty() || parsed.routeRules.isNotEmpty() || parsed.ruleSets.isNotEmpty() ||
             parsed.mitmHostnames.isNotEmpty() || parsed.urlRewrites.isNotEmpty() ||
             parsed.headerRewrites.isNotEmpty() || parsed.loonRewrites.isNotEmpty() ||
             parsed.scripts.isNotEmpty() || parsed.scriptLines.isNotEmpty()
@@ -571,6 +571,20 @@ object Actions {
             .digest(url.toByteArray())
             .joinToString("") { "%02x".format(it) }
         return "mod_${digest.take(10)}"
+    }
+
+    /** 拉取模块引用的规则集内容并缓存；失败保留旧缓存，rebuildModules 继续用旧内容。 */
+    private suspend fun fetchRuleSets(parsed: ParsedModule) {
+        parsed.ruleSets.forEach { rs ->
+            runCatching {
+                val text = fetchText(
+                    rs.url,
+                    maxBytes = 8 * 1024 * 1024,
+                    headers = headerMapFor(settings.current(), rs.url),
+                )
+                if (text.isNotBlank()) ConfigStore.ruleSetFile(App.context, rs.url).writeText(text)
+            }
+        }
     }
 
     private fun saveModuleFile(id: String, text: String) {
@@ -692,6 +706,7 @@ object Actions {
         val existing = settings.current().moduleSources.firstOrNull { it.url == target }
         val id = existing?.id ?: moduleId(target)
         saveModuleFile(id, text)
+        fetchRuleSets(parsed)
         val source = ModuleSource(
             id = id,
             name = displayName.trim().ifBlank { parsed.name.ifBlank { target.removePrefix("local://").substringAfter("://").substringBefore('/').ifBlank { "模块" } } },
@@ -745,6 +760,7 @@ object Actions {
                     throw RuntimeException("没有可用的 DNS/分流或 MITM/重写规则")
                 }
                 saveModuleFile(src.id, text)
+                fetchRuleSets(parsed)
                 results[src.id] = src.copy(
                     name = src.name.ifBlank { parsed.name },
                     app = parsed.app.ifBlank { src.app },

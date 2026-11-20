@@ -51,10 +51,10 @@
   "source": {
     "project": "南门DNS 2.3.8",
     "worktree": "work/v134",
-    "git_commit": null,
+    "git_commit": "v2.3.8 tag; see git log",
     "archive_name": "南门DNS-2.3.8-自研内核-完整源码.zip",
     "archive_sha256": "external (see delivery SHA256SUMS.txt)",
-    "code_source_sha256": "1feb6cc7dc4f637d3e461de3f569fb2256783223b9746b36c49c966a00a29c2e",
+    "code_source_sha256": "10e04e1219859487b9d1546206ebd31b1dcc8f421834ccc2132ca352ec7fb5c3",
     "code_source_digest_scope": "app/src, core/src, core/tests, gradle configs, compat/fixtures, compat/expected; excludes docs and build outputs"
   },
   "environment": {
@@ -67,8 +67,8 @@
     "ndk": "28.2.13676358",
     "device": "none (adb devices empty; no iOS devices)",
     "clean_build": "work/v134",
-    "clean_build_result": "BUILD SUCCESSFUL; Rust 148/148; Kotlin 96/96; Lint 0 error/38 warning; 2.2.1 config import local-only",
+    "clean_build_result": "BUILD SUCCESSFUL; Rust 184/184; Kotlin 118/118 (24 suites); Lint 0 error/38 warning; 2.3.8 rule-set/PROTOCOL increment",
     "dependency_cache": "Gradle/Cargo/Android SDK cache shared; fully offline not tested"
   },
-  "code_source_sha256": "09a91a7c7c09e8c3e5c7c3cfc841ceae66deecd56c0f56cc4e0b3c7ec0a74e9b"
+  "code_source_sha256": "10e04e1219859487b9d1546206ebd31b1dcc8f421834ccc2132ca352ec7fb5c3"
 }

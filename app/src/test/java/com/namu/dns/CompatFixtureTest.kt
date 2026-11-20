@@ -35,7 +35,10 @@ class CompatFixtureTest {
         assertEquals(2, parsed.mitmHostnames.size)
         assertEquals(4, parsed.urlRewrites.size)
         assertEquals(3, parsed.headerRewrites.size)
-        assertEquals(5, parsed.ignored)
+        // 规则集增量后：RULE-SET 行解析为规则集引用，不再计入 ignored（5→4）。
+        assertEquals(1, parsed.ruleSets.size)
+        assertEquals("https://example.com/rules.txt", parsed.ruleSets[0].url)
+        assertEquals(4, parsed.ignored)
     }
 
     @Test

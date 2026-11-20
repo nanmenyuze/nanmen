@@ -847,3 +847,29 @@ fn host_matcher_mid_wildcard_globs() {
     assert!(!m.matches("m1.maps.example.com.evil.com"));
     assert!(!m.is_empty());
 }
+
+
+/// PROTOCOL 规则按连接类型（TCP/UDP）匹配；无效值加载期拒绝，不当成不匹配静默。
+#[test]
+fn protocol_rule_matches_conn_kind() {
+    let cfg = Config {
+        rules: vec![RuleConf { kind: "PROTOCOL".into(), value: "UDP".into(), action: "block".into(), source: None }],
+        final_policy: "direct".into(),
+        ..Default::default()
+    };
+    let engine = RuleEngine::from_config(&cfg);
+    assert_eq!(engine.decide(Some("x.example.com"), "1.2.3.4".parse().unwrap(), 443, ConnKind::Udp), Action::Block);
+    assert_eq!(engine.decide(Some("x.example.com"), "1.2.3.4".parse().unwrap(), 443, ConnKind::Tcp), Action::Direct);
+}
+
+#[test]
+fn protocol_rule_invalid_value_is_rejected() {
+    let cfg = Config {
+        rules: vec![RuleConf { kind: "PROTOCOL".into(), value: "ICMP".into(), action: "block".into(), source: None }],
+        final_policy: "direct".into(),
+        ..Default::default()
+    };
+    let engine = RuleEngine::from_config(&cfg);
+    assert_eq!(engine.decide(None, "1.2.3.4".parse().unwrap(), 443, ConnKind::Udp), Action::Direct);
+    assert_eq!(engine.decide(None, "1.2.3.4".parse().unwrap(), 443, ConnKind::Tcp), Action::Direct);
+}

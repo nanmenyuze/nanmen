@@ -134,6 +134,13 @@ data class NodeInfo(
     }
 }
 
+/** 模块 [Rule] 中的规则集引用：壳层拉取 URL 内容后按 kind 展开，action 为集合策略。 */
+data class RuleSetRef(
+    val kind: String,
+    val url: String,
+    val action: String,
+)
+
 @Serializable
 data class RuleItem(
     val type: String,

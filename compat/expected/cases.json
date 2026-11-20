@@ -370,9 +370,10 @@
         "mitm_hostnames": 2,
         "url_rewrites": 4,
         "header_rewrites": 3,
-        "ignored": 7,
-        "note": "不解析 [Body Rewrite]/[Script]/[Host]；URL Rewrite 中 302/mock 尚未执行",
-        "status": "partial"
+        "ignored": 6,
+        "note": "不解析 [Body Rewrite]/[Script]/[Host]；URL Rewrite 中 302/mock 尚未执行；规则集增量后 RULE-SET 解析为引用（ignored 7→6）",
+        "status": "partial",
+        "rule_sets": 1
       }
     },
     {
@@ -503,13 +504,13 @@
       "fixture": "modules/surge-demo.sgmodule",
       "input": "RULE-SET remote",
       "expected": {
-        "import": "n/a",
+        "import": "partial",
         "matched_rule": null,
         "outbound": "proxy",
         "script_output": null,
-        "note": "被忽略，落到 FINAL",
-        "status": "unsupported",
-        "rule_status": "unsupported"
+        "note": "解析为规则集引用（ruleSets），导入/同步时拉取内容展开执行；fixture 仅锁定解析行为",
+        "status": "partial",
+        "rule_status": "supported"
       }
     },
     {

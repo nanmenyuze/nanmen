@@ -10,21 +10,21 @@
     "compileSdk": 36
   },
   "kernel": {
-    "source_hash": "afb2a2ac7e2c5f644be0345cb387a4ad9b554c51d1a5b09fa792cbca8b64f012",
+    "source_hash": "839b21d1b4221e8b9222da6275f896f8f48d42967d292ecba50a2405624cdad6",
     "cargo_hash": "7dcbb2870f1e838c1757ad08d7235fa76a4a77b3af7b458ecf806a75a2226f6a",
-    "arm64_so_sha256": "ff4906c17e23f64be3282fc8b449a8c3357782cc728333d1516a9511b7ecd2ec",
-    "armv7_so_sha256": "9ef953203298fe8e30425ba231fb996c8a32e65cd0c789cdf46a93ed13331015"
+    "arm64_so_sha256": "88e2fd4c20a6c00e94958dd2fc73749250c4e2531660017b9c9f2fa3a024b602",
+    "armv7_so_sha256": "c41ed924bd41dc6cc8827043aa4529ee1828ae87ec31ae6a460fdde1d22b252b"
   },
   "tests": {
     "rust": {
-      "total": 182,
-      "passed": 182,
+      "total": 184,
+      "passed": 184,
       "suites": {
         "lib": 107,
         "cert_name_probe": 1,
         "compat_fixtures": 13,
         "compat_rules": 1,
-        "core_test": 30,
+        "core_test": 32,
         "mitm_test": 20,
         "protocol_e2e": 4,
         "script_acceptance": 5,
@@ -32,9 +32,9 @@
       }
     },
     "kotlin": {
-      "total": 113,
-      "passed": 113,
-      "suites": 23,
+      "total": 118,
+      "passed": 118,
+      "suites": 24,
       "failures": 0,
       "errors": 0,
       "skipped": 0
@@ -47,8 +47,8 @@
   },
   "apk": {
     "path": "app/build/outputs/apk/debug/app-debug.apk",
-    "bytes": 44635933,
-    "sha256": "b1919c8f4a9aeb2ac911600ccf8a0d1be0f0a3484ed4b1fe5aada4f3d63aa8bc",
+    "bytes": 44652317,
+    "sha256": "b92a15b97908418b6b4519b66d43cbde8f4a8edd1e38b79b027a3758ec8bcd6f",
     "versionCode": 82,
     "versionName": "2.3.8",
     "debug_cert_sha256": "d38a1dbd4cc02bfff2dee2aadba050c6d77a0092de74140c837c817924aa5c54"
@@ -56,13 +56,13 @@
   "clean_build": {
     "directory": "work/v134",
     "result": "BUILD SUCCESSFUL",
-    "gradle_time": "4m 45s",
-    "tasks_executed": 54,
+    "gradle_time": "3m 17s",
+    "tasks_executed": 39,
     "first_attempt": "清洁构建：停止 Gradle 后删除 app/build，verifyKernel + assembleDebug 全量执行",
     "fully_offline": false
   },
   "source": {
-    "code_source_sha256": "1feb6cc7dc4f637d3e461de3f569fb2256783223b9746b36c49c966a00a29c2e",
+    "code_source_sha256": "10e04e1219859487b9d1546206ebd31b1dcc8f421834ccc2132ca352ec7fb5c3",
     "archive": "南门DNS-2.3.8-自研内核-完整源码.zip",
     "archive_sha256": "external (see delivery SHA256SUMS.txt)",
     "archive_name": "南门DNS-2.3.8-自研内核-完整源码.zip"
@@ -214,8 +214,8 @@
   },
   "m7": {
     "backup_schema": 1,
-    "kotlin_tests": 113,
-    "kotlin_suites": 23,
+    "kotlin_tests": 118,
+    "kotlin_suites": 24,
     "lint": {
       "errors": 0,
       "warnings": 38,
@@ -224,13 +224,22 @@
     "reload_rollback": "last-good JSON in memory",
     "device_matrix": "blocked: no Android device or AVD",
     "performance_baseline": "not measured",
-    "version_policy": "bumped to 2.3.8/82 with base DNS default change",
+    "version_policy": "kept 2.3.8/82; added RULE-SET/DOMAIN-SET/PROTOCOL without version bump",
     "notes": [
       "AppConfig + all .conf backup/restore with whole-package validation",
       "migration and crash reports persisted locally",
       "aggregate live connection panel; no per-connection 5-tuple",
       "cert guide and privacy/system-limit dialog"
     ]
+  },
+  "ruleset_protocol": {
+    "rule_set_cache_limit_mib": 8,
+    "domain_set_forms": [".x suffix incl. apex", "*.x wildcard subdomains", "bare exact"],
+    "protocol_values": ["TCP", "UDP"],
+    "unsupported": ["USER-AGENT", "IP-ASN", "full GEOIP", "logical rules"],
+    "rust_tests": 184,
+    "kotlin_tests": 118,
+    "device_test": "blocked: no Android device or AVD"
   },
   "dns": {
     "base_default": "system (follow underlying Wi-Fi/cellular/ethernet DNS)",
