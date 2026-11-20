@@ -185,7 +185,7 @@ $ emulator -list-avds
 - [ ] 性能基线（无设备，blocked）
 - [x] APK/源码打包（见下方交付物）
 - [x] 新源码包内 `scripts/m0_validate.py` 通过（`errors: []`）
-- [ ] GitHub 提交/推送（本轮只做本地交付，未推送）
+- [x] GitHub 提交/推送（`main` 与 `v2.3.8`，提交见 `git log`）
 
 ## 12. 2.3.8 后续变更：基础 DNS 跟随系统
 
