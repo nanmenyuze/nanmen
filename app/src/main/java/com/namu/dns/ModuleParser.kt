@@ -433,15 +433,10 @@ object ModuleParser {
     }
 
     private fun parseRuleLine(raw: String): ParsedRule {
-        val parts = raw.split(',')
-        if (parts.size < 3) return ParsedRule(ignoredReason = "invalid_rule")
-        val type = parts[0].trim().uppercase()
-        if (type == "URL-REGEX" || type == "RULE-SET" || type == "DOMAIN-SET") {
-            // 值可能含逗号（正则/URL 查询串）：首段类型、末段动作，中间拼回完整值。
-            val value = parts.subList(1, parts.size - 1).joinToString(",").trim().trim('"')
-            return makeRule(type, value, parts.last().trim())
-        }
-        return makeRule(type, parts[1].trim(), parts[2].trim())
+        // 值可能含逗号（DOMAIN-REGEX 的 {m,n} 量词、URL 查询串、规则集 URL 参数），
+        // 由 RuleLineParser 统一按策略位置切分：首段类型、末段（或第三段）动作、中间拼回完整值。
+        val line = RuleLineParser.split(raw) ?: return ParsedRule(ignoredReason = "invalid_rule")
+        return makeRule(line.type, line.value, line.action)
     }
 
     private fun makeRule(type: String, value: String, rawAction: String): ParsedRule {

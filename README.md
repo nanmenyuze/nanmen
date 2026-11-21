@@ -15,7 +15,9 @@
 > 2.6.2 正式版（内核 1.13.2）：把「单流慢」的主因补上——`TCP_SOCKET_BUFFER` 128K→512K（窗口缩放 shift=1→3，单流上限从 128K/RTT 抬到 512K/RTT），并配内存水位守卫：512K 档只给前 128 个 TCP socket，超出降级到 128K 档，1024 条连接最坏 ≈352MB（裸提会到 1GB）；判别仪表新增 `tcpRecvFull`（本地接收缓冲打成满/窗口 0）、`tcpSendStalled`（对端零窗口导致发送停滞，附一次性告警日志）、每连接累计字节（`up`/`down`，壳层差分算速率并在「实时连接」显示）、`tcpBufferDenied`；QUIC 假活回落开关落到配置项 `quicFallback`（默认开，443/UDP 2.5s 无回包判黑洞，10 分钟内对同一目标丢弃 QUIC）；源码 zip 不再夹带构建机 `local.properties`。> 版本：2.6（versionCode 90）；内核 1.13.0。
 
 > 2.6.3 正式版（内核 1.13.3，只修 2.6.2 的口径问题，无新增功能面）：大档名额改「并发」口径（`TCP_SOCKETS` 随 socket 关闭立刻归还，新连接可补位，不再被开机早期的推送/IM 长连接长期占满），新增 `bigTierInUse` 诊断；判别仪表从「次数」改为「条件成立期间累计毫秒」（`tcpRecvFull` = 接收缓冲满且 relay 仍有余量积压，`tcpSendStalled` = 待发非空但对端零窗口，超 3s 打一条告警），每连接速率改由内核 10s 采样写进快照（`upBps`/`downBps`）并打 top-5 日志；QUIC 黑洞判定改为按 (目的 IP, 端口)、仅在有上行活动时计时（纯空闲不判死）、收到该会话任何下行包即清除，并新增 `quicBlackholed` 计数与切网清空（壳层 `nativeClearQuicBlackhole`）。
-## 壳设计文档
+
+> 2.6.4 正式版：规则集载体兼容与 CSV 拆分修复。`RuleSetExpander` 不再只认 Surge 文本，新增 Clash `payload:` YAML 与 sing-box source JSON 解析（`domain`/`domain_suffix`/`domain_keyword`/`domain_regex`），含 `ip_cidr`、端口等非域名条件的规则整条跳过（AND 语义，不误杀）；二进制 `.srs` 明确提示端上不解析；空内容、未缓存、整集一条都没展开都会写进 `modules_mitm.json` 的 `ruleSetIssues`，模块页可见，不再静默失效。`parseRuleLine` 改走统一的 `RuleLineParser`：按策略位置切分，`DOMAIN-REGEX,^ads{1,3}\.x\.com$` 的 `{m,n}` 不再被逗号截断，`IP-CIDR,x,DIRECT,no-resolve` 的尾随选项也不会顶掉动作；规则集行允许省略策略，由集合策略覆盖。内核保持 1.13.4，未改动数据面。
+> 2.6.3 热修（内核 1.13.4，版本号不动）：修掉 `TCP_SOCKETS` 在「正常关闭（FIN 走完 state==Closed）」路径上的漏减——该路径原先用裸 `sockets.remove`，没归还大档计数，导致计数单调上涨、`next_tcp_buffer_bytes` 对之后所有新监听器永久返回 128K，把 512K 修复整条废掉；改为统一走 `release_tcp_socket`。`tcpBufferDenied` 接线：水位降级分支真正计数。速率 top-5 日志加 `512K`/`128K` 档位标签，便于下一份诊断直接闭环。`bigTierInUse` 刷新移出 QUIC 开关分支，关掉 QUIC 回落时仪表不再冻结。## 壳设计文档
 
 - Android 12+ 应用壳设计：`docs/UI_SHELL_ANDROID12.md`
 

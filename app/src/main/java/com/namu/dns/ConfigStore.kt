@@ -320,21 +320,40 @@ object ConfigStore {
         val loonRewrites = LinkedHashSet<String>()
         val scripts = LinkedHashMap<String, ScriptConfig>()
         val scriptIssues = LinkedHashSet<String>()
+        val ruleSetIssues = LinkedHashSet<String>()
         var ignored = 0
         cfg.moduleSources.filter { it.enabled }.forEach { src ->
             val file = moduleFile(context, src.id)
             if (!file.exists() || file.length() == 0L) return@forEach
-            val parsed = runCatching { ModuleParser.parse(file.readText()) }.getOrNull() ?: return@forEach
+            val parsed = runCatching { ModuleParser.parse(file.readText()) }.getOrNull()
+            if (parsed == null) {
+                ruleSetIssues.add("${src.name.ifBlank { "模块" }}：模块正文解析失败，整份模块不会生效")
+                return@forEach
+            }
             blocks.addAll(parsed.blockLines)
             allows.addAll(parsed.allowLines)
             routes.addAll(parsed.routeRules.map { it.copy(source = src.name.ifBlank { "模块" }) })
             // 规则集：用已缓存内容展开；未缓存/为空时跳过（导入/同步阶段负责拉取）。
-            parsed.ruleSets.forEach { rs ->
+            // 展开结果与跳过原因统一进 modules_mitm.json，避免「一条都没生效」无人察觉。
+            parsed.ruleSets.forEach rsLoop@{ rs ->
                 val cache = ruleSetFile(context, rs.url)
-                if (cache.exists() && cache.length() > 0) {
-                    val content = runCatching { cache.readText() }.getOrDefault("")
-                    routes.addAll(
-                        RuleSetExpander.expand(rs.kind, content, rs.action, src.name.ifBlank { "模块" } + "·规则集")
+                val label = rs.url.substringAfterLast('/').ifBlank { rs.url }.take(36)
+                if (!cache.exists() || cache.length() == 0L) {
+                    ruleSetIssues.add("${label}：内容未缓存，整个规则集不会生效（同步模块后重试）")
+                    return@rsLoop
+                }
+                val content = runCatching { cache.readText() }.getOrDefault("")
+                val res = RuleSetExpander.expandDetailed(
+                    rs.kind,
+                    content,
+                    rs.action,
+                    src.name.ifBlank { "模块" } + "·规则集",
+                )
+                routes.addAll(res.items)
+                if (res.note != null || res.items.isEmpty()) {
+                    ruleSetIssues.add(
+                        "$label：${res.format} 展开 ${res.items.size} 条" +
+                            (res.note?.let { "，$it" } ?: ""),
                     )
                 }
             }
@@ -377,6 +396,8 @@ object ConfigStore {
                 put("loonRewrites", JSONArray(loonRewrites.toList()))
                 put("scripts", JSONArray(scripts.values.map { it.toJsonObject() }))
                 put("scriptIssues", JSONArray(scriptIssues.toList()))
+                put("ruleSetIssues", JSONArray(ruleSetIssues.toList()))
+                put("ignoredRules", ignored)
             }.toString(),
         )
     }

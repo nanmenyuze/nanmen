@@ -38,11 +38,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.namu.dns.Actions
+import com.namu.dns.ConfigStore
 import com.namu.dns.core.LocalAppContainer
 import com.namu.dns.ModuleSource
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONObject
 
 @Composable
 fun ModulesScreen(onRestart: () -> Unit) {
@@ -57,6 +59,20 @@ fun ModulesScreen(onRestart: () -> Unit) {
     val messages = container.messages
     val modules = cfg.moduleSources
     val enabled = modules.count { it.enabled }
+    val ctx = LocalContext.current
+    // 规则集展开结果：缓存未命中、格式不识别、整集被跳过时都在这里提示，避免静默失效。
+    val ruleSetIssues = remember(modules) {
+        runCatching {
+            val o = JSONObject(ConfigStore.moduleMitmFile(ctx).readText())
+            val arr = o.optJSONArray("ruleSetIssues") ?: return@runCatching emptyList<String>()
+            (0 until arr.length()).map { arr.optString(it) }.filter { it.isNotBlank() }
+        }.getOrDefault(emptyList())
+    }
+    val ignoredRules = remember(modules) {
+        runCatching {
+            JSONObject(ConfigStore.moduleMitmFile(ctx).readText()).optInt("ignoredRules", 0)
+        }.getOrDefault(0)
+    }
 
     Column(
         Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
@@ -96,6 +112,28 @@ fun ModulesScreen(onRestart: () -> Unit) {
         }
 
         SectionHeader("已安装")
+        if (ruleSetIssues.isNotEmpty() || ignoredRules > 0) {
+            GroupCard {
+                Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)) {
+                    Text("模块规则提示", fontSize = 13.sp, color = NamuColors.Orange)
+                    Spacer(Modifier.height(4.dp))
+                    ruleSetIssues.take(5).forEach { issue ->
+                        Text("· $issue", fontSize = 11.sp, color = NamuColors.TextSub, lineHeight = 16.sp)
+                    }
+                    if (ruleSetIssues.size > 5) {
+                        Text("… 其余 ${ruleSetIssues.size - 5} 条在模块详情", fontSize = 11.sp, color = NamuColors.TextSub)
+                    }
+                    if (ignoredRules > 0) {
+                        Text(
+                            "· 另有 $ignoredRules 行规则类型端上未实现，已按能力边界跳过",
+                            fontSize = 11.sp,
+                            color = NamuColors.TextSub,
+                            lineHeight = 16.sp,
+                        )
+                    }
+                }
+            }
+        }
         if (modules.isEmpty()) {
             GroupCard {
                 Column(

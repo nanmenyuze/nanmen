@@ -162,11 +162,13 @@ const METER_TICK_MS: u64 = 500;
 /// 只用于决定新 socket 用哪一档缓冲；漏减只会让后续连接降级，不会造成内存越界。
 static TCP_SOCKETS: AtomicUsize = AtomicUsize::new(0);
 
-fn next_tcp_buffer_bytes() -> usize {
+/// 返回 (缓冲字节, 是否因水位降级)。降级要记进 `tcpBufferDenied`，
+/// 否则「守卫悄悄把大档收走了」在诊断里完全看不出来。
+fn next_tcp_buffer_bytes() -> (usize, bool) {
     if TCP_SOCKETS.load(Ordering::Relaxed) < TCP_BUFFER_HIGH_TIER_MAX {
-        TCP_SOCKET_BUFFER
+        (TCP_SOCKET_BUFFER, false)
     } else {
-        TCP_SOCKET_BUFFER_MIN
+        (TCP_SOCKET_BUFFER_MIN, true)
     }
 }
 
@@ -894,8 +896,16 @@ fn lookup_udp_flow(pkt: &[u8]) -> Option<(IpEndpoint, IpEndpoint)> {
     }
 }
 
-fn add_listener(sockets: &mut SocketSet<'_>, addr: IpAddress, port: u16) -> Option<SocketHandle> {
-    let buf_bytes = next_tcp_buffer_bytes();
+fn add_listener(
+    sockets: &mut SocketSet<'_>,
+    addr: IpAddress,
+    port: u16,
+    stats: &crate::stats::Stats,
+) -> Option<SocketHandle> {
+    let (buf_bytes, downgraded) = next_tcp_buffer_bytes();
+    if downgraded {
+        stats.tcp_buffer_denied.fetch_add(1, Ordering::Relaxed);
+    }
     let mut socket = tcp::Socket::new(
         tcp::SocketBuffer::new(vec![0u8; buf_bytes]),
         tcp::SocketBuffer::new(vec![0u8; buf_bytes]),
@@ -1471,7 +1481,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         }
                         if let Some((port, addr)) = lookup_tcp_dst(&pkt) {
                             if !listeners.contains_key(&(addr, port)) {
-                                if let Some(h) = add_listener(&mut sockets, addr, port) {
+                                if let Some(h) = add_listener(&mut sockets, addr, port, &ctx.stats) {
                                     listeners.insert((addr, port), (h, Instant::now()));
                                 }
                             }
@@ -1633,7 +1643,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             if sockets.get::<tcp::Socket>(*h).state() == tcp::State::Established
                 && !listeners.contains_key(&(*addr, *port))
             {
-                if let Some(nh) = add_listener(&mut sockets, *addr, *port) {
+                if let Some(nh) = add_listener(&mut sockets, *addr, *port, &ctx.stats) {
                     new_listeners.push((*addr, *port, nh));
                 }
             }
@@ -2222,7 +2232,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             let mut removed = 0i64;
             for idx in dead.into_iter().rev() {
                 let conn = conns.swap_remove(idx);
-                let _ = sockets.remove(conn.handle);
+                // 正常关闭（FIN 走完 state==Closed）也必须归还大档计数，
+                // 否则 TCP_SOCKETS 只增不减，后面的新连接永远被降级到 128K。
+                release_tcp_socket(&mut sockets, conn.handle);
                 ctx.conns
                     .write()
                     .unwrap_or_else(|p| p.into_inner())
@@ -2288,7 +2300,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
         if last_rate_sample.elapsed() >= Duration::from_secs(10) {
             last_rate_sample = Instant::now();
             let secs = 10.0f64;
-            let mut top: Vec<(u64, u64)> = Vec::new();
+            let mut top: Vec<(u64, u64, &'static str)> = Vec::new();
             let mut table = ctx
                 .conns
                 .write()
@@ -2304,7 +2316,17 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                 conn.rate_prev_down = down;
                 table.set_rates(id, up_bps, down_bps);
                 if down_bps > 0 {
-                    top.push((id, down_bps));
+                    // 档位标签：诊断时要能一眼看出这条流是不是被降到了 128K。
+                    let tier = if sockets
+                        .get::<tcp::Socket>(conn.handle)
+                        .recv_capacity()
+                        >= TCP_SOCKET_BUFFER
+                    {
+                        "512K"
+                    } else {
+                        "128K"
+                    };
+                    top.push((id, down_bps, tier));
                 }
             }
             drop(table);
@@ -2317,7 +2339,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         top.len().min(5),
                         top.iter()
                             .take(5)
-                            .map(|(id, bps)| format!("#{} {}KB/s", id, bps / 1024))
+                            .map(|(id, bps, tier)| format!("#{} {} {}KB/s", id, tier, bps / 1024))
                             .collect::<Vec<_>>()
                             .join(" · ")
                     ),
@@ -2472,10 +2494,6 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         );
                     }
                 }
-                // 诊断口径：大档是并发名额，这里刷新当前占用数。
-                ctx.stats
-                    .big_tier_in_use
-                    .store(TCP_SOCKETS.load(Ordering::Relaxed).min(TCP_BUFFER_HIGH_TIER_MAX) as i64, Ordering::Relaxed);
                 // 过期黑洞重新试探。
                 let expired: Vec<(IpAddress, u16)> = quic_blackhole
                     .iter()
@@ -2486,6 +2504,13 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                     quic_blackhole.remove(&key);
                 }
             }
+
+            // 诊断口径：大档是并发名额，这里刷新当前占用数。
+            // 必须放在 QUIC 开关之外——否则关掉 QUIC 回落，这个仪表就冻住了。
+            ctx.stats.big_tier_in_use.store(
+                TCP_SOCKETS.load(Ordering::Relaxed).min(TCP_BUFFER_HIGH_TIER_MAX) as i64,
+                Ordering::Relaxed,
+            );
 
             // TCP 空闲/僵尸连接回收。对端静默死亡时 keepalive + smoltcp timeout 会先
             // abort；这里兜「还能回 ACK、但长时间没有任何业务数据」的僵尸连接。
