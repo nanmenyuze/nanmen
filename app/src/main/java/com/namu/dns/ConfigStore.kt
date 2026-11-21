@@ -202,7 +202,13 @@ object ConfigStore {
             cfg.groupSelections.forEach { (k, v) -> if (k.isNotBlank() && v.isNotBlank()) put(k, v) }
         })
         root.put("rules", JSONArray().apply {
-            cfg.rules.filter { it.enabled }.forEach { put(it.copy(source = it.source.ifBlank { "配置" }).toJson()) }
+            // 包名类规则在这里展开成 UID：内核只认数值 UID，包名映射属于壳层职责。
+            // 未安装的包会解析不到 uid，此时跳过该条并记日志，避免下发一条永远不命中的规则。
+            val (expanded, unresolved) = AppUidResolver.expand(context, cfg.rules.filter { it.enabled })
+            if (unresolved.isNotEmpty()) {
+                android.util.Log.w("NamuUid", "包名规则未解析（应用可能未安装）：$unresolved")
+            }
+            expanded.forEach { put(it.copy(source = it.source.ifBlank { "配置" }).toJson()) }
             if (moduleRules != null) {
                 for (i in 0 until moduleRules.length()) put(moduleRules.get(i))
             }
@@ -249,6 +255,10 @@ object ConfigStore {
             put("body_limit", 2 * 1024 * 1024)
             put("fail_open_ttl", 300)
             put("upstream_insecure", false)
+            // 按 App MITM：配置里保留包名（可读、换机可重解析），下发前才展开成 UID。
+            val mitmUids = AppUidResolver.resolveUids(context, cfg.mitm.apps).first
+            put("app_mode", cfg.mitm.appMode)
+            put("app_uids", JSONArray(mitmUids))
         })
         root.put(
             "ads_files",

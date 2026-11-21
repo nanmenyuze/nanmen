@@ -291,18 +291,40 @@ fn body_ops(action: &str, params: &[String]) -> Option<(bool, Vec<BodyOp>)> {
 }
 
 /// 解析一条旧版 `[Rewrite]` 行。
+///
+/// 两种顺序都要认：
+/// - `url action [params]` —— reject-dict、mock-response-body data=...
+/// - `url target action`   —— header / 302 / 307（Loon 官方写法，动作在末位）
+///
+/// 之前只按第一种解析，导致社区模块里最常见的 `^url https://new 302` 与
+/// `^url https://new header` 全部被判不支持。
 fn parse_old(line: &str) -> Option<Vec<LoonRule>> {
-    let t = tokenize(line);
+    let mut t = tokenize(line);
+    // 旧版 Loon 允许 `url - action` 的写法。分隔符本身不是动作，
+    // 剥掉后再统一处理，否则整行会被判为不支持。
+    if t.len() >= 3 && t[1] == "-" {
+        t.remove(1);
+    }
     if t.len() < 2 {
         return None;
     }
     let url = Regex::new(&t[0]).ok()?;
-    let action = t[1].to_ascii_lowercase();
-    let params = &t[2..];
+    // 先按官方写法试末位动作：`url target header|302`。
+    if t.len() >= 3 {
+        let tail = t[t.len() - 1].to_ascii_lowercase();
+        let params: Vec<String> = t[1..t.len() - 1].to_vec();
+        if let Some(r) = build_old_rule(&url, &tail, &params, line) {
+            return Some(r);
+        }
+    }
+    build_old_rule(&url, &t[1].to_ascii_lowercase(), &t[2..], line)
+}
+
+/// 按 `url action params` 构造规则；动作不认识就返回 None，由调用方换另一种顺序重试。
+fn build_old_rule(url: &Regex, action: &str, params: &[String], line: &str) -> Option<Vec<LoonRule>> {
     let req = |a: LoonAction| {
         Some(vec![LoonRule { phase: LoonPhase::Request, url: url.clone(), action: a, raw: line.into() }])
     };
-
     if action == "header" {
         return req(LoonAction::UrlReplace(params.first()?.clone()));
     }
@@ -998,6 +1020,22 @@ mod tests {
         assert!(matches!(set.rules[0].action, LoonAction::Reject(RejectKind::Drop)));
         assert!(matches!(set.rules[1].action, LoonAction::UrlReplace(_)));
         assert!(matches!(set.rules[2].action, LoonAction::Redirect { status: 302, .. }));
+    }
+
+    #[test]
+    fn parses_dash_separated_old_syntax() {
+        // 社区模块最常见的写法：`url - reject-dict`。分隔符不能当成动作名。
+        let lines = vec![
+            r"^https://app\.x\.com/x/v2/splash/list - reject-dict".to_string(),
+            r"^https://acs\.x\.com/gw/mtop\.a\.getadv - reject-dict".to_string(),
+            r"^https://api\.x\.com/ad - reject".to_string(),
+            r"^https://api\.x\.com/j - response-body-json-del data.ads".to_string(),
+        ];
+        let set = parse_loon_rewrites(&lines);
+        assert_eq!(set.unsupported.len(), 0);
+        assert!(matches!(set.rules[0].action, LoonAction::Reject(RejectKind::JsonObject)));
+        assert!(matches!(set.rules[1].action, LoonAction::Reject(RejectKind::JsonObject)));
+        assert!(matches!(set.rules[2].action, LoonAction::Reject(RejectKind::Drop)));
     }
 
     #[test]

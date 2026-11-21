@@ -81,6 +81,37 @@ class ViewModelStateTest {
     }
 
     @Test
+    fun `filter only mode forces final policy to direct`() = runTest {
+        val settings = FakeSettingsRepository(AppConfig(mode = "rule", finalPolicy = "proxy"))
+        val vm = HomeViewModel(
+            settings, DefaultRuntimeRepository(), FakeStats(),
+            DefaultNodeRepository(settings), DefaultMessageRepository(),
+            ping = { _, _, _ -> 42L },
+        )
+        vm.setMode("filter_only")
+        val cfg = settings.current()
+        assertEquals("filter_only", cfg.mode)
+        // 纯过滤不代理：final 必须直接落到 direct，否则无节点时会先判代理再被兜底拦截。
+        assertEquals("direct", cfg.finalPolicy)
+    }
+
+    @Test
+    fun `switching to rule mode does not rewrite final policy`() = runTest {
+        val settings = FakeSettingsRepository(AppConfig(mode = "filter_only", finalPolicy = "direct"))
+        val vm = HomeViewModel(
+            settings, DefaultRuntimeRepository(), FakeStats(),
+            DefaultNodeRepository(settings), DefaultMessageRepository(),
+            ping = { _, _, _ -> 42L },
+        )
+        vm.setMode("rule")
+        assertEquals("rule", settings.current().mode)
+        // 从纯过滤切回规则模式时不能在背后改用户的 final 选择。
+        assertEquals("direct", settings.current().finalPolicy)
+        vm.setMode("global")
+        assertEquals("global", settings.current().mode)
+    }
+
+    @Test
     fun `home test state is kept in view model and uses configured method`() = runTest {
         val settings = FakeSettingsRepository(
             AppConfig(

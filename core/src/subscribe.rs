@@ -545,6 +545,7 @@ fn clash_node(v: &serde_yaml::Value) -> Option<Node> {
             ws_path: None,
             ws_host: None,
             flow: None,
+            udp: yaml_bool(v, "udp"),
         }),
         "trojan" => Some(Node {
             name,
@@ -567,6 +568,7 @@ fn clash_node(v: &serde_yaml::Value) -> Option<Node> {
                 .and_then(|h| yaml_str(h, "Host"))
                 .or_else(|| yaml_str(v, "host")),
             flow: None,
+            udp: yaml_bool(v, "udp"),
         }),
         "vless" => {
             // Reality / XTLS Vision 未实现：计入不支持，而不是静默导入必连不上的节点。
@@ -607,6 +609,7 @@ fn clash_node(v: &serde_yaml::Value) -> Option<Node> {
                 .and_then(|h| yaml_str(h, "Host"))
                 .or_else(|| yaml_str(v, "host")),
             flow: yaml_str(v, "flow"),
+            udp: yaml_bool(v, "udp"),
             })
         }
         "socks5" | "socks" => Some(Node {
@@ -623,6 +626,7 @@ fn clash_node(v: &serde_yaml::Value) -> Option<Node> {
             ws_path: None,
             ws_host: None,
             flow: None,
+            udp: yaml_bool(v, "udp"),
         }),
         "http" | "https" => Some(Node {
             name,
@@ -638,6 +642,7 @@ fn clash_node(v: &serde_yaml::Value) -> Option<Node> {
             ws_path: None,
             ws_host: None,
             flow: None,
+            udp: yaml_bool(v, "udp"),
         }),
         _ => None,
     }
@@ -703,6 +708,15 @@ fn decode_name(u: &Url) -> String {
         .to_string()
 }
 
+/// 分享链接的 `udp=false` 开关：只认明确的布尔写法，未知值按缺省（跟随协议能力）。
+fn uri_udp(q: &HashMap<String, String>) -> Option<bool> {
+    q.get("udp").and_then(|v| match v.to_ascii_lowercase().as_str() {
+        "false" | "0" => Some(false),
+        "true" | "1" => Some(true),
+        _ => None,
+    })
+}
+
 fn parse_ss(line: &str) -> Option<Node> {
     let body = line.strip_prefix("ss://")?;
     // SIP003 plugin 需要额外的本地插件进程；内核没有实现，不能静默丢掉 query 后
@@ -741,6 +755,7 @@ fn parse_ss(line: &str) -> Option<Node> {
             ws_path: None,
             ws_host: None,
             flow: None,
+            udp: None,
         });
     }
     // 全 base64 旧格式
@@ -763,6 +778,7 @@ fn parse_ss(line: &str) -> Option<Node> {
         ws_path: None,
         ws_host: None,
         flow: None,
+        udp: None,
     })
 }
 
@@ -819,6 +835,7 @@ fn parse_trojan(line: &str) -> Option<Node> {
         ws_path: q.get("path").cloned(),
         ws_host: q.get("host").cloned(),
         flow: None,
+        udp: uri_udp(&q),
     })
 }
 
@@ -861,6 +878,7 @@ fn parse_vless(line: &str) -> Option<Node> {
         ws_path: q.get("path").cloned(),
         ws_host: q.get("host").cloned(),
         flow: q.get("flow").cloned(),
+        udp: uri_udp(&q),
     })
 }
 
@@ -889,6 +907,7 @@ fn parse_socks(line: &str) -> Option<Node> {
         ws_path: None,
         ws_host: None,
         flow: None,
+        udp: None,
     })
 }
 
@@ -924,6 +943,7 @@ fn parse_http(line: &str) -> Option<Node> {
         ws_path: None,
         ws_host: None,
         flow: None,
+        udp: None,
     })
 }
 
@@ -943,6 +963,20 @@ mod tests {
     fn first(text: &str) -> Value {
         let v: Value = serde_json::from_str(&parse_to_json(text)).unwrap();
         v["nodes"][0].clone()
+    }
+
+    #[test]
+    fn node_level_udp_switch_is_parsed() {
+        // 分享链接：udp=false / udp=true
+        let t = first("trojan://pw@example.com:443?udp=false#t");
+        assert_eq!(t["udp"], false);
+        let v = first("vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&udp=true#v");
+        assert_eq!(v["udp"], true);
+
+        // Clash YAML：节点级 udp: false
+        let yaml = "proxies:\n  - {name: t, type: trojan, server: example.com, port: 443, password: pw, udp: false}\n";
+        let parsed: Value = serde_json::from_str(&parse_to_json(yaml)).unwrap();
+        assert_eq!(parsed["nodes"][0]["udp"], false);
     }
 
     #[test]

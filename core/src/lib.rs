@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 pub mod config;
 pub mod dns;
 pub mod dns_log;
@@ -13,6 +15,8 @@ pub mod sniff;
 pub mod udp;
 pub mod subscribe;
 pub mod strategy;
+pub mod uidmap;
+pub mod conns;
 
 use crate::config::Config;
 use crate::dns::DnsEngine;
@@ -55,6 +59,10 @@ fn stop_engine() {
 }
 
 static ENGINE_STATS: Lazy<Mutex<Arc<Stats>>> = Lazy::new(|| Mutex::new(Arc::new(Stats::new())));
+
+/// 壳层最近一次下发的 UID 表（紧凑 JSON）。nativeSetUidMap 在没有运行中的
+/// 内核时先存这里，等 nativeStart 建好会话再应用，避免启动窗口期丢规则。
+static UID_TABLE_PENDING: Lazy<Mutex<Option<String>>> = Lazy::new(|| Mutex::new(None));
 
 fn read_string(env: &mut JNIEnv, s: &JString) -> Option<String> {
     let js = env.get_string(s).ok()?;
@@ -126,7 +134,7 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStart<'local>(
             stats.clone(),
             &cfg.block_mode,
             cfg.block_enabled,
-            cfg.fake_ip && cfg.mode != "dns_only",
+            cfg.fake_ip && cfg.mode != "dns_only" && cfg.mode != "filter_only",
             cfg.dns.query_log,
         );
         dns.set_fake_path(if cfg.fake_ip && cfg.mode != "dns_only" {
@@ -157,6 +165,23 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStart<'local>(
         let selected = cfg.selected.clone();
         let health = Arc::new(strategy::HealthRegistry::new());
         let mitm_state = Arc::new(std::sync::RwLock::new(Arc::new(mitm::MitmState::build(&cfg.mitm))));
+        // 壳层可能在 nativeStart 之前就下发过 UID 表（服务启动顺序不保证），
+        // 这里把最后一份 pending 表应用到新会话，避免刚启动的窗口期 UID 规则失效。
+        let uid_map = Arc::new(std::sync::RwLock::new(crate::uidmap::UidMap::default()));
+        if let Some(text) = UID_TABLE_PENDING
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            let (rows, bad) = crate::uidmap::UidMap::parse_json(&text);
+            if bad > 0 {
+                logging::warn("uid", format!("UID 表启动应用：{} 条无效已跳过", bad));
+            }
+            uid_map
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .replace(rows);
+        }
         let ctx = Arc::new(Ctx {
             cfg: std::sync::RwLock::new(cfg),
             filter,
@@ -170,6 +195,8 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStart<'local>(
             health: health.clone(),
             decision: Arc::new(std::sync::RwLock::new(())),
             mitm: mitm_state,
+            uid_map: uid_map.clone(),
+            conns: Arc::new(std::sync::RwLock::new(crate::conns::ConnTable::new())),
         });
 
         let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -324,6 +351,73 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeParseSubscription<'loc
     to_jstring(&mut env, json)
 }
 
+/// 壳层下发「五元组 → 归属 UID」整表。返回接受的条数，-1 表示参数错误。
+/// 无 root 时壳层下发空表，等价于关闭 UID 规则（不会退化成按 UID 0 匹配）。
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeSetUidMap<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    table_json: JString<'local>,
+) -> jint {
+    catch_unwind(AssertUnwindSafe(|| -> i32 {
+        let json = match read_string(&mut env, &table_json) {
+            Some(s) => s,
+            None => return -1,
+        };
+        let (rows, bad) = crate::uidmap::UidMap::parse_json(&json);
+        let count = rows.len() as i32;
+        // 没有运行中的内核时先缓存，等 nativeStart 建好会话再应用。
+        *UID_TABLE_PENDING.lock().unwrap_or_else(|p| p.into_inner()) = Some(json);
+        let guard = match ENGINE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(engine) = guard.as_ref() {
+            engine
+                .ctx
+                .uid_map
+                .write()
+                .unwrap_or_else(|p| p.into_inner())
+                .replace(rows);
+        }
+        if bad > 0 {
+            logging::warn(
+                "uid",
+                format!("UID 表下发：{} 条无效已跳过，接受 {} 条", bad, count),
+            );
+        }
+        count
+    }))
+    .unwrap_or(-1)
+}
+
+/// 连接列表增量快照：`since` 是上次拿到的游标，首次传 0。
+/// 返回 `{"items":[...],"last":n,"total":n}`；内核未运行时给空表。
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeConnections<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    since: jlong,
+) -> jstring {
+    let json = catch_unwind(AssertUnwindSafe(|| {
+        let guard = match ENGINE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        match guard.as_ref() {
+            Some(engine) => engine
+                .ctx
+                .conns
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .json_since(since.max(0) as u64),
+            None => "{\"items\":[],\"last\":0,\"total\":0}".to_string(),
+        }
+    }))
+    .unwrap_or_else(|_| "{\"items\":[],\"last\":0,\"total\":0}".to_string());
+    to_jstring(&mut env, json)
+}
+
 /// 规则热重载（sing-box serviceReload 同款）：只换过滤/分流引擎，TUN 与连接不中断。
 #[no_mangle]
 pub extern "system" fn Java_com_namu_dns_NativeCore_nativeReloadRules<'local>(
@@ -369,7 +463,7 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeReloadRules<'local>(
             engine.stats.clone(),
             &cfg.block_mode,
             cfg.block_enabled,
-            cfg.fake_ip && cfg.mode != "dns_only",
+            cfg.fake_ip && cfg.mode != "dns_only" && cfg.mode != "filter_only",
             cfg.dns.query_log,
         );
         new_dns.set_fake_path(if cfg.fake_ip && cfg.mode != "dns_only" {
@@ -682,7 +776,7 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeVersion<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
-    to_jstring(&mut env, "1.12.5".into())
+    to_jstring(&mut env, "1.13.0".into())
 }
 
 #[cfg(test)]
@@ -693,7 +787,7 @@ mod rule_test_transport_tests {
     fn rule_test_reports_udp_unsupported_without_claiming_tcp_node() {
         let cfg: Config = serde_json::from_str(
             r#"{
-                "nodes":[{"name":"仅TCP","type":"trojan"}],
+                "nodes":[{"name":"仅TCP","type":"trojan","udp":false}],
                 "proxy_groups":[{
                     "name":"分组","type":"fallback","members":["仅TCP"],
                     "no_node_action":"block"

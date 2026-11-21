@@ -227,6 +227,20 @@ data class StatsData(
     val mitmRewritten: Long = 0,
     val mitmFailed: Long = 0,
     val mitmQuicBlocked: Long = 0,
+    /** 域名命中但因「按 App MITM」范围而放行的连接数。 */
+    val mitmAppSkipped: Long = 0,
+    // 按 App 分流：成功解析归属的连接数 / 有 UID 规则但归属未知的连接数
+    val uidResolved: Long = 0,
+    val uidUnknown: Long = 0,
+    // TUN 出口诊断：TxToken 队列满丢包 / pending_out 硬上限丢弃 / backlog 峰值 / 背压 / 写阻塞 / 写错误
+    val tunTxDrop: Long = 0,
+    val tunPendingDrop: Long = 0,
+    val tunPendingPeak: Long = 0,
+    val tunTxBackpressure: Long = 0,
+    val tunWriteWouldBlock: Long = 0,
+    val tunWriteError: Long = 0,
+    // 直连拨号熔断：冷却期内被抑制拨号的连接数（保持原失败时序，不立即 RST）
+    val dialBreakerRejected: Long = 0,
 ) {
     companion object {
         fun fromJson(text: String): StatsData {
@@ -269,6 +283,16 @@ data class StatsData(
                     mitmRewritten = o.optLong("mitmRewritten"),
                     mitmFailed = o.optLong("mitmFailed"),
                     mitmQuicBlocked = o.optLong("mitmQuicBlocked"),
+                    mitmAppSkipped = o.optLong("mitmAppSkipped"),
+                    uidResolved = o.optLong("uidResolved"),
+                    uidUnknown = o.optLong("uidUnknown"),
+                    tunTxDrop = o.optLong("tunTxDrop"),
+                    tunPendingDrop = o.optLong("tunPendingDrop"),
+                    tunPendingPeak = o.optLong("tunPendingPeak"),
+                    tunTxBackpressure = o.optLong("tunTxBackpressure"),
+                    tunWriteWouldBlock = o.optLong("tunWriteWouldBlock"),
+                    tunWriteError = o.optLong("tunWriteError"),
+                    dialBreakerRejected = o.optLong("dialBreakerRejected"),
                 )
             } catch (_: Exception) {
                 StatsData()
@@ -528,6 +552,15 @@ data class AppConfig(
     var autoClearLogs: Boolean = true,
     /** Root 设备上连接时临时关闭系统私人 DNS，断开后恢复；避免 DoT 绕过内核。 */
     var autoDisablePrivateDns: Boolean = false,
+    /**
+     * DNS-only 模式下是否全量接管流量（默认开）。
+     *
+     * 只接管 VPN 的 DNS 地址时，App 硬编码 8.8.8.8、DoT 853、App 自己的 DoH
+     * 都不进 TUN，等于 DNS 泄漏。全量接管后这些流量都进 TUN：
+     * 硬编码 DNS 被劫持到本地引擎，DoT 被 block_dot 拒绝。
+     * 代价是所有流量过一遍 TUN（非 DNS 连接直连转发），性能敏感时可关闭。
+     */
+    var dnsOnlyFullRoute: Boolean = true,
     /** system / light / dark；仅影响外壳配色，不进入内核配置。 */
     var themeMode: String = "system",
     /** 开机或默认网络恢复时自动启动 VPN。 */
@@ -576,6 +609,7 @@ data class AppConfig(
         put("blockWhenNoNode", blockWhenNoNode)
         put("fakeIp", fakeIp)
         put("blockAaaa", blockAaaa)
+        put("dnsOnlyFullRoute", dnsOnlyFullRoute)
         put("sniff", sniff)
         put("autoSelectNode", autoSelectNode)
         put("autoClearLogs", autoClearLogs)
@@ -707,6 +741,7 @@ data class AppConfig(
                     blockWhenNoNode = o.optBoolean("blockWhenNoNode", true),
                     fakeIp = o.optBoolean("fakeIp", false),
                     blockAaaa = o.optBoolean("blockAaaa", false),
+                    dnsOnlyFullRoute = o.optBoolean("dnsOnlyFullRoute", true),
                     sniff = o.optBoolean("sniff", true),
                     autoSelectNode = o.optBoolean("autoSelectNode", false),
                     autoClearLogs = o.optBoolean("autoClearLogs", true),

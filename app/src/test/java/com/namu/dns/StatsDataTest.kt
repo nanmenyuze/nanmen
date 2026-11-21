@@ -58,4 +58,26 @@ class StatsDataTest {
         assertEquals(14L, data.mitmFailed)
         assertEquals(15L, data.mitmQuicBlocked)
     }
+
+    @Test
+    fun `parses tun egress diagnostics from kernel json`() {
+        val data = StatsData.fromJson(
+            """
+            {
+              "tunTxDrop": 2,
+              "tunPendingDrop": 3,
+              "tunPendingPeak": 700,
+              "tunTxBackpressure": 6,
+              "tunWriteWouldBlock": 4,
+              "tunWriteError": 5
+            }
+            """.trimIndent(),
+        )
+        assertEquals(2L, data.tunTxDrop)
+        assertEquals(3L, data.tunPendingDrop)
+        assertEquals(700L, data.tunPendingPeak)
+        assertEquals(6L, data.tunTxBackpressure)
+        assertEquals(4L, data.tunWriteWouldBlock)
+        assertEquals(5L, data.tunWriteError)
+    }
 }

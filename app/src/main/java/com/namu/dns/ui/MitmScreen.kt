@@ -52,6 +52,7 @@ fun MitmScreen() {
     val mitm = cfg.mitm
     var showHosts by remember { mutableStateOf(false) }
     var showSkip by remember { mutableStateOf(false) }
+    var showApps by remember { mutableStateOf(false) }
     var hostsText by remember { mutableStateOf("") }
     var skipText by remember { mutableStateOf("") }
 
@@ -143,6 +144,17 @@ fun MitmScreen() {
         SectionHeader("域名与规则")
         GroupCard {
             SettingsRow(
+                title = "按 App MITM",
+                value = when (mitm.appMode) {
+                    "allow" -> "仅 ${mitm.apps.size} 个应用"
+                    "deny" -> "跳过 ${mitm.apps.size} 个应用"
+                    else -> "全部应用"
+                },
+                subtitle = "只解密选定应用，或把银行、支付、证书固定应用排除在外",
+                chevron = true,
+                onClick = { showApps = true },
+            )
+            SettingsRow(
                 title = "手动 MITM 域名",
                 value = "${mitm.hostnames.size} 个",
                 subtitle = "逗号分隔，支持 *.example.com（含主域与全部子域）",
@@ -184,6 +196,11 @@ fun MitmScreen() {
                 "QUIC 拦截回落 TCP",
                 value = stats.mitmQuicBlocked.toString(),
                 subtitle = "UDP 443 的 QUIC 被丢弃后，应用会自动改用 HTTPS/TCP 走 MITM",
+            )
+            SettingsRow(
+                "按 App 跳过",
+                value = stats.mitmAppSkipped.toString(),
+                subtitle = "域名命中但不在「按 App MITM」范围内、按原样直通的连接数",
                 showDivider = false,
             )
         }
@@ -209,6 +226,14 @@ fun MitmScreen() {
         ) {
             NamuTextField(hostsText, { hostsText = it }, "*.example.com, api.foo.cn")
         }
+    }
+    if (showApps) {
+        AppScopeDialog(
+            mode = mitm.appMode,
+            apps = mitm.apps,
+            onDismiss = { showApps = false },
+            onApply = { mode, apps -> vm.setApps(mode, apps) },
+        )
     }
     if (showSkip) {
         NamuDialog(

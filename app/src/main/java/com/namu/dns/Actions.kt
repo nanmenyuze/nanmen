@@ -1047,6 +1047,13 @@ object Actions {
     /** 永不 MITM 的跳过域名（银行/支付等）。 */
     suspend fun setMitmSkip(hostnames: List<String>) = updateMitm { it.copy(skipHostnames = hostnames) }
 
+    /**
+     * 按 App MITM：mode = all / allow / deny，apps 是包名列表。
+     * 写配置后重建模块并热重载；包名到 UID 的展开在下发内核时完成。
+     */
+    suspend fun setMitmApps(mode: String, apps: List<String>) =
+        updateMitm { it.copy(appMode = mode, apps = apps) }
+
     private suspend fun updateMitm(transform: (MitmConfig) -> MitmConfig) = withContext(Dispatchers.IO) {
         val next = settings.update { cfg -> cfg.copy(mitm = transform(cfg.mitm)) }
         ConfigStore.rebuildModules(App.context, next)

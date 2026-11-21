@@ -61,7 +61,11 @@ class HomeViewModel(
 
     fun setMode(mode: String) {
         if (settings.current().mode == mode) return
-        settings.update { it.copy(mode = mode) }
+        settings.update {
+            // 纯过滤不代理：final 必须落到直连，否则无节点时会把流量判成代理再兜底拦截。
+            if (mode == "filter_only") it.copy(mode = mode, finalPolicy = "direct")
+            else it.copy(mode = mode)
+        }
     }
 
     fun selectNode(name: String) = nodes.select(name)

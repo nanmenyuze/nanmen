@@ -84,6 +84,12 @@ pub struct MitmConfig {
     /// 调试用：跳过对真实服务器的证书校验。正常使用必须为 false。
     #[serde(default)]
     pub upstream_insecure: bool,
+    /// 按 App MITM：`all`（全部应用）/ `allow`（仅 app_uids 内）/ `deny`（app_uids 内跳过）。
+    #[serde(default)]
+    pub app_mode: String,
+    /// app_mode 使用的 UID 列表；壳层把用户选的包名解析成 UID 后下发。
+    #[serde(default)]
+    pub app_uids: Vec<u32>,
 }
 
 impl Default for MitmConfig {
@@ -102,6 +108,53 @@ impl Default for MitmConfig {
             body_limit: default_body_limit(),
             fail_open_ttl: default_fail_open_ttl(),
             upstream_insecure: false,
+            app_mode: String::new(),
+            app_uids: Vec::new(),
+        }
+    }
+}
+
+/// MITM 的 App 生效范围。UID 未知时按最保守的一侧处理：
+/// - `Allow`：不解密，避免把银行/支付这类证书固定应用误伤；
+/// - `Deny`：仍解密（列表外的应用本来就要处理），保持与全局模式一致。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum AppScope {
+    #[default]
+    All,
+    Allow(HashSet<u32>),
+    Deny(HashSet<u32>),
+}
+
+impl AppScope {
+    pub fn parse(mode: &str, uids: &[u32]) -> Self {
+        let set: HashSet<u32> = uids.iter().copied().collect();
+        if set.is_empty() {
+            return AppScope::All;
+        }
+        match mode.trim().to_ascii_lowercase().as_str() {
+            "allow" | "only" => AppScope::Allow(set),
+            "deny" | "skip" | "bypass" => AppScope::Deny(set),
+            _ => AppScope::All,
+        }
+    }
+
+    pub fn allows(&self, uid: Option<u32>) -> bool {
+        match self {
+            AppScope::All => true,
+            AppScope::Allow(set) => uid.is_some_and(|u| set.contains(&u)),
+            AppScope::Deny(set) => uid.is_none_or(|u| !set.contains(&u)),
+        }
+    }
+
+    pub fn is_all(&self) -> bool {
+        matches!(self, AppScope::All)
+    }
+
+    pub fn mode_name(&self) -> &'static str {
+        match self {
+            AppScope::All => "all",
+            AppScope::Allow(_) => "allow",
+            AppScope::Deny(_) => "deny",
         }
     }
 }
@@ -217,6 +270,8 @@ pub struct MitmEngine {
     pub scripts: ScriptEngine,
     pub body_limit: usize,
     pub upstream_insecure: bool,
+    /// 该配置对哪些应用生效；all 时与旧行为完全一致。
+    pub app_scope: AppScope,
     /// 编译失败被跳过的规则数（模块预览/日志用）。
     pub skipped_rules: usize,
     fail_open_ttl: Duration,
@@ -229,6 +284,7 @@ impl MitmEngine {
         let mut skipped = 0usize;
         // 兼容 1.33 壳层的原始规则行：拼成模块文本后复用同一套 Surge 解析器。
         let mut source_rules = cfg.rules.clone();
+        let mut extra_loon: Vec<String> = Vec::new();
         if !cfg.url_rewrites.is_empty() || !cfg.header_rewrites.is_empty() {
             let mut module = String::new();
             if !cfg.url_rewrites.is_empty() {
@@ -245,7 +301,10 @@ impl MitmEngine {
                     module.push('\n');
                 }
             }
-            source_rules.extend(parse_surge_module(&module).rules);
+            let surge = parse_surge_module(&module);
+            source_rules.extend(surge.rules);
+            // 302/307/3 段 header/mock 翻译成了 Loon 行，跟 cfg.loon_rewrites 合并解析。
+            extra_loon = surge.loon;
         }
         for r in &source_rules {
             let Some(action) = RewriteAction::parse(&r.action) else {
@@ -284,7 +343,9 @@ impl MitmEngine {
                 header_field: r.header_field.trim().to_string(),
             });
         }
-        let loon = crate::mitm::loon::parse_loon_rewrites(&cfg.loon_rewrites);
+        let mut loon_lines = cfg.loon_rewrites.clone();
+        loon_lines.extend(extra_loon);
+        let loon = crate::mitm::loon::parse_loon_rewrites(&loon_lines);
         let scripts = ScriptEngine::from_config(&cfg.scripts, &cfg.script_store_file);
         Self {
             enabled: cfg.enabled,
@@ -298,12 +359,28 @@ impl MitmEngine {
             upstream_insecure: cfg.upstream_insecure,
             skipped_rules: skipped,
             fail_open_ttl: Duration::from_secs(cfg.fail_open_ttl.max(1)),
+            app_scope: AppScope::parse(&cfg.app_mode, &cfg.app_uids),
             bypass: Mutex::new(HashMap::new()),
         }
     }
 
     /// 是否应该对该域名做 MITM（启用 + 命中列表 + 未跳过 + 未在放行期）。
+    /// 归属未知（如 UDP/QUIC 拿不到 socket 表）时按 [AppScope] 的保守分支处理。
     pub fn should_mitm(&self, host: &str) -> bool {
+        self.should_mitm_uid(host, None)
+    }
+
+    /// 带 App 归属的判定：先过 App 范围，再过域名规则。
+    pub fn should_mitm_uid(&self, host: &str, uid: Option<u32>) -> bool {
+        self.app_scope.allows(uid) && self.should_mitm_host(host)
+    }
+
+    /// App 范围是否放行该 UID（不做域名判定，供壳层统计“因按 App 跳过”）。
+    pub fn app_allows(&self, uid: Option<u32>) -> bool {
+        self.app_scope.allows(uid)
+    }
+
+    fn should_mitm_host(&self, host: &str) -> bool {
         if !self.enabled || self.hosts.is_empty() || self.skip.matches(host) {
             return false;
         }
@@ -424,6 +501,10 @@ pub fn apply_body_rules(body: &[u8], rules: &[&RewriteRule]) -> (Vec<u8>, bool) 
 pub struct SurgeMitm {
     pub hostnames: Vec<String>,
     pub rules: Vec<MitmRuleConf>,
+    /// Surge [URL Rewrite] 里 302/307/3 段 header/mock 的等价 Loon 行。
+    /// 这些动作在 Surge 语义里没有对应的 RewriteAction，但 Loon 执行器已实现，
+    /// 翻译后交给同一个执行器，避免两套实现漂移。
+    pub loon: Vec<String>,
     pub ignored: usize,
 }
 
@@ -482,11 +563,64 @@ fn valid_host_pattern(p: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
 }
 
+/// 把 Surge [URL Rewrite] 里 Loon 已支持、Surge 侧没有 RewriteAction 的动作翻译成 Loon 行。
+///
+/// - `^url https://new 302|307` → 原样交给 Loon（redirect）
+/// - `^url https://new header`（3 段）→ Loon `url new header`（URL 替换）
+/// - `^url mock|mock-request-body|mock-response-body <body>` → Loon mock 参数形式
+/// 已经是 Loon 参数形式（第三段带 `=`）时原样透传，避免二次包装。
+fn surge_rewrite_to_loon(t: &[String], _last: &str, raw: &str) -> Option<String> {
+    if t.len() < 3 {
+        return None;
+    }
+    // Surge 的动作在 t[1]（mock 的 body 在 t[2..]），302/307/header 则在 t[2]。
+    let action = t[1].to_ascii_lowercase();
+    // 302/307、3 段 header：动作在末位（`url new-url 302`）。
+    if t.len() == 3 {
+        let tail = t[2].to_ascii_lowercase();
+        if tail == "302" || tail == "307" {
+            return Some(format!("{} {} {}", t[0], t[1], tail));
+        }
+        if tail == "header" {
+            return Some(format!("{} {} header", t[0], t[1]));
+        }
+    }
+    // mock 族：动作在 t[1]，body 在 t[2..]。
+    if !matches!(action.as_str(), "mock" | "mock-request-body" | "mock-response-body") {
+        return None;
+    }
+    let dir = if action == "mock-request-body" {
+        "mock-request-body"
+    } else {
+        "mock-response-body"
+    };
+    // 已经是 Loon 的 `data-type=json data="..."` 写法，直接透传整行。
+    if t[2].contains('=') {
+        return Some(raw.trim().to_string());
+    }
+    // body 必须从原始行截取：tokenize 会把 JSON 里的引号当字符串边界剥掉，
+    // `mock {"code":0}` 重建成 `{code:0}` 后返回给 App 就不是合法 JSON。
+    let lower = raw.to_ascii_lowercase();
+    let body = match lower.rfind(action.as_str()) {
+        Some(pos) => raw[pos + action.len()..].trim().to_string(),
+        None => t[2..].join(" "),
+    };
+    let trimmed = body.trim_start();
+    let data_type = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        "json"
+    } else {
+        "text"
+    };
+    let escaped = body.replace('\\', "\\\\").replace('"', "\\\"");
+    Some(format!("{} {} data-type={} data=\"{}\"", t[0], dir, data_type, escaped))
+}
+
 /// 解析 .sgmodule 中的 [MITM] / [URL Rewrite] / [Header Rewrite] 段。
 /// 其余段由调用方（DNS 规则解析）处理；这里只统计本能力范围内的不支持行。
 pub fn parse_surge_module(text: &str) -> SurgeMitm {
     let mut hostnames: Vec<String> = Vec::new();
     let mut rules: Vec<MitmRuleConf> = Vec::new();
+    let mut loon: Vec<String> = Vec::new();
     let mut ignored = 0usize;
     let mut section = String::new();
     for raw in text.lines() {
@@ -524,6 +658,12 @@ pub fn parse_surge_module(text: &str) -> SurgeMitm {
                     continue;
                 }
                 let last = t[t.len() - 1].to_ascii_lowercase();
+                // 先走 Surge→Loon 翻译：302/307、3 段 header、mock 在 Surge 里
+                // 没有对应的 RewriteAction，硬塞进 reject/body/header 会静默丢规则。
+                if let Some(line2) = surge_rewrite_to_loon(&t, &last, line) {
+                    loon.push(line2);
+                    continue;
+                }
                 if let Some(action) = RewriteAction::parse(&last) {
                     match action {
                         RewriteAction::Reject | RewriteAction::Reject200 | RewriteAction::RejectTinyGif => {
@@ -600,7 +740,7 @@ pub fn parse_surge_module(text: &str) -> SurgeMitm {
     }
     hostnames.sort();
     hostnames.dedup();
-    SurgeMitm { hostnames, rules, ignored }
+    SurgeMitm { hostnames, rules, loon, ignored }
 }
 
 #[cfg(test)]
@@ -616,6 +756,35 @@ mod tests {
             header_field: String::new(),
             source: None,
         }
+    }
+
+    #[test]
+    fn surge_302_header_mock_translate_to_loon() {
+        let p = parse_surge_module(
+            "[URL Rewrite]\n\
+             ^https://api.a.com/v1 https://api.b.com/v1 302\n\
+             ^https://api.a.com/old https://api.a.com/new header\n\
+             ^https://api.a.com/ad mock {\"code\":0}\n\
+             ^https://api.a.com/r mock-request-body data-type=json data=\"{}\"",
+        );
+        assert_eq!(p.loon.len(), 4, "{:?}", p.loon);
+        let set = crate::mitm::loon::parse_loon_rewrites(&p.loon);
+        assert_eq!(set.rules.len(), 4, "unsupported={:?}", set.unsupported);
+        assert!(matches!(
+            set.rules[0].action,
+            crate::mitm::loon::LoonAction::Redirect { status: 302, .. }
+        ));
+        assert!(matches!(set.rules[1].action, crate::mitm::loon::LoonAction::UrlReplace(_)));
+        match &set.rules[2].action {
+            crate::mitm::loon::LoonAction::ResponseMock(m) => {
+                assert_eq!(m.body, b"{\"code\":0}".to_vec());
+            }
+            other => panic!("期望响应 mock，实际 {:?}", other),
+        }
+        assert!(matches!(
+            set.rules[3].action,
+            crate::mitm::loon::LoonAction::RequestMock(_)
+        ));
     }
 
     #[test]
@@ -649,6 +818,57 @@ mod tests {
         e.mark_bypass("x.ads.com");
         assert!(!e.should_mitm("x.ads.com"));
         assert!(e.should_mitm("y.ads.com"));
+    }
+
+    fn app_conf(mode: &str, uids: &[u32]) -> MitmConfig {
+        MitmConfig {
+            enabled: true,
+            hostnames: vec!["*.ads.com".into()],
+            app_mode: mode.into(),
+            app_uids: uids.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn app_scope_allow_only_selected_uid() {
+        let e = MitmEngine::from_config(&app_conf("allow", &[10086]));
+        assert!(e.should_mitm_uid("x.ads.com", Some(10086)));
+        assert!(!e.should_mitm_uid("x.ads.com", Some(10010)));
+        // 归属未知时不解密：宁可漏抓，不可误解银行/支付。
+        assert!(!e.should_mitm_uid("x.ads.com", None));
+
+    }
+
+    #[test]
+    fn app_scope_deny_skips_selected_uid() {
+        let e = MitmEngine::from_config(&app_conf("deny", &[10086]));
+        // 银行/支付在这份名单里：无论域名是否命中都不解密。
+        assert!(!e.should_mitm_uid("x.ads.com", Some(10086)));
+        assert!(e.should_mitm_uid("x.ads.com", Some(10010)));
+        // 未知归属保持旧行为（照常解密），否则等于把全局 MITM 悄悄关掉。
+        assert!(e.should_mitm_uid("x.ads.com", None));
+    }
+
+    #[test]
+    fn app_scope_all_and_empty_fall_back_to_global() {
+        let all = MitmEngine::from_config(&app_conf("all", &[1, 2]));
+        assert!(all.should_mitm_uid("x.ads.com", None));
+        assert!(all.should_mitm_uid("x.ads.com", Some(999)));
+        // 模式写 allow 但列表为空：退化为全局，避免一条规则配错就静默全关。
+        let empty = MitmEngine::from_config(&app_conf("allow", &[]));
+        assert!(empty.should_mitm_uid("x.ads.com", None));
+        assert!(empty.should_mitm_uid("x.ads.com", Some(7)));
+        assert_eq!(empty.app_scope.mode_name(), "all");
+    }
+
+    #[test]
+    fn app_scope_keeps_domain_skip_priority() {
+        let mut cfg = app_conf("deny", &[10086]);
+        cfg.skip = vec!["pin.ads.com".into()];
+        let e = MitmEngine::from_config(&cfg);
+        assert!(!e.should_mitm_uid("pin.ads.com", Some(10010)));
+        assert!(e.should_mitm_uid("x.ads.com", Some(10010)));
     }
 
     #[test]
@@ -739,7 +959,10 @@ DOMAIN-SUFFIX,ads.example.com,REJECT
         let p = parse_surge_module(text);
         assert_eq!(p.hostnames, vec!["*.example.com".to_string(), "api.foo.cn".to_string()]);
         assert_eq!(p.rules.len(), 5);
-        assert_eq!(p.ignored, 1); // 302 不支持
+        // 302 现在翻译成 Loon redirect，不再计入不支持
+        assert_eq!(p.ignored, 0);
+        assert_eq!(p.loon.len(), 1);
+        assert!(p.loon[0].ends_with(" 302"));
         assert_eq!(p.rules[0].action, "reject");
         assert_eq!(p.rules[2].action, "body");
         assert_eq!(p.rules[2].replacement, "");

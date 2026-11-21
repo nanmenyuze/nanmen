@@ -129,7 +129,7 @@
 | `IP-ASN` | 支持 | 无 | **未支持** | 需要 ASN 数据库 |
 | `USER-AGENT` | 支持 | 无 | **未支持** | MITM 层才能拿到 UA；见 `R06` |
 | `URL-REGEX` | 支持 | 无 | **未支持** | 需要 URL 级规则管线 |
-| `PROCESS-NAME` | 支持 | 无 | **未支持** | 需要 App UID/进程映射 |
+| `PROCESS-NAME` | 支持 | 支持（壳层解析包名→UID） | **已支持（TCP）** | 需要 Root 才能识别连接归属；UDP 暂不归属，见 `docs/APP_ISOLATION.md` |
 | `PROTOCOL` | 支持 | 无 | **未支持** | TCP/UDP/QUIC 分流未建模型 |
 | `SRC-IP` / `SRC-PORT` | 支持 | 无 | **未支持** | 需要连接五元组 |
 | `AND` / `OR` / `NOT` | 支持 | 无 | **未支持** | 需要逻辑规则 AST |

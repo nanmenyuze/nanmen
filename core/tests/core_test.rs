@@ -277,6 +277,7 @@ fn ss_udp_roundtrip() {
         ws_path: None,
         ws_host: None,
         flow: None,
+        udp: None,
     };
     let cipher = nanmen_core::proto::ss::SsUdpCipher::new(&node).unwrap();
     let target = nanmen_core::config::Target {
@@ -605,7 +606,7 @@ fn ss_udp_replay_rejected() {
         method: Some("aes-256-gcm".into()),
         password: Some("secret".into()),
         uuid: None, sni: None, insecure: None, tls: None,
-        ws_path: None, ws_host: None, flow: None,
+        ws_path: None, ws_host: None, flow: None, udp: None,
     };
     let cipher = nanmen_core::proto::ss::SsUdpCipher::new(&node).unwrap();
     let target = nanmen_core::config::Target {
@@ -628,6 +629,25 @@ fn stats_uptime_frozen_after_stop() {
     std::thread::sleep(std::time::Duration::from_millis(50));
     let j2: serde_json::Value = serde_json::from_str(&s.to_json()).unwrap();
     assert_eq!(j1["uptime"], j2["uptime"]);
+}
+
+#[test]
+fn stats_exposes_tun_egress_diagnostics() {
+    use std::sync::atomic::Ordering;
+    let s = Stats::new();
+    s.tun_tx_drop.fetch_add(2, Ordering::Relaxed);
+    s.tun_pending_drop.fetch_add(3, Ordering::Relaxed);
+    s.tun_pending_peak.fetch_add(700, Ordering::Relaxed);
+    s.tun_tx_backpressure.fetch_add(6, Ordering::Relaxed);
+    s.tun_write_would_block.fetch_add(4, Ordering::Relaxed);
+    s.tun_write_error.fetch_add(5, Ordering::Relaxed);
+    let j: serde_json::Value = serde_json::from_str(&s.to_json()).unwrap();
+    assert_eq!(j["tunTxDrop"], 2);
+    assert_eq!(j["tunPendingDrop"], 3);
+    assert_eq!(j["tunPendingPeak"], 700);
+    assert_eq!(j["tunTxBackpressure"], 6);
+    assert_eq!(j["tunWriteWouldBlock"], 4);
+    assert_eq!(j["tunWriteError"], 5);
 }
 
 #[test]
@@ -735,7 +755,7 @@ fn https_proxy_connects_with_tls_before_connect() {
             server: "127.0.0.1".into(),
             port: addr.port(),
             method: None, password: None, uuid: None, sni: None,
-            insecure: Some(true), tls: Some(true), ws_path: None, ws_host: None, flow: None,
+            insecure: Some(true), tls: Some(true), ws_path: None, ws_host: None, flow: None, udp: None,
         };
         let target = nanmen_core::config::Target {
             ip: "93.184.216.34".parse().unwrap(),
@@ -777,7 +797,7 @@ fn http_connect_keeps_early_data() {
             server: "127.0.0.1".into(),
             port: addr.port(),
             method: None, password: None, uuid: None, sni: None,
-            insecure: None, tls: Some(false), ws_path: None, ws_host: None, flow: None,
+            insecure: None, tls: Some(false), ws_path: None, ws_host: None, flow: None, udp: None,
         };
         let target = nanmen_core::config::Target {
             ip: "93.184.216.34".parse().unwrap(),

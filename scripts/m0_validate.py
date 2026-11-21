@@ -46,7 +46,7 @@ if not vm: fail("versionName not found")
 if not vc: fail("versionCode not found")
 version_name = vm.group(1) if vm else None
 version_code = vc.group(1) if vc else None
-if version_name != "2.3.8": fail(f"versionName={version_name}, expected 2.3.8")
+if version_name != "2.3.12": fail(f"versionName={version_name}, expected 2.3.12")
 
 # 2) kernel source version + kernel_version.txt
 lib = (ROOT / "core/src/lib.rs").read_text(encoding="utf-8")

@@ -31,6 +31,7 @@ class MitmViewModel(
     private val applyEnabled: suspend (Boolean) -> Unit,
     private val applyHostnames: suspend (List<String>) -> Unit,
     private val applySkip: suspend (List<String>) -> Unit,
+    private val applyApps: suspend (String, List<String>) -> Unit,
     private val exportDirFallback: () -> String = { "" },
     private val caFingerprintCheck: () -> String? = { null },
     private val systemCertCheck: (systemName: String) -> Boolean = { _ -> false },
@@ -101,6 +102,11 @@ class MitmViewModel(
         viewModelScope.launch { applySkip(list) }
     }
 
+    /** 按 App MITM：all / allow / deny + 包名列表。 */
+    fun setApps(mode: String, apps: List<String>) {
+        viewModelScope.launch { applyApps(mode, apps) }
+    }
+
     /** 生成 KernelSU/Magisk 系统信任模块（开机早期挂载、重启不丢）。 */
     fun generateTrustModule() = withExport { r ->
         val result = generateModule(r.pemPath, r.systemName)
@@ -145,6 +151,7 @@ class MitmViewModel(
                     applyEnabled = { Actions.setMitmEnabled(it) },
                     applyHostnames = { Actions.setMitmHostnames(it) },
                     applySkip = { Actions.setMitmSkip(it) },
+                    applyApps = { mode, apps -> Actions.setMitmApps(mode, apps) },
                     exportDirFallback = { MitmManager.exportDir(app).absolutePath },
                     caFingerprintCheck = { MitmManager.caFingerprint(app) },
                     systemCertCheck = { name -> MitmManager.systemCertInstalled(app, name) },

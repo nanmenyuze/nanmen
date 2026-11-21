@@ -9,14 +9,14 @@
 |---|---|---|---|---|---|
 | Shadowsocks AEAD（aes-128/256-gcm、chacha20-ietf-poly1305） | TCP | 否 | 支持 | 支持 | `core_test::ss_udp_roundtrip`、`ss_udp_replay_rejected`；TCP 由加密/分块单测覆盖 |
 | SOCKS5（无认证/用户名密码） | TCP | 否 | 支持（UDP ASSOCIATE） | 支持 | `protocol_e2e::socks5_connects_roundtrip_and_reconnects`、`socks5_udp_associate_is_separate_and_roundtrips` |
-| Trojan | TCP / WebSocket | TLS（默认开） | 不支持 | 支持 | `protocol_e2e::trojan_plain_connects_roundtrip_and_reconnects`（本地受控服务端，明文传输用于隔离握手逻辑） |
-| VLESS | TCP / WebSocket | TLS 可选 | 不支持 | 支持 | `protocol_e2e::vless_plain_connects_roundtrip_and_reconnects`；`vless_uri_without_security_defaults_to_plain` |
+| Trojan | TCP / WebSocket | TLS（默认开） | 支持（UDP ASSOCIATE） | 支持 | `protocol_e2e::trojan_plain_connects_roundtrip_and_reconnects`；`udp::udp_proto_tests::trojan_udp_roundtrip_with_local_server` |
+| VLESS | TCP / WebSocket | TLS 可选 | 支持（长度分帧） | 支持 | `protocol_e2e::vless_plain_connects_roundtrip_and_reconnects`；`udp::udp_proto_tests::vless_udp_roundtrip_with_local_server` |
 | HTTP / HTTPS CONNECT | TCP | HTTPS 时 TLS | 不支持 | 支持 | `core_test::http_connect_keeps_early_data`、`https_proxy_connects_with_tls_before_connect` |
 
 说明：
 - VLESS/Trojan 的 WebSocket 只支持标准 HTTP/1.1 Upgrade；gRPC、h2、HTTP/2 传输明确拒绝。
 - SSH、WireGuard、AnyTLS、Snell、ShadowTLS、SSR、Juicity、Mieru 等均未实现，按 `unsupported_protocol` 诊断跳过。
-- UDP 只对 SS 和 SOCKS5 声明可用；Trojan/VLESS/HTTP 的 UDP 不参与策略组，不做“TCP 探测成功即 UDP 可用”的推断。
+- UDP 对 SS、SOCKS5、Trojan、VLESS 声明可用；HTTP 仍不声明。所有节点都受节点级 `udp: false` 约束，策略组按 UDP 解析时只认节点真实能力，不做“TCP 探测成功即 UDP 可用”的推断。
 
 ## 2. 未实现协议评估
 

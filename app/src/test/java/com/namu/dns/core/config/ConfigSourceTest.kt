@@ -126,7 +126,7 @@ class ConfigSourceTest {
     }
 
     @Test
-    fun `loon rejects process and uid rules instead of guessing`() {
+    fun `loon imports process and uid rules as app rules`() {
         val text = """
             [Proxy]
             node = ss, 1.2.3.4, 8388, aes-128-gcm, pass
@@ -135,10 +135,26 @@ class ConfigSourceTest {
             UID,10001,REJECT
             DOMAIN,ad.example.com,REJECT
         """.trimIndent()
-        val preview = ConfigSourceRegistry.preview(text)
-        assertEquals(ConfigFormat.LOON, preview.format)
-        assertFalse(preview.canImport)
-        assertTrue(preview.issues.any { it.level == ConfigIssueLevel.ERROR && it.message.contains("UID") })
+        val result = ConfigSourceRegistry.parse(text)
+        // 按 App 分流已支持：包名类规则保留包名，下发内核前由壳层解析成 UID。
+        val types = result.config?.rules?.map { it.type } ?: emptyList()
+        assertTrue(types.contains("PROCESS-NAME"))
+        assertTrue(types.contains("UID"))
+        assertEquals(
+            "com.example.app",
+            result.config?.rules?.first { it.type == "PROCESS-NAME" }?.value,
+        )
+    }
+
+    @Test
+    fun `non numeric uid value is rejected instead of silently kept`() {
+        val text = """
+            [Rule]
+            UID,com.example.app,REJECT
+        """.trimIndent()
+        val result = ConfigSourceRegistry.parse(text)
+        // 包名写进 UID 字段是用户常见笔误，必须报错而不是下发一条永不命中的规则。
+        assertTrue(result.preview.issues.any { it.level == ConfigIssueLevel.ERROR && it.message.contains("必须是数字") })
     }
 
     @Test

@@ -207,20 +207,90 @@ pub async fn resolve_all(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     Ok(out)
 }
 
-/// 依次尝试前两个地址（双栈里常见首个地址不可达），总预算 8s。
-pub async fn connect_any(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
-    let mut last = io_err("没有可用地址");
-    for addr in addrs.iter().take(2) {
-        match tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(addr)).await {
-            Ok(Ok(s)) => {
-                s.set_nodelay(true).ok();
-                return Ok(s);
-            }
-            Ok(Err(e)) => last = e,
-            Err(_) => last = io_err(format!("直连超时 {}", addr)),
+/// 单地址连接：2s 超时，成功后关 Nagle（交互式代理流量不能被 Nagle 拖延迟）。
+/// 4s 对「不可达备选服务器」判死太慢：测速类 App 会串行试多个服务器，
+/// 每个白等 4s 把出数时间越拖越长；国内正常服务器 TCP 握手极少超过 1s。
+async fn connect_one(addr: SocketAddr) -> io::Result<TcpStream> {
+    match tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(addr)).await {
+        Ok(Ok(s)) => {
+            s.set_nodelay(true).ok();
+            tune_tcp(&s);
+            Ok(s)
         }
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(io_err(format!("直连超时 {}", addr))),
     }
-    Err(last)
+}
+
+/// 上游空闲多久开始 keepalive 探测（秒）。
+/// 运营商 NAT / 家用路由器的 TCP 映射通常空闲 3~5 分钟就被静默回收；
+/// Linux 默认 keepalive 要 7200s 才发第一个探测，等于没有。
+const UPSTREAM_KEEPALIVE_IDLE_SECS: libc::c_int = 60;
+/// 探测间隔（秒）与探测次数：4 次无回应即判定对端死亡，总时长 ≈ 60s + 15s×4。
+const UPSTREAM_KEEPALIVE_INTVL_SECS: libc::c_int = 15;
+const UPSTREAM_KEEPALIVE_PROBES: libc::c_int = 4;
+/// 有未确认数据时的内核级判死时间（毫秒）。默认 TCP 重传要 ~15 分钟才放弃，
+/// 手机切网后中继任务会一直挂在这条死连接上，APP 侧只能干等到超时。
+const UPSTREAM_USER_TIMEOUT_MS: libc::c_int = 120_000;
+
+unsafe fn set_sockopt_int(fd: std::os::fd::RawFd, level: libc::c_int, name: libc::c_int, value: libc::c_int) {
+    // 必须取 value 的地址：直接把整数 as *const 会变成「地址 = 60」的野指针，
+    // setsockopt 返回 EFAULT 但不会报错，选项静默不生效（编译期看不出来）。
+    libc::setsockopt(
+        fd,
+        level,
+        name,
+        &value as *const libc::c_int as *const libc::c_void,
+        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+    );
+}
+
+/// 给所有上游 TCP 打开保活和判死超时。TUN 侧到 APP 是本机回环，没有 NAT；
+/// 真正会被运营商静默掐掉的是「手机 -> 节点/目标站」这一段，必须在这里收紧。
+/// 失败只忽略（不同内核个别选项可能不可用），不影响连接本身。
+pub fn tune_tcp(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    unsafe {
+        set_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
+        set_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, UPSTREAM_KEEPALIVE_IDLE_SECS);
+        set_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, UPSTREAM_KEEPALIVE_INTVL_SECS);
+        set_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, UPSTREAM_KEEPALIVE_PROBES);
+        set_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, UPSTREAM_USER_TIMEOUT_MS);
+    }
+}
+
+/// 双地址并发竞速（happy-eyeballs 的简化版）：两边同时发起，先成功者胜出。
+/// 串行等首个地址会让「双栈首个地址不可达」白等整个超时，慢启动正是这么来的。
+async fn race_two(a: SocketAddr, b: SocketAddr) -> io::Result<TcpStream> {
+    let mut fa = Box::pin(connect_one(a));
+    let mut fb = Box::pin(connect_one(b));
+    tokio::select! {
+        r = fa.as_mut() => match r {
+            Ok(s) => Ok(s),
+            // 先返回失败不代表另一个也失败：另一个一直在并发跑，等它出结果。
+            Err(e1) => fb.await.map_err(|_| e1),
+        },
+        r = fb.as_mut() => match r {
+            Ok(s) => Ok(s),
+            Err(e2) => fa.await.map_err(|_| e2),
+        },
+    }
+}
+
+pub async fn connect_any(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
+    // v4 优先（stable sort，同族内保持原顺序）：竞速名额只有两个，
+    // 若按 getaddrinfo 原序取前两个，可能全是不可达 v6（含污染结果），
+    // 可用 v4 被挤在名额外，只能白等超时后失败。
+    let mut ordered: Vec<SocketAddr> = addrs.to_vec();
+    ordered.sort_by_key(|a| a.is_ipv6());
+    let cands: Vec<SocketAddr> = ordered.iter().take(2).copied().collect();
+    match cands.as_slice() {
+        [] => Err(io_err("没有可用地址")),
+        [one] => connect_one(*one).await,
+        [a, b] => race_two(*a, *b).await,
+        _ => unreachable!("take(2) 保证最多两个候选地址"),
+    }
 }
 
 pub fn is_fake_ip(ip: IpAddr) -> bool {
@@ -567,5 +637,66 @@ pub fn display_target(t: &Target) -> String {
     match &t.domain {
         Some(d) => format!("{}:{}", d, t.port),
         None => format!("{}:{}", t.ip, t.port),
+    }
+}
+
+#[cfg(test)]
+mod keepalive_tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+
+    unsafe fn get_sockopt_int(fd: std::os::fd::RawFd, level: libc::c_int, name: libc::c_int) -> libc::c_int {
+        let mut v: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let rc = libc::getsockopt(
+            fd,
+            level,
+            name,
+            &mut v as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        );
+        assert_eq!(rc, 0, "getsockopt {} 失败", name);
+        v
+    }
+
+    #[tokio::test]
+    async fn tune_tcp_options_are_actually_applied() {
+        // 只断言常量不够：setsockopt 的指针参数写错会静默失败，
+        // 必须用 getsockopt 回读，确认内核真的收下了。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        tune_tcp(&client);
+        let fd = client.as_raw_fd();
+        unsafe {
+            assert_eq!(get_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE), 1);
+            assert_eq!(
+                get_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE),
+                UPSTREAM_KEEPALIVE_IDLE_SECS
+            );
+            assert_eq!(
+                get_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL),
+                UPSTREAM_KEEPALIVE_INTVL_SECS
+            );
+            assert_eq!(
+                get_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT),
+                UPSTREAM_KEEPALIVE_PROBES
+            );
+            assert_eq!(
+                get_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT),
+                UPSTREAM_USER_TIMEOUT_MS
+            );
+        }
+        drop(listener);
+    }
+
+    #[test]
+    fn upstream_keepalive_beats_nat_expiry() {
+        // 运营商 NAT 空闲映射 3~5 分钟就没了：探测必须明显早于它。
+        assert!(UPSTREAM_KEEPALIVE_IDLE_SECS <= 60);
+        assert!(UPSTREAM_KEEPALIVE_INTVL_SECS <= 30);
+        assert!(UPSTREAM_KEEPALIVE_PROBES >= 3);
+        // 判死不能拖回默认 TCP 的 15 分钟：手机切网后中继必须尽快释放。
+        assert!(UPSTREAM_USER_TIMEOUT_MS <= 180_000);
     }
 }

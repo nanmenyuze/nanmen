@@ -2,6 +2,8 @@ package com.namu.dns.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import android.content.Intent
+import android.content.pm.PackageManager
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,6 +22,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -28,6 +31,7 @@ import androidx.compose.animation.core.spring
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -310,8 +314,21 @@ internal fun ruleValueError(type: String, raw: String): String? {
         }
         "IP-CIDR" -> if (validCidrValue(v, ipv6 = false)) null else "请输入合法 IPv4 CIDR（前缀 0–32）"
         "IP-CIDR6" -> if (validCidrValue(v, ipv6 = true)) null else "请输入合法 IPv6 CIDR（前缀 0–128）"
+        "APP", "PROCESS-NAME", "APP-NAME" -> if (validPackageName(v)) null else "请输入应用包名，如 com.bilibili.app"
+        "UID" -> if (v.toIntOrNull() != null) null else "UID 必须是数字"
         else -> null
     }
+}
+
+/** 包名校验：允许子进程后缀（com.example.app:push）。 */
+internal fun validPackageName(raw: String): Boolean {
+    val v = raw.trim().substringBefore(':')
+    if (v.isEmpty() || v.length > 255) return false
+    // 每段至少一个字符，且只允许字母/数字/下划线；首段不能以数字开头（Android 包名规则）。
+    val parts = v.split('.')
+    if (parts.size < 2) return false
+    if (parts.first()[0].isDigit()) return false
+    return parts.all { p -> p.isNotEmpty() && p.all { it.isLetterOrDigit() || it == '_' } }
 }
 
 private fun validCidrValue(value: String, ipv6: Boolean): Boolean {
@@ -604,6 +621,7 @@ fun AddRuleDialog(groups: List<String> = emptyList(), onDismiss: () -> Unit, onA
         "IP-CIDR" to "IPv4 段",
         "IP-CIDR6" to "IPv6 段",
         "PORT" to "端口",
+        "APP" to "按应用",
     )
     val actions = listOf("proxy" to "代理", "direct" to "直连", "block" to "拦截")
     val inputError = if (value.isBlank()) null else ruleValueError(type, value)
@@ -623,6 +641,8 @@ fun AddRuleDialog(groups: List<String> = emptyList(), onDismiss: () -> Unit, onA
                 "PORT" -> "443、8443 或 1-65535"
                 "IP-CIDR" -> "1.2.3.0/24"
                 "IP-CIDR6" -> "2001:db8::/32"
+                "APP", "PROCESS-NAME", "APP-NAME" -> "com.bilibili.app"
+                "UID" -> "10100"
                 else -> "example.com 或 1.2.3.0/24"
             },
             singleLine = true,
@@ -648,6 +668,8 @@ fun AddRuleDialog(groups: List<String> = emptyList(), onDismiss: () -> Unit, onA
                 "PORT" -> "匹配目标端口，范围 1–65535"
                 "IP-CIDR" -> "匹配 IPv4 CIDR；前缀范围 0–32"
                 "IP-CIDR6" -> "匹配 IPv6 CIDR；前缀范围 0–128"
+                "APP", "PROCESS-NAME", "APP-NAME" -> "只对填写的应用生效，其他应用不受影响；识别归属需要 Root"
+                "UID" -> "按 Android UID 匹配；需要 Root 才能识别连接归属"
                 else -> "按 IP 段匹配"
             },
             fontSize = 11.sp,
@@ -1407,5 +1429,132 @@ private fun formatAbsoluteTime(ts: Long): String {
         fmt.format(java.util.Date(ts))
     } catch (_: Exception) {
         "-"
+    }
+}
+
+/** 可启动应用项：按 App MITM 选择器的数据源。 */
+data class AppEntry(val pkg: String, val label: String)
+
+/**
+ * 只查 launcher intent（Manifest 里声明了对应 `<queries>`），不申请 QUERY_ALL_PACKAGES。
+ * 返回按名称排序、同包名去重的结果；单个应用取标签失败不影响整个列表。
+ */
+private fun loadLaunchableApps(ctx: android.content.Context): List<AppEntry> {
+    val pm = ctx.packageManager
+    val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+    val resolved = runCatching { pm.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY) }
+        .getOrDefault(emptyList())
+    return resolved.mapNotNull { info ->
+        val pkg = info.activityInfo?.packageName ?: return@mapNotNull null
+        val label = runCatching { info.loadLabel(pm).toString() }.getOrDefault(pkg)
+        AppEntry(pkg, label)
+    }.distinctBy { it.pkg }.sortedBy { it.label.lowercase() }
+}
+
+@Composable
+fun AppScopeDialog(
+    mode: String,
+    apps: List<String>,
+    onDismiss: () -> Unit,
+    onApply: (String, List<String>) -> Unit,
+) {
+    val ctx = LocalContext.current
+    var localMode by remember { mutableStateOf(if (mode == "allow" || mode == "deny") mode else "all") }
+    val selected = remember { mutableStateListOf<String>().apply { addAll(apps) } }
+    var query by remember { mutableStateOf("") }
+    var entries by remember { mutableStateOf<List<AppEntry>>(emptyList()) }
+    LaunchedEffect(Unit) {
+        entries = withContext(Dispatchers.IO) { loadLaunchableApps(ctx) }
+    }
+    val filtered = remember(entries, query, selected.size) {
+        val q = query.trim().lowercase()
+        val base = if (q.isEmpty()) entries else entries.filter {
+            it.label.lowercase().contains(q) || it.pkg.lowercase().contains(q)
+        }
+        base
+    }
+    NamuDialog(
+        title = "按 App MITM",
+        message = "只解密指定应用，或把银行/支付等证书固定应用排除在外；范围之外的连接保持原样直通",
+        confirmText = "保存",
+        onConfirm = {
+            if (localMode == "all") onApply("all", emptyList())
+            else onApply(localMode, selected.toList())
+            onDismiss()
+        },
+        onDismiss = onDismiss,
+    ) {
+        Column(Modifier.fillMaxWidth()) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                ChoiceChip("全部应用", localMode == "all", Modifier.weight(1f)) { localMode = "all" }
+                ChoiceChip("仅选中", localMode == "allow", Modifier.weight(1f)) { localMode = "allow" }
+                ChoiceChip("跳过选中", localMode == "deny", Modifier.weight(1f)) { localMode = "deny" }
+            }
+            if (localMode != "all") {
+                Spacer(Modifier.height(8.dp))
+                NamuTextField(
+                    value = query,
+                    onChange = { query = it },
+                    placeholder = "搜索应用名或包名",
+                    singleLine = true,
+                )
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    "已选 ${selected.size} 个${if (entries.isEmpty()) " · 读取中…" else ""}",
+                    fontSize = 12.sp,
+                    color = NamuColors.TextSub,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 210.dp)
+                        .verticalScroll(rememberScrollState()),
+                ) {
+                    filtered.forEach { e ->
+                        val checked = selected.contains(e.pkg)
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    if (checked) selected.remove(e.pkg) else selected.add(e.pkg)
+                                }
+                                .padding(vertical = 3.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Checkbox(
+                                checked = checked,
+                                onCheckedChange = { on ->
+                                    if (on) { if (!selected.contains(e.pkg)) selected.add(e.pkg) }
+                                    else selected.remove(e.pkg)
+                                },
+                            )
+                            Column(Modifier.weight(1f)) {
+                                Text(e.label, fontSize = 13.sp, color = NamuColors.TextMain, maxLines = 1)
+                                Text(
+                                    e.pkg,
+                                    fontSize = 10.sp,
+                                    color = NamuColors.TextTertiary,
+                                    maxLines = 1,
+                                )
+                            }
+                        }
+                    }
+                    if (filtered.isEmpty()) {
+                        Text(
+                            if (entries.isEmpty()) "正在读取应用列表" else "没有匹配的应用",
+                            fontSize = 12.sp,
+                            color = NamuColors.TextSub,
+                            modifier = Modifier.padding(vertical = 10.dp),
+                        )
+                    }
+                }
+                Text(
+                    "仅列表内应用生效；未列出通常是系统未开放可见性，可换成 root 授权访问",
+                    fontSize = 11.sp,
+                    color = NamuColors.TextTertiary,
+                )
+            }
+        }
     }
 }

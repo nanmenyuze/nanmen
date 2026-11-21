@@ -89,6 +89,8 @@ fn test_ctx(state: Arc<MitmState>, stats: Arc<nanmen_core::stats::Stats>) -> Arc
         health: Arc::new(nanmen_core::strategy::HealthRegistry::new()),
         decision: Arc::new(RwLock::new(())),
         mitm: Arc::new(RwLock::new(state)),
+        uid_map: Arc::new(RwLock::new(nanmen_core::uidmap::UidMap::default())),
+        conns: Arc::new(RwLock::new(nanmen_core::conns::ConnTable::new())),
     })
 }
 

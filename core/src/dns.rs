@@ -353,7 +353,7 @@ pub struct DnsEngine {
     serve_expired: bool,
     race: bool,
     rebind_protection: bool,
-    inflight: Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Option<(Vec<u8>, bool)>>>>>,
+    inflight: Mutex<HashMap<String, Arc<tokio::sync::OnceCell<Option<(Vec<u8>, &'static str)>>>>>,
     breaker: Mutex<Breaker>,
     /// 本地拦截应答缓存：TTL 内跳过规则查询/报文构造；换规则时清空。
     blocked_cache: Mutex<HashMap<String, (Vec<u8>, Instant)>>,
@@ -758,7 +758,7 @@ impl DnsEngine {
         let (cell, leader) = {
             let mut map = self.inflight.lock().unwrap_or_else(|p| p.into_inner());
             let existed = map.contains_key(&key);
-            let cell: Arc<tokio::sync::OnceCell<Option<(Vec<u8>, bool)>>> = map
+            let cell: Arc<tokio::sync::OnceCell<Option<(Vec<u8>, &'static str)>>> = map
                 .entry(key.clone())
                 .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
                 .clone();
@@ -767,6 +767,8 @@ impl DnsEngine {
         let qname2 = qname.clone();
         let key2 = key.clone();
         let key3 = key.clone();
+        // 日志标签要同时给闭包和外层用：闭包是 move 的，必须各持一份。
+        let qtype_label_inner = qtype_label.clone();
         let engine = self.clone();
         let req2 = req.clone();
         let resp = cell
@@ -779,10 +781,29 @@ impl DnsEngine {
                         if engine.rebind_protection && is_rebind(&r, &qname2, &filter) {
                             engine.stats.dns_rebind.fetch_add(1, Ordering::Relaxed);
                             logging::warn("dns", format!("rebind 防护拦截 {}", qname2));
-                            Some((engine.blocked_response(&req2, qtype), true))
+                            Some((engine.blocked_response(&req2, qtype), "rebind"))
+                        } else if let Some(target) = blocked_cname_target(&r, &filter, qtype) {
+                            // CNAME 伪装：查询名是第一方正常域名，广告域名藏在应答链里。
+                            // 只查 qname 会整条放过去，这里对链上目标再过一遍规则。
+                            engine.stats.dns_cname_blocked.fetch_add(1, Ordering::Relaxed);
+                            engine.stats.dns_blocked.fetch_add(1, Ordering::Relaxed);
+                            logging::info(
+                                "dns",
+                                format!("CNAME 伪装拦截 {} -> {}", qname2, target),
+                            );
+                            if engine.query_log {
+                                dns_log::add(
+                                    &qname2,
+                                    &qtype_label_inner,
+                                    "拦截",
+                                    "CNAME 伪装",
+                                    t0.elapsed().as_millis() as u64,
+                                );
+                            }
+                            Some((engine.blocked_response(&req2, qtype), "cname"))
                         } else {
                             engine.cache_and_reverse(&key3, &qname2, &r);
-                            Some((r, false))
+                            Some((r, ""))
                         }
                     }
                     None => None,
@@ -797,10 +818,10 @@ impl DnsEngine {
         if !leader {
             self.stats.dns_coalesced.fetch_add(1, Ordering::Relaxed);
         }
-        let rebind_blocked: bool;
+        let block_reason: &'static str;
         let mut resp = match resp {
-            Some((r, rebind)) => {
-                rebind_blocked = rebind;
+            Some((r, why)) => {
+                block_reason = why;
                 r
             }
             None => {
@@ -812,8 +833,11 @@ impl DnsEngine {
             }
         };
         if self.query_log {
-            if rebind_blocked {
-                dns_log::add(&qname, &qtype_label, "拦截", "rebind 防护", started.elapsed().as_millis() as u64);
+            if !block_reason.is_empty() {
+                // CNAME 拦截在上游回调里已经写过日志，这里只补 rebind 的。
+                if block_reason == "rebind" {
+                    dns_log::add(&qname, &qtype_label, "拦截", "rebind 防护", started.elapsed().as_millis() as u64);
+                }
             } else {
                 dns_log::add(
                     &qname,
@@ -847,6 +871,7 @@ impl DnsEngine {
         let req2 = req.clone();
         let key2 = key.to_string();
         let qname2 = qname.to_string();
+        let qt = req.query().map(|q| q.query_type()).unwrap_or(RecordType::A);
         tokio::spawn(async move {
             let bytes = fwd.to_vec().unwrap_or_default();
             let resp = engine.query_upstream(&bytes, &req2).await;
@@ -856,6 +881,11 @@ impl DnsEngine {
                     // 后台刷新也必须过同一套 rebind 检查，否则坏应答会绕过防护进缓存。
                     engine.stats.dns_rebind.fetch_add(1, Ordering::Relaxed);
                     logging::warn("dns", format!("rebind 防护拦截(刷新) {}", qname2));
+                } else if let Some(target) = blocked_cname_target(&r, &filter, qt) {
+                    // 刷新路径同样要查 CNAME，否则坏应答会先进缓存、绕过首次查询的检查。
+                    engine.stats.dns_cname_blocked.fetch_add(1, Ordering::Relaxed);
+                    engine.stats.dns_blocked.fetch_add(1, Ordering::Relaxed);
+                    logging::info("dns", format!("CNAME 伪装拦截(刷新) {} -> {}", qname2, target));
                 } else {
                     engine.cache_and_reverse(&key2, &qname2, &r);
                 }
@@ -1108,6 +1138,9 @@ impl DnsEngine {
         let addr = resolve_host(host, port, &self.bootstrap).await?;
         let tcp = TcpStream::connect(addr).await.ok()?;
         tcp.set_nodelay(true).ok();
+        // DoT 连接池里的空闲连接同样会被 NAT 清掉：统一开保活，别等 2 小时默认探测。
+        crate::outbound::tune_tcp(&tcp);
+
         let connector = tokio_rustls::TlsConnector::from(TLS_CONFIG.clone());
         let server_name = rustls::pki_types::ServerName::try_from(host.to_string()).ok()?;
         connector.connect(server_name, tcp).await.ok()
@@ -1307,6 +1340,31 @@ pub fn fit_udp_response(req: &[u8], resp: Vec<u8>) -> Vec<u8> {
 
 /// DNS rebind 防护（dnsmasq stop-dns-rebind / AdGuard 同款）：
 /// 公网域名解析出私网/环回/链路本地等保留地址视为投毒，白名单域豁免。
+/// 检查上游应答的 CNAME 链目标是否命中拦截规则。
+///
+/// 广告主常用「第一方域名 CNAME 到广告域名」的伪装：查询名本身正常，
+/// 只查 qname 会整条放过去。这里对链上每个 CNAME 目标再过一遍规则。
+///
+/// 只对 A/AAAA 查询生效：其他类型（MX/TXT/SRV）没有「连接目标」语义，
+/// 拦截它们只会造成误伤。
+fn blocked_cname_target(bytes: &[u8], filter: &FilterEngine, qtype: RecordType) -> Option<String> {
+    if qtype != RecordType::A && qtype != RecordType::AAAA {
+        return None;
+    }
+    let msg = Message::from_vec(bytes).ok()?;
+    for ans in msg.answers() {
+        let Some(RData::CNAME(c)) = ans.data() else { continue };
+        let target = c.0.to_utf8().trim_end_matches('.').to_ascii_lowercase();
+        if target.is_empty() {
+            continue;
+        }
+        if filter.is_blocked(&target) {
+            return Some(target);
+        }
+    }
+    None
+}
+
 fn is_rebind(bytes: &[u8], qname: &str, filter: &FilterEngine) -> bool {
     if filter.is_allowed(qname) {
         return false;
@@ -1641,6 +1699,9 @@ async fn tcp_query(addr: SocketAddr, req: &[u8], orig: &Message) -> Option<Vec<u
     tokio::time::timeout(Duration::from_secs(8), async {
         let mut tcp = TcpStream::connect(addr).await.ok()?;
         tcp.set_nodelay(true).ok();
+        // DoT 连接池里的空闲连接同样会被 NAT 清掉：统一开保活，别等 2 小时默认探测。
+        crate::outbound::tune_tcp(&tcp);
+
         let mut out = Vec::with_capacity(req.len() + 2);
         out.extend_from_slice(&(req.len() as u16).to_be_bytes());
         out.extend_from_slice(req);
@@ -1718,6 +1779,46 @@ mod tests {
         assert!(msg.truncated());
         assert!(msg.answers().is_empty());
         assert_eq!(msg.id(), 3);
+    }
+
+    #[test]
+    fn cname_chain_target_is_blocked() {
+        let mut filter = FilterEngine::new();
+        filter.add_line("||adserver.example^");
+        let mut resp = Message::new();
+        resp.set_message_type(MessageType::Response);
+        resp.add_answer(Record::from_rdata(
+            Name::from_utf8("first-party.example").unwrap(),
+            60,
+            RData::CNAME(hickory_proto::rr::rdata::CNAME(
+                Name::from_utf8("adserver.example").unwrap(),
+            )),
+        ));
+        let bytes = resp.to_vec().unwrap();
+        assert_eq!(
+            blocked_cname_target(&bytes, &filter, RecordType::A).as_deref(),
+            Some("adserver.example"),
+            "查询名正常、CNAME 目标命中规则时必须拦截"
+        );
+        // 非 A/AAAA 查询没有连接目标语义，不检查 CNAME，避免误伤 MX/TXT。
+        assert!(blocked_cname_target(&bytes, &filter, RecordType::MX).is_none());
+    }
+
+    #[test]
+    fn cname_to_clean_target_is_not_blocked() {
+        let mut filter = FilterEngine::new();
+        filter.add_line("||adserver.example^");
+        let mut resp = Message::new();
+        resp.set_message_type(MessageType::Response);
+        resp.add_answer(Record::from_rdata(
+            Name::from_utf8("www.example.com").unwrap(),
+            60,
+            RData::CNAME(hickory_proto::rr::rdata::CNAME(
+                Name::from_utf8("cdn.example.net").unwrap(),
+            )),
+        ));
+        let bytes = resp.to_vec().unwrap();
+        assert!(blocked_cname_target(&bytes, &filter, RecordType::A).is_none());
     }
 
     #[test]

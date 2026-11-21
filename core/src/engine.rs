@@ -319,6 +319,73 @@ impl FilterEngine {
         self.allow.contains(&normalize_domain(domain))
     }
 
+    /// 把分流规则里的 REJECT 域名规则并入 DNS 过滤。
+    ///
+    /// 为什么必须并入：DNS-only 模式下连接层对所有非 DNS 连接直接直连，
+    /// route 层永远不会有 REJECT 的机会——用户在配置里写的 `DOMAIN,...,REJECT`
+    /// 会「导入成功但实际不拦截」。只有放进 DNS 过滤，拦截才真正生效。
+    ///
+    /// 优先级用 `important`：手写的 REJECT 是明确指令，应该压过订阅广告源里
+    /// 的 `@@` 例外，否则会出现「规则明明写了却拦不住」的困惑。
+    pub fn add_route_block(&mut self, kind: &str, value: &str) -> bool {
+        let k = kind.trim().to_ascii_uppercase();
+        let v = value.trim();
+        match k.as_str() {
+            "DOMAIN" => {
+                let d = normalize_domain(v);
+                if valid_host(&d) {
+                    self.important.insert_exact(&d);
+                    self.lines += 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            "DOMAIN-SUFFIX" => {
+                let d = v.trim_start_matches('.').to_ascii_lowercase();
+                if valid_host(&d) {
+                    self.important.insert_suffix(&d);
+                    self.lines += 1;
+                    true
+                } else {
+                    false
+                }
+            }
+            "DOMAIN-KEYWORD" => {
+                let kw = v.to_ascii_lowercase();
+                if kw.is_empty() {
+                    false
+                } else {
+                    self.keywords.push(kw);
+                    // OnceCell 可能已在之前的判定里初始化，重置它让新关键词进入自动机。
+                    self.keywords_ac = once_cell::sync::OnceCell::new();
+                    self.lines += 1;
+                    true
+                }
+            }
+            "DOMAIN-REGEX" => match Regex::new(v) {
+                Ok(re) => {
+                    self.regexes.push(re);
+                    self.lines += 1;
+                    true
+                }
+                Err(e) => {
+                    logging::warn("filter", format!("分流 REJECT 正则无效已跳过 {}: {}", v, e));
+                    false
+                }
+            },
+            "DOMAIN-WILDCARD" => match wildcard_regex(v) {
+                Ok(re) => {
+                    self.regexes.push(re);
+                    self.lines += 1;
+                    true
+                }
+                Err(_) => false,
+            },
+            _ => false,
+        }
+    }
+
     fn add_allow(&mut self, rest: &str) {
         let rest = rest.trim().trim_start_matches("@@");
         let host = if let Some(r) = rest.strip_prefix("||") {
@@ -484,7 +551,21 @@ enum RuleKind {
     Port(u16),
     /// PROTOCOL：按连接类型匹配（TCP/UDP）。
     Protocol(ConnKind),
+    /// UID：按 Android 应用 UID 匹配。包名/进程名规则由壳层先解析成 UID 再下发，
+    /// 内核不持有包名表——包名到 UID 的映射随应用安装/卸载变化，属于壳层职责。
+    Uid(u32),
     Final,
+}
+
+/// 一条连接进入规则匹配时需要知道的全部信息。
+/// `uid` 为 None 表示「归属未知」（没有 root、或表里还没这个 socket），
+/// 此时 UID 规则一律不命中，绝不退化成匹配 UID 0。
+pub struct MatchInput<'a> {
+    pub domain: Option<&'a str>,
+    pub ip: IpAddr,
+    pub port: u16,
+    pub kind: ConnKind,
+    pub uid: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -508,6 +589,8 @@ pub struct RuleEngine {
     cn_domains: DomainSet,
     cn_ips: Vec<(u32, u32)>,
     pub rule_count: usize,
+    /// 配置里是否存在 UID 规则。用于「没 root 时提醒规则不生效」的统计与界面提示。
+    has_uid: bool,
 }
 
 impl RuleEngine {
@@ -524,6 +607,9 @@ impl RuleEngine {
             .map(|n| n.name.trim().to_string())
             .filter(|n| !n.is_empty())
             .collect();
+        // 纯过滤模式：全量 TUN、不使用任何节点。代理类动作全部降级为直连，
+        // 否则 final=proxy 或引用了不存在节点的规则会命中「无节点兜底拦截」直接断网。
+        let filter_only = cfg.mode.eq_ignore_ascii_case("filter_only");
         let mut rules = Vec::new();
         for rc in &cfg.rules {
             // 规则值在加载期归一化（小写/去前导点），判定热路径不再重复分配。
@@ -565,12 +651,20 @@ impl RuleEngine {
                     }
                 },
                 "FINAL" | "MATCH" => RuleKind::Final,
-                // 这些规则依赖 Android 进程/UID 数据源；未实现前明确拒绝，不能静默当成不匹配。
-                "PROCESS-NAME" | "PROCESS-PATH" | "UID" | "APP" | "APP-NAME" => {
+                // 这些规则依赖 Android 进程/UID 数据源。UID 数值规则可直接用；
+                // 包名类规则由壳层解析成 UID 后再下发，内核侧不再重复实现一套包名表。
+                "UID" => match rc.value.trim().parse::<u32>() {
+                    Ok(u) => RuleKind::Uid(u),
+                    Err(_) => {
+                        logging::warn("rule", format!("拒绝 UID 规则值 {}：不是合法整数", rc.value));
+                        continue;
+                    }
+                },
+                "PROCESS-NAME" | "PROCESS-PATH" | "APP" | "APP-NAME" => {
                     logging::warn(
                         "rule",
                         format!(
-                            "拒绝 {} 规则 {}：当前内核没有可靠的 Android UID/进程名数据源",
+                            "拒绝 {} 规则 {}：包名类规则需先由壳层解析成 UID 规则",
                             rc.kind, rc.value
                         ),
                     );
@@ -588,14 +682,17 @@ impl RuleEngine {
                 RuleKind::Protocol(_) => rc.value.trim().to_ascii_uppercase(),
                 _ => rc.value.clone(),
             };
+            let action = classify_action(&rc.action, &group_names, &node_names);
+            let action = if filter_only { proxy_to_direct(action) } else { action };
             rules.push(RouteRule {
                 kind,
                 value,
-                action: classify_action(&rc.action, &group_names, &node_names),
+                action,
                 source: rc.source.clone(),
             });
         }
         let final_action = classify_action(&cfg.final_policy, &group_names, &node_names);
+        let final_action = if filter_only { proxy_to_direct(final_action) } else { final_action };
         if !rules.iter().any(|r| matches!(r.kind, RuleKind::Final)) {
             rules.push(RouteRule {
                 kind: RuleKind::Final,
@@ -633,6 +730,7 @@ impl RuleEngine {
             .unwrap_or_default();
 
         let rule_count = rules.len() + cn_domains.len();
+        let has_uid = rules.iter().any(|r| matches!(r.kind, RuleKind::Uid(_)));
         Self {
             rules,
             final_action,
@@ -640,7 +738,13 @@ impl RuleEngine {
             cn_domains,
             cn_ips,
             rule_count,
+            has_uid,
         }
+    }
+
+    /// 配置是否引用了 UID 规则（决定是否需要 UID 表、以及无 root 时是否提示）。
+    pub fn has_uid_rules(&self) -> bool {
+        self.has_uid
     }
 
     pub fn decide(&self, domain: Option<&str>, ip: IpAddr, port: u16, kind: ConnKind) -> Action {
@@ -648,8 +752,20 @@ impl RuleEngine {
     }
 
     /// 与 decide 同一套逻辑，另返回命中说明（供「测试规则」展示，保证单一事实来源）。
-    pub fn decide_detail(&self, domain: Option<&str>, ip: IpAddr, _port: u16, _kind: ConnKind) -> (Action, String) {
-        let dom = domain.map(normalize_domain);
+    pub fn decide_detail(&self, domain: Option<&str>, ip: IpAddr, port: u16, kind: ConnKind) -> (Action, String) {
+        // 没有 UID 数据源的调用方（测试规则、UDP 早期路径）按「归属未知」处理。
+        self.decide_input(&MatchInput {
+            domain,
+            ip,
+            port,
+            kind,
+            uid: None,
+        })
+    }
+
+    /// 带 App 归属的连接判定。UID 规则只在 `input.uid` 有值时才参与匹配。
+    pub fn decide_input(&self, input: &MatchInput<'_>) -> (Action, String) {
+        let dom = input.domain.map(normalize_domain);
         // 顺序：自定义规则 -> 国内直连 -> 最终策略。FINAL 不能提前命中。
         for (idx, r) in self.rules.iter().enumerate() {
             if matches!(r.kind, RuleKind::Final) {
@@ -675,14 +791,16 @@ impl RuleEngine {
                 RuleKind::DomainRegex(re) => dom.as_ref().map(|d| re.is_match(d)).unwrap_or(false),
                 RuleKind::DomainWildcard(re) => dom.as_ref().map(|d| re.is_match(d)).unwrap_or(false),
                 RuleKind::GeoIp(code) => {
-                    code == "CN" && match ip {
+                    code == "CN" && match input.ip {
                         IpAddr::V4(v4) => self.cn_ip_contains(v4),
                         IpAddr::V6(_) => false,
                     }
                 }
-                RuleKind::IpCidr(net) => net.contains(&ip),
-                RuleKind::Port(p) => _port == *p,
-                RuleKind::Protocol(k) => _kind == *k,
+                RuleKind::IpCidr(net) => net.contains(&input.ip),
+                RuleKind::Port(p) => input.port == *p,
+                RuleKind::Protocol(k) => input.kind == *k,
+                // 归属未知时 UID 规则不命中：不能把 None 当成 0（0 是 root）去比。
+                RuleKind::Uid(u) => input.uid.map(|v| v == *u).unwrap_or(false),
                 RuleKind::Final => false,
             };
             if matched {
@@ -712,9 +830,9 @@ impl RuleEngine {
                     return (Action::Direct, format!("国内直连：域名 {} 命中 CN 域名库", d));
                 }
             }
-            if let IpAddr::V4(v4) = ip {
+            if let IpAddr::V4(v4) = input.ip {
                 if self.cn_ip_contains(v4) {
-                    return (Action::Direct, format!("国内直连：IP {} 命中 CN IP 库", ip));
+                    return (Action::Direct, format!("国内直连：IP {} 命中 CN IP 库", input.ip));
                 }
             }
         }
@@ -772,6 +890,7 @@ fn kind_name(kind: &RuleKind) -> &'static str {
         RuleKind::IpCidr(_) => "IP-CIDR",
         RuleKind::Port(_) => "PORT",
         RuleKind::Protocol(_) => "PROTOCOL",
+        RuleKind::Uid(_) => "UID",
         RuleKind::Final => "FINAL",
     }
 }
@@ -828,8 +947,39 @@ pub(crate) fn load_cn_ips(path: &str) -> Vec<(u32, u32)> {
     merged
 }
 
+/// 规则动作是否是「拦截」。只认字面值：`block` / `reject` / `reject-drop`。
+/// 组名间接指向拦截的情况不在这里展开——build_filter 拿不到节点/组表，
+/// 那种规则仍会在连接层生效（仅 rule/global 全量 TUN 模式）。
+/// 纯过滤模式的动作降级：没有节点时，任何"走代理"的意图都落空，
+/// 与其让它命中无节点兜底拦截（用户会以为 App 坏了），不如直连。
+fn proxy_to_direct(a: Action) -> Action {
+    match a {
+        Action::Proxy | Action::Node(_) | Action::Group(_) | Action::Missing(_) => Action::Direct,
+        other => other,
+    }
+}
+
+fn action_is_block(action: &str) -> bool {
+    let a = action.trim();
+    a.eq_ignore_ascii_case("block")
+        || a.eq_ignore_ascii_case("reject")
+        || a.eq_ignore_ascii_case("reject-drop")
+}
+
 pub fn build_filter(cfg: &Config) -> FilterEngine {
     let mut filter = FilterEngine::new();
+    // 分流里的 REJECT 域名规则先并入 DNS 过滤，且**不受 block_enabled 影响**：
+    // 它是分流语义（用户明确要求拦截），不是广告过滤。DNS-only 模式下连接层
+    // 对所有非 DNS 连接直接直连，route 层没有机会拦截，只有 DNS 层能兜住。
+    let mut route_blocked = 0usize;
+    for rc in &cfg.rules {
+        if action_is_block(&rc.action) && filter.add_route_block(&rc.kind, &rc.value) {
+            route_blocked += 1;
+        }
+    }
+    if route_blocked > 0 {
+        logging::info("filter", format!("分流 REJECT 已并入 DNS 拦截 {} 条", route_blocked));
+    }
     if !cfg.block_enabled {
         return filter;
     }
@@ -908,5 +1058,201 @@ mod tests {
         assert!(!f.is_blocked("allowed.example.org"));
         assert!(!f.is_blocked("a.allowed.example.org"));
         assert!(!f.is_blocked("allowed.example.net"));
+    }
+
+    fn uid_cfg() -> Config {
+        let mut cfg = Config::default();
+        // 场景：只对 B 站（uid 10100）拦 ads.bilibili.com，微信（uid 10200）照常走。
+        cfg.rules = vec![
+            crate::config::RuleConf {
+                kind: "UID".into(),
+                value: "10100".into(),
+                action: "BLOCK".into(),
+                source: None,
+            },
+            crate::config::RuleConf {
+                kind: "DOMAIN-SUFFIX".into(),
+                value: "ads.bilibili.com".into(),
+                action: "BLOCK".into(),
+                source: None,
+            },
+        ];
+        cfg
+    }
+
+    #[test]
+    fn uid_rule_participates_in_matching() {
+        let cfg = uid_cfg();
+        let engine = RuleEngine::from_config(&cfg);
+        assert!(engine.has_uid_rules());
+        assert_eq!(engine.rule_count, 3, "两条配置规则 + 自动补的 FINAL，UID 规则不能被丢弃");
+    }
+
+    #[test]
+    fn uid_rule_only_hits_the_named_app() {
+        let cfg = uid_cfg();
+        let engine = RuleEngine::from_config(&cfg);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        // B 站命中 BLOCK
+        let (a, why) = engine.decide_input(&MatchInput {
+            domain: Some("www.bilibili.com"),
+            ip,
+            port: 443,
+            kind: ConnKind::Tcp,
+            uid: Some(10100),
+        });
+        assert!(matches!(a, Action::Block), "uid 10100 应命中 BLOCK，实际 {:?}", a);
+        assert!(why.contains("UID"), "命中说明应标明来源规则：{}", why);
+        // 微信同域名不受影响
+        let (a2, _) = engine.decide_input(&MatchInput {
+            domain: Some("www.bilibili.com"),
+            ip,
+            port: 443,
+            kind: ConnKind::Tcp,
+            uid: Some(10200),
+        });
+        assert!(!matches!(a2, Action::Block), "uid 10200 不应被 B 站规则影响，实际 {:?}", a2);
+    }
+
+    #[test]
+    fn uid_rule_does_not_match_when_uid_unknown() {
+        let cfg = uid_cfg();
+        let engine = RuleEngine::from_config(&cfg);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        // 归属未知（无 root / 表里没这条）时不能命中，更不能退化成 uid 0
+        let (a, _) = engine.decide_input(&MatchInput {
+            domain: Some("www.bilibili.com"),
+            ip,
+            port: 443,
+            kind: ConnKind::Tcp,
+            uid: None,
+        });
+        assert!(matches!(a, Action::Proxy), "归属未知时应回落到最终策略(proxy)，实际 {:?}", a);
+    }
+
+    #[test]
+    fn invalid_uid_value_is_rejected_not_silently_kept() {
+        let mut cfg = Config::default();
+        cfg.rules = vec![crate::config::RuleConf {
+            kind: "UID".into(),
+            value: "com.bilibili.app".into(),
+            action: "BLOCK".into(),
+            source: None,
+        }];
+        let engine = RuleEngine::from_config(&cfg);
+        // 包名误写成 UID 时该条规则必须被丢弃，否则会匹配不到任何连接却让人以为生效
+        assert_eq!(engine.rule_count, 1, "只剩自动补的 FINAL");
+        assert!(!engine.has_uid_rules());
+    }
+
+    #[test]
+    fn filter_only_mode_degrades_proxy_to_direct() {
+        let mut cfg = Config::default();
+        cfg.mode = "filter_only".into();
+        cfg.final_policy = "proxy".into();
+        cfg.rules = vec![
+            crate::config::RuleConf { kind: "DOMAIN-SUFFIX".into(), value: "via-proxy.example".into(), action: "proxy".into(), source: None },
+            crate::config::RuleConf { kind: "DOMAIN-SUFFIX".into(), value: "blocked.example".into(), action: "block".into(), source: None },
+        ];
+        let engine = RuleEngine::from_config(&cfg);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        // 没有节点也不打算代理：代理意图降级直连，不能命中「无节点兜底拦截」断网。
+        let (a, _) = engine.decide_input(&MatchInput {
+            domain: Some("cdn.via-proxy.example"),
+            ip, port: 443, kind: ConnKind::Tcp, uid: None,
+        });
+        assert!(matches!(a, Action::Direct), "代理规则应降级为直连，实际 {:?}", a);
+        // FINAL 也降级
+        let (f, _) = engine.decide_input(&MatchInput {
+            domain: Some("unknown.example"),
+            ip, port: 443, kind: ConnKind::Tcp, uid: None,
+        });
+        assert!(matches!(f, Action::Direct), "final=proxy 应降级为直连，实际 {:?}", f);
+        // 拦截规则必须原样保留
+        let (b, why) = engine.decide_input(&MatchInput {
+            domain: Some("x.blocked.example"),
+            ip, port: 443, kind: ConnKind::Tcp, uid: None,
+        });
+        assert!(matches!(b, Action::Block), "拦截不能被降级，实际 {:?}", b);
+        assert!(why.contains("DOMAIN-SUFFIX"));
+    }
+
+    #[test]
+    fn rule_mode_keeps_proxy_intent() {
+        let mut cfg = Config::default();
+        cfg.mode = "rule".into();
+        cfg.final_policy = "proxy".into();
+        let engine = RuleEngine::from_config(&cfg);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let (a, _) = engine.decide_input(&MatchInput {
+            domain: Some("example.com"), ip, port: 443, kind: ConnKind::Tcp, uid: None,
+        });
+        // 对照：普通规则模式下 final=proxy 保持原样，由运行时无节点兜底处理。
+        assert!(matches!(a, Action::Proxy), "实际 {:?}", a);
+    }
+
+    #[test]
+    fn route_reject_rules_feed_dns_filter() {
+        let mut cfg = Config::default();
+        cfg.rules = vec![
+            crate::config::RuleConf { kind: "DOMAIN".into(), value: "ad.example.com".into(), action: "block".into(), source: None },
+            crate::config::RuleConf { kind: "DOMAIN-SUFFIX".into(), value: "tracker.example".into(), action: "BLOCK".into(), source: None },
+            crate::config::RuleConf { kind: "DOMAIN-KEYWORD".into(), value: "adserv".into(), action: "reject".into(), source: None },
+            crate::config::RuleConf { kind: "DOMAIN-REGEX".into(), value: "^ads\\d+\\.foo\\.com$".into(), action: "block".into(), source: None },
+            crate::config::RuleConf { kind: "DOMAIN-WILDCARD".into(), value: "*.banner.example".into(), action: "block".into(), source: None },
+            crate::config::RuleConf { kind: "DOMAIN".into(), value: "allow.example.com".into(), action: "direct".into(), source: None },
+        ];
+        let f = build_filter(&cfg);
+        // DNS-only 下连接层不会执行 REJECT，这五类拦截必须在 DNS 层生效。
+        assert!(f.is_blocked("ad.example.com"), "DOMAIN 精确");
+        assert!(!f.is_blocked("sub.ad.example.com"), "精确规则不能误伤子域名");
+        assert!(f.is_blocked("x.tracker.example"), "DOMAIN-SUFFIX");
+        assert!(f.is_blocked("cdn.adserv.io"), "DOMAIN-KEYWORD");
+        assert!(f.is_blocked("ads12.foo.com"), "DOMAIN-REGEX");
+        assert!(f.is_blocked("a.banner.example"), "DOMAIN-WILDCARD");
+        assert!(!f.is_blocked("allow.example.com"), "DIRECT 规则不能被当成拦截");
+    }
+
+    #[test]
+    fn route_reject_applies_even_when_ads_block_disabled() {
+        let mut cfg = Config::default();
+        cfg.block_enabled = false;
+        cfg.rules = vec![crate::config::RuleConf {
+            kind: "DOMAIN-SUFFIX".into(),
+            value: "tracker.example".into(),
+            action: "block".into(),
+            source: None,
+        }];
+        let f = build_filter(&cfg);
+        // 分流拦截是用户明确指令，不能被广告过滤总开关一起关掉。
+        assert!(f.is_blocked("x.tracker.example"));
+    }
+
+    #[test]
+    fn invalid_route_reject_regex_is_skipped() {
+        let mut cfg = Config::default();
+        cfg.rules = vec![crate::config::RuleConf {
+            kind: "DOMAIN-REGEX".into(),
+            value: "([".into(),
+            action: "block".into(),
+            source: None,
+        }];
+        let f = build_filter(&cfg);
+        // 非法正则不能让内核 panic 或误匹配任何域名
+        assert!(!f.is_blocked("anything.example"));
+    }
+
+    #[test]
+    fn package_name_rules_still_rejected_with_explicit_reason() {
+        let mut cfg = Config::default();
+        cfg.rules = vec![crate::config::RuleConf {
+            kind: "PROCESS-NAME".into(),
+            value: "com.bilibili.app".into(),
+            action: "BLOCK".into(),
+            source: None,
+        }];
+        let engine = RuleEngine::from_config(&cfg);
+        // 包名类规则由壳层展开成 UID 后下发；内核直接收到时应拒绝而不是误匹配
+        assert_eq!(engine.rule_count, 1, "只剩自动补的 FINAL");
     }
 }

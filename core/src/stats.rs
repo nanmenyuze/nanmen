@@ -15,6 +15,8 @@ pub struct Stats {
     pub dns_queries: AtomicU64,
     /// 被内核拒绝的 DoT/DoQ（853）连接数。
     pub dot_blocked: AtomicU64,
+    /// CNAME 伪装拦截数（查询名正常、应答链里的目标命中广告规则）。
+    pub dns_cname_blocked: AtomicU64,
     pub dns_blocked: AtomicU64,
     pub active_conns: AtomicI64,
     pub total_conns: AtomicU64,
@@ -56,6 +58,26 @@ pub struct Stats {
     pub mitm_rewritten: AtomicU64,
     pub mitm_failed: AtomicU64,
     pub mitm_quic_blocked: AtomicU64,
+    /// 域名命中但 App 不在 MITM 允许范围（或属于跳过列表）而放行的连接数。
+    pub mitm_app_skipped: AtomicU64,
+    /// TUN 出口诊断：TxToken 队列满静默丢包 / pending_out 硬上限丢弃 /
+    /// 历史 backlog 峰值 / transmit() 因高水位返回 None 的背压次数 /
+    /// write(2) 返回 WouldBlock 的次数 / 其他写错误。
+    pub tun_tx_drop: AtomicU64,
+    pub tun_pending_drop: AtomicU64,
+    pub tun_pending_peak: AtomicU64,
+    pub tun_tx_backpressure: AtomicU64,
+    pub tun_write_would_block: AtomicU64,
+    pub tun_write_error: AtomicU64,
+    /// TCP 回收：空闲兜底回收 / 达到并发上限时淘汰最久空闲连接。
+    pub tcp_idle_reaped: AtomicU64,
+    pub tcp_limit_evicted: AtomicU64,
+    /// 直连拨号熔断：冷却期内被抑制拨号的连接数。
+    pub dial_breaker_rejected: AtomicU64,
+    /// App 归属解析：成功查到 UID 的 TCP 连接数 / 有 UID 规则但查不到归属的连接数。
+    /// 后者持续增长通常意味着无 root 或壳层轮询没跟上。
+    pub uid_resolved: AtomicU64,
+    pub uid_unknown: AtomicU64,
 }
 
 impl Stats {
@@ -120,6 +142,7 @@ impl Stats {
             "dnsQueries": self.dns_queries.load(Ordering::Relaxed),
             "dotBlocked": self.dot_blocked.load(Ordering::Relaxed),
             "dnsBlocked": self.dns_blocked.load(Ordering::Relaxed),
+            "dnsCnameBlocked": self.dns_cname_blocked.load(Ordering::Relaxed),
             "activeConns": self.active_conns.load(Ordering::Relaxed),
             "totalConns": self.total_conns.load(Ordering::Relaxed),
             "filterRules": self.filter_rules.load(Ordering::Relaxed),
@@ -152,6 +175,18 @@ impl Stats {
             "mitmRewritten": self.mitm_rewritten.load(Ordering::Relaxed),
             "mitmFailed": self.mitm_failed.load(Ordering::Relaxed),
             "mitmQuicBlocked": self.mitm_quic_blocked.load(Ordering::Relaxed),
+            "mitmAppSkipped": self.mitm_app_skipped.load(Ordering::Relaxed),
+            "tunTxDrop": self.tun_tx_drop.load(Ordering::Relaxed),
+            "tunPendingDrop": self.tun_pending_drop.load(Ordering::Relaxed),
+            "tunPendingPeak": self.tun_pending_peak.load(Ordering::Relaxed),
+            "tunTxBackpressure": self.tun_tx_backpressure.load(Ordering::Relaxed),
+            "tunWriteWouldBlock": self.tun_write_would_block.load(Ordering::Relaxed),
+            "tunWriteError": self.tun_write_error.load(Ordering::Relaxed),
+            "tcpIdleReaped": self.tcp_idle_reaped.load(Ordering::Relaxed),
+            "tcpLimitEvicted": self.tcp_limit_evicted.load(Ordering::Relaxed),
+            "dialBreakerRejected": self.dial_breaker_rejected.load(Ordering::Relaxed),
+            "uidResolved": self.uid_resolved.load(Ordering::Relaxed),
+            "uidUnknown": self.uid_unknown.load(Ordering::Relaxed),
             "uptime": uptime,
         })
         .to_string()

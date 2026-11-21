@@ -10,8 +10,13 @@ object NativeCore {
 
     @JvmStatic external fun nativeStart(tunFd: Int, configJson: String): Boolean
     @JvmStatic external fun nativeReloadRules(configJson: String): Boolean
+    /** 下发「五元组 → 归属 UID」整表，返回接受的条数；-1 表示参数错误。 */
+    @JvmStatic external fun nativeSetUidMap(tableJson: String): Int
     @JvmStatic external fun nativeStop()
     @JvmStatic external fun nativeStats(): String
+
+    /** 活跃连接增量快照；`since` 是上次的游标，首次传 0。 */
+    @JvmStatic external fun nativeConnections(since: Long): String
     @JvmStatic external fun nativeLogs(sinceId: Long): String
     @JvmStatic external fun nativeClearLogs()
     @JvmStatic external fun nativeDnsLogs(sinceId: Long): String

@@ -23,6 +23,7 @@ fn node(kind: &str, port: u16) -> Node {
         ws_path: None,
         ws_host: None,
         flow: None,
+        udp: None,
     }
 }
 

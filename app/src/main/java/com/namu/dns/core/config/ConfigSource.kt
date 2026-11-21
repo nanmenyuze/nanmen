@@ -547,12 +547,33 @@ private fun parseSectionConfig(
             if (target.isNotBlank()) finalPolicy = targetAction(target, nodeNames, groupNames, issues, "[Rule] line $line")
             return@forEach
         }
-        if (kind in setOf("PROCESS-NAME", "PROCESS-PATH", "UID", "APP", "APP-NAME")) {
+        // 按 App 分流：UID 用数值直接下发；包名类规则保留包名，等内核启动前
+        // 由壳层用 PackageManager 解析成 UID 再展开（换机/重装后才能自动重解析）。
+        if (kind in setOf("UID", "PROCESS-NAME", "APP", "APP-NAME")) {
+            val value = parts.drop(1).dropLast(1).joinToString(",").trim()
+            if (value.isBlank()) {
+                issues += ConfigIssue(ConfigIssueLevel.ERROR, "[Rule] line $line", "规则缺少值")
+                return@forEach
+            }
+            if (kind == "UID" && value.toIntOrNull() == null) {
+                issues += ConfigIssue(
+                    ConfigIssueLevel.ERROR,
+                    "[Rule] line $line",
+                    "UID 规则的值必须是数字：$value",
+                )
+                return@forEach
+            }
+            val action = targetAction(parts.last().trim(), nodeNames, groupNames, issues, "[Rule] line $line")
+            nativeRules += RuleItem(type = kind, value = value, action = action, source = "[Rule]")
+            appRules++
+            return@forEach
+        }
+        if (kind == "PROCESS-PATH") {
             appRules++
             issues += ConfigIssue(
-                ConfigIssueLevel.ERROR,
+                ConfigIssueLevel.WARNING,
                 "[Rule] line $line",
-                "当前内核没有 Android UID/进程名数据源，拒绝按猜测导入 $kind",
+                "PROCESS-PATH 需要路径到包名的映射，尚未支持，已跳过",
             )
             return@forEach
         }
@@ -598,7 +619,7 @@ private fun parseSectionConfig(
             "Rewrite", "Host", "Script" -> skipped += "[$it]"
         }
     }
-    if (appRules > 0) skipped += "应用/UID 规则 $appRules 条（无可靠 UID 数据源）"
+    if (appRules > 0) supported += "按 App 规则($appRules 条)"
     if (skippedRules > 0) skipped += "未实现规则 $skippedRules 条"
     val errors = issues.any { it.level == ConfigIssueLevel.ERROR }
     val canImport = !errors && (nodes.isNotEmpty() || groupDefs.isNotEmpty() || nativeRules.isNotEmpty())

@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 pub struct Ctx {
     /// 运行配置可热更：nativeReloadRules 会整体替换，
@@ -44,6 +44,11 @@ pub struct Ctx {
     pub decision: Arc<std::sync::RwLock<()>>,
     /// MITM 去广告状态（引擎 + CA），热重载整体替换。
     pub mitm: Arc<std::sync::RwLock<Arc<crate::mitm::MitmState>>>,
+    /// 五元组 → 归属 UID。由壳层用 root 读 socket 表后整表下发；
+    /// 没有 root 时为空，UID 规则不生效而不是猜。
+    pub uid_map: Arc<std::sync::RwLock<crate::uidmap::UidMap>>,
+    /// 活跃 TCP 连接快照，供壳层「实时连接」页轮询。
+    pub conns: Arc<std::sync::RwLock<crate::conns::ConnTable>>,
 }
 
 impl Ctx {
@@ -78,28 +83,175 @@ impl Ctx {
 
 struct TunDevice {
     rx: VecDeque<Vec<u8>>,
-    tx: Arc<Mutex<Vec<Vec<u8>>>>,
+    tx: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    rx_pool: Arc<Mutex<Vec<Vec<u8>>>>,
+    tx_pool: Arc<Mutex<Vec<Vec<u8>>>>,
     mtu: usize,
+    stats: Arc<Stats>,
 }
 
-struct TunRxToken(Vec<u8>);
+/// 单次 iface.poll 允许暂存的 TxToken 包数；达到高水位后 transmit() 返回 None，
+/// 让 smoltcp 保留在 socket 缓冲里，而不是在这里静默丢包。
+const MAX_TX_QUEUE: usize = 256;
+/// pending_out 的高水位：达到后暂停从 tx 队列取包并暂停读 TUN，形成端到端背压。
+/// 这是背压信号，不是丢包点；不再 truncate。
+/// 256×2048B≈512KB：1024 档（2MB）在 100Mbps 下排队时延可达 ~170ms，
+/// 测速满载时延迟/抖动被这段队列直接抬高（bufferbloat）。
+/// 收紧后多余数据留在 smoltcp socket 缓冲里由 TCP 窗口流控回压，不丢包。
+const MAX_PENDING_OUT: usize = 256;
+/// 每轮主循环写 TUN 的包数上限。旧逻辑一口气写完 pending_out（最多 256 包），
+/// 高吞吐时单轮几十 ms，同 worker 的拨号/DNS 任务被饿死（排队尖刺 795/1109/4344ms）。
+/// 封顶后剩余包留在 pending_out，等待逻辑见其非空即 1ms 兜底，吞吐不降、单轮有界。
+const MAX_TX_WRITE_BURST: usize = 128;
+/// 直连拨号熔断：首次失败容忍（瞬时抖动），第 2 次连续失败起冷却 10s，
+/// 之后翻倍、封顶 60s。冷却期内同目标新连接直接 RST，不发 SYN 白等 2s。
+const DIAL_BREAKER_BASE_SECS: u64 = 10;
+const DIAL_BREAKER_CAP_SECS: u64 = 60;
+/// 新连接等待首包（SNI/HTTP 探测判定）的上限。180ms 会把「连上就不发数据」
+/// 的延迟探测类连接每条凭空加 180ms；60ms 足够覆盖正常 TLS ClientHello 到达。
+const SNI_WAIT_MS: u64 = 60;
+/// 单次 TUN 可读事件最多连续读取的包数，避免饿死其他 select 分支。
+const MAX_RX_BURST: usize = 64;
+/// 每轮主循环从 relay 通道搬入 pending 的最大块数。
+/// 太小会把单连接吞吐压成「块数 × 块大小 / 轮询间隔」，太大则单连接 pending 占内存。
+const RELAY_DRAIN_BURST: usize = 32;
+/// 非空闲时的兜底轮询间隔。出站数据由 Notify 事件唤醒，兜底只管「万一漏唤醒」，
+/// 因此保持 20ms：挂着的空闲长连接不该被更密的定时器反复空转，那是纯耗电。
+const IDLE_SAFETY_WAIT_MS: u64 = 20;
+/// 收发缓冲池上限；每个缓冲最多 2048 字节。
+const MAX_POOL: usize = 128;
+const MAX_TUN_PACKET: usize = 2048;
+/// 每条 TCP 连接在 smoltcp 内的收发缓冲（每方向 128K）。
+/// 关键不只是缓冲大小：smoltcp 0.11 的接收窗口缩放 shift = log2(rx_cap) - 16，
+/// 128K 时 shift=1、通告窗口可达 ~128K；砍到 32K 时 shift=0（无缩放），
+/// 单流吞吐被锁成「32K / RTT」（RTT 20ms 仅 ~13Mbps），这正是高带宽链路测速变差的根源。
+const TCP_SOCKET_BUFFER: usize = 128 * 1024;
+/// MITM 本地双工管道容量；DNS TCP 管道同档 64K。
+const MITM_DUPLEX_CAP: usize = 128 * 1024;
+const DNS_TCP_DUPLEX_CAP: usize = 64 * 1024;
+/// 每个 UDP 目的端点的单方向缓冲。QUIC 包约 1400 字节，
+/// 8192 只装得下 5 个包，而 UDP 没有背压语义——缓冲满即丢，
+/// 大流量 QUIC 会先被这个缓冲卡住，而不是被协议栈算力卡住。
+const UDP_DST_BUF: usize = 32 * 1024;
+/// metadata 槽位必须跟缓冲容量匹配：槽位先耗尽会提前丢包，缓冲再大也没用。
+const UDP_META_SLOTS: usize = 64;
+
+/// TCP keep-alive 探测间隔。运营商 NAT / 家用路由器的空闲映射通常 3~5 分钟就被静默清掉，
+/// 不主动探测的话长连接会「看着还连着、实际已经死了」：推送延迟、消息半天不到、游戏掉线。
+/// 60s 一次 ACK 探测足以把 NAT 映射续住，又不像 15s 那样频繁唤醒射频。
+const TCP_KEEPALIVE_SECS: u64 = 60;
+/// smoltcp 连接超时。keep-alive 探测或在途数据连续 180s 没有任何回应即判死并发 RST：
+/// 切网/上游静默死亡后连接不会无限重传，也不会一直占着 1024 名额。
+const TCP_DEAD_TIMEOUT_SECS: u64 = 180;
+/// 长时间零业务数据的兜底回收。keepalive 仍在跑，有心跳/推送的长连接（微信等）不受影响；
+/// 这里只清「对端已经消失、但恰好被中间盒吞掉 RST/FIN」的僵尸连接。
+const TCP_IDLE_REAP_SECS: u64 = 2 * 60 * 60;
+/// 并发连接硬上限。满了先淘汰最久没有业务数据的连接，绝不直接拒绝新连接——
+/// 旧逻辑「达到上限就拒绝」会让所有 APP 一起断网，只能重启内核。
+const MAX_TCP_CONNS: usize = 1024;
+/// accept 之后等待 SNI/首包/探测判定的连接上限。每个连接带 256K 收发缓冲，
+/// 不封顶的话半开连接就能把内存吃光。
+const MAX_PENDING_ACCEPT: usize = 512;
+/// 单连接下行 pending 字节上限。客户端收不动（零窗口/进程冻结/暂停下载）时，
+/// smoltcp 发送缓冲塞满后若继续无脑从 relay 通道搬运，pending 会无界增长，
+/// 一条卡住的大下载就能吃几百 MB，最终 LMK 杀进程表现为「随机全断」。
+/// 达到上限即停止搬运 → 通道填满 → relay 暂停读上游 → 真实 TCP 窗口自然收紧。
+/// 取 512K（4 倍 smoltcp 发送缓冲）：健康连接永远到不了上限，吞吐不受影响。
+const TCP_PENDING_CAP: usize = 512 * 1024;
+
+struct TunRxToken {
+    data: Option<Vec<u8>>,
+    pool: Arc<Mutex<Vec<Vec<u8>>>>,
+}
 struct TunTxToken {
-    tx: Arc<Mutex<Vec<Vec<u8>>>>,
+    tx: Arc<Mutex<VecDeque<Vec<u8>>>>,
+    pool: Arc<Mutex<Vec<Vec<u8>>>>,
+    stats: Arc<Stats>,
+}
+
+fn pool_take(pool: &Mutex<Vec<Vec<u8>>>, capacity: usize) -> Vec<u8> {
+    let mut g = match pool.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    g.pop().unwrap_or_else(|| Vec::with_capacity(capacity))
+}
+
+fn pool_put(pool: &Mutex<Vec<Vec<u8>>>, buf: Vec<u8>) {
+    if buf.capacity() > MAX_TUN_PACKET {
+        return;
+    }
+    let mut g = match pool.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if g.len() < MAX_POOL {
+        g.push(buf);
+    }
 }
 
 impl TunDevice {
-    fn new(mtu: usize) -> Self {
+    fn new(mtu: usize, stats: Arc<Stats>) -> Self {
         Self {
-            rx: VecDeque::with_capacity(256),
-            tx: Arc::new(Mutex::new(Vec::new())),
+            rx: VecDeque::with_capacity(MAX_RX_BURST),
+            tx: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_TX_QUEUE))),
+            rx_pool: Arc::new(Mutex::new(Vec::with_capacity(MAX_POOL))),
+            tx_pool: Arc::new(Mutex::new(Vec::with_capacity(MAX_POOL))),
             mtu,
+            stats,
         }
     }
-    fn take_tx(&self) -> Vec<Vec<u8>> {
-        match self.tx.lock() {
-            Ok(mut g) => g.drain(..).collect(),
-            Err(p) => p.into_inner().drain(..).collect(),
+
+    /// 从池里取一个缓冲直接读 TUN；读满后 set_len，避免每包分配和清零。
+    fn read_rx(&mut self, fd: RawFd) -> io::Result<Option<Vec<u8>>> {
+        let mut buf = pool_take(&self.rx_pool, MAX_TUN_PACKET);
+        buf.clear();
+        if buf.capacity() < MAX_TUN_PACKET {
+            buf.reserve(MAX_TUN_PACKET - buf.capacity());
         }
+        let n = unsafe {
+            libc::read(
+                fd,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                MAX_TUN_PACKET,
+            )
+        };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            pool_put(&self.rx_pool, buf);
+            return Err(err);
+        }
+        if n == 0 {
+            pool_put(&self.rx_pool, buf);
+            return Ok(None);
+        }
+        // 内核刚刚写满了 n 字节，set_len 后这段内存已初始化。
+        unsafe { buf.set_len(n as usize) };
+        Ok(Some(buf))
+    }
+
+    fn drain_tx_into(&self, pending: &mut VecDeque<Vec<u8>>, limit: usize) {
+        if limit == 0 {
+            return;
+        }
+        let mut g = match self.tx.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let mut taken = 0;
+        while taken < limit {
+            match g.pop_front() {
+                Some(pkt) => {
+                    pending.push_back(pkt);
+                    taken += 1;
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn recycle_tx(&self, buf: Vec<u8>) {
+        pool_put(&self.tx_pool, buf);
     }
 }
 
@@ -109,11 +261,37 @@ impl Device for TunDevice {
 
     fn receive(&mut self, _timestamp: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let pkt = self.rx.pop_front()?;
-        Some((TunRxToken(pkt), TunTxToken { tx: self.tx.clone() }))
+        Some((
+            TunRxToken {
+                data: Some(pkt),
+                pool: self.rx_pool.clone(),
+            },
+            TunTxToken {
+                tx: self.tx.clone(),
+                pool: self.tx_pool.clone(),
+                stats: self.stats.clone(),
+            },
+        ))
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
-        Some(TunTxToken { tx: self.tx.clone() })
+        {
+            let g = match self.tx.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if g.len() >= MAX_TX_QUEUE {
+                // 高水位返回 None，smoltcp 会把报文保留在 socket 发送缓冲，
+                // 下一次 poll 再试；这是背压，不是丢包。
+                self.stats.tun_tx_backpressure.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        }
+        Some(TunTxToken {
+            tx: self.tx.clone(),
+            pool: self.tx_pool.clone(),
+            stats: self.stats.clone(),
+        })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -126,12 +304,22 @@ impl Device for TunDevice {
 }
 
 impl RxToken for TunRxToken {
-    fn consume<R, F>(self, f: F) -> R
+    fn consume<R, F>(mut self, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut data = self.0;
-        f(&mut data)
+        let mut data = self.data.take().expect("TunRxToken consumed twice");
+        let r = f(&mut data);
+        pool_put(&self.pool, data);
+        r
+    }
+}
+
+impl Drop for TunRxToken {
+    fn drop(&mut self) {
+        if let Some(data) = self.data.take() {
+            pool_put(&self.pool, data);
+        }
     }
 }
 
@@ -140,26 +328,309 @@ impl TxToken for TunTxToken {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buf = vec![0u8; len];
+        let mut buf = pool_take(&self.pool, len.max(MAX_TUN_PACKET));
+        buf.clear();
+        buf.resize(len, 0);
         let r = f(&mut buf);
-        if let Ok(mut g) = self.tx.lock() {
-            if g.len() < 256 {
-                g.push(buf);
-            }
+        let mut g = match self.tx.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if g.len() < MAX_TX_QUEUE {
+            g.push_back(buf);
+        } else {
+            // transmit() 已做高水位检查；这里只是最后一道保护，正常不应命中。
+            drop(g);
+            pool_put(&self.pool, buf);
+            self.stats.tun_tx_drop.fetch_add(1, Ordering::Relaxed);
         }
         r
     }
 }
 
+/// 记录 pending_out 峰值；高水位只做背压，不再截断。
+fn note_pending_out(pending: &VecDeque<Vec<u8>>, stats: &Stats) {
+    stats
+        .tun_pending_peak
+        .fetch_max(pending.len() as u64, Ordering::Relaxed);
+}
+
+/// 连通性探测（captive portal / 网络验证）域名清单。
+/// Android NetworkMonitor、GMS 与各家 ROM 用这些域名判断网络「能不能上网」。
+/// 探测走 VPN 全部超时（海外直连不可达）时，系统会把 VPN 一直标成「未验证」
+/// 并每 3s 重探一轮；很多 App（含测速）要等网络「已验证」回调才开始干活，
+/// 这正是测速迟迟不出数的系统级原因之一。Surge/Loon 对这类探测都做本地处理。
+const PROBE_HOSTS: &[&str] = &[
+    "www.google.com",
+    "www.google.cn",
+    "connectivitycheck.gstatic.com",
+    "www.gstatic.com",
+    "connectivitycheck.android.com",
+    "clients3.google.com",
+    "clients4.google.com",
+    "connect.rom.miui.com",
+    "connectivitycheck.platform.hicloud.com",
+    "connectivitycheck.platform.hihonorcloud.com",
+    "conn1.oppomobile.com",
+    "conn2.oppomobile.com",
+    "wifi.vivo.com.cn",
+    "captive.apple.com",
+    "www.msftconnecttest.com",
+    "www.msftncsi.com",
+    // GMS 后台域名：直连必不通，不快速 RST 的话 GMS 每 2s 一轮无限重试，
+    // 白占连接名额和主循环时间片。RST 后 GMS 进入自己的指数退避。
+    // 与上面一样只拦直连：配了节点走代理时不受影响。
+    "firebaseinstallations.googleapis.com",
+    "checkin.gstatic.com",
+    "android.clients.google.com",
+    "mtalk.google.com",
+    "alt1-mtalk.google.com",
+    "alt2-mtalk.google.com",
+    "alt3-mtalk.google.com",
+    "alt4-mtalk.google.com",
+    "alt5-mtalk.google.com",
+    "alt6-mtalk.google.com",
+    "alt7-mtalk.google.com",
+    "alt8-mtalk.google.com",
+];
+
+fn is_probe_host(host: &str) -> bool {
+    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    PROBE_HOSTS.iter().any(|p| h == *p)
+}
+
+/// HTTP 连通性探测本地代答：只应答「探测域名 + 探测路径」的组合，
+/// 正常网页流量（其他路径/域名）原样放行，不影响真实业务。
+/// 头部不完整或非明文 HTTP 返回 None，由调用方决定等待或放行。
+fn probe_http_response(req: &[u8]) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(req).ok()?;
+    let end = text.find("\r\n\r\n")?;
+    let head = &text[..end];
+    let mut lines = head.lines();
+    let request_line = lines.next()?;
+    let mut parts = request_line.split_ascii_whitespace();
+    let method = parts.next()?;
+    if method != "GET" && method != "HEAD" {
+        return None;
+    }
+    let path = parts.next()?;
+    let host = lines.find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        if k.eq_ignore_ascii_case("host") {
+            Some(v.trim())
+        } else {
+            None
+        }
+    })?;
+    if !is_probe_host(host) {
+        return None;
+    }
+    let path = path.split('?').next().unwrap_or(path);
+    let body: &[u8] = match path {
+        "/generate_204" | "/gen_204" | "/generate204" => {
+            return Some(
+                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\nCache-Control: no-cache\r\n\r\n".to_vec(),
+            );
+        }
+        "/hotspot-detect.html" | "/library/test/success.html" => {
+            b"<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>"
+        }
+        "/connecttest.txt" => b"Microsoft Connect Test",
+        "/ncsi.txt" => b"Microsoft NCSI",
+        "/success.txt" => b"success\n",
+        _ => return None,
+    };
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-cache\r\n\r\n",
+        body.len()
+    );
+    let mut out = head.into_bytes();
+    out.extend_from_slice(body);
+    Some(out)
+}
+
 struct TcpConn {
     handle: SocketHandle,
+    /// 连接快照 id；本地代答/熔断抑制/DNS over TCP 等没有真实出站的连接为 None。
+    snap: Option<u64>, 
     to_relay: Option<mpsc::Sender<Vec<u8>>>,
     from_relay: mpsc::Receiver<Vec<u8>>,
     pending: VecDeque<Vec<u8>>,
+    /// pending 中的总字节数，与 TCP_PENDING_CAP 配对形成下行背压。
+    pending_bytes: usize,
+    /// 主循环搬走 pending/通道数据后通知 relay 恢复读上游。
+    /// 没有它，relay 在通道满时会永久停读（mpsc 不会因容量释放唤醒发送方）。
+    read_wake: Arc<Notify>,
     relay_closed: bool,
     client_closed: bool,
     closing: bool,
+    /// 最后一次有业务数据流动的时刻（任一方向）。keepalive ACK 不算业务数据：
+    /// 上限淘汰和空闲回收只按真实流量排序，避免把「心跳很密但没数据」的连接误判成活跃。
+    last_active: Instant,
 }
+
+/// 是否还有出站数据躺在 relay 通道里没搬进 smoltcp。
+/// 用于把兜底轮询收紧到 1ms：Notify 只保证「有新数据」时唤醒，
+/// 但被背压打断的一轮可能只搬了一部分，这里保证剩余部分不等到兜底间隔。
+fn has_relay_backlog(conns: &[TcpConn]) -> bool {
+    conns.iter().any(|c| !c.from_relay.is_empty())
+}
+
+/// 把下行数据从 relay 通道搬入 pending，受 TCP_PENDING_CAP 字节上限约束。
+/// 返回是否搬到了数据（调用方据此更新活跃时间）。搬到数据即唤醒 relay：
+/// 通道腾出了容量，它可以恢复读上游了。
+fn drain_relay_to_pending(conn: &mut TcpConn) -> bool {
+    let mut drained = false;
+    while conn.pending_bytes < TCP_PENDING_CAP {
+        match conn.from_relay.try_recv() {
+            Ok(data) => {
+                drained = true;
+                conn.pending_bytes += data.len();
+                conn.pending.push_back(data);
+                if conn.pending.len() >= RELAY_DRAIN_BURST {
+                    break;
+                }
+            }
+            Err(mpsc::error::TryRecvError::Empty) => break,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                conn.relay_closed = true;
+                break;
+            }
+        }
+    }
+    if drained {
+        conn.read_wake.notify_one();
+    }
+    drained
+}
+
+/// 熔断键：优先按「域名+端口」计，纯 IP 连接（测速服务器等）才按「IP+端口」。
+/// 只按 IP 计会让 CDN 下同 IP:443 的不同域名互相连坐——一个域名失败，
+/// 同 IP 的另一个域名也被冷却，而它们的真实可达性未必相同。
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+enum DialKey {
+    Name(String, u16),
+    Addr(IpAddr, u16),
+}
+
+fn dial_key(domain: Option<&str>, ip: IpAddr, port: u16) -> DialKey {
+    match domain {
+        Some(d) if !d.is_empty() => DialKey::Name(d.to_ascii_lowercase(), port),
+        _ => DialKey::Addr(ip, port),
+    }
+}
+
+/// 直连拨号失败冷却表。只记 DIRECT：代理节点已有健康登记 + top3 回落，不重复管。
+#[derive(Default)]
+struct DialFails {
+    /// 值=(连续失败次数, 冷却截止)。
+    fails: HashMap<DialKey, (u32, Instant)>,
+    /// 近期失败（键+时刻），用于区分「目标全死了」和「本机链路出问题了」。
+    recent: VecDeque<(DialKey, Instant)>,
+    /// 链路自愈：多目标同时失败时暂停熔断，期间一律真实拨号。
+    suspend_until: Option<Instant>,
+}
+
+/// 链路自愈判据：10s 内 ≥8 个不同目标失败，基本只能是本机链路问题
+/// （信号差/切网瞬间/上游断），此时熔断纯属误伤，清空并暂停。
+const LINK_FAIL_WINDOW_SECS: u64 = 10;
+const LINK_FAIL_DISTINCT_TARGETS: usize = 8;
+/// 自愈后暂停熔断的时长：给链路恢复留时间，暂停期也不累计失败。
+const LINK_SELF_HEAL_SUSPEND_SECS: u64 = 30;
+/// 熔断命中后的失败时序：必须与真实拨号超时（outbound 2s）一致。
+const SUPPRESSED_DIAL_FAIL_SECS: u64 = 2;
+
+/// 按连续失败次数算冷却时长：1 次不冷却，2 次 10s，翻倍封顶 60s。
+fn dial_cooldown(fails: u32) -> Option<Duration> {
+    if fails < 2 {
+        return None;
+    }
+    let exp = (fails - 2).min(6);
+    Some(Duration::from_secs(
+        (DIAL_BREAKER_BASE_SECS << exp).min(DIAL_BREAKER_CAP_SECS),
+    ))
+}
+
+fn dial_breaker_active(fails: &DialFails, key: &DialKey, now: Instant) -> bool {
+    // 链路自愈暂停期一律不熔断：这时候失败多半不是目标的错。
+    if fails.suspend_until.map(|u| now < u).unwrap_or(false) {
+        return false;
+    }
+    fails.fails.get(key).map(|(_, until)| now < *until).unwrap_or(false)
+}
+
+/// 记录一次直连失败；返回 true 表示触发了链路自愈（调用方负责打日志）。
+fn dial_breaker_record(fails: &mut DialFails, key: DialKey, now: Instant) -> bool {
+    if fails.suspend_until.map(|u| now < u).unwrap_or(false) {
+        // 暂停期不累计：链路恢复过程中的失败不该被记成目标的连续失败。
+        return false;
+    }
+    fails.suspend_until = None;
+    let e = fails.fails.entry(key.clone()).or_insert((0, now));
+    e.0 = e.0.saturating_add(1);
+    if let Some(cd) = dial_cooldown(e.0) {
+        e.1 = now + cd;
+    }
+    let window = Duration::from_secs(LINK_FAIL_WINDOW_SECS);
+    fails.recent.push_back((key, now));
+    while fails
+        .recent
+        .front()
+        .map(|(_, t)| now.saturating_duration_since(*t) > window)
+        .unwrap_or(false)
+    {
+        fails.recent.pop_front();
+    }
+    let distinct: std::collections::HashSet<&DialKey> =
+        fails.recent.iter().map(|(k, _)| k).collect();
+    if distinct.len() >= LINK_FAIL_DISTINCT_TARGETS {
+        fails.fails.clear();
+        fails.recent.clear();
+        fails.suspend_until = Some(now + Duration::from_secs(LINK_SELF_HEAL_SUSPEND_SECS));
+        return true;
+    }
+    false
+}
+
+fn dial_breaker_clear(fails: &mut DialFails, key: &DialKey) {
+    fails.fails.remove(key);
+}
+
+/// 熔断表清陈旧：冷却结束超过 5 分钟且无新失败的条目丢弃，
+/// 保留近期条目以便再次失败时继续升级冷却。
+fn dial_breaker_sweep(fails: &mut DialFails) {
+    fails
+        .fails
+        .retain(|_, (_, until)| until.elapsed() < Duration::from_secs(300));
+}
+
+/// 上限淘汰的排序键：先按「有没有堆积」分组（有堆积的排在后面，别踢正在传输的连接），
+/// 同组内越久没有业务数据越先淘汰。
+fn victim_rank(idle: Duration, busy: bool) -> (u8, std::cmp::Reverse<u128>) {
+    (busy as u8, std::cmp::Reverse(idle.as_millis()))
+}
+
+/// 选择上限压力下要被淘汰的连接。closing 的不选（已经在四次挥手，马上自己释放）。
+fn pick_victim(conns: &[TcpConn], now: Instant) -> Option<usize> {
+    conns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.closing)
+        .min_by_key(|(_, c)| {
+            victim_rank(
+                now.saturating_duration_since(c.last_active),
+                !c.pending.is_empty() || !c.from_relay.is_empty(),
+            )
+        })
+        .map(|(idx, _)| idx)
+}
+
+/// 空闲回收判据：既没堆积、也没有半关闭流程，且超过兜底阈值才回收。
+/// 正在慢速传输（有 pending/from_relay 数据）的连接绝不按时间踢掉。
+fn should_reap_idle(idle: Duration, busy: bool, closing: bool) -> bool {
+    !closing && !busy && idle >= Duration::from_secs(TCP_IDLE_REAP_SECS)
+}
+
 
 struct UdpClient {
     tx: mpsc::Sender<(Target, Vec<u8>)>,
@@ -188,19 +659,6 @@ fn is_local_dns_endpoint(ep: IpEndpoint) -> bool {
     }
 }
 
-fn read_tun(fd: RawFd) -> io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; 2048];
-    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    buf.truncate(n as usize);
-    Ok(buf)
-}
-
 fn write_tun(fd: RawFd, data: &[u8]) -> io::Result<()> {
     let n = unsafe { libc::write(fd, data.as_ptr() as *const libc::c_void, data.len()) };
     if n < 0 {
@@ -211,6 +669,108 @@ fn write_tun(fd: RawFd, data: &[u8]) -> io::Result<()> {
         return Err(io::Error::new(io::ErrorKind::WriteZero, "TUN 部分写入"));
     }
     Ok(())
+}
+
+/// RFC 1071 因特网校验和（16 位反码求和）。
+fn inet_checksum(data: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for chunk in data.chunks(2) {
+        let w = if chunk.len() == 2 {
+            u16::from_be_bytes([chunk[0], chunk[1]])
+        } else {
+            (chunk[0] as u16) << 8
+        };
+        sum += w as u32;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// 合成 ICMP echo reply（v4 type 8→0 / v6 type 128→129），本地代答。
+/// 用户态栈不转发 ICMP：测速/探活类 App 用 ping 给服务器排序选路，
+/// 全部超时会让它不停重选服务器、测速迟迟不出数（Clash/sing-box TUN 同样本地代答）。
+/// 非 echo request、截断或校验和错误的报文返回 None。
+fn icmp_echo_reply(pkt: &[u8]) -> Option<Vec<u8>> {
+    let version = *pkt.first()? >> 4;
+    match version {
+        4 => {
+            let ip = Ipv4Packet::new_checked(pkt).ok()?;
+            if ip.next_header() != IpProtocol::Icmp {
+                return None;
+            }
+            let ihl = ip.header_len() as usize;
+            let total = ip.total_len() as usize;
+            if total > pkt.len() || ihl >= total {
+                return None;
+            }
+            let icmp = &pkt[ihl..total];
+            if icmp.len() < 8 || icmp[0] != 8 || icmp[1] != 0 {
+                return None;
+            }
+            if inet_checksum(icmp) != 0 {
+                return None;
+            }
+            let mut out = pkt[..total].to_vec();
+            // 交换 src/dst：16 位求和可交换，IPv4 头校验和不变，TTL 不动。
+            out[12..16].copy_from_slice(&pkt[16..20]);
+            out[16..20].copy_from_slice(&pkt[12..16]);
+            out[ihl] = 0;
+            out[ihl + 2] = 0;
+            out[ihl + 3] = 0;
+            let c = inet_checksum(&out[ihl..]);
+            out[ihl + 2..ihl + 4].copy_from_slice(&c.to_be_bytes());
+            Some(out)
+        }
+        6 => {
+            let ip = Ipv6Packet::new_checked(pkt).ok()?;
+            if ip.next_header() != IpProtocol::Icmpv6 {
+                return None;
+            }
+            let start = 40;
+            let end = start + ip.payload_len() as usize;
+            if end > pkt.len() {
+                return None;
+            }
+            let icmp = &pkt[start..end];
+            if icmp.len() < 8 || icmp[0] != 128 || icmp[1] != 0 {
+                return None;
+            }
+            let mut out = pkt[..end].to_vec();
+            out[8..24].copy_from_slice(&pkt[24..40]);
+            out[24..40].copy_from_slice(&pkt[8..24]);
+            out[start] = 129;
+            out[start + 2] = 0;
+            out[start + 3] = 0;
+            // ICMPv6 校验和含伪头：src + dst + 上层长度 + next_header(58)。
+            let mut sum = 0u32;
+            for chunk in out[8..40].chunks(2) {
+                sum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+            }
+            let len = out.len() - start;
+            sum += (len as u32) >> 16;
+            sum += (len as u32) & 0xFFFF;
+            sum += 58;
+            for chunk in out[start..].chunks(2) {
+                let w = if chunk.len() == 2 {
+                    u16::from_be_bytes([chunk[0], chunk[1]])
+                } else {
+                    (chunk[0] as u16) << 8
+                };
+                sum += w as u32;
+            }
+            while sum >> 16 != 0 {
+                sum = (sum & 0xFFFF) + (sum >> 16);
+            }
+            let c = !(sum as u16);
+            // RFC 4443：ICMPv6 校验和不允许为 0（0 表示未计算）。
+            let c = if c == 0 { 0xFFFF } else { c };
+            out[start + 2..start + 4].copy_from_slice(&c.to_be_bytes());
+            Some(out)
+        }
+        _ => None,
+    }
 }
 
 fn lookup_tcp_dst(pkt: &[u8]) -> Option<(u16, IpAddress)> {
@@ -275,9 +835,14 @@ fn lookup_udp_flow(pkt: &[u8]) -> Option<(IpEndpoint, IpEndpoint)> {
 
 fn add_listener(sockets: &mut SocketSet<'_>, addr: IpAddress, port: u16) -> Option<SocketHandle> {
     let mut socket = tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0u8; 32768]),
-        tcp::SocketBuffer::new(vec![0u8; 32768]),
+        tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER]),
+        tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER]),
     );
+    // 监听 socket 上设一次，accept 出来的连接自动继承：
+    // keepalive 负责续住空闲长连接并配合 timeout 识别静默死亡的对端；
+    // timeout 同时兜住「SYN 之后客户端消失」的半开连接，避免永久占用缓冲。
+    socket.set_keep_alive(Some(Duration::from_secs(TCP_KEEPALIVE_SECS).into()));
+    socket.set_timeout(Some(Duration::from_secs(TCP_DEAD_TIMEOUT_SECS).into()));
     if socket
         .listen(IpListenEndpoint {
             addr: Some(addr),
@@ -296,8 +861,14 @@ fn add_udp_dst_socket(
     port: u16,
 ) -> Option<SocketHandle> {
     let mut socket = udp::Socket::new(
-        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 8192]),
-        udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 8192]),
+        udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; UDP_META_SLOTS],
+            vec![0u8; UDP_DST_BUF],
+        ),
+        udp::PacketBuffer::new(
+            vec![udp::PacketMetadata::EMPTY; UDP_META_SLOTS],
+            vec![0u8; UDP_DST_BUF],
+        ),
     );
     if socket
         .bind(IpListenEndpoint {
@@ -356,41 +927,92 @@ fn udp_mode(ctx: &Ctx, action: &Action) -> UdpMode {
             return UdpMode::Unsupported(format!("策略引用不存在: {}", name));
         }
     };
+    // 节点级 udp:false 优先：即使协议本身支持 UDP，也按用户配置拒绝转发。
+    if !node.udp_supported() {
+        return if node.udp == Some(false) {
+            UdpMode::Unsupported(format!("{} 节点已关闭 UDP（udp: false）", node.label()))
+        } else {
+            UdpMode::Unsupported(format!("{} 节点不支持 UDP", node.kind))
+        };
+    }
     match node.kind.as_str() {
         "ss" => UdpMode::Ss(node),
         "socks5" => UdpMode::Socks5(node),
+        "trojan" => UdpMode::Trojan(node),
+        "vless" => UdpMode::Vless(node),
         other => UdpMode::Unsupported(format!("{} 节点暂不支持 UDP", other)),
     }
 }
 
-fn decide_action(
+/// 带 App 归属的判定：`uid` 为 None 表示归属未知，UID 规则不参与匹配。
+fn decide_action_uid(
     ctx: &Ctx,
     domain: Option<&str>,
     ip: IpAddr,
     port: u16,
     kind: ConnKind,
+    uid: Option<u32>,
 ) -> Action {
+    decide_detail_for(ctx, domain, ip, port, kind, uid).0
+}
+
+/// 同 decide_action_uid，额外返回「为什么这么判」的可读说明，供连接列表展示。
+/// 说明是多行文案，调用方展示时取第一行即可。
+fn decide_detail_for(
+    ctx: &Ctx,
+    domain: Option<&str>,
+    ip: IpAddr,
+    port: u16,
+    kind: ConnKind,
+    uid: Option<u32>,
+) -> (Action, String) {
     // mihomo/sing-box 同款：853 是 DoT/DoQ，私人 DNS 开着时会绕过 53 劫持。
     // 直接拒绝，让 Android 的 opportunistic 模式回落到 VPN DNS。
     if port == 853 && ctx.block_dot() {
         ctx.stats.dot_blocked.fetch_add(1, Ordering::Relaxed);
-        return Action::Block;
+        return (Action::Block, "DoT(853) 已阻断".to_string());
     }
+    let mut detail: String;
     let mut action = match ctx.mode().as_str() {
-        "global" => Action::Proxy,
-        "dns_only" => Action::Direct,
-        _ => ctx.rules.read().unwrap_or_else(|p| p.into_inner()).decide(domain, ip, port, kind),
+        "global" => {
+            detail = "全局模式：全部流量走节点".to_string();
+            Action::Proxy
+        }
+        "dns_only" => {
+            detail = "仅 DNS 接管：流量直连".to_string();
+            Action::Direct
+        }
+        _ => {
+            let (a, d) = ctx
+                .rules
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .decide_input(&crate::engine::MatchInput {
+                    domain,
+                    ip,
+                    port,
+                    kind,
+                    uid,
+                });
+            detail = d;
+            a
+        }
     };
     // 策略组只在规则/最终策略真正引用它时展开；global 模式仍走当前选中节点。
     if let Action::Group(name) = action.clone() {
         action = resolve_group_action(ctx, &name, kind, domain);
+        detail = format!(
+            "策略组 {} → {}",
+            name,
+            ctx.rules.read().unwrap_or_else(|p| p.into_inner()).decision_label(&action)
+        );
     }
     if let Action::Missing(name) = &action {
         logging::warn(
             "strategy",
             format!("规则引用的目标已失效：{}；按拦截处理，不回落到当前选中节点", name),
         );
-        return Action::Block;
+        return (Action::Block, format!("{}；目标 {} 已失效，按拦截处理", detail, name));
     }
     if let Action::Node(name) = &action {
         if !ctx.nodes_snapshot().iter().any(|n| &n.name == name) {
@@ -398,7 +1020,7 @@ fn decide_action(
                 "strategy",
                 format!("节点已不存在：{}；按拦截处理，不回落到当前选中节点", name),
             );
-            return Action::Block;
+            return (Action::Block, format!("{}；节点 {} 已不存在，按拦截处理", detail, name));
         }
     }
     if matches!(action, Action::Proxy) && ctx.nodes_snapshot().is_empty() {
@@ -407,8 +1029,25 @@ fn decide_action(
         } else {
             Action::Direct
         };
+        detail = format!(
+            "{}；无可用节点，已降级为{}",
+            detail,
+            if action == Action::Block { "拦截" } else { "直连" }
+        );
     }
-    action
+    // HTTPS 连通性探测：直连时这些海外域名根本不可达，挂 4~7s 等超时只会让
+    // 系统验证反复失败、每 3s 重探一轮。立即 RST 让 NetworkMonitor 快速回落
+    // 到 HTTP 探测（由 probe_http_response 本地代答），VPN 网络秒级变「已验证」。
+    // 只拦直连：配置了代理节点时探测走节点，不受影响。
+    if port == 443 && matches!(action, Action::Direct) {
+        if let Some(d) = domain {
+            if is_probe_host(d) {
+                logging::info("probe", format!("连通性探测快速拒绝 {}:{}（直连不可达）", d, port));
+                return (Action::Block, "连通性探测：直连不可达，快速拒绝".to_string());
+            }
+        }
+    }
+    (action, detail)
 }
 
 fn resolve_group_action(ctx: &Ctx, name: &str, kind: ConnKind, domain: Option<&str>) -> Action {
@@ -459,13 +1098,30 @@ async fn relay_stream(
     stream: BoxStream,
     mut client_rx: mpsc::Receiver<Vec<u8>>,
     server_tx: mpsc::Sender<Vec<u8>>,
+    relay_wake: Arc<Notify>,
+    read_wake: Arc<Notify>,
 ) {
     let (mut r, mut w) = tokio::io::split(stream);
     let mut buf = vec![0u8; 16384];
     // 半关闭语义：客户端停止发送（channel 关闭）只关出站写侧，
     // 服务端方向的响应必须继续读完，否则半关闭客户端会丢响应。
     let mut client_done = false;
+    // 下行背压：通道满时绝不能阻塞在 send().await——select 会卡在发送分支，
+    // 上传方向跟着一起停摆（双向流互卡）。改为把读到的块暂存 staged、
+    // 禁用读分支，等主循环搬走数据后 read_wake 唤醒；上传分支全程可服务。
+    let mut staged: Option<Vec<u8>> = None;
     loop {
+        if let Some(data) = staged.take() {
+            match server_tx.try_send(data) {
+                Ok(_) => {
+                    // 出站数据已入 channel：必须显式唤醒主循环，
+                    // 否则它只能靠兜底定时器醒来，稳态下载被判死在上限里。
+                    relay_wake.notify_one();
+                }
+                Err(mpsc::error::TrySendError::Full(data)) => staged = Some(data),
+                Err(mpsc::error::TrySendError::Closed(_)) => break,
+            }
+        }
         tokio::select! {
             msg = client_rx.recv(), if !client_done => {
                 match msg {
@@ -478,15 +1134,14 @@ async fn relay_stream(
                     }
                 }
             }
-            res = r.read(&mut buf) => {
+            res = r.read(&mut buf), if staged.is_none() && server_tx.capacity() > 0 => {
                 match res {
                     Ok(0) => break,
-                    Ok(n) => {
-                        if server_tx.send(buf[..n].to_vec()).await.is_err() { break; }
-                    }
+                    Ok(n) => staged = Some(buf[..n].to_vec()),
                     Err(_) => break,
                 }
             }
+            _ = read_wake.notified(), if staged.is_some() || server_tx.capacity() == 0 => {}
         }
     }
     let _ = w.shutdown().await;
@@ -552,7 +1207,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
     let async_fd = unsafe { tokio::io::unix::AsyncFd::register(owned)? };
     STACK_READY.store(true, Ordering::Release);
 
-    let mut device = TunDevice::new(1500);
+    let mut device = TunDevice::new(1500, ctx.stats.clone());
     let mut iface_cfg = IfaceConfig::new(HardwareAddress::Ip);
     iface_cfg.random_seed = rand::random();
     let mut iface = Interface::new(iface_cfg, &mut device, smol_now(Instant::now()));
@@ -623,6 +1278,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
     let mut listeners: HashMap<(IpAddress, u16), (SocketHandle, Instant)> = HashMap::new();
     let mut pending_accept: Vec<(IpAddress, u16, SocketHandle, Instant)> = Vec::new();
     let mut conns: Vec<TcpConn> = Vec::new();
+    // 出站数据唤醒：relay 读到上游数据后 notify，主循环立刻排空，
+    // 而不是只能等兜底定时器；否则单连接稳态吞吐被「每轮块数 / 轮询间隔」卡死。
+    let relay_wake = Arc::new(Notify::new());
 
     let mut udp_dsts: HashMap<(IpAddress, u16), (SocketHandle, Instant)> = HashMap::new();
     let mut udp_clients: HashMap<(IpAddress, u16, IpAddress, u16), UdpClient> = HashMap::new();
@@ -630,7 +1288,10 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
     let mut udp_replies: VecDeque<(IpEndpoint, IpEndpoint, Vec<u8>)> = VecDeque::new();
 
     let mut pending_out: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut write_blocked = false;
     let mut last_sweep = Instant::now();
+    // 直连拨号失败冷却表：主循环判定 + 拨号任务记录，跨任务共享。
+    let dial_fails: Arc<Mutex<DialFails>> = Arc::new(Mutex::new(DialFails::default()));
     let start = Instant::now();
 
     logging::info(
@@ -643,19 +1304,30 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             break;
         }
 
-        // 空闲时降低唤醒频率；有活动连接时保持较低调度延迟。新报文到达会立即唤醒 AsyncFd。
+        // 空闲时降低唤醒频率；有 tx backlog 或写阻塞时保持 1ms 兜底。
+        // 新报文到达、TUN 可写、出站数据入队都会立即唤醒，这里的兜底只防漏唤醒。
         let idle = conns.is_empty() && udp_clients.is_empty();
-        let wait = if idle {
+        let backlogged = pending_out.len() >= MAX_PENDING_OUT;
+        let wait = if write_blocked || !pending_out.is_empty() || has_relay_backlog(&conns) {
+            Duration::from_millis(1)
+        } else if idle {
             Duration::from_millis(250)
         } else {
-            Duration::from_millis(20)
+            Duration::from_millis(IDLE_SAFETY_WAIT_MS)
         };
-        // 事件驱动：TUN 可读、UDP 响应、DNS 响应任一到达即唤醒；空闲时仅保留兜底定时器。
-        let mut guard = None;
+        // 事件驱动：TUN 可读、TUN 可写、UDP 响应、DNS 响应任一到达即唤醒。
+        // backlog 达到高水位时暂停读 TUN，背压回内核，避免 pending_out 无界增长。
+        let mut read_guard = None;
         tokio::select! {
-            r = async_fd.readable() => {
+            r = async_fd.readable(), if !backlogged => {
                 if let Ok(g) = r {
-                    guard = Some(g);
+                    read_guard = Some(g);
+                }
+            }
+            r = async_fd.writable(), if write_blocked => {
+                if let Ok(mut g) = r {
+                    g.clear_ready();
+                    write_blocked = false;
                 }
             }
             r = udp_resp_rx.recv() => {
@@ -672,25 +1344,33 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                     }
                 }
             }
+            // 出站数据到达即唤醒：relay 读到上游数据后 notify_one，
+            // 这里醒来后紧接着的 drain 段把 channel 搬进 smoltcp。
+            // Notify 会保留一个 permit，drain 与唤醒之间不会丢事件。
+            _ = relay_wake.notified() => {}
             _ = tokio::time::sleep(wait) => {}
         }
 
-        if let Some(g) = guard.as_mut() {
+        if let Some(_g) = read_guard.as_mut() {
             let mut rounds = 0;
             loop {
                 rounds += 1;
-                if rounds > 64 {
+                if rounds > MAX_RX_BURST {
                     break;
                 }
-                let r = g.try_io(|inner| read_tun(inner.get_ref().as_raw_fd()));
-                match r {
-                    Ok(Ok(pkt)) => {
-                        if pkt.is_empty() {
-                            break;
-                        }
+                match device.read_rx(async_fd.get_ref().as_raw_fd()) {
+                    Ok(Some(pkt)) => {
                         ctx.stats
                             .up_bytes
                             .fetch_add(pkt.len() as u64, Ordering::Relaxed);
+                        // ICMP echo 本地代答：不进 smoltcp（它不路由非本机目的地址，
+                        // 转发型 ping 会被静默丢弃），直接合成应答写回 TUN。
+                        if let Some(reply) = icmp_echo_reply(&pkt) {
+                            if pending_out.len() < MAX_PENDING_OUT {
+                                pending_out.push_back(reply);
+                            }
+                            continue;
+                        }
                         if let Some((port, addr)) = lookup_tcp_dst(&pkt) {
                             if !listeners.contains_key(&(addr, port)) {
                                 if let Some(h) = add_listener(&mut sockets, addr, port) {
@@ -743,12 +1423,13 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                     .decision
                                     .read()
                                     .unwrap_or_else(|p| p.into_inner());
-                                let action = decide_action(
+                                let action = decide_action_uid(
                                     &ctx,
                                     domain.as_deref(),
                                     IpAddr::from(dst.addr),
                                     dst.port,
                                     ConnKind::Udp,
+                                    None,
                                 );
                                 let mode = udp_mode(&ctx, &action);
                                 drop(decision_guard);
@@ -780,17 +1461,20 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         }
                         device.rx.push_back(pkt);
                     }
-                    Ok(Err(e)) => {
+                    Ok(None) => break,
+                    Err(e) => {
                         if e.kind() != io::ErrorKind::WouldBlock {
                             logging::warn("tun", format!("读取失败: {}", e));
                         }
                         break;
                     }
-                    Err(_) => break,
                 }
             }
         }
 
+        // 协作让出①：RX burst 之后让同 worker 的拨号/DNS 任务跑一轮，
+        // 避免长轮把它们饿死（排队尖刺的来源）。
+        tokio::task::yield_now().await;
         let now = smol_now(start);
         let _ = iface.poll(now, &mut device, &mut sockets);
 
@@ -808,6 +1492,17 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             listeners.remove(&key);
         }
         for (addr, port, handle, accepted_at) in accepted {
+            // 半开连接也要封顶：每个 socket 带 256K 缓冲，只靠 listeners 上限兜不住。
+            // 超限时先清掉最早那一条（它等首包/握手的时间最长，基本已经废了）。
+            if pending_accept.len() >= MAX_PENDING_ACCEPT {
+                let (a, p, h, _) = pending_accept.remove(0);
+                logging::warn(
+                    "tun",
+                    format!("等待首包的连接过多({})，丢弃最早一条 {}:{}", MAX_PENDING_ACCEPT, IpAddr::from(a), p),
+                );
+                sockets.get_mut::<tcp::Socket>(h).abort();
+                let _ = sockets.remove(h);
+            }
             pending_accept.push((addr, port, handle, accepted_at));
         }
         // 保证每个已消费的端口仍有监听器（后续新连接）
@@ -831,15 +1526,64 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             let state = sockets.get::<tcp::Socket>(handle).state();
             match state {
                 tcp::State::Established => {
-                    // 连接总数上限：每条连接带协议栈缓冲与中继任务，
-                    // 高并发下宁可拒绝新连接，也不能让内存无界增长。
-                    if conns.len() >= 1024 {
-                        logging::warn("tun", "并发连接达到上限(1024)，拒绝新连接");
-                        let _ = sockets.remove(handle);
-                        continue;
+                    // 连接总数上限：每条连接带协议栈缓冲与中继任务，不能让内存无界增长。
+                    // 但绝不能像旧逻辑那样「满了就拒绝新连接」——那会让所有 APP 一起断网。
+                    // 先淘汰最久没有业务数据的那条（死连接早就该被 keepalive/timeout 清掉，
+                    // 走到这里说明对端还活着但没流量），实在没有可淘汰的才拒绝。
+                    if conns.len() >= MAX_TCP_CONNS {
+                        let now_i = Instant::now();
+                        if let Some(idx) = pick_victim(&conns, now_i) {
+                            let victim = conns.swap_remove(idx);
+                            ctx.conns
+                                .write()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .remove(victim.snap);
+                            let victim_ep = sockets
+                                .get::<tcp::Socket>(victim.handle)
+                                .remote_endpoint()
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "-".into());
+                            let idle_secs = now_i
+                                .saturating_duration_since(victim.last_active)
+                                .as_secs();
+                            sockets.get_mut::<tcp::Socket>(victim.handle).abort();
+                            let _ = sockets.remove(victim.handle);
+                            ctx.stats.active_conns.fetch_sub(1, Ordering::Relaxed);
+                            ctx.stats.tcp_limit_evicted.fetch_add(1, Ordering::Relaxed);
+                            logging::warn(
+                                "tun",
+                                format!(
+                                    "并发连接达到上限({})，淘汰最久空闲连接 {}（空闲 {}s）",
+                                    MAX_TCP_CONNS, victim_ep, idle_secs
+                                ),
+                            );
+                        } else {
+                            logging::warn(
+                                "tun",
+                                format!("并发连接达到上限({})，暂无可淘汰连接，拒绝新连接", MAX_TCP_CONNS),
+                            );
+                            sockets.get_mut::<tcp::Socket>(handle).abort();
+                            let _ = sockets.remove(handle);
+                            continue;
+                        }
                     }
                     let remote = sockets.get::<tcp::Socket>(handle).remote_endpoint();
                     let local_ip = IpAddr::from(addr);
+                    // App 归属：用 (客户端端口, 目标地址, 目标端口) 查壳层下发的 socket 表。
+                    // 客户端 IP 只作精确匹配用——TUN 里是 VPN 地址、表里是物理网卡地址，
+                    // 所以真正的定位靠端口，IP 对不上是常态而不是异常。
+                    let client_uid = remote.and_then(|r| {
+                        let client_ip = IpAddr::from(r.addr);
+                        ctx.uid_map
+                            .read()
+                            .ok()
+                            .and_then(|m| m.lookup_flow(client_ip, r.port, local_ip, port))
+                    });
+                    if client_uid.is_some() {
+                        ctx.stats.uid_resolved.fetch_add(1, Ordering::Relaxed);
+                    } else if ctx.rules.read().unwrap_or_else(|p| p.into_inner()).has_uid_rules() {
+                        ctx.stats.uid_unknown.fetch_add(1, Ordering::Relaxed);
+                    }
                     let mut domain = ctx
                         .dns()
                         .reverse
@@ -853,7 +1597,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                     // 由上层透明转发，避免签出与 SNI 不匹配的叶子证书。
                     if ctx.sniff() && !dns_conn && (domain.is_none() || port == 443) {
                         // 443 也要短暂等待首包：反向映射可能属于 CDN 共用 IP 的另一个站点。
-                        // 最多等 180ms，避免 Server-first 协议被长时间卡住。
+                        // 最多等 SNI_WAIT_MS，避免 Server-first 协议被长时间卡住。
                         let mut first = [0u8; 2048];
                         let n = sockets
                             .get_mut::<tcp::Socket>(handle)
@@ -869,9 +1613,17 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             }
                         }
                         let may_be_tls = n > 0 && first[0] == 0x16;
+                        // 反向映射已有域名、且 MITM 不可能命中时不再等首包：
+                        // 延迟探测类连接连上后不发数据，等待只会凭空加延迟。
+                        // （MITM 可能命中时仍必须等 SNI，避免签错证书。）
+                        let mitm_maybe = domain
+                            .as_deref()
+                            .map(|d| ctx.mitm().should_mitm(d))
+                            .unwrap_or(true);
                         if (domain.is_none() || (port == 443 && sni.is_none()))
-                            && accepted_at.elapsed() < Duration::from_millis(180)
+                            && accepted_at.elapsed() < Duration::from_millis(SNI_WAIT_MS)
                             && (n == 0 || may_be_tls)
+                            && (domain.is_none() || mitm_maybe)
                         {
                             still_pending.push((addr, port, handle, accepted_at));
                             continue;
@@ -881,6 +1633,50 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 rev.insert(local_ip, d, 120);
                             }
                             logging::info("sniff", format!("{}:{} -> {}", local_ip, port, d));
+                        }
+                    }
+                    // HTTP 连通性探测本地代答：系统/ROM 的 generate_204 等探测
+                    // 直接回 204/Success，让 VPN 网络立即通过「已验证」，
+                    // App 不再等验证回调，探测风暴也就此停止。
+                    if !dns_conn && port == 80 {
+                        let mut first = [0u8; 2048];
+                        let n = sockets
+                            .get_mut::<tcp::Socket>(handle)
+                            .peek_slice(&mut first)
+                            .unwrap_or(0);
+                        if n > 0 {
+                            if let Some(resp) = probe_http_response(&first[..n]) {
+                                let (stx, srx) = mpsc::channel::<Vec<u8>>(1);
+                                let _ = stx.try_send(resp);
+                                drop(stx); // 响应发完即 EOF：主循环排空后正常四次挥手
+                                conns.push(TcpConn {
+                                    handle,
+                                    snap: None,
+                                    to_relay: None,
+                                    from_relay: srx,
+                                    pending: VecDeque::new(),
+                                    pending_bytes: 0,
+                                    read_wake: Arc::new(Notify::new()),
+                                    relay_closed: false,
+                                    client_closed: false,
+                                    closing: false,
+                                    last_active: Instant::now(),
+                                });
+                                ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
+                                ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
+                                logging::info("probe", format!("连通性探测本地代答 {}:{}", local_ip, port));
+                                continue;
+                            }
+                            // 头部还没收全：最多再等 SNI_WAIT_MS，避免探测请求分包漏判。
+                            if !first[..n].windows(4).any(|w| w == b"\r\n\r\n")
+                                && accepted_at.elapsed() < Duration::from_millis(SNI_WAIT_MS)
+                            {
+                                still_pending.push((addr, port, handle, accepted_at));
+                                continue;
+                            }
+                        } else if accepted_at.elapsed() < Duration::from_millis(SNI_WAIT_MS) {
+                            still_pending.push((addr, port, handle, accepted_at));
+                            continue;
                         }
                     }
                     let route_domain = sni.clone().or_else(|| domain.clone());
@@ -896,15 +1692,16 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         .decision
                         .read()
                         .unwrap_or_else(|p| p.into_inner());
-                    let action = if dns_conn {
-                        Action::Direct
+                    let (action, rule_detail) = if dns_conn {
+                        (Action::Direct, "DNS over TCP：本地应答".to_string())
                     } else {
-                        decide_action(
+                        decide_detail_for(
                             &ctx,
                             route_domain.as_deref(),
                             local_ip,
                             port,
                             ConnKind::Tcp,
+                            client_uid,
                         )
                     };
                     let conn_id = ctx.stats.new_conn_id();
@@ -936,6 +1733,50 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         let _ = sockets.remove(handle);
                         continue;
                     }
+                    // 直连熔断：冷却期内抑制真实拨号（不发 SYN、不占拨号 worker），
+                    // 但绝不立即 RST——测速/探活 App 会把「秒拒」当成另一种结果，
+                    // 延迟读数和服务器排序都会被污染。保持与真实不可达完全一致的
+                    // 失败时序：静默等待后按「拨号失败」的同一条路径关闭连接。
+                    if !dns_conn && matches!(action, Action::Direct) {
+                        let key = dial_key(route_domain.as_deref(), local_ip, port);
+                        let suppressed = {
+                            let br = dial_fails.lock().unwrap_or_else(|p| p.into_inner());
+                            dial_breaker_active(&br, &key, Instant::now())
+                        };
+                        if suppressed {
+                            let (stx, srx) = mpsc::channel::<Vec<u8>>(1);
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(SUPPRESSED_DIAL_FAIL_SECS)).await;
+                                // 与拨号失败 Err 分支完全相同的收尾：drop sender →
+                                // 主循环 relay_closed → 正常四次挥手，而不是 RST。
+                                drop(stx);
+                            });
+                            conns.push(TcpConn {
+                                handle,
+                                snap: None,
+                                to_relay: None,
+                                from_relay: srx,
+                                pending: VecDeque::new(),
+                                pending_bytes: 0,
+                                read_wake: Arc::new(Notify::new()),
+                                relay_closed: false,
+                                client_closed: false,
+                                closing: false,
+                                last_active: Instant::now(),
+                            });
+                            ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
+                            ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
+                            ctx.stats.dial_breaker_rejected.fetch_add(1, Ordering::Relaxed);
+                            logging::info(
+                                "conn",
+                                format!(
+                                    "#{} 熔断抑制拨号 {}:{}（{}s 后按原时序失败）",
+                                    conn_id, target_label, port, SUPPRESSED_DIAL_FAIL_SECS
+                                ),
+                            );
+                            continue;
+                        }
+                    }
                     // MITM：SNI/反向映射命中域名列表的 443 连接改走本地 TLS 终止 + 规则改写。
                     let mitm_state = ctx.mitm();
                     let mitm_hit = !dns_conn
@@ -945,7 +1786,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             .map(|d| mitm_state.should_mitm(d))
                             .unwrap_or(false);
                     if mitm_hit {
-                        let (a, b) = tokio::io::duplex(64 * 1024);
+                        let (a, b) = tokio::io::duplex(MITM_DUPLEX_CAP);
                         let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
                         let (stx, srx) = mpsc::channel::<Vec<u8>>(64);
                         let host = mitm_host.clone().unwrap_or_default();
@@ -956,35 +1797,58 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         tokio::spawn(async move {
                             crate::mitm::handle(a, host, target2, action2, ctx2, ms, conn_id).await;
                         });
-                        tokio::spawn(relay_stream(Box::new(b), rx, stx));
+                        let read_wake = Arc::new(Notify::new());
+                        tokio::spawn(relay_stream(Box::new(b), rx, stx, relay_wake.clone(), read_wake.clone()));
+                        let snap = ctx
+                            .conns
+                            .write()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(
+                                client_uid,
+                                mitm_host.clone(),
+                                local_ip.to_string(),
+                                port,
+                                action_label.clone(),
+                                rule_detail.split('\n').next().unwrap_or("").to_string(),
+                                true,
+                            );
                         conns.push(TcpConn {
                             handle,
+                            snap: Some(snap),
                             to_relay: Some(tx),
                             from_relay: srx,
                             pending: VecDeque::new(),
+                            pending_bytes: 0,
+                            read_wake,
                             relay_closed: false,
                             client_closed: false,
                             closing: false,
+                            last_active: Instant::now(),
                         });
                         ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                         ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
                     if dns_conn {
-                        let (a, b) = tokio::io::duplex(64 * 1024);
+                        let (a, b) = tokio::io::duplex(DNS_TCP_DUPLEX_CAP);
                         let dns = ctx.dns.read().unwrap_or_else(|p| p.into_inner()).clone();
                         tokio::spawn(dns_tcp_server(dns, a));
                         let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
                         let (stx, srx) = mpsc::channel::<Vec<u8>>(64);
-                        tokio::spawn(relay_stream(Box::new(b), rx, stx));
+                        let read_wake = Arc::new(Notify::new());
+                        tokio::spawn(relay_stream(Box::new(b), rx, stx, relay_wake.clone(), read_wake.clone()));
                         conns.push(TcpConn {
                             handle,
+                            snap: None,
                             to_relay: Some(tx),
                             from_relay: srx,
                             pending: VecDeque::new(),
+                            pending_bytes: 0,
+                            read_wake,
                             relay_closed: false,
                             client_closed: false,
                             closing: false,
+                            last_active: Instant::now(),
                         });
                         ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                         ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
@@ -1000,8 +1864,19 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         let health = ctx.health.clone();
                         let health_action = action2.clone();
                         let health_started = Instant::now();
+                        // 唤醒句柄必须在外层 clone 后 move 进 spawn 块，
+                        // 否则 Arc 被 move 走，主循环这一轮之后就拿不到它了。
+                        let relay_wake2 = relay_wake.clone();
+                        let read_wake = Arc::new(Notify::new());
+                        let read_wake2 = read_wake.clone();
+                        let dial_fails2 = dial_fails.clone();
+                        let breaker_key = dial_key(route_domain.as_deref(), local_ip, port);
                         tokio::spawn(async move {
+                            // 分段计时：排队（accept→任务首次执行）与拨号分开，
+                            // 否则「耗时 7914ms」分不清是 2s 拨号超时还是任务被调度挂住。
+                            let dial_start = Instant::now();
                             let result = outbound::connect(&action2, &nodes, selected.as_deref(), target, Some(&dns)).await;
+                            let dial_ms = dial_start.elapsed().as_millis();
                             if let Action::Node(name) = &health_action {
                                 // 用真实连接结果更新 TCP 健康；UDP 状态绝不从这里推导。
                                 health.record(
@@ -1019,17 +1894,46 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 );
                             }
                             match result {
-                                Ok(stream) => relay_stream(stream, rx, stx).await,
+                                Ok(stream) => {
+                                    // 直连成功即清除冷却计数：路径恢复后不该继续被熔断。
+                                    if matches!(health_action, Action::Direct) {
+                                        dial_breaker_clear(
+                                            &mut dial_fails2.lock().unwrap_or_else(|p| p.into_inner()),
+                                            &breaker_key,
+                                        );
+                                    }
+                                    relay_stream(stream, rx, stx, relay_wake2, read_wake2).await
+                                }
                                 Err(e) => {
+                                    // 直连失败记入冷却表：连续失败升级冷却，阻断无限重试。
+                                    // 多目标同时失败会触发链路自愈（判定为本机链路问题）。
+                                    if matches!(health_action, Action::Direct) {
+                                        let healed = dial_breaker_record(
+                                            &mut dial_fails2.lock().unwrap_or_else(|p| p.into_inner()),
+                                            breaker_key,
+                                            Instant::now(),
+                                        );
+                                        if healed {
+                                            logging::warn(
+                                                "conn",
+                                                format!(
+                                                    "{}s 内多个不同目标拨号失败，判定为本地链路问题：清空熔断并暂停 {}s",
+                                                    LINK_FAIL_WINDOW_SECS, LINK_SELF_HEAL_SUSPEND_SECS
+                                                ),
+                                            );
+                                        }
+                                    }
                                     logging::warn(
                                         "conn",
                                         format!(
-                                            "#{} 连接失败 {}:{} [{}] 耗时 {}ms: {}",
+                                            "#{} 连接失败 {}:{} [{}] 耗时 {}ms（排队 {}ms + 拨号 {}ms）: {}",
                                             conn_id,
                                             target_label2,
                                             port,
                                             action_label2,
                                             accepted_at.elapsed().as_millis(),
+                                            dial_start.duration_since(accepted_at).as_millis(),
+                                            dial_ms,
                                             e
                                         ),
                                     );
@@ -1037,14 +1941,31 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 }
                             }
                         });
+                        let snap = ctx
+                            .conns
+                            .write()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(
+                                client_uid,
+                                route_domain.clone(),
+                                local_ip.to_string(),
+                                port,
+                                action_label.clone(),
+                                rule_detail.split('\n').next().unwrap_or("").to_string(),
+                                false,
+                            );
                         conns.push(TcpConn {
                             handle,
+                            snap: Some(snap),
                             to_relay: Some(tx),
                             from_relay: srx,
                             pending: VecDeque::new(),
+                            pending_bytes: 0,
+                            read_wake,
                             relay_closed: false,
                             client_closed: false,
                             closing: false,
+                            last_active: Instant::now(),
                         });
                         ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                         ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
@@ -1063,7 +1984,10 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
         // TCP 连接数据（scratch 复用，避免每个报文都新建 16KB）
         let mut dead: Vec<usize> = Vec::new();
         let mut tcp_scratch = vec![0u8; 16384];
+        // 每轮只取一次时钟：1024 条连接全调 Instant::now 是无谓的系统调用开销。
+        let now_i = Instant::now();
         for (idx, conn) in conns.iter_mut().enumerate() {
+            let mut touched = false;
             let sock = sockets.get_mut::<tcp::Socket>(conn.handle);
             if sock.state() == tcp::State::Closed {
                 dead.push(idx);
@@ -1073,6 +1997,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             while sock.can_recv() && conn.to_relay.as_ref().map(|t| t.capacity() > 0).unwrap_or(false) {
                 match sock.recv_slice(&mut tcp_scratch) {
                     Ok(n) if n > 0 => {
+                        touched = true;
                         let data = tcp_scratch[..n].to_vec();
                         match conn.to_relay.as_ref().unwrap().try_send(data) {
                             Ok(_) => {}
@@ -1097,28 +2022,21 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                 conn.to_relay = None;
             }
 
-            loop {
-                match conn.from_relay.try_recv() {
-                    Ok(data) => {
-                        conn.pending.push_back(data);
-                        if conn.pending.len() >= 16 {
-                            break;
-                        }
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => break,
-                    Err(mpsc::error::TryRecvError::Disconnected) => {
-                        conn.relay_closed = true;
-                        break;
-                    }
-                }
+            // 下行背压：pending 到上限就停止搬运，让通道填满、relay 停读上游。
+            if drain_relay_to_pending(conn) {
+                touched = true;
             }
             while sock.can_send() {
                 match conn.pending.front_mut() {
                     Some(front) => match sock.send_slice(front) {
                         Ok(n) if n == front.len() => {
+                            touched = true;
+                            conn.pending_bytes -= front.len();
                             conn.pending.pop_front();
                         }
                         Ok(n) => {
+                            touched = true;
+                            conn.pending_bytes -= n;
                             front.drain(..n);
                         }
                         Err(_) => break,
@@ -1138,6 +2056,8 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             }
             if sock.state() == tcp::State::Closed {
                 dead.push(idx);
+            } else if touched {
+                conn.last_active = now_i;
             }
         }
         if !dead.is_empty() {
@@ -1145,10 +2065,17 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             for idx in dead.into_iter().rev() {
                 let conn = conns.swap_remove(idx);
                 let _ = sockets.remove(conn.handle);
+                ctx.conns
+                    .write()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(conn.snap);
                 removed += 1;
             }
             ctx.stats.active_conns.fetch_sub(removed, Ordering::Relaxed);
         }
+
+        // 协作让出②：连接遍历（最重的一段）之后，拨号/DNS 任务插队执行。
+        tokio::task::yield_now().await;
 
         // UDP 客户端 -> 远端：从每个目标地址的 smoltcp socket 收取数据
         {
@@ -1170,6 +2097,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                     }
                 }
             }
+            let mut dead_udp: Vec<(IpAddress, u16, IpAddress, u16)> = Vec::new();
             for (dst, client, data) in incoming {
                 let key = (client.addr, client.port, dst.addr, dst.port);
                 let domain = ctx
@@ -1185,8 +2113,18 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                 };
                 if let Some(sess) = udp_clients.get_mut(&key) {
                     sess.last = Instant::now();
-                    let _ = sess.tx.try_send((target, data));
+                    match sess.tx.try_send((target, data)) {
+                        Ok(_) => {}
+                        // 队列满只是瞬时背压，等下一包；通道关闭才是代理会话已经结束。
+                        Err(mpsc::error::TrySendError::Full(_)) => {}
+                        Err(mpsc::error::TrySendError::Closed(_)) => dead_udp.push(key),
+                    }
                 }
+            }
+            // 代理任务退出后立刻移除，后续包会重建会话；否则要等 180s 空闲清扫，
+            // 中途所有 UDP（QUIC/游戏/语音）都会被静默丢掉。
+            for key in dead_udp {
+                udp_clients.remove(&key);
             }
         }
 
@@ -1242,8 +2180,53 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
 
         // 定期回收闲置监听器 / UDP 会话，避免长期运行累积 socket
         if last_sweep.elapsed() >= Duration::from_secs(10) {
+            // 熔断表清陈旧：冷却结束超过 5 分钟且无新失败的条目丢弃，
+            // 保留近期条目以便再次失败时继续升级冷却。
+            dial_breaker_sweep(&mut dial_fails.lock().unwrap_or_else(|p| p.into_inner()));
             last_sweep = Instant::now();
             let now_i = Instant::now();
+
+            // TCP 空闲/僵尸连接回收。对端静默死亡时 keepalive + smoltcp timeout 会先
+            // abort；这里兜「还能回 ACK、但长时间没有任何业务数据」的僵尸连接。
+            // 有堆积（慢速传输中）或已在关闭流程的连接不动，避免误杀。
+            let mut reap: Vec<usize> = Vec::new();
+            for (idx, conn) in conns.iter().enumerate() {
+                let busy = !conn.pending.is_empty() || !conn.from_relay.is_empty();
+                if should_reap_idle(
+                    now_i.saturating_duration_since(conn.last_active),
+                    busy,
+                    conn.closing,
+                ) {
+                    reap.push(idx);
+                }
+            }
+            if !reap.is_empty() {
+                let mut removed = 0i64;
+                for idx in reap.into_iter().rev() {
+                    let conn = conns.swap_remove(idx);
+                    ctx.conns
+                        .write()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(conn.snap);
+                    let idle_secs = now_i
+                        .saturating_duration_since(conn.last_active)
+                        .as_secs();
+                    let ep = sockets
+                        .get::<tcp::Socket>(conn.handle)
+                        .remote_endpoint()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "-".into());
+                    sockets.get_mut::<tcp::Socket>(conn.handle).abort();
+                    let _ = sockets.remove(conn.handle);
+                    ctx.stats.tcp_idle_reaped.fetch_add(1, Ordering::Relaxed);
+                    removed += 1;
+                    logging::info(
+                        "tun",
+                        format!("空闲回收 TCP 连接 {}（空闲 {}s）", ep, idle_secs),
+                    );
+                }
+                ctx.stats.active_conns.fetch_sub(removed, Ordering::Relaxed);
+            }
 
             let expired_udp: Vec<(IpAddress, u16, IpAddress, u16)> = udp_clients
                 .iter()
@@ -1380,29 +2363,569 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
 
         // 发送到 TUN
         let _ = iface.poll(smol_now(start), &mut device, &mut sockets);
-        for pkt in device.take_tx() {
-            pending_out.push_back(pkt);
+        if pending_out.len() < MAX_PENDING_OUT {
+            let room = MAX_PENDING_OUT - pending_out.len();
+            device.drain_tx_into(&mut pending_out, room);
         }
+        note_pending_out(&pending_out, &ctx.stats);
+        let mut tx_written = 0usize;
         while let Some(pkt) = pending_out.pop_front() {
             match write_tun(async_fd.get_ref().as_raw_fd(), &pkt) {
                 Ok(_) => {
                     ctx.stats.down_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
+                    device.recycle_tx(pkt);
+                    write_blocked = false;
+                    tx_written += 1;
+                    // 每轮封顶：剩余包留在 pending_out，等待逻辑见其非空即 1ms 兜底，
+                    // 吞吐不降，但单轮时长有界，拨号/DNS 不再被长轮压住。
+                    if tx_written >= MAX_TX_WRITE_BURST {
+                        break;
+                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    ctx.stats.tun_write_would_block.fetch_add(1, Ordering::Relaxed);
                     pending_out.push_front(pkt);
+                    write_blocked = true;
                     break;
                 }
                 Err(e) => {
+                    ctx.stats.tun_write_error.fetch_add(1, Ordering::Relaxed);
                     logging::warn("tun", format!("写入失败: {}", e));
+                    device.recycle_tx(pkt);
+                    write_blocked = false;
                     break;
                 }
             }
         }
-        if pending_out.len() > 512 {
-            pending_out.truncate(512);
-        }
+        // 协作让出③：TX 写出后让出，本轮结束前再给其他任务一次机会。
+        tokio::task::yield_now().await;
     }
 
     logging::info("tun", "协议栈已停止");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_stats() -> Arc<Stats> {
+        Arc::new(Stats::new())
+    }
+
+    #[test]
+    fn http_probe_gets_local_answer() {
+        // Android/ROM 的 generate_204 探测：本地回 204
+        let req = b"GET /generate_204 HTTP/1.1\r\nHost: connectivitycheck.gstatic.com\r\nUser-Agent: dalvik\r\n\r\n";
+        assert!(probe_http_response(req).unwrap().starts_with(b"HTTP/1.1 204"));
+        let req2 = b"GET /generate_204 HTTP/1.1\r\nHost: www.google.com\r\n\r\n";
+        assert!(probe_http_response(req2).unwrap().starts_with(b"HTTP/1.1 204"));
+        // Apple 探测：回 Success 页面
+        let req3 = b"GET /hotspot-detect.html HTTP/1.0\r\nHost: captive.apple.com\r\n\r\n";
+        let r3 = probe_http_response(req3).unwrap();
+        assert!(r3.starts_with(b"HTTP/1.1 200"));
+        assert!(r3.windows(7).any(|w| w == b"Success"));
+        // 微软探测
+        let req4 = b"GET /connecttest.txt HTTP/1.1\r\nHost: www.msftconnecttest.com\r\n\r\n";
+        assert!(probe_http_response(req4).unwrap().windows(22).any(|w| w == b"Microsoft Connect Test"));
+        // 正常路径 / 非探测域名：不代答，原样放行
+        assert!(probe_http_response(b"GET / HTTP/1.1\r\nHost: www.google.com\r\n\r\n").is_none());
+        assert!(probe_http_response(b"GET /generate_204 HTTP/1.1\r\nHost: example.com\r\n\r\n").is_none());
+        // 头部不完整 / 非明文 HTTP：不代答
+        assert!(probe_http_response(b"GET /generate_204 HTTP/1.1\r\nHost: gstatic").is_none());
+        assert!(probe_http_response(&[0x16, 0x03, 0x01, 0x00]).is_none());
+    }
+
+    #[test]
+    fn probe_hosts_match_exactly() {
+        assert!(is_probe_host("www.google.com"));
+        assert!(is_probe_host("ConnectivityCheck.Gstatic.com."));
+        assert!(is_probe_host("captive.apple.com"));
+        // 精确匹配：不能把子串/相似域名误判成探测
+        assert!(!is_probe_host("google.com"));
+        assert!(!is_probe_host("evil-www.google.com"));
+        assert!(!is_probe_host("www.google.com.attacker.cn"));
+        assert!(!is_probe_host("gstatic.com"));
+    }
+
+    #[test]
+    fn icmpv4_echo_request_gets_local_reply() {
+        let mut pkt = vec![0u8; 28];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&28u16.to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = 1;
+        pkt[12..16].copy_from_slice(&[10, 10, 10, 2]);
+        pkt[16..20].copy_from_slice(&[1, 2, 3, 4]);
+        let hc = inet_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&hc.to_be_bytes());
+        pkt[20] = 8;
+        pkt[24..26].copy_from_slice(&0x1234u16.to_be_bytes());
+        let ic = inet_checksum(&pkt[20..]);
+        pkt[22..24].copy_from_slice(&ic.to_be_bytes());
+
+        let reply = icmp_echo_reply(&pkt).expect("应生成本地应答");
+        assert_eq!(reply[20], 0);
+        assert_eq!(&reply[12..16], &[1, 2, 3, 4]);
+        assert_eq!(&reply[16..20], &[10, 10, 10, 2]);
+        assert_eq!(inet_checksum(&reply[..20]), 0);
+        assert_eq!(inet_checksum(&reply[20..]), 0);
+        assert_eq!(&reply[24..28], &pkt[24..28]);
+        // echo reply、非 ICMP、截断报文都不代答
+        assert!(icmp_echo_reply(&reply).is_none());
+        let mut tcp = pkt.clone();
+        tcp[9] = 6;
+        assert!(icmp_echo_reply(&tcp).is_none());
+        assert!(icmp_echo_reply(&pkt[..10]).is_none());
+    }
+
+    #[test]
+    fn icmpv6_echo_request_gets_local_reply() {
+        let mut pkt = vec![0u8; 48];
+        pkt[0] = 0x60;
+        pkt[4..6].copy_from_slice(&8u16.to_be_bytes());
+        pkt[6] = 58;
+        pkt[7] = 64;
+        pkt[8] = 0xfd;
+        pkt[23] = 2;
+        pkt[24] = 0x24;
+        pkt[39] = 1;
+        pkt[40] = 128;
+        let mut sum = 0u32;
+        for c in pkt[8..40].chunks(2) {
+            sum += u16::from_be_bytes([c[0], c[1]]) as u32;
+        }
+        sum += 8 + 58;
+        for c in pkt[40..].chunks(2) {
+            sum += u16::from_be_bytes([c[0], c[1]]) as u32;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        pkt[42..44].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+
+        let reply = icmp_echo_reply(&pkt).expect("应生成本地应答");
+        assert_eq!(reply[40], 129);
+        assert_eq!(&reply[8..24], &pkt[24..40]);
+        assert_eq!(&reply[24..40], &pkt[8..24]);
+        let mut sum = 0u32;
+        for c in reply[8..40].chunks(2) {
+            sum += u16::from_be_bytes([c[0], c[1]]) as u32;
+        }
+        sum += 8 + 58;
+        for c in reply[40..].chunks(2) {
+            sum += u16::from_be_bytes([c[0], c[1]]) as u32;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        assert_eq!(sum as u16, 0xFFFF);
+        assert!(icmp_echo_reply(&reply).is_none());
+    }
+
+    #[test]
+    fn tcp_keepalive_and_timeout_plan() {
+        // keepalive 必须明显早于运营商 NAT 的空闲映射回收（3~5 分钟）。
+        assert!(TCP_KEEPALIVE_SECS <= 60);
+        // 判死不能拖到默认 TCP 重传的十几分钟，也不能短到误杀慢速链路。
+        assert!((120..=300).contains(&TCP_DEAD_TIMEOUT_SECS));
+        // 空闲兜底要明显长于正常心跳间隔，避免误杀微信这类长连接。
+        assert!(TCP_IDLE_REAP_SECS >= 1800);
+        // 上限仍然保持 1024（每条连接 256K 缓冲），只是满了改为淘汰而不是拒绝。
+        assert_eq!(MAX_TCP_CONNS, 1024);
+        assert!(MAX_PENDING_ACCEPT < MAX_TCP_CONNS);
+    }
+
+    #[test]
+    fn victim_rank_prefers_idle_and_oldest() {
+        // 有堆积的连接排后面：正在传输的连接要优先保留。
+        assert!(
+            victim_rank(Duration::from_secs(60), false)
+                < victim_rank(Duration::from_secs(0), true)
+        );
+        // 同为空闲时，越久没有业务数据越先淘汰。
+        assert!(
+            victim_rank(Duration::from_secs(600), false)
+                < victim_rank(Duration::from_secs(60), false)
+        );
+        // 同为堆积时同样按空闲时间排序。
+        assert!(
+            victim_rank(Duration::from_secs(600), true)
+                < victim_rank(Duration::from_secs(60), true)
+        );
+    }
+
+    #[test]
+    fn idle_reap_never_kills_busy_or_closing() {
+        let over = Duration::from_secs(TCP_IDLE_REAP_SECS + 1);
+        let under = Duration::from_secs(TCP_IDLE_REAP_SECS - 1);
+        assert!(should_reap_idle(over, false, false));
+        assert!(!should_reap_idle(over, true, false));
+        assert!(!should_reap_idle(over, false, true));
+        assert!(!should_reap_idle(under, false, false));
+    }
+
+    #[test]
+    fn buffer_plan_uses_128k_tcp_and_mitm_pipes() {
+        // 128K 让 smoltcp 窗口缩放 shift=1（通告窗口 ~128K）；
+        // 降到 32K 会退回无缩放，单流被「32K / RTT」锁死。
+        assert_eq!(TCP_SOCKET_BUFFER, 128 * 1024);
+        assert_eq!(MITM_DUPLEX_CAP, 128 * 1024);
+        assert_eq!(DNS_TCP_DUPLEX_CAP, 64 * 1024);
+    }
+
+    #[test]
+    fn latency_plan_caps_queueing_and_sniff_wait() {
+        // 下行排队上限 256×2048B≈512KB：100Mbps 下排队时延 ~40ms 量级；
+        // 1024 档（2MB）会到 ~170ms，测速满载时延迟/抖动直接被队列抬高。
+        assert_eq!(MAX_PENDING_OUT, 256);
+        assert!(MAX_PENDING_OUT * MAX_TUN_PACKET <= 512 * 1024);
+        // 首包等待不能回到 180ms：延迟探测类连接连上不发数据，等待即纯延迟。
+        assert!(SNI_WAIT_MS <= 60);
+    }
+
+    #[test]
+    fn relay_drain_is_event_driven_not_timer_bound() {
+        // 出站数据必须由 Notify 唤醒，不能靠收紧兜底定时器去刷吞吐：
+        // 兜底保持 20ms，挂着空闲长连接时不该被更密的定时器空转（那是纯耗电）。
+        assert!(IDLE_SAFETY_WAIT_MS >= 20);
+        // 单次唤醒搬够 512KB，漏唤醒时的最坏下限也不至于掉回 100Mbps 量级。
+        const RELAY_CHUNK: usize = 16384;
+        assert!(RELAY_DRAIN_BURST * RELAY_CHUNK >= 512 * 1024);
+    }
+
+    #[test]
+    fn pending_cap_bounds_downstream_memory() {
+        // 上限必须明显大于 smoltcp 发送缓冲（健康连接不受影响），
+        // 又必须远小于「无界增长」：单连接下行堆积封顶在 1MB 内。
+        assert!(TCP_PENDING_CAP >= 2 * TCP_SOCKET_BUFFER);
+        assert!(TCP_PENDING_CAP <= 1024 * 1024);
+    }
+
+    fn dummy_handle() -> SocketHandle {
+        let mut sockets = SocketSet::new(vec![]);
+        let s = udp::Socket::new(
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 2048]),
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0u8; 2048]),
+        );
+        sockets.add(s)
+    }
+
+    #[tokio::test]
+    async fn drain_stops_at_pending_cap_and_wakes_relay() {
+        let (stx, srx) = mpsc::channel::<Vec<u8>>(64);
+        let mut conn = TcpConn {
+            handle: dummy_handle(),
+            snap: None,
+            to_relay: None,
+            from_relay: srx,
+            pending: VecDeque::new(),
+            pending_bytes: 0,
+            read_wake: Arc::new(Notify::new()),
+            relay_closed: false,
+            client_closed: false,
+            closing: false,
+            last_active: Instant::now(),
+        };
+        // 灌 640K（40×16K），超过 512K 上限。
+        for _ in 0..40 {
+            stx.send(vec![7u8; 16384]).await.unwrap();
+        }
+        assert!(drain_relay_to_pending(&mut conn));
+        // 搬运在达到上限后停止：最多超出一个块（先检查后搬运）。
+        assert!(conn.pending_bytes >= TCP_PENDING_CAP);
+        assert!(conn.pending_bytes <= TCP_PENDING_CAP + 16384);
+        assert!(conn.pending.len() <= RELAY_DRAIN_BURST);
+        assert!(!conn.relay_closed);
+        // 搬到数据必须唤醒 relay（permit 已存，立即就绪）。
+        assert!(tokio::time::timeout(Duration::from_millis(50), conn.read_wake.notified())
+            .await
+            .is_ok());
+        // 上限期间继续搬运无效：通道里还有数据但 pending 已满。
+        assert!(!drain_relay_to_pending(&mut conn));
+        // 模拟发送 loop 把 pending 写进 smoltcp 后，下一轮恢复搬运。
+        conn.pending.clear();
+        conn.pending_bytes = 0;
+        assert!(drain_relay_to_pending(&mut conn));
+        assert!(conn.pending_bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn relay_backpressure_keeps_upload_flowing() {
+        // 下行通道满（客户端收不动）时，上传方向必须仍可写：
+        // 旧实现阻塞在 send().await 会把 select 卡死，双向一起停摆。
+        let (upstream, relay_end) = tokio::io::duplex(64 * 1024);
+        let (ctx_tx, ctx_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (stx, mut srx) = mpsc::channel::<Vec<u8>>(2);
+        let relay_wake = Arc::new(Notify::new());
+        let read_wake = Arc::new(Notify::new());
+        let h = tokio::spawn(relay_stream(
+            Box::new(relay_end),
+            ctx_rx,
+            stx,
+            relay_wake.clone(),
+            read_wake.clone(),
+        ));
+        let (mut up_r, mut up_w) = tokio::io::split(upstream);
+        // 上游猛灌 1MB，无人消费 srx → 通道满 + staged → relay 停读。
+        tokio::spawn(async move {
+            let data = vec![9u8; 16384];
+            for _ in 0..64 {
+                if up_w.write_all(&data).await.is_err() {
+                    break;
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // 下行已背压，上传 PING 仍必须穿过 relay 到达上游。
+        ctx_tx.send(b"PING".to_vec()).await.unwrap();
+        let mut buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(2), up_r.read_exact(&mut buf))
+            .await
+            .expect("背压期间上传方向被卡死")
+            .unwrap();
+        assert_eq!(&buf, b"PING");
+        // 主循环搬走数据并唤醒后，下行恢复流动。
+        while srx.try_recv().is_ok() {}
+        read_wake.notify_one();
+        let got = tokio::time::timeout(Duration::from_secs(2), srx.recv())
+            .await
+            .expect("唤醒后下行未恢复");
+        assert!(got.is_some());
+        h.abort();
+    }
+
+    #[test]
+    fn probe_hosts_cover_gms_background() {
+        assert!(is_probe_host("firebaseinstallations.googleapis.com"));
+        assert!(is_probe_host("checkin.gstatic.com"));
+        assert!(is_probe_host("android.clients.google.com"));
+        assert!(is_probe_host("mtalk.google.com"));
+        assert!(is_probe_host("alt5-mtalk.google.com"));
+        // 正常业务域名不能被探测清单误伤（清单是精确匹配，不含通配）。
+        assert!(!is_probe_host("firebase.googleapis.com"));
+        assert!(!is_probe_host("www.googleapis.com"));
+        assert!(!is_probe_host("mtalk.google.com.example.com"));
+    }
+
+    #[test]
+    fn dial_breaker_cooldown_escalates_and_caps() {
+        assert_eq!(dial_cooldown(0), None);
+        assert_eq!(dial_cooldown(1), None);
+        assert_eq!(dial_cooldown(2), Some(Duration::from_secs(10)));
+        assert_eq!(dial_cooldown(3), Some(Duration::from_secs(20)));
+        assert_eq!(dial_cooldown(4), Some(Duration::from_secs(40)));
+        assert_eq!(dial_cooldown(5), Some(Duration::from_secs(60)));
+        assert_eq!(dial_cooldown(50), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn dial_breaker_record_active_clear() {
+        let mut f = DialFails::default();
+        let key = dial_key(None, IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4)), 443);
+        let now = Instant::now();
+        // 首次失败：容忍，不冷却。
+        assert!(!dial_breaker_record(&mut f, key.clone(), now));
+        assert!(!dial_breaker_active(&f, &key, now));
+        // 第二次连续失败：进入 10s 冷却。
+        assert!(!dial_breaker_record(&mut f, key.clone(), now));
+        assert!(dial_breaker_active(&f, &key, now));
+        assert!(!dial_breaker_active(&f, &key, now + Duration::from_secs(11)));
+        // 成功即清除：路径恢复后不再被熔断。
+        dial_breaker_clear(&mut f, &key);
+        assert!(!dial_breaker_active(&f, &key, now));
+    }
+
+    #[test]
+    fn dial_breaker_key_isolates_cdn_domains_on_same_ip() {
+        let ip = IpAddr::V4(std::net::Ipv4Addr::new(104, 16, 1, 1));
+        let mut f = DialFails::default();
+        let now = Instant::now();
+        let a = dial_key(Some("a.example.com"), ip, 443);
+        let b = dial_key(Some("b.example.com"), ip, 443);
+        let bare = dial_key(None, ip, 443);
+        // 同一个 IP:443 上的 a 连续失败进入冷却，b 和裸 IP 连接都不能被连坐。
+        dial_breaker_record(&mut f, a.clone(), now);
+        dial_breaker_record(&mut f, a.clone(), now);
+        assert!(dial_breaker_active(&f, &a, now));
+        assert!(!dial_breaker_active(&f, &b, now));
+        assert!(!dial_breaker_active(&f, &bare, now));
+        // 同域名不同端口也是不同目标。
+        assert!(!dial_breaker_active(&f, &dial_key(Some("a.example.com"), ip, 80), now));
+        // 域名大小写归一：同一域名不因为大小写差异被当成两个目标。
+        assert_eq!(
+            dial_key(Some("A.Example.COM"), ip, 443),
+            dial_key(Some("a.example.com"), ip, 443)
+        );
+    }
+
+    #[test]
+    fn dial_breaker_self_heals_when_link_fails() {
+        let mut f = DialFails::default();
+        let now = Instant::now();
+        // 先让某个目标进入冷却。
+        let victim = dial_key(None, IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)), 443);
+        dial_breaker_record(&mut f, victim.clone(), now);
+        dial_breaker_record(&mut f, victim.clone(), now);
+        assert!(dial_breaker_active(&f, &victim, now));
+        // 10s 窗口内不同目标接连失败（含上面的 victim，满 8 个即触发）：
+        // 触发后进入暂停期，后续 record 返回 false，所以要累计「是否曾触发」。
+        let mut healed = false;
+        for i in 0..LINK_FAIL_DISTINCT_TARGETS {
+            let k = dial_key(
+                Some(&format!("host{}.example.com", i)),
+                IpAddr::V4(std::net::Ipv4Addr::new(2, 2, 2, 2)),
+                443,
+            );
+            healed = dial_breaker_record(&mut f, k, now) || healed;
+        }
+        assert!(healed, "多目标同时失败应触发链路自愈");
+        // 自愈后：旧冷却被清空，暂停期内一律不熔断。
+        assert!(!dial_breaker_active(&f, &victim, now));
+        assert!(f.fails.is_empty());
+        // 暂停期内的失败不累计（链路恢复中的失败不是目标的错）。
+        assert!(!dial_breaker_record(&mut f, victim.clone(), now));
+        assert!(!dial_breaker_active(&f, &victim, now));
+        // 暂停期结束后恢复正常判定。
+        let after = now + Duration::from_secs(LINK_SELF_HEAL_SUSPEND_SECS + 1);
+        dial_breaker_record(&mut f, victim.clone(), after);
+        dial_breaker_record(&mut f, victim.clone(), after);
+        assert!(dial_breaker_active(&f, &victim, after));
+    }
+
+    #[test]
+    fn suppressed_dial_keeps_real_failure_timing() {
+        // 熔断抑制拨号后必须保持与真实拨号超时相同的失败时序：
+        // 立即 RST 会让测速/探活 App 把「秒拒」当成另一种结果，污染延迟读数。
+        assert_eq!(SUPPRESSED_DIAL_FAIL_SECS, 2);
+        // 自愈判据必须明显严于「单个目标反复失败」，否则正常重试也会误触暂停。
+        assert!(LINK_FAIL_DISTINCT_TARGETS >= 8);
+        assert!(LINK_SELF_HEAL_SUSPEND_SECS >= 30);
+    }
+
+    #[test]
+    fn tx_write_burst_bounds_round_length() {
+        // 封顶必须不大于 pending_out 容量（否则上限无意义），
+        // 又不能太小（单轮搬运量过低会抬高调度开销）。
+        assert!(MAX_TX_WRITE_BURST <= MAX_PENDING_OUT);
+        assert!(MAX_TX_WRITE_BURST >= 64);
+    }
+
+    #[test]
+    fn udp_dst_buffer_fits_real_quic_bursts() {
+        // QUIC 包约 1400 字节；8192 的旧档只装得下 5 个包，而 UDP 满即丢。
+        const QUIC_PKT: usize = 1400;
+        assert!(UDP_DST_BUF / QUIC_PKT >= 20);
+        // metadata 槽位不能先于缓冲耗尽，否则扩容缓冲毫无意义。
+        assert!(UDP_META_SLOTS >= UDP_DST_BUF / QUIC_PKT);
+    }
+
+    #[test]
+    fn tx_token_queue_full_counts_silent_drop() {
+        let stats = test_stats();
+        let tx = Arc::new(Mutex::new(
+            (0..MAX_TX_QUEUE)
+                .map(|_| vec![0u8; 4])
+                .collect::<VecDeque<_>>(),
+        ));
+        let pool = Arc::new(Mutex::new(Vec::new()));
+        let token = TunTxToken {
+            tx: tx.clone(),
+            pool: pool.clone(),
+            stats: stats.clone(),
+        };
+        let len = token.consume(4, |buf| {
+            buf[0] = 1;
+            buf.len()
+        });
+        assert_eq!(len, 4);
+        assert_eq!(
+            tx.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            MAX_TX_QUEUE
+        );
+        assert_eq!(stats.tun_tx_drop.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.tun_pending_drop.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.lock().unwrap_or_else(|p| p.into_inner()).len(), 1);
+    }
+
+    #[test]
+    fn tx_token_queue_below_limit_keeps_packet() {
+        let stats = test_stats();
+        let tx = Arc::new(Mutex::new(
+            (0..MAX_TX_QUEUE - 1)
+                .map(|_| vec![0u8; 4])
+                .collect::<VecDeque<_>>(),
+        ));
+        let pool = Arc::new(Mutex::new(Vec::new()));
+        let token = TunTxToken {
+            tx: tx.clone(),
+            pool,
+            stats: stats.clone(),
+        };
+        let _ = token.consume(4, |buf| {
+            buf.fill(2);
+        });
+        assert_eq!(
+            tx.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            MAX_TX_QUEUE
+        );
+        assert_eq!(stats.tun_tx_drop.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn transmit_returns_none_at_tx_high_water() {
+        let stats = test_stats();
+        let mut device = TunDevice::new(1500, stats.clone());
+        {
+            let mut g = device.tx.lock().unwrap_or_else(|p| p.into_inner());
+            for _ in 0..MAX_TX_QUEUE {
+                g.push_back(vec![0u8; 4]);
+            }
+        }
+        assert!(device.transmit(SmolInstant::from_millis(0)).is_none());
+        assert_eq!(stats.tun_tx_backpressure.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn pending_out_peak_is_counted_without_truncation() {
+        let stats = test_stats();
+        let mut pending: VecDeque<Vec<u8>> = (0..MAX_PENDING_OUT + 7)
+            .map(|i| vec![i as u8])
+            .collect();
+        note_pending_out(&pending, &stats);
+        // 高水位是背压信号，不再截断 pending_out。
+        assert_eq!(pending.len(), MAX_PENDING_OUT + 7);
+        assert_eq!(
+            stats.tun_pending_peak.load(Ordering::Relaxed),
+            (MAX_PENDING_OUT + 7) as u64
+        );
+        assert_eq!(stats.tun_pending_drop.load(Ordering::Relaxed), 0);
+
+        // 峰值只增不减；后续较短队列不应覆盖历史峰值。
+        pending.truncate(3);
+        note_pending_out(&pending, &stats);
+        assert_eq!(
+            stats.tun_pending_peak.load(Ordering::Relaxed),
+            (MAX_PENDING_OUT + 7) as u64
+        );
+    }
+
+    #[test]
+    fn drain_tx_into_respects_remaining_room() {
+        let stats = test_stats();
+        let device = TunDevice::new(1500, stats);
+        {
+            let mut g = device.tx.lock().unwrap_or_else(|p| p.into_inner());
+            for i in 0..5u8 {
+                g.push_back(vec![i; 4]);
+            }
+        }
+        let mut pending = VecDeque::new();
+        device.drain_tx_into(&mut pending, 3);
+        assert_eq!(pending.len(), 3);
+        assert_eq!(
+            device.tx.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            2
+        );
+    }
 }

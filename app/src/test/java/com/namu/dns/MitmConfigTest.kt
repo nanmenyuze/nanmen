@@ -186,6 +186,38 @@ class MitmConfigTest {
     }
 
     @Test
+    fun `per app mitm defaults to all and survives json round trip`() {
+        // 老配置没有 appMode/apps：必须回落 all，否则升级后 MITM 会静默失效。
+        val legacy = MitmConfig(enabled = true, hostnames = listOf("*.ads.com"))
+        val o = legacy.toJsonObject()
+        assertEquals("all", o.getString("appMode"))
+        assertEquals(0, o.getJSONArray("apps").length())
+        val back = MitmConfig.fromJsonObject(o)
+        assertEquals("all", back.appMode)
+        assertTrue(back.apps.isEmpty())
+
+        val scoped = MitmConfig(
+            enabled = true,
+            hostnames = listOf("*.ads.com"),
+            appMode = "deny",
+            apps = listOf("com.bank.app", "com.pay.wallet"),
+        )
+        val o2 = scoped.toJsonObject()
+        assertEquals("deny", o2.getString("appMode"))
+        assertEquals(2, o2.getJSONArray("apps").length())
+        val back2 = MitmConfig.fromJsonObject(o2)
+        assertEquals("deny", back2.appMode)
+        assertEquals(listOf("com.bank.app", "com.pay.wallet"), back2.apps)
+    }
+
+    @Test
+    fun `per app mitm does not make an otherwise empty config non empty`() {
+        assertTrue(MitmConfig().isEmpty)
+        // 只有 appMode=all 且没有应用：仍然是空配置，不应触发模块合并。
+        assertFalse(MitmConfig(appMode = "deny", apps = listOf("com.bank.app")).isEmpty)
+    }
+
+    @Test
     fun `pure mitm module has no dns rules but carries mitm`() {
         val module = """
             #!name=纯MITM

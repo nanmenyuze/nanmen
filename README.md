@@ -1,8 +1,16 @@
-# 南门DNS（自研内核版）2.3.8
+# 南门DNS 2.6
 
 > 内核 crate / JNI：`nanmen_core` / `libnanmen_core.so`；许可证：**GPL-3.0-only**（见 `LICENSE`、`NOTICE`、`THIRD_PARTY_NOTICES.md`）。
 
-> 2.3.8 = Android 12+ 应用壳（`minSdk 31`）+ 自研 MITM 去广告内核（1.12.5）。在 2.3.7 基础上补齐 M7 备份/恢复、迁移与崩溃报告、实时连接/网络状态、重载失败回滚，并把基础配置 DNS 改为跟随手机底层网络，新增 RULE-SET / DOMAIN-SET / PROTOCOL 规则能力，并修复 h2 空闲连接被误判握手超时；内核版本仍为 1.12.5。
+> 2.6 = Android 12+ 应用壳（`minSdk 31`）+ 自研 MITM 去广告内核（1.13.0）。在 2.3.7 基础上补齐 M7 备份/恢复、迁移与崩溃报告、实时连接/网络状态、重载失败回滚，并把基础配置 DNS 改为跟随手机底层网络，新增 RULE-SET / DOMAIN-SET / PROTOCOL 规则能力，并修复 h2 空闲连接被误判握手超时；内核版本仍为 1.12.5。
+>
+> 2.3.8 测试包追加（不改版本号）：按 App 分流（`UID`/`PROCESS-NAME`/`APP` 规则 + Root 读 socket 表，见 `docs/APP_ISOLATION.md`）；DNS-only 默认全量接管（硬编码 DNS 与 DoT 853 进 TUN，可在配置页关闭）；上游应答的 CNAME 链检测（拦截 CNAME 伪装）；分流 `REJECT` 域名规则并入 DNS 过滤（DNS-only 下也真正拦截）；新增「纯过滤」模式（全量 TUN、不需要节点、代理类动作自动降级直连，可做连接层 REJECT / 853 拦截 / MITM，`AutoConnect` 也允许无节点自动连接）；MITM 支持按 App 生效（全部 / 仅选中 / 跳过选中，TCP 443 用 socket 表定位 UID，银行与证书固定应用可精确排除）；Loon 旧版 `url - action` 写法（社区模块最常见的 `- reject-dict`）不再被当成不支持而丢弃。
+>
+> 2.3.8 测试包再追加（不改版本号）：逐连接快照表与「实时连接」列表（内核 `conns.rs` 记录 UID/域名/IP/端口/动作/命中规则/MITM 标记/存活时长，JNI `nativeConnections(since)` 增量下发，壳层每秒轮询、按内核活跃总数自动淘汰已关闭条目）；Surge `.sgmodule` 的 `[URL Rewrite]` 补齐 `302`/`307`、3 段 `header`（URL 替换）与 `mock`/`mock-request-body`/`mock-response-body`（翻译成等价 Loon 规则执行，不再计为不支持）；修正 Loon 旧语法 `^url https://new 302|header`（动作在末位）被整行丢弃的问题。内核 1.12.8。
+>
+> 2.6 正式版 = 合并两条迭代线。数据面（来自 2.3.9~2.3.12，内核 1.12.9）：TUN 收发改缓冲池 + 批量写 + 背压诊断（`tunTxDrop`/`tunPendingDrop`/`tunPendingPeak`/`tunTxBackpressure`/`tunWriteWouldBlock`/`tunWriteError`）；ICMP Echo 本地回显；直连拨号熔断（按目标冷却、连续失败自愈、`dialBreakerRejected`）与「保持真实失败时序」的抑制策略；并发上限改为淘汰最久空闲（`tcpLimitEvicted`）而非拒绝新连接；空闲兜底回收（`tcpIdleReaped`）；HTTPS/HTTP 连通性探测本地代答；切网滞回（5s 确认窗口）与重建失败自动重试；节点级 `udp:false` 与 SOCKS5/Trojan/VLESS UDP。过滤与分流（来自 2.3.8 测试包，内核 1.13.0）：按 App 分流（`uidmap` + Root 读 socket 表）、按 App MITM、CNAME 伪装拦截、DNS-only 全量接管、纯过滤无节点模式、Surge `[URL Rewrite]` 的 302/307/header/mock 映射、Loon `url target action` 旧语法、逐连接快照与「实时连接」列表。
+>
+> 版本：2.6（versionCode 90）；内核 1.13.0。
 
 ## 壳设计文档
 
@@ -28,7 +36,7 @@
 - 固定样本：`compat/fixtures/` 48 个，机器可读预期：`compat/expected/cases.json` 52 条
 - 机读矩阵：`compat/matrix.json` 99 行；逐 case 覆盖：`compat/expected/coverage.json` 52 条
 - 回归基线：`core/tests/compat_fixtures.rs` 13 项、`core/tests/compat_rules.rs` 1 项、`app/src/test/java/com/namu/dns/CompatFixtureTest.kt` 9 项
-- 2.3.8 基线：Rust 185/185（lib 107 + binary_frame 1 + 既有套件）、Kotlin 118/118（24 suites）、Lint 0 error / 38 warning、`verifyKernel` 通过；APK/源码 hash 见构建产物与 `SHA256SUMS.txt`
+- 2.6 基线：Rust 174 lib + 集成套件全通过、Kotlin 全通过、`verifyKernel` 通过；APK/源码 hash 见构建产物与 `SHA256SUMS.txt`
 - 规则集/PROTOCOL：`RULE-SET` / `DOMAIN-SET` 导入时缓存并展开，`PROTOCOL,TCP|UDP` 由内核按连接类型匹配；纯规则集模块可导入；详见 `docs/RULESET_PROTOCOL.md`
 - 状态：**IMPLEMENTED_WITH_BLOCKERS**；M6 代码/单测通过，脚本端到端仍未验收（无真机、无 iOS/Loon/Shadowrocket 对照设备、无真实授权脚本全集）
 - 结论：模块可解析 Loon `.plugin` 的 `[Argument]/[General]/[Rule]/[Rewrite]/[Host]/[Script]/[MITM]`，执行常用 `[Rewrite]` 与结构化 `[Script]`；参数替换、Host 映射、General 全局项仍只记录并展示功能缺口；应用/UID 规则、VMess/Reality/Hysteria2/TUIC 仍明确拒绝
@@ -65,7 +73,7 @@
 - Clash 规则目标保留策略组名，组名优先于内置 `PROXY`；`proxy-groups` 导入为设备策略组；`proxies` 节点仍走订阅。
 - 远程规则源支持 `ETag`/`Last-Modified` 条件请求，304 复用缓存；失败保留旧文件和 `.bak`，UI 标记“失败·用旧缓存”。
 - 规则引擎新增 `DOMAIN-WILDCARD`、`GEOIP(CN)`；`PROCESS-NAME`/`UID` 等无可靠数据源的规则明确拒绝，不静默丢弃。
-- 协议新增本地受控服务端验收：Trojan/VLESS/SOCKS5 建立、双向、失败、重连；SOCKS5 UDP 单独验证；未实现的 VMess/Reality/Hysteria2/TUIC 准确拒绝。
+- 协议新增本地受控服务端验收：Trojan/VLESS/SOCKS5 建立、双向、失败、重连；SOCKS5 / Trojan / VLESS UDP 单独验证（含节点级 udp:false）；未实现的 VMess/Reality/Hysteria2/TUIC 准确拒绝。
 - 版本：2.1（versionCode 71），内核 1.11.5；Rust 139/139、Kotlin 95/95、Lint 0 error/38 warning。
 
 ## M3：策略组与规则分流
@@ -522,7 +530,7 @@ Kotlin 壳 + 自研 Rust 内核（`core/`，crate `nanmen_core`，JNI `libnanmen
 - race 分支与全局锁的 unwrap 改为容错（poison 锁不再 panic）
 
 已知但本轮不改（记录在案）：
-- 应用自带 DoT/DoH 或 DoH3/HTTPDNS 时仍可绕过本地过滤：53 端口的硬编码 DNS 已在 1.9.7 劫持，但 443/853 加密 DNS 不在 53 劫持范围内；系统私人 DNS 仍建议关闭或设为自动
+- 应用自带 DoH / DoH3 / HTTPDNS 时仍可能绕过本地过滤：DNS-only 全量接管后 53 端口任意目的地址都已被劫持、853 默认被 `block_dot` 拒绝，但 443 上的加密 DNS 在不开 MITM 时无法识别；系统私人 DNS 仍建议关闭或设为自动
 - 单条 DoT 连接串行化，突发查询会排队（可扩成 2-4 条连接池）
 - 直连域名用系统解析，查询会走底层网络 DNS（隐私上可接受）
 - WS 握手未校验 Sec-WebSocket-Accept、早到帧会丢弃（自建节点场景影响小）

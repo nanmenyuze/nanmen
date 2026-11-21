@@ -478,6 +478,15 @@ fun ConfigDetailScreen(onRestart: () -> Unit, onOpenModules: () -> Unit, onOpenM
                 if (runtime.current().connected) onRestart()
             }
             SwitchRow(
+                title = "DNS-only 全量接管",
+                subtitle = "只对 DNS-only 生效：接管全部流量，硬编码 DNS 与 DoT 853 才进内核；" +
+                    "关闭后只接管本机 DNS 地址，冷门 DNS 和 DoH 可绕过",
+                checked = cfg.dnsOnlyFullRoute,
+            ) {
+                settings.update { current -> current.copy(dnsOnlyFullRoute = it) }
+                if (runtime.current().connected) onRestart()
+            }
+            SwitchRow(
                 title = "TLS / HTTP 域名嗅探",
                 subtitle = "没有 DNS 映射时，从首包读取 SNI / Host",
                 checked = cfg.sniff,
@@ -824,6 +833,8 @@ private fun ruleTypeLabel(type: String): String = when (type) {
     "DOMAIN-REGEX" -> "正则"
     "IP-CIDR", "IP-CIDR6" -> "IP 段"
     "PORT" -> "端口"
+    "APP", "PROCESS-NAME", "APP-NAME" -> "按应用"
+    "UID" -> "UID"
     "FINAL", "MATCH" -> "最终规则"
     else -> type
 }

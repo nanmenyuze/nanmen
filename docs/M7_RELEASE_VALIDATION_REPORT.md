@@ -211,14 +211,66 @@ $ emulator -list-avds
 - 回归：新增 `h2_idle_client_preface_is_reclaimed_quietly`；Rust 185/185。
 - 详见 `docs/H2_IDLE_TIMEOUT.md`。
 
+## 12.3 2.3.8 增量：TUN 数据面 Phase 1
+
+- 目标：不换协议栈，先消除静默丢包、复用缓冲、把写阻塞从固定 20ms 重试改为事件驱动。
+- 收发侧增加缓冲池：读 TUN 直接复用 2048 字节缓冲，`set_len` 后交给 smoltcp；TxToken 复用缓冲，写成功后回池。
+- `transmit()` 在 tx 队列达到 256 时返回 `None`，让 smoltcp 保留在 socket 发送缓冲，不再静默丢包；新增 `tunTxBackpressure` 计数。
+- `pending_out` 高水位改为 1024：达到后暂停从 tx 队列取包并暂停读 TUN，形成端到端背压；不再 `truncate(512)`。
+- 写 TUN 返回 `WouldBlock` 后，用 `AsyncFd::writable()` 等待可写事件；有 backlog 时兜底定时器缩短到 1ms。
+- 诊断页/报告新增「背压」计数；`tunPendingDrop` 保留为极端兜底字段，当前路径不再触发。
+- Rust 191/191；Kotlin 119/119（24 suites）；Lint 0 error / 38 warning / 3 information。
+- 未做真机吞吐复测（当前无 ADB 设备）；Phase 1 的验收点是 `tunTxDrop`、`tunPendingDrop` 和 `tunWriteWouldBlock` 是否下降，而不是直接承诺回到 588 Mbps。
+
+## 12.4 2.3.8 增量：128K TCP/MITM 缓冲档位
+
+- smoltcp 每条 TCP 连接 rx/tx 缓冲从 32K 抬到 128K；MITM 本地 duplex 从 64K 抬到 128K；DNS TCP duplex 保持 64K，DNS 查询路径不动。
+- 每活跃 TCP 连接的协议栈缓冲从 64K 增到 256K，增量约 192KB；100 条活跃连接约 +18.75MB，叠加任务/管道开销后接近旧评估的 +25MB；连接上限和正文改写内存上限不变。
+- 新增常量断言 `buffer_plan_uses_128k_tcp_and_mitm_pipes`，锁定 TCP/MITM/DNS 三档缓冲，防止后续误回退。
+- 验证：Rust 192/192；Kotlin 119/119（24 suites）；Lint 0 error / 38 warning / 3 information；M0 `errors: []`。
+- 当前无 ADB 设备，未做真机吞吐复测；下一轮需要在 `mitmConns > 0` 的 A/B 测速里同时观察下行、Native 堆和 LMK 压力。
+
+## 12.5 2.3.8 增量：64K 档回退 + 出站数据事件唤醒
+
+- 回退动因：128K 档在真机诊断中未见下行改善。三次诊断报告里测速 8443 连接全部为 `DIRECT`，MITM 一次未介入，`mitmConns` 为 0 或 3 次握手失败，A/B 无法对比；同时每活跃连接的协议栈缓冲从 64K 抬到 256K，Native 堆与 PSS 上升。按用户决定回退到基线档位。
+- 回退内容：`TCP_SOCKET_BUFFER` 128K → 32K（每方向 32K，合计 64K）；`MITM_DUPLEX_CAP` 128K → 64K；`DNS_TCP_DUPLEX_CAP` 保持 64K。断言测试改名 `buffer_plan_uses_32k_tcp_and_mitm_pipes`。
+- 同期修正数据面唤醒（静态核实后确认的架构缺口）：
+  - 主循环新增共享 `Arc<Notify>`：`relay_stream` 每读到上游数据并送入 `from_relay` 通道后 `notify_one()`，主循环 `select!` 新增 `notified()` 分支。此前唤醒源只有 TUN 可读、TUN 可写、UDP 响应、DNS 响应和定时器，出站数据无专属唤醒。
+  - 非空闲兜底间隔维持 20ms（`IDLE_SAFETY_WAIT_MS`），并新增 `has_relay_backlog`：通道仍有残留时按 1ms 跑，避免被背压打断的一轮要等兜底定时器。兜底不靠收紧定时器去刷吞吐——挂着空闲长连接时更密的定时器是纯耗电，快路径由 Notify 负责。
+  - 每轮从 relay 通道搬入 `pending` 的块数 16 → 32（`RELAY_DRAIN_BURST`）。此前单连接稳态吞吐被「块数 × 块大小 / 轮询间隔」限制在约 100 Mbps 量级。
+  - 背压语义不变：通道满时 `server_tx.send().await` 阻塞并收缩上游接收窗口，不静默丢包。
+- 新增测试 `relay_drain_is_event_driven_not_timer_bound`，锁定「兜底 ≥20ms、单轮搬运 ≥512KB」：出站提速必须来自事件唤醒，不能靠缩短定时器。
+- 验证：Rust 193/193；Kotlin 119/119（24 suites）；Lint 0 error / 38 warning / 3 information；M0 `errors: []`。
+- 真机对照（00:56 诊断，运行 1 分 47 秒）：背压 0 次、backlog 峰值 116、`tunTxDrop`/`tunPendingDrop` 均为 0，下行 1.79 GB、上行 812 MB；Native 堆 33.5 MB、PSS 269,695 KB，较 128K 档的 47.6–54.4 MB / 274,540–277,095 KB 明显回落。该次会话 `mitmConns` 仍为 0，MITM 未介入，A/B 对比仍缺。
+- 新内核哈希：arm64 `0dcc5d2316c1fdeb6956151c575567c33a0303bcf674491f7b127a3562cca626`；armv7 `4390cba29185559aa46869693b7ce30e2fec1065087504c420b382aba083fcbc`。
+- 未做真机吞吐复测（当前无 ADB 设备）。验收点：同一测速服务器、同一链路速率下，DNS+MITM 全开与关 MITM 的下行差距是否收窄，且 `tunTxDrop`/`tunPendingDrop` 保持为 0。
+
+## 12.6 2.3.8 增量：出站多地址改并发竞速
+
+- 问题：`connect_any` 串行尝试前两个地址、每个 4s；注释自述「双栈里常见首个地址不可达」，却仍串行等首个地址超时才试下一个，双栈场景白等约 4s，表现为「半天才出数据」。
+- 修复：拆出 `connect_one`（单地址 4s 超时 + `set_nodelay`）与 `race_two`（并发竞速），`connect_any` 按候选数分派。两个地址同时发起，先成功者胜出；先返回失败则继续等另一个（另一个一直在并发跑，不额外增加等待）。
+- 影响面：仅当候选地址 ≥2 时行为改变。当前配置 `fakeIp=false` 且节点数为 0，DIRECT 走「已有真实 IP 直接连」分支只传单地址，改动前不触发串行等待；开启 fake-IP 或使用域名节点时才会命中。
+- 核算后未改的部分（记录判断依据）：
+  - 「DIRECT 绕过自研 DNS」不成立：fake-IP 分支走 `dns.resolve_real()`，内部有 `real_cache`、`block_aaaa`、规则 `filter` 与加密上游；非 fake-IP 分支直接使用 TUN 捕获的真实 IP，不重复解析。
+  - 真正走系统解析的是 `tls_connect()` → `tcp_connect()` → `resolve_all()` → `lookup_host`，用于 MITM 上游连目标站点。当前 `mitmConns=0` 未命中，收益低且需把 `DnsEngine` 透传到 TLS 调用链，暂不改。
+- 验证：Rust 193/193；清洁构建 `verifyKernel` 通过。
+
+## 12.7 2.3.8 增量：UDP 目的端点缓冲放大
+
+- 问题：`add_udp_dst_socket` 每方向仅 `8192 字节 / 16 metadata`。QUIC 包约 1400 字节，只装得下 5 个包；而 UDP 无背压语义，缓冲满即丢，大流量 QUIC 会被这个缓冲先卡住。
+- 修复：改为 `UDP_DST_BUF = 32KB`、`UDP_META_SLOTS = 64`（metadata 槽位必须与缓冲容量匹配，否则槽位先耗尽会提前丢包）。每目的端点内存从 16KB 增至 64KB，增量 48KB。
+- 新增测试 `udp_dst_buffer_fits_real_quic_bursts`，锁定「32KB 至少容纳 20 个 QUIC 包且 metadata 槽位不先耗尽」。
+- 未改（评估后记录）：UDP 决策仍是每包 `reverse.lock()` + `decide_action` 重算，`udp_clients` 只缓存 tx 句柄不缓存 action/mode。按五元组缓存 action 需要配合规则热更的失效机制，风险中等，暂不落地。出站连接池同样暂不做——当前 `mitmConns=0`，MITM 未命中，连接池无用户。
+- 验证：Rust 194/194。
+
 ## 13. 交付物
 
 | 文件 | 大小 | SHA-256 |
 |---|---|---|
-| `南门DNS-2.3.8-自研内核.apk` | 44,652,317 B | `d3756d82953b87a211f037911a91af71e5a24b61240b1da108186b11a26e2fc6` |
+| `南门DNS-2.3.8-自研内核.apk` | 44,652,317 B | `de8162ed4cc825a4d5a97016c1e3a822bde74a096f07d9b470928efe4af78baa` |
 | `南门DNS-2.3.8-自研内核-完整源码.zip` | 见交付时文件列表 | 见根目录 `SHA256SUMS.txt`（避免报告自引用导致 hash 变化） |
 
 - APK 版本：`versionCode=82`、`versionName=2.3.8`。
 - 源码 zip 的最终 SHA-256 以根目录 `SHA256SUMS.txt` 为准；报告不内嵌自身压缩包的 hash，避免自引用。
 - 源码包从 `work/v134` 根打包，排除 `build/`、`app/build/`、`core/target/`、`.gradle/`、`.kotlin/`、`.git/`、`local.properties`、`keystore/`、`*.apk`、`*.zip`、`*.log`。
-- 源码包内 `scripts/m0_validate.py` 校验结果：`versionName=2.3.8`、`versionCode=82`、`code_source_sha256=84d57b1db3186209e81a4505528bc0022c33c02bdbe1126fbaa031e94f0e2dd0`、`errors: []`。
+- 源码包内 `scripts/m0_validate.py` 校验结果：`versionName=2.3.8`、`versionCode=82`、`code_source_sha256=1fbc4ec71ffaac81c22aefc4731933c07ac13d77f47da2852eddfa77b0be645c`、`errors: []`。

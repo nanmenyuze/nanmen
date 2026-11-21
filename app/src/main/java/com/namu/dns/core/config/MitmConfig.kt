@@ -81,11 +81,18 @@ data class MitmConfig(
     val loonRewrites: List<String> = emptyList(),
     /** 请求/响应脚本；模块导入时下载正文并缓存。 */
     val scripts: List<ScriptConfig> = emptyList(),
+    /**
+     * 按 App MITM：`all` 全部应用 / `allow` 仅 [apps] 内 / `deny` [apps] 内跳过。
+     * 银行、支付、证书固定应用放进 deny 即可避免被解密后握手失败。
+     */
+    val appMode: String = "all",
+    /** [appMode] 使用的包名列表；下发内核前解析成 UID。 */
+    val apps: List<String> = emptyList(),
 ) {
     val isEmpty: Boolean
         get() = !enabled && hostnames.isEmpty() && skipHostnames.isEmpty() &&
             urlRewrites.isEmpty() && headerRewrites.isEmpty() && loonRewrites.isEmpty() &&
-            scripts.isEmpty()
+            scripts.isEmpty() && apps.isEmpty()
 
     fun toJsonObject(): JSONObject = JSONObject().apply {
         put("enabled", enabled)
@@ -95,6 +102,8 @@ data class MitmConfig(
         put("headerRewrites", JSONArray(headerRewrites))
         put("loonRewrites", JSONArray(loonRewrites))
         put("scripts", JSONArray(scripts.map { it.toJsonObject() }))
+        put("appMode", appMode)
+        put("apps", JSONArray(apps))
     }
 
     companion object {
@@ -116,6 +125,8 @@ data class MitmConfig(
                         a.optJSONObject(i)?.let { ScriptConfig.fromJsonObject(it) }
                     }
                 } ?: emptyList(),
+                appMode = o.optString("appMode", "all").ifBlank { "all" },
+                apps = arr("apps"),
             )
         }
     }

@@ -99,6 +99,9 @@ pub struct StrategySet {
     groups: Vec<GroupDef>,
     by_name: HashMap<String, usize>,
     node_types: HashMap<String, String>,
+    /// 节点是否真的能转发 UDP（协议能力 + 节点级 udp 开关）。
+    /// 策略组按 UDP 解析时只认这张表，不能拿 TCP 探测成功来背书。
+    node_udp: HashMap<String, bool>,
     selections: BTreeMap<String, String>,
     issues: Vec<GroupIssue>,
     disabled: HashSet<String>,
@@ -109,6 +112,7 @@ impl StrategySet {
     pub fn from_config(cfg: &Config) -> Self {
         let mut issues = Vec::new();
         let mut node_types = HashMap::new();
+        let mut node_udp = HashMap::new();
         let mut node_counts: HashMap<String, usize> = HashMap::new();
         for node in &cfg.nodes {
             let name = node.name.trim();
@@ -117,6 +121,7 @@ impl StrategySet {
             }
             *node_counts.entry(name.to_string()).or_insert(0) += 1;
             node_types.insert(name.to_string(), node.kind.clone());
+            node_udp.insert(name.to_string(), node.udp_supported());
         }
         let duplicate_nodes: Vec<String> = node_counts
             .iter()
@@ -326,6 +331,7 @@ impl StrategySet {
             groups,
             by_name,
             node_types,
+            node_udp,
             selections: cfg.group_selections.clone(),
             issues,
             disabled,
@@ -588,7 +594,7 @@ impl StrategySet {
                 NoNodePolicy::Global,
             ));
         };
-        if transport == Transport::Udp && !supports_udp(kind) {
+        if transport == Transport::Udp && !self.node_udp.get(member).copied().unwrap_or(false) {
             return Err(ResolveFailure::new(
                 "udp_unsupported",
                 format!("节点 {}（{}）不支持 UDP，不能作为 UDP 策略成员", member, kind),
@@ -699,10 +705,6 @@ fn dfs_cycle(
     }
     stack.pop();
     color[idx] = 2;
-}
-
-fn supports_udp(kind: &str) -> bool {
-    matches!(kind, "ss" | "socks5")
 }
 
 #[derive(Clone, Debug)]
@@ -1063,8 +1065,11 @@ mod tests {
 
     #[test]
     fn udp_never_uses_tcp_probe_or_trojan_node() {
+        // trojan 本身已支持 UDP；这里显式 udp:false，验证「TCP 健康不能给 UDP 背书」。
+        let mut tj = node("tj", "trojan");
+        tj.udp = Some(false);
         let cfg = config(
-            vec![node("tj", "trojan"), node("ss", "ss")],
+            vec![tj, node("ss", "ss")],
             vec![group("F", "fallback", &["tj", "ss"])],
             &[],
         );
@@ -1076,8 +1081,10 @@ mod tests {
         // UDP 必须跳过不支持 UDP 的 trojan，不能拿 TCP 健康当 UDP 可用。
         assert_eq!(set.resolve_group("F", Transport::Udp, &h).unwrap().node, "ss");
 
+        let mut only_tj_node = node("tj", "trojan");
+        only_tj_node.udp = Some(false);
         let only_tj = config(
-            vec![node("tj", "trojan")],
+            vec![only_tj_node],
             vec![group("F", "fallback", &["tj"])],
             &[],
         );
@@ -1085,6 +1092,20 @@ mod tests {
         let err = set.resolve_group("F", Transport::Udp, &HealthRegistry::new()).unwrap_err();
         assert_eq!(err.code, "no_available_member");
         assert!(err.message.contains("不支持 UDP"));
+    }
+
+    #[test]
+    fn trojan_and_vless_support_udp_by_default() {
+        for kind in ["trojan", "vless"] {
+            let cfg = config(
+                vec![node("n", kind)],
+                vec![group("F", "fallback", &["n"])],
+                &[],
+            );
+            let set = StrategySet::from_config(&cfg);
+            let r = set.resolve_group("F", Transport::Udp, &HealthRegistry::new()).unwrap();
+            assert_eq!(r.node, "n", "{} 默认应可用于 UDP", kind);
+        }
     }
 
     #[test]

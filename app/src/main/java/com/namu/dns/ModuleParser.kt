@@ -416,8 +416,16 @@ object ModuleParser {
             )
             return thenPart.split(';').map { it.trim() }.all { call -> supportedFns.any { call.startsWith(it) } }
         }
-        val parts = line.split(Regex("\\s+"), limit = 3)
-        val action = parts.getOrNull(1)?.lowercase() ?: return false
+        val parts = line.split(Regex("\\s+")).filter { it.isNotBlank() }
+        // 动作可能在末位（Loon 官方写法 `url target header|302`），也可能在第二位
+        // （`url reject-dict`、旧版 `url - action`）。两种都认，避免预览把能跑的规则标成不支持。
+        val last = parts.lastOrNull()?.lowercase()
+        val second = parts.getOrNull(1)?.lowercase()
+        val action = when {
+            parts.size >= 3 && last in loonSimpleActions -> last!!
+            second == "-" && parts.size >= 3 -> parts[2].lowercase()
+            else -> second
+        } ?: return false
         if (action !in loonSimpleActions) return false
         if (action.contains("json-jq") || action.endsWith("-jq")) return false
         if (action.startsWith("mock-") && lower.contains("data-path=")) return false

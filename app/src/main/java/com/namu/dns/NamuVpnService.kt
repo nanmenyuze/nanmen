@@ -21,6 +21,9 @@ import androidx.core.app.NotificationManagerCompat
 
 class NamuVpnService : VpnService() {
 
+    /** 切网纯决策结果，与 Android 框架解耦以便单测。 */
+    enum class NetSwitchDecision { NONE, REBUILD_NOW, CONFIRM_LATER }
+
     companion object {
         const val ACTION_START = "com.namu.dns.START"
         const val ACTION_STOP = "com.namu.dns.STOP"
@@ -72,6 +75,26 @@ class NamuVpnService : VpnService() {
 
         private const val CHANNEL_ID = "namu_vpn_status"
         private const val NOTIF_ID = 1001
+
+        /**
+         * 切网确认窗口。Wi-Fi 的 VALIDATED 位会抖（门户复验/息屏/ROM 周期重验），
+         * 每抖一次就整隧道重建会让所有连接瞬断（随机全断）。
+         * 当前网络仍可用时，"更优"网络必须稳定存在这么久才真正切换；
+         * 当前网络真正丢失（onLost）则立即重建，不受窗口限制。
+         */
+        const val NETWORK_SWITCH_CONFIRM_MS = 5000L
+        /** 重建失败后的自动重试延迟：切网瞬间 establish 偶发失败，重试一次通常即成。 */
+        const val REBUILD_RETRY_DELAY_MS = 3000L
+
+        fun decideNetworkSwitch(
+            pickedIsNull: Boolean,
+            pickedIsCurrent: Boolean,
+            currentUsable: Boolean,
+        ): NetSwitchDecision = when {
+            pickedIsNull || pickedIsCurrent -> NetSwitchDecision.NONE
+            !currentUsable -> NetSwitchDecision.REBUILD_NOW
+            else -> NetSwitchDecision.CONFIRM_LATER
+        }
     }
 
     private var tun: ParcelFileDescriptor? = null
@@ -90,6 +113,9 @@ class NamuVpnService : VpnService() {
 
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
     private val rebuildRunnable = Runnable { rebuildTunnel() }
+    private val confirmSwitchRunnable = Runnable { confirmNetworkSwitch() }
+    /** 重建失败已自动重试过一次：再失败就干净停止，不留半死状态。 */
+    @Volatile private var rebuildRetried = false
     // 所有 nativeStart / nativeStop 串行执行，避免关闭线程把刚启动的新内核再停掉。
     private val nativeLock = Any()
 
@@ -202,6 +228,7 @@ class NamuVpnService : VpnService() {
     private fun modeLabel(): String = when (settings.current().mode) {
         "global" -> "全局代理"
         "dns_only" -> "仅 DNS 过滤"
+        "filter_only" -> "纯过滤（不代理）"
         else -> "规则分流"
     }
 
@@ -264,10 +291,13 @@ class NamuVpnService : VpnService() {
                 lastGoodJson = json
                 running = true
                 alive = true
+                rebuildRetried = false
                 runtime.markConnected(android.os.SystemClock.elapsedRealtime() - startedAt)
                 App.container.refreshRuntime()
                 startNetworkMonitor()
                 startNotifUpdates()
+                // 按 App 分流的数据源：VPN 起来后才开始读表下发。
+                UidTablePublisher.start()
             } catch (t: Throwable) {
                 messages.show("启动失败: ${t.message}")
                 runtime.markStartFailed()
@@ -373,6 +403,13 @@ class NamuVpnService : VpnService() {
         if (cfg.mode != "dns_only") {
             builder.addRoute("0.0.0.0", 0)
             builder.addRoute("::", 0)
+        } else if (cfg.dnsOnlyFullRoute) {
+            // DNS-only 也要全量接管：只加 VPN 的 DNS 地址时，App 硬编码 8.8.8.8、
+            // 系统 DoT 853、App 自己的 DoH 都不进 TUN，等于 DNS 泄漏。
+            // 全量接管后非 DNS 连接仍直连（内核在 dns_only 下判 Direct），
+            // 但所有 DNS 查询都会被劫持到本地引擎，DoT 才会被 block_dot 看到。
+            builder.addRoute("0.0.0.0", 0)
+            builder.addRoute("::", 0)
         }
         try {
             builder.addDisallowedApplication(packageName)
@@ -435,6 +472,7 @@ class NamuVpnService : VpnService() {
         val cb = networkCallback ?: return
         networkCallback = null
         mainHandler.removeCallbacks(rebuildRunnable)
+        mainHandler.removeCallbacks(confirmSwitchRunnable)
         try {
             getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb)
         } catch (_: Exception) {
@@ -442,15 +480,56 @@ class NamuVpnService : VpnService() {
     }
 
     private fun evaluateNetworks() {
+        if (!running || stopping) return
         val picked = pickUnderlyingNetwork()
-        val changed = currentNetwork != picked
-        currentNetwork = picked
-        if (!changed || !running || stopping) return
-        // 全部网络丢失时只记录状态；等网络恢复（null -> non-null）会走到这里触发重建，
-        // 否则飞行模式/Wi-Fi 断开再恢复后隧道一直挂在旧网络上。
-        if (picked == null) return
+        val current = currentNetwork
+        when (decideNetworkSwitch(
+            pickedIsNull = picked == null,
+            pickedIsCurrent = picked == current,
+            currentUsable = isNetworkUsable(current),
+        )) {
+            NetSwitchDecision.NONE -> {
+                // 无变化或抖动已还原：撤销待确认的切换。
+                // 全部网络丢失时也走这里；等网络恢复后 currentUsable=false 会立即重建。
+                mainHandler.removeCallbacks(confirmSwitchRunnable)
+            }
+            NetSwitchDecision.REBUILD_NOW -> {
+                // 当前网络真正丢失：立即切换，不等确认窗口。
+                currentNetwork = picked
+                mainHandler.removeCallbacks(confirmSwitchRunnable)
+                scheduleRebuild()
+            }
+            NetSwitchDecision.CONFIRM_LATER -> {
+                // 当前仍可用但出现"更优"网络：可能是验证位抖动，稳定一个窗口后再切。
+                mainHandler.removeCallbacks(confirmSwitchRunnable)
+                mainHandler.postDelayed(confirmSwitchRunnable, NETWORK_SWITCH_CONFIRM_MS)
+            }
+        }
+    }
+
+    /** 确认窗口到期复核：仍然翻转才真正切换，抖动还原则什么都不做。 */
+    private fun confirmNetworkSwitch() {
+        if (!running || stopping) return
+        val picked = pickUnderlyingNetwork()
+        if (picked == null || picked == currentNetwork) return
         if (rebuilding) {
-            // 重建期间又切网：记一笔，等本次重建结束后再补一次，避免连续重建互相打断。
+            pendingNetworkRebuild = true
+            return
+        }
+        currentNetwork = picked
+        scheduleRebuild()
+    }
+
+    private fun isNetworkUsable(network: Network?): Boolean {
+        if (network == null) return false
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return false
+        val caps = cm.getNetworkCapabilities(network) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
+    private fun scheduleRebuild() {
+        if (rebuilding) {
+            // 重建期间又切网：记一笔，等本次重建结束后再评估，避免连续重建互相打断。
             pendingNetworkRebuild = true
             return
         }
@@ -509,6 +588,7 @@ class NamuVpnService : VpnService() {
                 rebuilding = false
             }
             if (success) {
+                rebuildRetried = false
                 runtime.markConnected(0L)
                 App.container.refreshRuntime()
                 if (pendingReload) {
@@ -516,15 +596,23 @@ class NamuVpnService : VpnService() {
                     reloadConfig()
                 }
             } else if (running && !stopping) {
-                messages.show("网络已切换，但隧道重建失败，请手动重连")
-                runtime.markStartFailed()
-                App.container.refreshRuntime()
+                if (!rebuildRetried) {
+                    // 自动重试一次：切网瞬间 establish 偶发失败，第二次通常即成。
+                    rebuildRetried = true
+                    mainHandler.removeCallbacks(rebuildRunnable)
+                    mainHandler.postDelayed(rebuildRunnable, REBUILD_RETRY_DELAY_MS)
+                } else {
+                    // 连续两次失败：干净停止。旧逻辑留 running=true/tun=null 的半死态，
+                    // 界面显示失败但服务自认在跑，后续重载/切网全部静默失效。
+                    messages.show("网络已切换，但隧道重建连续失败，已自动停止，请重新连接")
+                    stopVpn()
+                }
             }
             if (pendingNetworkRebuild) {
                 pendingNetworkRebuild = false
                 if (running && !stopping) {
-                    mainHandler.removeCallbacks(rebuildRunnable)
-                    mainHandler.postDelayed(rebuildRunnable, 500)
+                    // 重建期间网络又变了：重新走滞回评估，而不是无脑再重建。
+                    evaluateNetworks()
                 }
             }
         }.start()
@@ -537,6 +625,7 @@ class NamuVpnService : VpnService() {
         reloading = false
         stopNetworkMonitor()
         stopNotifUpdates()
+        UidTablePublisher.stop()
         mainHandler.removeCallbacks(rebuildRunnable)
         runtime.markStopping()
         // 先显示“正在关闭”，等 nativeStop 真正返回后再撤 TUN/服务，

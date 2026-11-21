@@ -167,6 +167,7 @@ fun SettingsScreen(onRestart: () -> Unit, onOpenLogs: () -> Unit, onOpenMitm: ()
                 value = when (cfg.mode) {
                     "global" -> "全局"
                     "dns_only" -> "仅 DNS"
+                    "filter_only" -> "纯过滤"
                     else -> "规则"
                 },
                 icon = Icons.Rounded.Layers,
@@ -218,7 +219,7 @@ fun SettingsScreen(onRestart: () -> Unit, onOpenLogs: () -> Unit, onOpenMitm: ()
         SectionHeader("关于")
         GroupCard {
             SettingsRow("版本", value = BuildConfig.VERSION_NAME)
-            SettingsRow("内核", value = "nanmen_core · 1.12.5")
+            SettingsRow("内核", value = "nanmen_core · 1.13.0")
             SettingsRow("代理协议", value = "SS · Trojan · VLESS")
             SettingsRow("DNS", value = "DoH · DoT · UDP")
             SettingsRow(

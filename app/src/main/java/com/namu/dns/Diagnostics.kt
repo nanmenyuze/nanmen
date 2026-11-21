@@ -136,6 +136,12 @@ object Diagnostics {
                     "本地拦截/缓存平均：${statsJson.optLong("dnsLocalAvgMs")} ms",
             )
             sb.appendLine("DoT/DoQ 拦截：${statsJson.optLong("dotBlocked")} 次")
+            sb.appendLine("直连熔断抑制拨号：${statsJson.optLong("dialBreakerRejected")} 次")
+            sb.appendLine(
+                "TUN 发送：队列表满丢包 ${statsJson.optLong("tunTxDrop")}，backlog 溢出 ${statsJson.optLong("tunPendingDrop")}，" +
+                    "背压 ${statsJson.optLong("tunTxBackpressure")}，写阻塞 ${statsJson.optLong("tunWriteWouldBlock")}，" +
+                    "写错误 ${statsJson.optLong("tunWriteError")}，backlog 峰值 ${statsJson.optLong("tunPendingPeak")}",
+            )
             val lat = statsJson.optJSONObject("dnsLatency")
             if (lat != null) {
                 sb.appendLine(

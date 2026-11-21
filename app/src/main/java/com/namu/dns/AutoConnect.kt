@@ -82,7 +82,8 @@ object AutoConnect {
             )
             return
         }
-        if (cfg.nodes.isEmpty() && cfg.mode != "dns_only") {
+        // 纯过滤与仅 DNS 都不需要节点：没有节点时也应该能自动连接。
+        if (cfg.nodes.isEmpty() && cfg.mode != "dns_only" && cfg.mode != "filter_only") {
             notify(
                 app,
                 "自动连接暂不可用",

@@ -45,6 +45,7 @@ class MitmViewModelTest {
             applyEnabled = { enabledCalls.add(it) },
             applyHostnames = { hostCalls.add(it) },
             applySkip = { skipCalls.add(it) },
+            applyApps = { _, _ -> },
             exportDirFallback = { "/data/export" },
         )
         fun lastMessage(): String = messages.messages.replayCache.lastOrNull() ?: ""

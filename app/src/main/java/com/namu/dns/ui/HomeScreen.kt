@@ -162,6 +162,7 @@ fun HomeScreen(onToggle: () -> Unit, onOpenNodes: () -> Unit, onRestart: () -> U
                 value = when (cfg.mode) {
                     "global" -> "代理"
                     "dns_only" -> "直连"
+                    "filter_only" -> "纯过滤"
                     else -> "配置"
                 },
                 icon = Icons.Rounded.Settings,
@@ -247,7 +248,10 @@ fun HomeScreen(onToggle: () -> Unit, onOpenNodes: () -> Unit, onRestart: () -> U
             }
         }
 
-        if (cfg.nodes.isEmpty() && (cfg.mode == "global" || cfg.finalPolicy == "proxy")) {
+        // 纯过滤模式本来就不需要节点，不该提示「没有可用节点」打扰用户。
+        if (cfg.nodes.isEmpty() && cfg.mode != "filter_only" && cfg.mode != "dns_only" &&
+            (cfg.mode == "global" || cfg.finalPolicy == "proxy")
+        ) {
             GroupCard {
                 SettingsRow(
                     title = "没有可用节点",
@@ -350,6 +354,7 @@ fun HomeScreen(onToggle: () -> Unit, onOpenNodes: () -> Unit, onRestart: () -> U
             options = listOf(
                 "rule" to "配置（按规则分流）",
                 "global" to "代理（全部流量走节点）",
+                "filter_only" to "纯过滤（全量接管，不代理只拦截）",
                 "dns_only" to "直连（仅 DNS 过滤）",
             ),
             selected = cfg.mode,

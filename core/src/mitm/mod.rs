@@ -157,6 +157,15 @@ impl MitmState {
         self.active() && self.engine.should_mitm(host)
     }
 
+    /// 带 App 归属的判定（TCP 443 有 socket 表时可精确到 UID）。
+    pub fn should_mitm_uid(&self, host: &str, uid: Option<u32>) -> bool {
+        self.active() && self.engine.should_mitm_uid(host, uid)
+    }
+
+    pub fn app_allows(&self, uid: Option<u32>) -> bool {
+        self.engine.app_allows(uid)
+    }
+
     /// 依次执行命中的脚本。QuickJS 固定在专用工作线程上，MITM 路径同步等待；
     /// 外层用 blocking 线程池和信号量限制并发，避免拖住 tokio worker。
     pub async fn run_scripts(

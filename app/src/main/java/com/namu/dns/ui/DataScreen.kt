@@ -1,6 +1,8 @@
 package com.namu.dns.ui
 
 import com.namu.dns.core.LocalDockClearance
+import com.namu.dns.AppUidResolver
+import com.namu.dns.UidTablePublisher
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -98,6 +100,14 @@ fun DataScreen(
                 modifier = Modifier.padding(bottom = 8.dp),
                 fontSize = 11.sp,
                 color = NamuColors.TextSub,
+                textAlign = TextAlign.Center,
+            )
+            Text(
+                "TUN 发送：队列丢包 ${stats.tunTxDrop} · 背压 ${stats.tunTxBackpressure} · " +
+                    "backlog 溢出 ${stats.tunPendingDrop} · 写阻塞 ${stats.tunWriteWouldBlock} · 峰值 ${stats.tunPendingPeak}",
+                modifier = Modifier.padding(bottom = 8.dp),
+                fontSize = 11.sp,
+                color = if (stats.tunTxDrop > 0 || stats.tunPendingDrop > 0) NamuColors.Orange else NamuColors.TextSub,
                 textAlign = TextAlign.Center,
             )
             Row(Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
@@ -198,6 +208,29 @@ fun DataScreen(
             }
         }
 
+        if (cfg.rules.any { AppUidResolver.isAppRule(it) } || stats.uidResolved > 0 || stats.uidUnknown > 0) {
+            SectionHeader("按 App 分流")
+            GroupCard {
+                Row(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
+                    DataMetric("已识别归属", stats.uidResolved.toString(), Modifier.weight(1f))
+                    DataMetric("归属未知", stats.uidUnknown.toString(), Modifier.weight(1f))
+                    DataMetric("下发条目", UidTablePublisher.lastCount.toString(), Modifier.weight(1f))
+                }
+                // 归属未知持续增长 = 规则不生效，必须让人看见原因而不是以为已经生效。
+                val hint = when {
+                    UidTablePublisher.lastError != null -> UidTablePublisher.lastError!!
+                    stats.uidUnknown > 0 -> "部分连接查不到归属：请确认已授予 Root，UID 规则只对查到的连接生效"
+                    else -> "规则只对归属识别成功的连接生效"
+                }
+                Text(
+                    hint,
+                    fontSize = 11.sp,
+                    color = NamuColors.TextSub,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
+                )
+            }
+        }
+
         SectionHeader("诊断")
         GroupCard {
             SettingsRow(
@@ -248,7 +281,7 @@ fun DataScreen(
             val net = NetworkStatus.current(ctx)
             SettingsRow(
                 title = "实时连接",
-                subtitle = "聚合连接数、当前节点、底层网络和最近连接日志",
+                subtitle = "逐连接五元组、归属应用、动作与命中规则",
                 value = "${stats.activeConns} 活跃",
                 chevron = true,
                 onClick = { showLive = true },
@@ -280,6 +313,7 @@ fun DataScreen(
                 value = when (cfg.mode) {
                     "global" -> "代理"
                     "dns_only" -> "直连"
+                    "filter_only" -> "纯过滤"
                     else -> "配置"
                 },
                 showDivider = false,

@@ -12,7 +12,8 @@
   - `[General]`：`dns-server`、`doh-server`、`dns-fallback`、`ipv6=false`。
   - 未知段落写入 `unknownRoot.sourceUnknownSections`，不冒充已支持。
 - 节点属于设备侧：`ConfigSourceResult.nodes` 返回解析结果，`ConfigRepository.import` 在保存新配置后激活它并合并节点；不会把导入内容覆盖到旧 active `.conf`。
-- `PROCESS-NAME`、`PROCESS-PATH`、`UID`、`APP` 规则：当前没有可靠 Android UID/进程名数据源，导入时直接报错拒绝，不做猜测。
+- `PROCESS-NAME`、`UID`、`APP`、`APP-NAME` 规则：已支持（2026-11-21 起）。`UID` 以数值直接下发；包名类规则保留包名，在下发内核前由壳层用 PackageManager 解析成 UID。识别连接归属依赖 Root 读取 socket 表，详见 `docs/APP_ISOLATION.md`。
+- `PROCESS-PATH`：仍不支持，需要路径到包名的映射，导入时 WARNING 跳过。
 
 ### Clash YAML
 - `ClashConfigParser` 解析 `proxy-groups` 的 `name/type/proxies`，导入为 `ConfigFile.proxyGroups`。
@@ -40,7 +41,7 @@
 - 新增 `DOMAIN-WILDCARD`：大小写不敏感 glob 正则，`*` 任意字符、`?` 单字符。
 - 新增 `GEOIP(CN)`：使用内置 CN IP 库；`cn_direct=false` 时也加载 CN IP 文件，因为 GEOIP 与“CN 直连”是两个独立能力。
 - 非 CN GEOIP 不猜测，告警后跳过。
-- `PROCESS-NAME`/`PROCESS-PATH`/`UID`/`APP`/`APP-NAME` 及未知规则类型在内核加载时明确告警拒绝，不再静默丢弃。
+- `PROCESS-NAME`/`APP`/`APP-NAME`/`UID` 已由壳层展开成 UID 规则后下发，内核接受数值 UID 规则；`PROCESS-PATH` 及未知规则类型仍在内核加载时明确告警拒绝，不再静默丢弃。
 
 ## 4. 协议验收
 

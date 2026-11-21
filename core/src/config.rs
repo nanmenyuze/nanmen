@@ -273,6 +273,10 @@ pub struct Node {
     pub ws_host: Option<String>,
     #[serde(default)]
     pub flow: Option<String>,
+    /// 节点级 UDP 开关。Clash 订阅里的 `udp: false`、分享链接的 `udp=false`
+    /// 都落到这里；缺省跟随协议能力（SS/SOCKS5/Trojan/VLESS 可用）。
+    #[serde(default)]
+    pub udp: Option<bool>,
 }
 
 impl Node {
@@ -282,6 +286,14 @@ impl Node {
         } else {
             self.name.clone()
         }
+    }
+
+    /// 节点是否允许转发 UDP：显式 `udp: false` 优先，其次看协议是否实现。
+    pub fn udp_supported(&self) -> bool {
+        if self.udp == Some(false) {
+            return false;
+        }
+        matches!(self.kind.as_str(), "ss" | "socks5" | "trojan" | "vless")
     }
 }
 
