@@ -71,10 +71,16 @@ pub struct Stats {
     pub tun_write_error: AtomicU64,
     /// TCP 回收：空闲兜底回收 / 达到并发上限时淘汰最久空闲连接。
     pub tcp_idle_reaped: AtomicU64,
-    /// 判别仪表：接收缓冲打进满状态（窗口 0）的连接次数；对端零窗口导致发送停滞的次数。
-    /// 这两个计数直接用来看「单流慢」到底卡在本地收不动，还是对端不收。
+    /// 判别仪表（单位毫秒，不是次数）：条件成立期间累计的时长。
+    /// tcpRecvFull = 本地接收缓冲满且 relay 仍有余量积压（H1 实锤：上游有数据但我们收不下）；
+    /// tcpSendStalled = 待发队列非空但对端通告窗口为 0（对端不收）。
+    /// 主循环 wait 在 1ms/空闲之间切换，按轮计数会失真，所以一律按毫秒累计。
     pub tcp_recv_full: AtomicU64,
     pub tcp_send_stalled: AtomicU64,
+    /// 当前占着 512K 大档的 socket 数（并发口径，关闭即释放，新连接可补位）。
+    pub big_tier_in_use: AtomicI64,
+    /// QUIC 假活判为黑洞的目标累计数（与丢弃包数 quicFallback 区分）。
+    pub quic_blackholed: AtomicU64,
     /// TCP 缓冲预算不足被拒绝的新连接数（水位守卫兜底）。
     pub tcp_buffer_denied: AtomicU64,
     /// QUIC 假活回落：累计判为黑洞的目标数。
@@ -195,6 +201,8 @@ impl Stats {
             "tcpSendStalled": self.tcp_send_stalled.load(Ordering::Relaxed),
             "tcpBufferDenied": self.tcp_buffer_denied.load(Ordering::Relaxed),
             "quicFallback": self.quic_fallback.load(Ordering::Relaxed),
+            "quicBlackholed": self.quic_blackholed.load(Ordering::Relaxed),
+            "bigTierInUse": self.big_tier_in_use.load(Ordering::Relaxed),
             "tcpLimitEvicted": self.tcp_limit_evicted.load(Ordering::Relaxed),
             "dialBreakerRejected": self.dial_breaker_rejected.load(Ordering::Relaxed),
             "uidResolved": self.uid_resolved.load(Ordering::Relaxed),

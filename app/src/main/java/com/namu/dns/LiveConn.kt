@@ -84,7 +84,11 @@ internal class LiveConnStore {
                     ageMs = c.optLong("ageMs"),
                     upBytes = c.optLong("up"),
                     downBytes = c.optLong("down"),
-                )
+                ).also {
+                    // 内核 10s 采样给出的速率优先；本地差分只在没有内核值时兜底。
+                    it.upBps = c.optLong("upBps")
+                    it.downBps = c.optLong("downBps")
+                }
             }
         }
         // id 单调递增，keys 的插入顺序就是建立顺序；超出总数就从头删最旧的。
@@ -100,7 +104,7 @@ internal class LiveConnStore {
             if (dt >= 0.2) {
                 for (c in items.values) {
                     val p = prevBytes[c.id]
-                    if (p != null) {
+                    if (p != null && c.upBps == 0L && c.downBps == 0L) {
                         c.upBps = ((c.upBytes - p.first).coerceAtLeast(0L) / dt).toLong()
                         c.downBps = ((c.downBytes - p.second).coerceAtLeast(0L) / dt).toLong()
                     }

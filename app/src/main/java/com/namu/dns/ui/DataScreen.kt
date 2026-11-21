@@ -111,8 +111,9 @@ fun DataScreen(
                 textAlign = TextAlign.Center,
             )
             Text(
-                "判别：接收满 ${stats.tcpRecvFull} · 发送停滞 ${stats.tcpSendStalled} · " +
-                    "QUIC 回落 ${stats.quicFallback} · 缓冲拒绝 ${stats.tcpBufferDenied}",
+                "判别：接收满 ${msToText(stats.tcpRecvFull)} · 发送停滞 ${msToText(stats.tcpSendStalled)} · " +
+                    "QUIC 黑洞 ${stats.quicBlackholed} · 丢弃 ${stats.quicFallback} · " +
+                    "大档 ${stats.bigTierInUse}/128 · 缓冲拒绝 ${stats.tcpBufferDenied}",
                 modifier = Modifier.padding(bottom = 8.dp),
                 fontSize = 11.sp,
                 color = if (stats.tcpRecvFull > 0 || stats.tcpSendStalled > 0) NamuColors.Orange else NamuColors.TextSub,
@@ -451,3 +452,8 @@ private fun formatUptime(ms: Long): String {
     val sec = totalSec % 60
     return if (h > 0) "${h}h ${m}m" else if (m > 0) "${m}m ${sec}s" else "${sec}s"
 }
+
+/** 判别仪表是「条件成立期间累计毫秒」，这里换算成秒，避免大数字看不出量级。 */
+private fun msToText(ms: Long): String =
+    if (ms < 1000) "${ms}ms" else "%.1fs".format(ms / 1000.0)
+

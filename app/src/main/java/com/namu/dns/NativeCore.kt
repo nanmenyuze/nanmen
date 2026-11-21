@@ -17,6 +17,8 @@ object NativeCore {
 
     /** 活跃连接增量快照；`since` 是上次的游标，首次传 0。 */
     @JvmStatic external fun nativeConnections(since: Long): String
+    /** 切网后调用：作废旧网络上的 QUIC 假活判定。 */
+    @JvmStatic external fun nativeClearQuicBlackhole()
     @JvmStatic external fun nativeLogs(sinceId: Long): String
     @JvmStatic external fun nativeClearLogs()
     @JvmStatic external fun nativeDnsLogs(sinceId: Long): String

@@ -497,6 +497,8 @@ class NamuVpnService : VpnService() {
                 // 当前网络真正丢失：立即切换，不等确认窗口。
                 currentNetwork = picked
                 mainHandler.removeCallbacks(confirmSwitchRunnable)
+                // 旧网络上的 QUIC 假活结论必须作废，否则新链路会被误压制 10 分钟。
+                if (NativeCore.available) runCatching { NativeCore.nativeClearQuicBlackhole() }
                 scheduleRebuild()
             }
             NetSwitchDecision.CONFIRM_LATER -> {
@@ -512,6 +514,7 @@ class NamuVpnService : VpnService() {
         if (!running || stopping) return
         val picked = pickUnderlyingNetwork()
         if (picked == null || picked == currentNetwork) return
+        if (NativeCore.available) runCatching { NativeCore.nativeClearQuicBlackhole() }
         if (rebuilding) {
             pendingNetworkRebuild = true
             return

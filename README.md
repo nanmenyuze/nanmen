@@ -1,4 +1,4 @@
-# 南门DNS 2.6.2
+# 南门DNS 2.6.3
 
 > 内核 crate / JNI：`nanmen_core` / `libnanmen_core.so`；许可证：**GPL-3.0-only**（见 `LICENSE`、`NOTICE`、`THIRD_PARTY_NOTICES.md`）。
 
@@ -14,6 +14,7 @@
 
 > 2.6.2 正式版（内核 1.13.2）：把「单流慢」的主因补上——`TCP_SOCKET_BUFFER` 128K→512K（窗口缩放 shift=1→3，单流上限从 128K/RTT 抬到 512K/RTT），并配内存水位守卫：512K 档只给前 128 个 TCP socket，超出降级到 128K 档，1024 条连接最坏 ≈352MB（裸提会到 1GB）；判别仪表新增 `tcpRecvFull`（本地接收缓冲打成满/窗口 0）、`tcpSendStalled`（对端零窗口导致发送停滞，附一次性告警日志）、每连接累计字节（`up`/`down`，壳层差分算速率并在「实时连接」显示）、`tcpBufferDenied`；QUIC 假活回落开关落到配置项 `quicFallback`（默认开，443/UDP 2.5s 无回包判黑洞，10 分钟内对同一目标丢弃 QUIC）；源码 zip 不再夹带构建机 `local.properties`。> 版本：2.6（versionCode 90）；内核 1.13.0。
 
+> 2.6.3 正式版（内核 1.13.3，只修 2.6.2 的口径问题，无新增功能面）：大档名额改「并发」口径（`TCP_SOCKETS` 随 socket 关闭立刻归还，新连接可补位，不再被开机早期的推送/IM 长连接长期占满），新增 `bigTierInUse` 诊断；判别仪表从「次数」改为「条件成立期间累计毫秒」（`tcpRecvFull` = 接收缓冲满且 relay 仍有余量积压，`tcpSendStalled` = 待发非空但对端零窗口，超 3s 打一条告警），每连接速率改由内核 10s 采样写进快照（`upBps`/`downBps`）并打 top-5 日志；QUIC 黑洞判定改为按 (目的 IP, 端口)、仅在有上行活动时计时（纯空闲不判死）、收到该会话任何下行包即清除，并新增 `quicBlackholed` 计数与切网清空（壳层 `nativeClearQuicBlackhole`）。
 ## 壳设计文档
 
 - Android 12+ 应用壳设计：`docs/UI_SHELL_ANDROID12.md`

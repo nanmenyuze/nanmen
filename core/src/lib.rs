@@ -197,6 +197,7 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStart<'local>(
             mitm: mitm_state,
             uid_map: uid_map.clone(),
             conns: Arc::new(std::sync::RwLock::new(crate::conns::ConnTable::new())),
+            quic_clear: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
 
         let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -416,6 +417,24 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeConnections<'local>(
     }))
     .unwrap_or_else(|_| "{\"items\":[],\"last\":0,\"total\":0}".to_string());
     to_jstring(&mut env, json)
+}
+
+/// 壳层切网后调用：置位后主循环在下一轮清空 QUIC 黑洞判定（旧网络结论作废）。
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeClearQuicBlackhole(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) {
+    let guard = match ENGINE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(engine) = guard.as_ref() {
+        engine
+            .ctx
+            .quic_clear
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// 规则热重载（sing-box serviceReload 同款）：只换过滤/分流引擎，TUN 与连接不中断。
@@ -776,7 +795,7 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeVersion<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
-    to_jstring(&mut env, "1.13.2".into())
+    to_jstring(&mut env, "1.13.3".into())
 }
 
 #[cfg(test)]

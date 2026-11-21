@@ -49,6 +49,9 @@ pub struct Ctx {
     pub uid_map: Arc<std::sync::RwLock<crate::uidmap::UidMap>>,
     /// 活跃 TCP 连接快照，供壳层「实时连接」页轮询。
     pub conns: Arc<std::sync::RwLock<crate::conns::ConnTable>>,
+    /// 壳层切网（蜂窝↔Wi-Fi）时置位：主循环下一轮清空 QUIC 黑洞判定。
+    /// 旧网络上的「UDP 假活」结论不能带到新网络，否则新链路会被误压制 10 分钟。
+    pub quic_clear: Arc<AtomicBool>,
 }
 
 impl Ctx {
@@ -147,9 +150,14 @@ const TCP_SOCKET_BUFFER: usize = 512 * 1024;
 /// 内存水位降级档：活跃 TCP socket 超过 `TCP_BUFFER_HIGH_TIER_MAX` 后新建的用 128K。
 /// 不设这条守卫，1024 条连接每条双向 1MB，最坏会顶到 1GB，VPN 进程会被 LMK 直接杀。
 const TCP_SOCKET_BUFFER_MIN: usize = 128 * 1024;
-/// 用 512K 档的 socket 数量上限：128 条 × 双向 1MB ≈ 128MB；
-/// 其余走 128K 档（每条双向 256KB），1024 条满打满算 ≈ 128 + 896×0.25 ≈ 352MB。
+/// 用 512K 档的「当前并发」socket 数量上限（不是历史前 128 条）：
+/// 大档名额随 socket 关闭立刻释放，新连接可以补位——否则开机早期的推送/IM 长连接
+/// 会把大档占满，后面真正跑量的下载只能拿 128K。
+/// 内存口径：vec![0u8; N] 走 alloc_zeroed→calloc 的惰性零页，物理页按真实写入增长，
+/// 所以 352MB 是虚拟 worst-case，PSS 只随真实流量涨，LMK 风险比纸面小。
 const TCP_BUFFER_HIGH_TIER_MAX: usize = 128;
+/// 判别仪表的采样节拍（毫秒），计数按「条件成立期间累计 ms」记。
+const METER_TICK_MS: u64 = 500;
 /// 活跃 smoltcp TCP socket 数（listener 与已建连接共用同一个 socket，只算一次）。
 /// 只用于决定新 socket 用哪一档缓冲；漏减只会让后续连接降级，不会造成内存越界。
 static TCP_SOCKETS: AtomicUsize = AtomicUsize::new(0);
@@ -515,6 +523,11 @@ struct TcpConn {
     recv_full: bool,
     /// 发送被对端零窗口卡住的起始时刻；用于停滞告警与判别计数。
     send_stall_since: Option<Instant>,
+    /// 停滞告警是否已经打过（>3s 只打一条，不刷屏）。
+    send_stall_logged: bool,
+    /// 上次速率采样时的累计字节（10s 差分用）。
+    rate_prev_up: u64,
+    rate_prev_down: u64,
 }
 
 /// 是否还有出站数据躺在 relay 通道里没搬进 smoltcp。
@@ -1334,14 +1347,18 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
     let mut dns_udp_dsts: HashMap<(IpAddress, u16), (SocketHandle, Instant)> = HashMap::new();
 
     let mut listeners: HashMap<(IpAddress, u16), (SocketHandle, Instant)> = HashMap::new();
-    // QUIC 假活探测：发过 443/UDP 包但还没收到任何回包的目标。
-    let mut quic_probe: HashMap<IpAddress, Instant> = HashMap::new();
-    // 判定为 UDP 黑洞的目标 + 判定时刻。
-    let mut quic_blackhole: HashMap<IpAddress, Instant> = HashMap::new();
+    // QUIC 假活探测：(目标 IP, 目标端口) → (首次上行时刻, 最近上行时刻)。
+    // 只有「持续有上行、却一个回包都没见到」才算假活；纯空闲会话不判死，
+    // 否则 keepalive 间隔长的 QUIC 会被误杀。
+    let mut quic_probe: HashMap<(IpAddress, u16), (Instant, Instant)> = HashMap::new();
+    // 判为 UDP 黑洞的目标 + 判定时刻；冷却按 (IP, port)，有效期 10 分钟。
+    let mut quic_blackhole: HashMap<(IpAddress, u16), Instant> = HashMap::new();
     let mut pending_accept: Vec<(IpAddress, u16, SocketHandle, Instant)> = Vec::new();
     let mut conns: Vec<TcpConn> = Vec::new();
     // 判别仪表节拍：每 500ms 扫一次连接队列水位。
     let mut last_meter = Instant::now();
+    // 每连接速率采样节拍：10s 一次（太短会被瞬时抖动放大）。
+    let mut last_rate_sample = Instant::now();
     // 出站数据唤醒：relay 读到上游数据后 notify，主循环立刻排空，
     // 而不是只能等兜底定时器；否则单连接稳态吞吐被「每轮块数 / 轮询间隔」卡死。
     let relay_wake = Arc::new(Notify::new());
@@ -1366,6 +1383,15 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
     loop {
         if ctx.shutdown.load(Ordering::Relaxed) {
             break;
+        }
+        // 切网（蜂窝↔Wi-Fi）后旧网络的 QUIC 假活结论必须失效：壳层置位，这里整表清空。
+        if ctx.quic_clear.swap(false, Ordering::Relaxed) {
+            let n = quic_blackhole.len();
+            quic_blackhole.clear();
+            quic_probe.clear();
+            if n > 0 {
+                logging::info("tun", format!("网络切换：清空 {} 条 QUIC 黑洞判定", n));
+            }
         }
 
         // 空闲时降低唤醒频率；有 tx backlog 或写阻塞时保持 1ms 兜底。
@@ -1398,9 +1424,10 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             }
             r = udp_resp_rx.recv() => {
                 if let Some((client, remote, data)) = r {
-                    // 有回包说明这条路径的 UDP 是活的：清掉探测与黑洞标记。
-                    quic_probe.remove(&remote.addr);
-                    quic_blackhole.remove(&remote.addr);
+                    // 该会话任何下行包（含 ACK/PING）都算活着：清掉探测与黑洞标记。
+                    let key = (remote.addr, remote.port);
+                    quic_probe.remove(&key);
+                    quic_blackhole.remove(&key);
                     if udp_replies.len() < 512 {
                         udp_replies.push_back((remote, client, data));
                     }
@@ -1513,16 +1540,21 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                         .unwrap_or_else(|p| p.into_inner())
                                         .quic_fallback
                                 {
-                                    if let Some(t) = quic_blackhole.get(&dst.addr) {
+                                    let key = (dst.addr, dst.port);
+                                    if let Some(t) = quic_blackhole.get(&key) {
                                         if Instant::now().duration_since(*t)
                                             < Duration::from_secs(QUIC_BLACKHOLE_TTL_SECS)
                                         {
                                             ctx.stats.quic_fallback.fetch_add(1, Ordering::Relaxed);
                                             continue;
                                         }
-                                        quic_blackhole.remove(&dst.addr);
+                                        quic_blackhole.remove(&key);
                                     }
-                                    quic_probe.entry(dst.addr).or_insert_with(Instant::now);
+                                    let now_up = Instant::now();
+                                    quic_probe
+                                        .entry(key)
+                                        .and_modify(|(_, last)| *last = now_up)
+                                        .or_insert((now_up, now_up));
                                 }
                                 if !matches!(mode, UdpMode::Unsupported(_)) {
                                     if !udp_dsts.contains_key(&(dst.addr, dst.port)) {
@@ -1752,6 +1784,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                     meter: None,
                                     recv_full: false,
                                     send_stall_since: None,
+                                    send_stall_logged: false,
+                                    rate_prev_up: 0,
+                                    rate_prev_down: 0,
                                 });
                                 ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                                 ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
@@ -1856,6 +1891,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 meter: None,
                                 recv_full: false,
                                 send_stall_since: None,
+                                send_stall_logged: false,
+                                rate_prev_up: 0,
+                                rate_prev_down: 0,
                             });
                             ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                             ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
@@ -1920,6 +1958,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             meter: Some(meter),
                             recv_full: false,
                             send_stall_since: None,
+                            send_stall_logged: false,
+                            rate_prev_up: 0,
+                            rate_prev_down: 0,
                         });
                         ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                         ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
@@ -1948,6 +1989,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             meter: None,
                             recv_full: false,
                             send_stall_since: None,
+                            send_stall_logged: false,
+                            rate_prev_up: 0,
+                            rate_prev_down: 0,
                         });
                         ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                         ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
@@ -2068,6 +2112,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             meter: Some(meter),
                             recv_full: false,
                             send_stall_since: None,
+                            send_stall_logged: false,
+                            rate_prev_up: 0,
+                            rate_prev_down: 0,
                         });
                         ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                         ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
@@ -2185,9 +2232,10 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             ctx.stats.active_conns.fetch_sub(removed, Ordering::Relaxed);
         }
 
-        // 数据面判别仪表：每 500ms 扫一遍连接，把「本地收不动」和「对端不收」分开计数。
-        // 只读队列计数，不搬数据；recv 满只在进入状态时计一次，避免 500ms 采样重复累加。
-        if last_meter.elapsed() >= Duration::from_millis(500) {
+        // 数据面判别仪表：每 500ms 采样一次，按「条件成立期间累计毫秒」记，不记轮数。
+        // 主循环 wait 在 1ms/空闲之间切换，轮数换算出来会失真；毫秒口径可以直接
+        // 换算成「这段时间里有多少比例在等」。
+        if last_meter.elapsed() >= Duration::from_millis(METER_TICK_MS) {
             last_meter = Instant::now();
             let now_m = Instant::now();
             for conn in conns.iter_mut() {
@@ -2196,19 +2244,27 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                 let rq = sock.recv_queue();
                 let sc = sock.send_capacity();
                 let sq = sock.send_queue();
-                let full = rc > 0 && rq >= rc;
-                if full {
-                    if !conn.recv_full {
-                        conn.recv_full = true;
-                        ctx.stats.tcp_recv_full.fetch_add(1, Ordering::Relaxed);
-                    }
-                } else {
+                // H1 实锤：本地接收缓冲满，并且 relay 侧还有积压（上游数据已经躺在通道里）。
+                // 只满足前者可能是对端在灌包而我们正在搬；两个同时成立才是「收不下」。
+                let recv_pressure = rc > 0
+                    && rq >= rc
+                    && (!conn.from_relay.is_empty() || !conn.pending.is_empty());
+                if recv_pressure && !conn.recv_full {
+                    conn.recv_full = true;
+                } else if !recv_pressure {
                     conn.recv_full = false;
                 }
+                if recv_pressure {
+                    ctx.stats.tcp_recv_full.fetch_add(METER_TICK_MS, Ordering::Relaxed);
+                }
+                // 发送侧：待发队列非空、对端通告窗口为 0 → 对端不收。
                 if sq > 0 && sc == 0 {
-                    if conn.send_stall_since.is_none() {
-                        conn.send_stall_since = Some(now_m);
-                        ctx.stats.tcp_send_stalled.fetch_add(1, Ordering::Relaxed);
+                    ctx.stats.tcp_send_stalled.fetch_add(METER_TICK_MS, Ordering::Relaxed);
+                    let since = *conn.send_stall_since.get_or_insert(now_m);
+                    if !conn.send_stall_logged
+                        && now_m.duration_since(since) >= Duration::from_secs(3)
+                    {
+                        conn.send_stall_logged = true;
                         let ep = sock
                             .remote_endpoint()
                             .map(|e| e.to_string())
@@ -2216,14 +2272,56 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         logging::warn(
                             "tun",
                             format!(
-                                "发送停滞 {}：对端零窗口，待发 {}B，本地收队列 {}/{}B",
+                                "发送停滞超过 3s：{} 对端零窗口，待发 {}B（本地接收队列 {}/{}B）",
                                 ep, sq, rq, rc
                             ),
                         );
                     }
                 } else {
                     conn.send_stall_since = None;
+                    conn.send_stall_logged = false;
                 }
+            }
+        }
+
+        // 每连接速率：10s 采样一次，用累计字节差分写进连接快照；诊断再打 top-N。
+        if last_rate_sample.elapsed() >= Duration::from_secs(10) {
+            last_rate_sample = Instant::now();
+            let secs = 10.0f64;
+            let mut top: Vec<(u64, u64)> = Vec::new();
+            let mut table = ctx
+                .conns
+                .write()
+                .unwrap_or_else(|p| p.into_inner());
+            for conn in conns.iter_mut() {
+                let Some(id) = conn.snap else { continue };
+                let Some(m) = conn.meter.as_ref() else { continue };
+                let up = m.up.load(Ordering::Relaxed);
+                let down = m.down.load(Ordering::Relaxed);
+                let up_bps = ((up.saturating_sub(conn.rate_prev_up)) as f64 / secs) as u64;
+                let down_bps = ((down.saturating_sub(conn.rate_prev_down)) as f64 / secs) as u64;
+                conn.rate_prev_up = up;
+                conn.rate_prev_down = down;
+                table.set_rates(id, up_bps, down_bps);
+                if down_bps > 0 {
+                    top.push((id, down_bps));
+                }
+            }
+            drop(table);
+            top.sort_by(|a, b| b.1.cmp(&a.1));
+            if !top.is_empty() {
+                logging::info(
+                    "tun",
+                    format!(
+                        "连接速率 top{}：{}",
+                        top.len().min(5),
+                        top.iter()
+                            .take(5)
+                            .map(|(id, bps)| format!("#{} {}KB/s", id, bps / 1024))
+                            .collect::<Vec<_>>()
+                            .join(" · ")
+                    ),
+                );
             }
         }
 
@@ -2346,33 +2444,46 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                 .unwrap_or_else(|p| p.into_inner())
                 .quic_fallback
             {
-                let mut judged: Vec<IpAddress> = Vec::new();
-                for (ip, since) in quic_probe.iter() {
-                    if now_i.duration_since(*since) >= Duration::from_millis(QUIC_PROBE_WAIT_MS) {
-                        judged.push(*ip);
+                let mut judged: Vec<(IpAddress, u16)> = Vec::new();
+                let mut idle: Vec<(IpAddress, u16)> = Vec::new();
+                for (key, (first, last)) in quic_probe.iter() {
+                    if now_i.duration_since(*last) >= Duration::from_millis(QUIC_PROBE_WAIT_MS) {
+                        // 已经静默了：纯空闲会话不判死，只丢掉探测记录，下次上行重新计时。
+                        idle.push(*key);
+                    } else if now_i.duration_since(*first) >= Duration::from_millis(QUIC_PROBE_WAIT_MS) {
+                        // 窗口内一直有上行，却一次下行包都没见到 → 判假活。
+                        judged.push(*key);
                     }
                 }
-                for ip in judged {
-                    quic_probe.remove(&ip);
-                    if !quic_blackhole.contains_key(&ip) {
-                        quic_blackhole.insert(ip, now_i);
+                for key in idle {
+                    quic_probe.remove(&key);
+                }
+                for key in judged {
+                    quic_probe.remove(&key);
+                    if !quic_blackhole.contains_key(&key) {
+                        quic_blackhole.insert(key, now_i);
+                        ctx.stats.quic_blackholed.fetch_add(1, Ordering::Relaxed);
                         logging::warn(
                             "tun",
                             format!(
-                                "QUIC 假活：{} 在 {}ms 内无回包，{}s 内丢弃该目标 QUIC 让客户端回落 TCP",
-                                ip, QUIC_PROBE_WAIT_MS, QUIC_BLACKHOLE_TTL_SECS
+                                "QUIC 假活：{}:{} 持续 {}ms 有上行但无任何回包，{}s 内丢弃它的 QUIC 让客户端回落 TCP",
+                                key.0, key.1, QUIC_PROBE_WAIT_MS, QUIC_BLACKHOLE_TTL_SECS
                             ),
                         );
                     }
                 }
+                // 诊断口径：大档是并发名额，这里刷新当前占用数。
+                ctx.stats
+                    .big_tier_in_use
+                    .store(TCP_SOCKETS.load(Ordering::Relaxed).min(TCP_BUFFER_HIGH_TIER_MAX) as i64, Ordering::Relaxed);
                 // 过期黑洞重新试探。
-                let expired: Vec<IpAddress> = quic_blackhole
+                let expired: Vec<(IpAddress, u16)> = quic_blackhole
                     .iter()
                     .filter(|(_, t)| now_i.duration_since(**t) >= Duration::from_secs(QUIC_BLACKHOLE_TTL_SECS))
-                    .map(|(ip, _)| *ip)
+                    .map(|(k, _)| *k)
                     .collect();
-                for ip in expired {
-                    quic_blackhole.remove(&ip);
+                for key in expired {
+                    quic_blackhole.remove(&key);
                 }
             }
 
@@ -2843,6 +2954,9 @@ mod tests {
             meter: None,
             recv_full: false,
             send_stall_since: None,
+            send_stall_logged: false,
+            rate_prev_up: 0,
+            rate_prev_down: 0,
         };
         // 灌 640K（40×16K），超过 512K 上限。
         for _ in 0..40 {

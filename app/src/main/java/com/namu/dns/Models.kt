@@ -246,8 +246,11 @@ data class StatsData(
     val tcpSendStalled: Long = 0,
     // TCP 缓冲水位守卫拒绝的新连接数
     val tcpBufferDenied: Long = 0,
-    // QUIC 假活回落次数（丢弃 QUIC 包、让客户端回退 TCP）
+    // QUIC 假活回落：丢弃的 QUIC 包数 / 判为黑洞的目标数
     val quicFallback: Long = 0,
+    val quicBlackholed: Long = 0,
+    // 当前占着 512K 大档的 TCP socket 数（并发名额）
+    val bigTierInUse: Long = 0,
 ) {
     companion object {
         fun fromJson(text: String): StatsData {
@@ -304,6 +307,8 @@ data class StatsData(
                     tcpSendStalled = o.optLong("tcpSendStalled"),
                     tcpBufferDenied = o.optLong("tcpBufferDenied"),
                     quicFallback = o.optLong("quicFallback"),
+                    quicBlackholed = o.optLong("quicBlackholed"),
+                    bigTierInUse = o.optLong("bigTierInUse"),
                 )
             } catch (_: Exception) {
                 StatsData()

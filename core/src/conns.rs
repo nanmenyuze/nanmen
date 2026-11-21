@@ -31,6 +31,9 @@ pub struct ConnInfo {
     pub mitm: bool,
     pub started: Instant,
     pub meter: Arc<ConnMeter>,
+    /// 内核 10s 采样算出的速率（B/s），壳层直接显示，不再自己做差分。
+    pub up_bps: u64,
+    pub down_bps: u64,
 }
 
 /// 输出给 JNI 的扁平结构，`age_ms` 在取快照时计算，避免壳层处理 Instant。
@@ -47,6 +50,8 @@ pub struct ConnOut {
     pub age_ms: u64,
     pub up_bytes: u64,
     pub down_bytes: u64,
+    pub up_bps: u64,
+    pub down_bps: u64,
 }
 
 #[derive(Debug, Default)]
@@ -98,9 +103,19 @@ impl ConnTable {
                 mitm,
                 started: Instant::now(),
                 meter: meter.clone(),
+                up_bps: 0,
+                down_bps: 0,
             },
         );
         (id, meter)
+    }
+
+    /// 写入内核采样出的每连接速率（10s 一次，主循环持有写锁时调用）。
+    pub fn set_rates(&mut self, id: u64, up_bps: u64, down_bps: u64) {
+        if let Some(c) = self.items.get_mut(&id) {
+            c.up_bps = up_bps;
+            c.down_bps = down_bps;
+        }
     }
 
     pub fn remove(&mut self, id: Option<u64>) {
@@ -135,6 +150,8 @@ impl ConnTable {
                 age_ms: now.duration_since(c.started).as_millis() as u64,
                 up_bytes: c.meter.up.load(Ordering::Relaxed),
                 down_bytes: c.meter.down.load(Ordering::Relaxed),
+                up_bps: c.up_bps,
+                down_bps: c.down_bps,
             })
             .collect();
         // 用 id 倒序而不是 age_ms：同一毫秒内建立的连接 age_ms 相等，排序会不稳定。
@@ -163,6 +180,8 @@ impl ConnTable {
                 age_ms: now.duration_since(c.started).as_millis() as u64,
                 up_bytes: c.meter.up.load(Ordering::Relaxed),
                 down_bytes: c.meter.down.load(Ordering::Relaxed),
+                up_bps: c.up_bps,
+                down_bps: c.down_bps,
             })
             .collect();
         rows.sort_by_key(|r| r.id);
@@ -205,7 +224,7 @@ impl ConnOut {
             None => "null".to_string(),
         };
         format!(
-            "{{\"id\":{},\"uid\":{},\"domain\":{},\"ip\":\"{}\",\"port\":{},\"action\":\"{}\",\"rule\":\"{}\",\"mitm\":{},\"ageMs\":{},\"up\":{},\"down\":{}}}",
+            "{{\"id\":{},\"uid\":{},\"domain\":{},\"ip\":\"{}\",\"port\":{},\"action\":\"{}\",\"rule\":\"{}\",\"mitm\":{},\"ageMs\":{},\"up\":{},\"down\":{},\"upBps\":{},\"downBps\":{}}}",
             self.id,
             uid,
             domain,
@@ -216,7 +235,9 @@ impl ConnOut {
             self.mitm,
             self.age_ms,
             self.up_bytes,
-            self.down_bytes
+            self.down_bytes,
+            self.up_bps,
+            self.down_bps
         )
     }
 }
