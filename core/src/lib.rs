@@ -776,7 +776,7 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeVersion<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
-    to_jstring(&mut env, "1.13.1".into())
+    to_jstring(&mut env, "1.13.2".into())
 }
 
 #[cfg(test)]

@@ -71,6 +71,14 @@ pub struct Stats {
     pub tun_write_error: AtomicU64,
     /// TCP 回收：空闲兜底回收 / 达到并发上限时淘汰最久空闲连接。
     pub tcp_idle_reaped: AtomicU64,
+    /// 判别仪表：接收缓冲打进满状态（窗口 0）的连接次数；对端零窗口导致发送停滞的次数。
+    /// 这两个计数直接用来看「单流慢」到底卡在本地收不动，还是对端不收。
+    pub tcp_recv_full: AtomicU64,
+    pub tcp_send_stalled: AtomicU64,
+    /// TCP 缓冲预算不足被拒绝的新连接数（水位守卫兜底）。
+    pub tcp_buffer_denied: AtomicU64,
+    /// QUIC 假活回落：累计判为黑洞的目标数。
+    pub quic_fallback: AtomicU64,
     pub tcp_limit_evicted: AtomicU64,
     /// 直连拨号熔断：冷却期内被抑制拨号的连接数。
     pub dial_breaker_rejected: AtomicU64,
@@ -183,6 +191,10 @@ impl Stats {
             "tunWriteWouldBlock": self.tun_write_would_block.load(Ordering::Relaxed),
             "tunWriteError": self.tun_write_error.load(Ordering::Relaxed),
             "tcpIdleReaped": self.tcp_idle_reaped.load(Ordering::Relaxed),
+            "tcpRecvFull": self.tcp_recv_full.load(Ordering::Relaxed),
+            "tcpSendStalled": self.tcp_send_stalled.load(Ordering::Relaxed),
+            "tcpBufferDenied": self.tcp_buffer_denied.load(Ordering::Relaxed),
+            "quicFallback": self.quic_fallback.load(Ordering::Relaxed),
             "tcpLimitEvicted": self.tcp_limit_evicted.load(Ordering::Relaxed),
             "dialBreakerRejected": self.dial_breaker_rejected.load(Ordering::Relaxed),
             "uidResolved": self.uid_resolved.load(Ordering::Relaxed),

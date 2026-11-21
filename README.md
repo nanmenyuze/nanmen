@@ -1,4 +1,4 @@
-# 南门DNS 2.6.1
+# 南门DNS 2.6.2
 
 > 内核 crate / JNI：`nanmen_core` / `libnanmen_core.so`；许可证：**GPL-3.0-only**（见 `LICENSE`、`NOTICE`、`THIRD_PARTY_NOTICES.md`）。
 
@@ -11,7 +11,8 @@
 > 2.6 正式版 = 合并两条迭代线。数据面（来自 2.3.9~2.3.12，内核 1.12.9）：TUN 收发改缓冲池 + 批量写 + 背压诊断（`tunTxDrop`/`tunPendingDrop`/`tunPendingPeak`/`tunTxBackpressure`/`tunWriteWouldBlock`/`tunWriteError`）；ICMP Echo 本地回显；直连拨号熔断（按目标冷却、连续失败自愈、`dialBreakerRejected`）与「保持真实失败时序」的抑制策略；并发上限改为淘汰最久空闲（`tcpLimitEvicted`）而非拒绝新连接；空闲兜底回收（`tcpIdleReaped`）；HTTPS/HTTP 连通性探测本地代答；切网滞回（5s 确认窗口）与重建失败自动重试；节点级 `udp:false` 与 SOCKS5/Trojan/VLESS UDP。过滤与分流（来自 2.3.8 测试包，内核 1.13.0）：按 App 分流（`uidmap` + Root 读 socket 表）、按 App MITM、CNAME 伪装拦截、DNS-only 全量接管、纯过滤无节点模式、Surge `[URL Rewrite]` 的 302/307/header/mock 映射、Loon `url target action` 旧语法、逐连接快照与「实时连接」列表。
 
 > 2.6.1 正式版（只调数据面档位与 TCP 小包参数，内核 1.13.1）：下行三档成对抬到 512 —— `MAX_TX_QUEUE`（smoltcp tx 暂存包）512、`MAX_PENDING_OUT`（待写 TUN 队列，512×2048B≈1MB）512、`MAX_TX_WRITE_BURST`（每轮写入，≈1MB/轮）512；读侧 `MAX_RX_BURST` 64→512。并把读 TUN 从「依赖 select 的 readable 分支被选中」改为每轮固定执行的非阻塞步骤（`readable` 只负责唤醒并清就绪位），避免边沿触发或漏唤醒把 RX 停住——RX 一停 ACK 回填就慢，下行窗口会跟着被压。`SNI_WAIT_MS` 保持 60ms 不动。同时关闭 TCP Nagle（`set_nagle_enabled(false)`）、延迟 ACK 从 smoltcp 默认 10ms 压到 5ms，减少小包合并与确认等待叠加出来的 RTT 级停顿。>
-> 版本：2.6（versionCode 90）；内核 1.13.0。
+
+> 2.6.2 正式版（内核 1.13.2）：把「单流慢」的主因补上——`TCP_SOCKET_BUFFER` 128K→512K（窗口缩放 shift=1→3，单流上限从 128K/RTT 抬到 512K/RTT），并配内存水位守卫：512K 档只给前 128 个 TCP socket，超出降级到 128K 档，1024 条连接最坏 ≈352MB（裸提会到 1GB）；判别仪表新增 `tcpRecvFull`（本地接收缓冲打成满/窗口 0）、`tcpSendStalled`（对端零窗口导致发送停滞，附一次性告警日志）、每连接累计字节（`up`/`down`，壳层差分算速率并在「实时连接」显示）、`tcpBufferDenied`；QUIC 假活回落开关落到配置项 `quicFallback`（默认开，443/UDP 2.5s 无回包判黑洞，10 分钟内对同一目标丢弃 QUIC）；源码 zip 不再夹带构建机 `local.properties`。> 版本：2.6（versionCode 90）；内核 1.13.0。
 
 ## 壳设计文档
 

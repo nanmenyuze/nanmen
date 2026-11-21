@@ -241,6 +241,13 @@ data class StatsData(
     val tunWriteError: Long = 0,
     // 直连拨号熔断：冷却期内被抑制拨号的连接数（保持原失败时序，不立即 RST）
     val dialBreakerRejected: Long = 0,
+    // 数据面判别仪表：本地接收缓冲满（窗口 0）次数 / 对端零窗口导致发送停滞次数
+    val tcpRecvFull: Long = 0,
+    val tcpSendStalled: Long = 0,
+    // TCP 缓冲水位守卫拒绝的新连接数
+    val tcpBufferDenied: Long = 0,
+    // QUIC 假活回落次数（丢弃 QUIC 包、让客户端回退 TCP）
+    val quicFallback: Long = 0,
 ) {
     companion object {
         fun fromJson(text: String): StatsData {
@@ -293,6 +300,10 @@ data class StatsData(
                     tunWriteWouldBlock = o.optLong("tunWriteWouldBlock"),
                     tunWriteError = o.optLong("tunWriteError"),
                     dialBreakerRejected = o.optLong("dialBreakerRejected"),
+                    tcpRecvFull = o.optLong("tcpRecvFull"),
+                    tcpSendStalled = o.optLong("tcpSendStalled"),
+                    tcpBufferDenied = o.optLong("tcpBufferDenied"),
+                    quicFallback = o.optLong("quicFallback"),
                 )
             } catch (_: Exception) {
                 StatsData()
@@ -561,6 +572,8 @@ data class AppConfig(
      * 代价是所有流量过一遍 TUN（非 DNS 连接直连转发），性能敏感时可关闭。
      */
     var dnsOnlyFullRoute: Boolean = true,
+    /** 蜂窝 UDP 假活（QUIC 黑洞）自动回落 TCP：长时间无回包即对同一目标丢弃 QUIC。 */
+    var quicFallback: Boolean = true,
     /** system / light / dark；仅影响外壳配色，不进入内核配置。 */
     var themeMode: String = "system",
     /** 开机或默认网络恢复时自动启动 VPN。 */
@@ -610,6 +623,7 @@ data class AppConfig(
         put("fakeIp", fakeIp)
         put("blockAaaa", blockAaaa)
         put("dnsOnlyFullRoute", dnsOnlyFullRoute)
+        put("quicFallback", quicFallback)
         put("sniff", sniff)
         put("autoSelectNode", autoSelectNode)
         put("autoClearLogs", autoClearLogs)
@@ -742,6 +756,7 @@ data class AppConfig(
                     fakeIp = o.optBoolean("fakeIp", false),
                     blockAaaa = o.optBoolean("blockAaaa", false),
                     dnsOnlyFullRoute = o.optBoolean("dnsOnlyFullRoute", true),
+                    quicFallback = o.optBoolean("quicFallback", true),
                     sniff = o.optBoolean("sniff", true),
                     autoSelectNode = o.optBoolean("autoSelectNode", false),
                     autoClearLogs = o.optBoolean("autoClearLogs", true),

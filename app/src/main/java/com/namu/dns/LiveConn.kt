@@ -14,7 +14,12 @@ data class LiveConn(
     val rule: String,
     val mitm: Boolean,
     val ageMs: Long,
+    val upBytes: Long,
+    val downBytes: Long,
 ) {
+    /** 瞬时速率（B/s），由 LiveConnStore 每次刷新时按两次采样差分算好写入。 */
+    var upBps: Long = 0L
+    var downBps: Long = 0L
     /** 列表主标题：有域名用域名，否则用 IP。 */
     val target: String get() = domain?.takeIf { it.isNotEmpty() } ?: ip
 
@@ -40,6 +45,9 @@ data class LiveConn(
 internal class LiveConnStore {
     private val items = LinkedHashMap<Long, LiveConn>()
     private var cursor = 0L
+    // 速率差分：保留上次采样的累计字节与时刻（内核给的是累计值，不是速率）。
+    private val prevBytes = HashMap<Long, Pair<Long, Long>>()
+    private var lastSampleMs = 0L
 
     var total: Int = 0
         private set
@@ -74,6 +82,8 @@ internal class LiveConnStore {
                     rule = c.optString("rule"),
                     mitm = c.optBoolean("mitm"),
                     ageMs = c.optLong("ageMs"),
+                    upBytes = c.optLong("up"),
+                    downBytes = c.optLong("down"),
                 )
             }
         }
@@ -81,6 +91,27 @@ internal class LiveConnStore {
         while (items.size > total) {
             val oldest = items.keys.firstOrNull() ?: break
             items.remove(oldest)
+            prevBytes.remove(oldest)
+        }
+        // 速率差分：间隔太短会放大抖动，0.2s 以下直接沿用上次结果。
+        val nowMs = System.currentTimeMillis()
+        if (lastSampleMs > 0L) {
+            val dt = (nowMs - lastSampleMs) / 1000.0
+            if (dt >= 0.2) {
+                for (c in items.values) {
+                    val p = prevBytes[c.id]
+                    if (p != null) {
+                        c.upBps = ((c.upBytes - p.first).coerceAtLeast(0L) / dt).toLong()
+                        c.downBps = ((c.downBytes - p.second).coerceAtLeast(0L) / dt).toLong()
+                    }
+                }
+                prevBytes.clear()
+                for (c in items.values) prevBytes[c.id] = c.upBytes to c.downBytes
+                lastSampleMs = nowMs
+            }
+        } else {
+            for (c in items.values) prevBytes[c.id] = c.upBytes to c.downBytes
+            lastSampleMs = nowMs
         }
         return rows()
     }

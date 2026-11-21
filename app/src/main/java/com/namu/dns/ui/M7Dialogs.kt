@@ -399,6 +399,15 @@ private fun LiveConnRow(ctx: android.content.Context, c: LiveConn) {
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.fillMaxWidth().padding(top = 1.dp),
         )
+        if (c.upBps > 0L || c.downBps > 0L) {
+            Text(
+                "速度 ↑ ${formatBytes(c.upBps)}/s  ↓ ${formatBytes(c.downBps)}/s",
+                fontSize = 10.sp,
+                color = NamuColors.TextSub,
+                maxLines = 1,
+                modifier = Modifier.fillMaxWidth().padding(top = 1.dp),
+            )
+        }
         if (c.rule.isNotEmpty()) {
             Text(
                 "命中：${c.rule}",

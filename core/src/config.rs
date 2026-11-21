@@ -31,6 +31,10 @@ pub struct Config {
     pub block_enabled: bool,
     #[serde(default = "default_block_mode")]
     pub block_mode: String,
+    /// 蜂窝 UDP 假活（QUIC 黑洞）自动回落 TCP：443/UDP 在探测窗口内没有任何回包，
+    /// 即判定该目标 QUIC 假活，之后对同一目标丢弃 QUIC 包，由客户端自己回退 TCP。
+    #[serde(rename = "quicFallback", default = "default_true")]
+    pub quic_fallback: bool,
     #[serde(default = "default_true")]
     pub cn_direct: bool,
     #[serde(default = "default_true")]
@@ -81,6 +85,7 @@ impl Default for Config {
             cn_ip_file: None,
             block_enabled: true,
             block_mode: default_block_mode(),
+            quic_fallback: true,
             cn_direct: true,
             block_when_no_node: true,
             fake_ip: false,

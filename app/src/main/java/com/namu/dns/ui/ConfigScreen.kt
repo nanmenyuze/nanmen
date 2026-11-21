@@ -487,6 +487,15 @@ fun ConfigDetailScreen(onRestart: () -> Unit, onOpenModules: () -> Unit, onOpenM
                 if (runtime.current().connected) onRestart()
             }
             SwitchRow(
+                title = "QUIC 假活自动回落",
+                subtitle = "蜂窝网络下 UDP 假活（发得出去、收不到回包）时，判定该目标 QUIC 不可用，" +
+                    "之后丢弃它的 QUIC 包让 App 走 TCP；关闭后完全由 App 自己超时回退",
+                checked = cfg.quicFallback,
+            ) {
+                settings.update { current -> current.copy(quicFallback = it) }
+                if (runtime.current().connected) onRestart()
+            }
+            SwitchRow(
                 title = "TLS / HTTP 域名嗅探",
                 subtitle = "没有 DNS 映射时，从首包读取 SNI / Host",
                 checked = cfg.sniff,

@@ -5,10 +5,19 @@
 //! 表本身有上限，漏删的条目会被最旧淘汰兜住，不会无界增长。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// 与 TUN 连接上限一致：活跃连接最多 1024 条，快照表不需要比它大。
 const MAX_ENTRIES: usize = 1024;
+
+/// 每连接流量计：主循环只做原子累加（无锁），快照时读一次交给壳层算速率。
+#[derive(Debug, Default)]
+pub struct ConnMeter {
+    pub up: AtomicU64,
+    pub down: AtomicU64,
+}
 
 #[derive(Debug, Clone)]
 pub struct ConnInfo {
@@ -21,6 +30,7 @@ pub struct ConnInfo {
     pub rule: String,
     pub mitm: bool,
     pub started: Instant,
+    pub meter: Arc<ConnMeter>,
 }
 
 /// 输出给 JNI 的扁平结构，`age_ms` 在取快照时计算，避免壳层处理 Instant。
@@ -35,6 +45,8 @@ pub struct ConnOut {
     pub rule: String,
     pub mitm: bool,
     pub age_ms: u64,
+    pub up_bytes: u64,
+    pub down_bytes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -59,7 +71,7 @@ impl ConnTable {
         action: String,
         rule: String,
         mitm: bool,
-    ) -> u64 {
+    ) -> (u64, Arc<ConnMeter>) {
         if self.items.len() >= MAX_ENTRIES {
             if let Some(oldest) = self
                 .items
@@ -72,6 +84,7 @@ impl ConnTable {
         }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
+        let meter = Arc::new(ConnMeter::default());
         self.items.insert(
             id,
             ConnInfo {
@@ -84,9 +97,10 @@ impl ConnTable {
                 rule,
                 mitm,
                 started: Instant::now(),
+                meter: meter.clone(),
             },
         );
-        id
+        (id, meter)
     }
 
     pub fn remove(&mut self, id: Option<u64>) {
@@ -119,6 +133,8 @@ impl ConnTable {
                 rule: c.rule.clone(),
                 mitm: c.mitm,
                 age_ms: now.duration_since(c.started).as_millis() as u64,
+                up_bytes: c.meter.up.load(Ordering::Relaxed),
+                down_bytes: c.meter.down.load(Ordering::Relaxed),
             })
             .collect();
         // 用 id 倒序而不是 age_ms：同一毫秒内建立的连接 age_ms 相等，排序会不稳定。
@@ -145,6 +161,8 @@ impl ConnTable {
                 rule: c.rule.clone(),
                 mitm: c.mitm,
                 age_ms: now.duration_since(c.started).as_millis() as u64,
+                up_bytes: c.meter.up.load(Ordering::Relaxed),
+                down_bytes: c.meter.down.load(Ordering::Relaxed),
             })
             .collect();
         rows.sort_by_key(|r| r.id);
@@ -187,7 +205,7 @@ impl ConnOut {
             None => "null".to_string(),
         };
         format!(
-            "{{\"id\":{},\"uid\":{},\"domain\":{},\"ip\":\"{}\",\"port\":{},\"action\":\"{}\",\"rule\":\"{}\",\"mitm\":{},\"ageMs\":{}}}",
+            "{{\"id\":{},\"uid\":{},\"domain\":{},\"ip\":\"{}\",\"port\":{},\"action\":\"{}\",\"rule\":\"{}\",\"mitm\":{},\"ageMs\":{},\"up\":{},\"down\":{}}}",
             self.id,
             uid,
             domain,
@@ -196,7 +214,9 @@ impl ConnOut {
             escape(&self.action),
             escape(&self.rule),
             self.mitm,
-            self.age_ms
+            self.age_ms,
+            self.up_bytes,
+            self.down_bytes
         )
     }
 }
@@ -225,6 +245,7 @@ mod tests {
             "命中第 3 条规则 DOMAIN-SUFFIX ads.com → 拦截".into(),
             false,
         )
+        .0
     }
 
     #[test]

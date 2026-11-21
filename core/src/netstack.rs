@@ -18,7 +18,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::IpAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -112,6 +112,11 @@ const MAX_PENDING_OUT: usize = 512;
 /// 一轮可清空整个 pending_out（≈1MB），单轮写入是 memcpy 级（512 次 write，约 1–2ms），
 /// 仍远低于旧逻辑「一口气 + 慢写」导致的几十 ms 饿死区间。
 const MAX_TX_WRITE_BURST: usize = 512;
+/// QUIC 假活探测窗口：客户端发了 443/UDP 包，这么久没有任何回包就判定该目标
+/// UDP 不可用（蜂窝网上的 QUIC 黑洞），之后对同一目标丢弃 QUIC 让客户端回退 TCP。
+const QUIC_PROBE_WAIT_MS: u64 = 2500;
+/// 判定为 UDP 黑洞后的压制时长；到期会重新试探，避免网络恢复后一直走 TCP。
+const QUIC_BLACKHOLE_TTL_SECS: u64 = 600;
 /// 直连拨号熔断：首次失败容忍（瞬时抖动），第 2 次连续失败起冷却 10s，
 /// 之后翻倍、封顶 60s。冷却期内同目标新连接直接 RST，不发 SYN 白等 2s。
 const DIAL_BREAKER_BASE_SECS: u64 = 10;
@@ -132,11 +137,37 @@ const IDLE_SAFETY_WAIT_MS: u64 = 20;
 /// 收发缓冲池上限；每个缓冲最多 2048 字节。
 const MAX_POOL: usize = 128;
 const MAX_TUN_PACKET: usize = 2048;
-/// 每条 TCP 连接在 smoltcp 内的收发缓冲（每方向 128K）。
+/// 每条 TCP 连接在 smoltcp 内的收发缓冲（每方向 512K）。
 /// 关键不只是缓冲大小：smoltcp 0.11 的接收窗口缩放 shift = log2(rx_cap) - 16，
-/// 128K 时 shift=1、通告窗口可达 ~128K；砍到 32K 时 shift=0（无缩放），
-/// 单流吞吐被锁成「32K / RTT」（RTT 20ms 仅 ~13Mbps），这正是高带宽链路测速变差的根源。
-const TCP_SOCKET_BUFFER: usize = 128 * 1024;
+/// 512K 时 shift=3、通告窗口 ~512K，单流上限从「128K / RTT」抬到「512K / RTT」：
+/// RTT 40ms 时 128K 档只有 ~25Mbps，512K 档能到 ~100Mbps——这就是「单流慢、
+/// RTT 抖一下下载就掉」的主因，只放宽 TUN 队列治不了它（积压只是从 pending
+/// 挪回 socket 缓冲，窗口该关的时候照样关）。
+const TCP_SOCKET_BUFFER: usize = 512 * 1024;
+/// 内存水位降级档：活跃 TCP socket 超过 `TCP_BUFFER_HIGH_TIER_MAX` 后新建的用 128K。
+/// 不设这条守卫，1024 条连接每条双向 1MB，最坏会顶到 1GB，VPN 进程会被 LMK 直接杀。
+const TCP_SOCKET_BUFFER_MIN: usize = 128 * 1024;
+/// 用 512K 档的 socket 数量上限：128 条 × 双向 1MB ≈ 128MB；
+/// 其余走 128K 档（每条双向 256KB），1024 条满打满算 ≈ 128 + 896×0.25 ≈ 352MB。
+const TCP_BUFFER_HIGH_TIER_MAX: usize = 128;
+/// 活跃 smoltcp TCP socket 数（listener 与已建连接共用同一个 socket，只算一次）。
+/// 只用于决定新 socket 用哪一档缓冲；漏减只会让后续连接降级，不会造成内存越界。
+static TCP_SOCKETS: AtomicUsize = AtomicUsize::new(0);
+
+fn next_tcp_buffer_bytes() -> usize {
+    if TCP_SOCKETS.load(Ordering::Relaxed) < TCP_BUFFER_HIGH_TIER_MAX {
+        TCP_SOCKET_BUFFER
+    } else {
+        TCP_SOCKET_BUFFER_MIN
+    }
+}
+
+/// 所有 TCP socket 的销毁都必须走这里：abort + remove + 归还计数。
+fn release_tcp_socket(sockets: &mut SocketSet<'_>, handle: SocketHandle) {
+    sockets.get_mut::<tcp::Socket>(handle).abort();
+    let _ = sockets.remove(handle);
+    TCP_SOCKETS.fetch_sub(1, Ordering::Relaxed);
+}
 /// MITM 本地双工管道容量；DNS TCP 管道同档 64K。
 const MITM_DUPLEX_CAP: usize = 128 * 1024;
 const DNS_TCP_DUPLEX_CAP: usize = 64 * 1024;
@@ -478,6 +509,12 @@ struct TcpConn {
     /// 最后一次有业务数据流动的时刻（任一方向）。keepalive ACK 不算业务数据：
     /// 上限淘汰和空闲回收只按真实流量排序，避免把「心跳很密但没数据」的连接误判成活跃。
     last_active: Instant,
+    /// 每连接流量计（上行/下行累计字节），壳层据此算速率。
+    meter: Option<Arc<crate::conns::ConnMeter>>,
+    /// 接收缓冲是否已进入「满」状态：只在进入时计数一次，避免每轮重复 +1。
+    recv_full: bool,
+    /// 发送被对端零窗口卡住的起始时刻；用于停滞告警与判别计数。
+    send_stall_since: Option<Instant>,
 }
 
 /// 是否还有出站数据躺在 relay 通道里没搬进 smoltcp。
@@ -845,9 +882,10 @@ fn lookup_udp_flow(pkt: &[u8]) -> Option<(IpEndpoint, IpEndpoint)> {
 }
 
 fn add_listener(sockets: &mut SocketSet<'_>, addr: IpAddress, port: u16) -> Option<SocketHandle> {
+    let buf_bytes = next_tcp_buffer_bytes();
     let mut socket = tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER]),
-        tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER]),
+        tcp::SocketBuffer::new(vec![0u8; buf_bytes]),
+        tcp::SocketBuffer::new(vec![0u8; buf_bytes]),
     );
     // 这个 TUN 数据面是「一条 TCP 连接就是一条本地 smoltcp 连接」，监听 socket 直接
     // 转成已建立连接（state != Listen 后原地复用），所以在这里设一次即全程生效。
@@ -871,6 +909,7 @@ fn add_listener(sockets: &mut SocketSet<'_>, addr: IpAddress, port: u16) -> Opti
     {
         return None;
     }
+    TCP_SOCKETS.fetch_add(1, Ordering::Relaxed);
     Some(sockets.add(socket))
 }
 
@@ -1295,8 +1334,14 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
     let mut dns_udp_dsts: HashMap<(IpAddress, u16), (SocketHandle, Instant)> = HashMap::new();
 
     let mut listeners: HashMap<(IpAddress, u16), (SocketHandle, Instant)> = HashMap::new();
+    // QUIC 假活探测：发过 443/UDP 包但还没收到任何回包的目标。
+    let mut quic_probe: HashMap<IpAddress, Instant> = HashMap::new();
+    // 判定为 UDP 黑洞的目标 + 判定时刻。
+    let mut quic_blackhole: HashMap<IpAddress, Instant> = HashMap::new();
     let mut pending_accept: Vec<(IpAddress, u16, SocketHandle, Instant)> = Vec::new();
     let mut conns: Vec<TcpConn> = Vec::new();
+    // 判别仪表节拍：每 500ms 扫一次连接队列水位。
+    let mut last_meter = Instant::now();
     // 出站数据唤醒：relay 读到上游数据后 notify，主循环立刻排空，
     // 而不是只能等兜底定时器；否则单连接稳态吞吐被「每轮块数 / 轮询间隔」卡死。
     let relay_wake = Arc::new(Notify::new());
@@ -1353,6 +1398,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             }
             r = udp_resp_rx.recv() => {
                 if let Some((client, remote, data)) = r {
+                    // 有回包说明这条路径的 UDP 是活的：清掉探测与黑洞标记。
+                    quic_probe.remove(&remote.addr);
+                    quic_blackhole.remove(&remote.addr);
                     if udp_replies.len() < 512 {
                         udp_replies.push_back((remote, client, data));
                     }
@@ -1456,6 +1504,26 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 );
                                 let mode = udp_mode(&ctx, &action);
                                 drop(decision_guard);
+                                // QUIC 假活回落：这个目标已被判为 UDP 黑洞时，直接吞掉 QUIC
+                                    // 包（不发、也不建会话），让客户端自己的 Happy Eyeballs 回退 TCP。
+                                if dst.port == 443
+                                    && ctx
+                                        .cfg
+                                        .read()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .quic_fallback
+                                {
+                                    if let Some(t) = quic_blackhole.get(&dst.addr) {
+                                        if Instant::now().duration_since(*t)
+                                            < Duration::from_secs(QUIC_BLACKHOLE_TTL_SECS)
+                                        {
+                                            ctx.stats.quic_fallback.fetch_add(1, Ordering::Relaxed);
+                                            continue;
+                                        }
+                                        quic_blackhole.remove(&dst.addr);
+                                    }
+                                    quic_probe.entry(dst.addr).or_insert_with(Instant::now);
+                                }
                                 if !matches!(mode, UdpMode::Unsupported(_)) {
                                     if !udp_dsts.contains_key(&(dst.addr, dst.port)) {
                                         if let Some(h) = add_udp_dst_socket(&mut sockets, dst.addr, dst.port) {
@@ -1523,8 +1591,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                     "tun",
                     format!("等待首包的连接过多({})，丢弃最早一条 {}:{}", MAX_PENDING_ACCEPT, IpAddr::from(a), p),
                 );
-                sockets.get_mut::<tcp::Socket>(h).abort();
-                let _ = sockets.remove(h);
+                release_tcp_socket(&mut sockets, h);
             }
             pending_accept.push((addr, port, handle, accepted_at));
         }
@@ -1569,8 +1636,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             let idle_secs = now_i
                                 .saturating_duration_since(victim.last_active)
                                 .as_secs();
-                            sockets.get_mut::<tcp::Socket>(victim.handle).abort();
-                            let _ = sockets.remove(victim.handle);
+                            release_tcp_socket(&mut sockets, victim.handle);
                             ctx.stats.active_conns.fetch_sub(1, Ordering::Relaxed);
                             ctx.stats.tcp_limit_evicted.fetch_add(1, Ordering::Relaxed);
                             logging::warn(
@@ -1585,8 +1651,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 "tun",
                                 format!("并发连接达到上限({})，暂无可淘汰连接，拒绝新连接", MAX_TCP_CONNS),
                             );
-                            sockets.get_mut::<tcp::Socket>(handle).abort();
-                            let _ = sockets.remove(handle);
+                            release_tcp_socket(&mut sockets, handle);
                             continue;
                         }
                     }
@@ -1684,6 +1749,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                     client_closed: false,
                                     closing: false,
                                     last_active: Instant::now(),
+                                    meter: None,
+                                    recv_full: false,
+                                    send_stall_since: None,
                                 });
                                 ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                                 ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
@@ -1752,8 +1820,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                     if matches!(action, Action::Block) {
                         // 主动 RST：DoT 探测快速失败，Android 才能尽快回落；
                         // 规则拦截的连接也不该挂着等超时。
-                        sockets.get_mut::<tcp::Socket>(handle).abort();
-                        let _ = sockets.remove(handle);
+                        release_tcp_socket(&mut sockets, handle);
                         continue;
                     }
                     // 直连熔断：冷却期内抑制真实拨号（不发 SYN、不占拨号 worker），
@@ -1786,6 +1853,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 client_closed: false,
                                 closing: false,
                                 last_active: Instant::now(),
+                                meter: None,
+                                recv_full: false,
+                                send_stall_since: None,
                             });
                             ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                             ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
@@ -1822,7 +1892,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         });
                         let read_wake = Arc::new(Notify::new());
                         tokio::spawn(relay_stream(Box::new(b), rx, stx, relay_wake.clone(), read_wake.clone()));
-                        let snap = ctx
+                        let (snap, meter) = ctx
                             .conns
                             .write()
                             .unwrap_or_else(|p| p.into_inner())
@@ -1847,6 +1917,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             client_closed: false,
                             closing: false,
                             last_active: Instant::now(),
+                            meter: Some(meter),
+                            recv_full: false,
+                            send_stall_since: None,
                         });
                         ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                         ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
@@ -1872,6 +1945,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             client_closed: false,
                             closing: false,
                             last_active: Instant::now(),
+                            meter: None,
+                            recv_full: false,
+                            send_stall_since: None,
                         });
                         ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                         ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
@@ -1964,7 +2040,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 }
                             }
                         });
-                        let snap = ctx
+                        let (snap, meter) = ctx
                             .conns
                             .write()
                             .unwrap_or_else(|p| p.into_inner())
@@ -1989,13 +2065,16 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             client_closed: false,
                             closing: false,
                             last_active: Instant::now(),
+                            meter: Some(meter),
+                            recv_full: false,
+                            send_stall_since: None,
                         });
                         ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                         ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 tcp::State::Closed => {
-                    let _ = sockets.remove(handle);
+                    release_tcp_socket(&mut sockets, handle);
                 }
                 _ => {
                     still_pending.push((addr, port, handle, accepted_at));
@@ -2021,6 +2100,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                 match sock.recv_slice(&mut tcp_scratch) {
                     Ok(n) if n > 0 => {
                         touched = true;
+                        if let Some(m) = conn.meter.as_ref() {
+                            m.up.fetch_add(n as u64, Ordering::Relaxed);
+                        }
                         let data = tcp_scratch[..n].to_vec();
                         match conn.to_relay.as_ref().unwrap().try_send(data) {
                             Ok(_) => {}
@@ -2055,11 +2137,17 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         Ok(n) if n == front.len() => {
                             touched = true;
                             conn.pending_bytes -= front.len();
+                            if let Some(m) = conn.meter.as_ref() {
+                                m.down.fetch_add(n as u64, Ordering::Relaxed);
+                            }
                             conn.pending.pop_front();
                         }
                         Ok(n) => {
                             touched = true;
                             conn.pending_bytes -= n;
+                            if let Some(m) = conn.meter.as_ref() {
+                                m.down.fetch_add(n as u64, Ordering::Relaxed);
+                            }
                             front.drain(..n);
                         }
                         Err(_) => break,
@@ -2095,6 +2183,48 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                 removed += 1;
             }
             ctx.stats.active_conns.fetch_sub(removed, Ordering::Relaxed);
+        }
+
+        // 数据面判别仪表：每 500ms 扫一遍连接，把「本地收不动」和「对端不收」分开计数。
+        // 只读队列计数，不搬数据；recv 满只在进入状态时计一次，避免 500ms 采样重复累加。
+        if last_meter.elapsed() >= Duration::from_millis(500) {
+            last_meter = Instant::now();
+            let now_m = Instant::now();
+            for conn in conns.iter_mut() {
+                let sock = sockets.get::<tcp::Socket>(conn.handle);
+                let rc = sock.recv_capacity();
+                let rq = sock.recv_queue();
+                let sc = sock.send_capacity();
+                let sq = sock.send_queue();
+                let full = rc > 0 && rq >= rc;
+                if full {
+                    if !conn.recv_full {
+                        conn.recv_full = true;
+                        ctx.stats.tcp_recv_full.fetch_add(1, Ordering::Relaxed);
+                    }
+                } else {
+                    conn.recv_full = false;
+                }
+                if sq > 0 && sc == 0 {
+                    if conn.send_stall_since.is_none() {
+                        conn.send_stall_since = Some(now_m);
+                        ctx.stats.tcp_send_stalled.fetch_add(1, Ordering::Relaxed);
+                        let ep = sock
+                            .remote_endpoint()
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "-".into());
+                        logging::warn(
+                            "tun",
+                            format!(
+                                "发送停滞 {}：对端零窗口，待发 {}B，本地收队列 {}/{}B",
+                                ep, sq, rq, rc
+                            ),
+                        );
+                    }
+                } else {
+                    conn.send_stall_since = None;
+                }
+            }
         }
 
         // 协作让出②：连接遍历（最重的一段）之后，拨号/DNS 任务插队执行。
@@ -2209,6 +2339,43 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             last_sweep = Instant::now();
             let now_i = Instant::now();
 
+            // QUIC 假活判定：探测窗口内一次回包都没有 → 判黑洞，压制一段时间。
+            if ctx
+                .cfg
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .quic_fallback
+            {
+                let mut judged: Vec<IpAddress> = Vec::new();
+                for (ip, since) in quic_probe.iter() {
+                    if now_i.duration_since(*since) >= Duration::from_millis(QUIC_PROBE_WAIT_MS) {
+                        judged.push(*ip);
+                    }
+                }
+                for ip in judged {
+                    quic_probe.remove(&ip);
+                    if !quic_blackhole.contains_key(&ip) {
+                        quic_blackhole.insert(ip, now_i);
+                        logging::warn(
+                            "tun",
+                            format!(
+                                "QUIC 假活：{} 在 {}ms 内无回包，{}s 内丢弃该目标 QUIC 让客户端回落 TCP",
+                                ip, QUIC_PROBE_WAIT_MS, QUIC_BLACKHOLE_TTL_SECS
+                            ),
+                        );
+                    }
+                }
+                // 过期黑洞重新试探。
+                let expired: Vec<IpAddress> = quic_blackhole
+                    .iter()
+                    .filter(|(_, t)| now_i.duration_since(**t) >= Duration::from_secs(QUIC_BLACKHOLE_TTL_SECS))
+                    .map(|(ip, _)| *ip)
+                    .collect();
+                for ip in expired {
+                    quic_blackhole.remove(&ip);
+                }
+            }
+
             // TCP 空闲/僵尸连接回收。对端静默死亡时 keepalive + smoltcp timeout 会先
             // abort；这里兜「还能回 ACK、但长时间没有任何业务数据」的僵尸连接。
             // 有堆积（慢速传输中）或已在关闭流程的连接不动，避免误杀。
@@ -2239,8 +2406,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         .remote_endpoint()
                         .map(|e| e.to_string())
                         .unwrap_or_else(|| "-".into());
-                    sockets.get_mut::<tcp::Socket>(conn.handle).abort();
-                    let _ = sockets.remove(conn.handle);
+                    release_tcp_socket(&mut sockets, conn.handle);
                     ctx.stats.tcp_idle_reaped.fetch_add(1, Ordering::Relaxed);
                     removed += 1;
                     logging::info(
@@ -2311,7 +2477,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             }
             for key in expired_listeners {
                 if let Some((handle, _)) = listeners.remove(&key) {
-                    let _ = sockets.remove(handle);
+                    release_tcp_socket(&mut sockets, handle);
                 }
             }
         }
@@ -2589,12 +2755,31 @@ mod tests {
     }
 
     #[test]
-    fn buffer_plan_uses_128k_tcp_and_mitm_pipes() {
-        // 128K 让 smoltcp 窗口缩放 shift=1（通告窗口 ~128K）；
-        // 降到 32K 会退回无缩放，单流被「32K / RTT」锁死。
-        assert_eq!(TCP_SOCKET_BUFFER, 128 * 1024);
+    fn buffer_plan_uses_512k_tcp_and_memory_guard() {
+        // 512K 让 smoltcp 窗口缩放 shift=3（通告窗口 ~512K），单流上限 512K/RTT；
+        // 128K 档只有 128K/RTT，RTT 一抖就掉到 25Mbps 量级。
+        assert_eq!(TCP_SOCKET_BUFFER, 512 * 1024);
+        // 水位守卫：高价位档只给前 128 条 socket，其余降级 128K。
+        assert_eq!(TCP_SOCKET_BUFFER_MIN, 128 * 1024);
+        assert!(TCP_BUFFER_HIGH_TIER_MAX >= 64);
+        // 最坏内存：128×1MB + (1024-128)×0.25MB ≈ 352MB，
+        // 远低于「裸提 1024 条全 512K」的 1GB。
+        assert!(
+            TCP_BUFFER_HIGH_TIER_MAX * 2 * TCP_SOCKET_BUFFER
+                + (1024 - TCP_BUFFER_HIGH_TIER_MAX) * 2 * TCP_SOCKET_BUFFER_MIN
+                <= 384 * 1024 * 1024
+        );
         assert_eq!(MITM_DUPLEX_CAP, 128 * 1024);
         assert_eq!(DNS_TCP_DUPLEX_CAP, 64 * 1024);
+    }
+
+    #[test]
+    fn quic_fallback_probe_window_is_sane() {
+        // 探测窗口要覆盖蜂窝 RTT（太短会把正常 QUIC 误判成假活），也不能拖太久。
+        assert!(QUIC_PROBE_WAIT_MS >= 1000);
+        assert!(QUIC_PROBE_WAIT_MS <= 4000);
+        // 黑洞有效期至少几分钟，否则客户端每轮都要重新踩一次假活。
+        assert!(QUIC_BLACKHOLE_TTL_SECS >= 300);
     }
 
     #[test]
@@ -2625,7 +2810,9 @@ mod tests {
     fn pending_cap_bounds_downstream_memory() {
         // 上限必须明显大于 smoltcp 发送缓冲（健康连接不受影响），
         // 又必须远小于「无界增长」：单连接下行堆积封顶在 1MB 内。
-        assert!(TCP_PENDING_CAP >= 2 * TCP_SOCKET_BUFFER);
+        // pending 上限至少覆盖一个 socket 缓冲，否则一屏数据都放不下就开始背压；
+        // 同时单连接下行堆积仍封顶在 1MB 内。
+        assert!(TCP_PENDING_CAP >= TCP_SOCKET_BUFFER);
         assert!(TCP_PENDING_CAP <= 1024 * 1024);
     }
 
@@ -2653,6 +2840,9 @@ mod tests {
             client_closed: false,
             closing: false,
             last_active: Instant::now(),
+            meter: None,
+            recv_full: false,
+            send_stall_since: None,
         };
         // 灌 640K（40×16K），超过 512K 上限。
         for _ in 0..40 {

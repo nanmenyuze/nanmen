@@ -110,6 +110,14 @@ fun DataScreen(
                 color = if (stats.tunTxDrop > 0 || stats.tunPendingDrop > 0) NamuColors.Orange else NamuColors.TextSub,
                 textAlign = TextAlign.Center,
             )
+            Text(
+                "判别：接收满 ${stats.tcpRecvFull} · 发送停滞 ${stats.tcpSendStalled} · " +
+                    "QUIC 回落 ${stats.quicFallback} · 缓冲拒绝 ${stats.tcpBufferDenied}",
+                modifier = Modifier.padding(bottom = 8.dp),
+                fontSize = 11.sp,
+                color = if (stats.tcpRecvFull > 0 || stats.tcpSendStalled > 0) NamuColors.Orange else NamuColors.TextSub,
+                textAlign = TextAlign.Center,
+            )
             Row(Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
                 DataMetric("活跃连接", stats.activeConns.toString(), Modifier.weight(1f))
                 DataMetric("运行时长", formatUptime(stats.uptime), Modifier.weight(1f))
