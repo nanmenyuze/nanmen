@@ -1,4 +1,4 @@
-# 南门DNS 2.6
+# 南门DNS 2.6.1
 
 > 内核 crate / JNI：`nanmen_core` / `libnanmen_core.so`；许可证：**GPL-3.0-only**（见 `LICENSE`、`NOTICE`、`THIRD_PARTY_NOTICES.md`）。
 
@@ -9,7 +9,8 @@
 > 2.3.8 测试包再追加（不改版本号）：逐连接快照表与「实时连接」列表（内核 `conns.rs` 记录 UID/域名/IP/端口/动作/命中规则/MITM 标记/存活时长，JNI `nativeConnections(since)` 增量下发，壳层每秒轮询、按内核活跃总数自动淘汰已关闭条目）；Surge `.sgmodule` 的 `[URL Rewrite]` 补齐 `302`/`307`、3 段 `header`（URL 替换）与 `mock`/`mock-request-body`/`mock-response-body`（翻译成等价 Loon 规则执行，不再计为不支持）；修正 Loon 旧语法 `^url https://new 302|header`（动作在末位）被整行丢弃的问题。内核 1.12.8。
 >
 > 2.6 正式版 = 合并两条迭代线。数据面（来自 2.3.9~2.3.12，内核 1.12.9）：TUN 收发改缓冲池 + 批量写 + 背压诊断（`tunTxDrop`/`tunPendingDrop`/`tunPendingPeak`/`tunTxBackpressure`/`tunWriteWouldBlock`/`tunWriteError`）；ICMP Echo 本地回显；直连拨号熔断（按目标冷却、连续失败自愈、`dialBreakerRejected`）与「保持真实失败时序」的抑制策略；并发上限改为淘汰最久空闲（`tcpLimitEvicted`）而非拒绝新连接；空闲兜底回收（`tcpIdleReaped`）；HTTPS/HTTP 连通性探测本地代答；切网滞回（5s 确认窗口）与重建失败自动重试；节点级 `udp:false` 与 SOCKS5/Trojan/VLESS UDP。过滤与分流（来自 2.3.8 测试包，内核 1.13.0）：按 App 分流（`uidmap` + Root 读 socket 表）、按 App MITM、CNAME 伪装拦截、DNS-only 全量接管、纯过滤无节点模式、Surge `[URL Rewrite]` 的 302/307/header/mock 映射、Loon `url target action` 旧语法、逐连接快照与「实时连接」列表。
->
+
+> 2.6.1 正式版（只调数据面档位与 TCP 小包参数，内核 1.13.1）：下行三档成对抬到 512 —— `MAX_TX_QUEUE`（smoltcp tx 暂存包）512、`MAX_PENDING_OUT`（待写 TUN 队列，512×2048B≈1MB）512、`MAX_TX_WRITE_BURST`（每轮写入，≈1MB/轮）512；读侧 `MAX_RX_BURST` 64→512。并把读 TUN 从「依赖 select 的 readable 分支被选中」改为每轮固定执行的非阻塞步骤（`readable` 只负责唤醒并清就绪位），避免边沿触发或漏唤醒把 RX 停住——RX 一停 ACK 回填就慢，下行窗口会跟着被压。`SNI_WAIT_MS` 保持 60ms 不动。同时关闭 TCP Nagle（`set_nagle_enabled(false)`）、延迟 ACK 从 smoltcp 默认 10ms 压到 5ms，减少小包合并与确认等待叠加出来的 RTT 级停顿。>
 > 版本：2.6（versionCode 90）；内核 1.13.0。
 
 ## 壳设计文档

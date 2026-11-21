@@ -90,19 +90,28 @@ struct TunDevice {
     stats: Arc<Stats>,
 }
 
+/// smoltcp 的延迟 ACK 时长。默认 10ms 会让下行 ACK 回填慢半拍，
+/// 在高带宽链路上一旦窗口被 ACK 节奏卡住，表现就是瞬时速率上不去、抖动变大。
+/// 5ms 是「少发几个纯 ACK 包」和「窗口不断流」之间的折中。
+const ACK_DELAY_MS: u64 = 5;
 /// 单次 iface.poll 允许暂存的 TxToken 包数；达到高水位后 transmit() 返回 None，
 /// 让 smoltcp 保留在 socket 缓冲里，而不是在这里静默丢包。
-const MAX_TX_QUEUE: usize = 256;
+/// 512×2048B≈1MB：与 pending_out 上限对齐，避免 tx 队列先于 pending 见顶。
+const MAX_TX_QUEUE: usize = 512;
 /// pending_out 的高水位：达到后暂停从 tx 队列取包并暂停读 TUN，形成端到端背压。
 /// 这是背压信号，不是丢包点；不再 truncate。
-/// 256×2048B≈512KB：1024 档（2MB）在 100Mbps 下排队时延可达 ~170ms，
-/// 测速满载时延迟/抖动被这段队列直接抬高（bufferbloat）。
-/// 收紧后多余数据留在 smoltcp socket 缓冲里由 TCP 窗口流控回压，不丢包。
-const MAX_PENDING_OUT: usize = 256;
+/// 512×2048B≈1MB：实测 256 档在跑量时长期顶满（backlog 峰值 = 上限、伴背压），
+/// 说明下行消费速度被批量写卡住而不是链路饱和，故放宽一档。
+/// 1MB 在 100Mbps 满载的理论排队时延约 85ms，但队列只在瞬时突发时堆积，
+/// 稳态由写 TUN 的消费速度决定；多余的长期积压仍由 TCP 窗口流控回压，不丢包。
+const MAX_PENDING_OUT: usize = 512;
 /// 每轮主循环写 TUN 的包数上限。旧逻辑一口气写完 pending_out（最多 256 包），
 /// 高吞吐时单轮几十 ms，同 worker 的拨号/DNS 任务被饿死（排队尖刺 795/1109/4344ms）。
 /// 封顶后剩余包留在 pending_out，等待逻辑见其非空即 1ms 兜底，吞吐不降、单轮有界。
-const MAX_TX_WRITE_BURST: usize = 128;
+/// 128 档（≈256KB/轮）在跑量时把队列推到顶格并触发背压，故与队列上限成对放宽到 512 档：
+/// 一轮可清空整个 pending_out（≈1MB），单轮写入是 memcpy 级（512 次 write，约 1–2ms），
+/// 仍远低于旧逻辑「一口气 + 慢写」导致的几十 ms 饿死区间。
+const MAX_TX_WRITE_BURST: usize = 512;
 /// 直连拨号熔断：首次失败容忍（瞬时抖动），第 2 次连续失败起冷却 10s，
 /// 之后翻倍、封顶 60s。冷却期内同目标新连接直接 RST，不发 SYN 白等 2s。
 const DIAL_BREAKER_BASE_SECS: u64 = 10;
@@ -110,8 +119,10 @@ const DIAL_BREAKER_CAP_SECS: u64 = 60;
 /// 新连接等待首包（SNI/HTTP 探测判定）的上限。180ms 会把「连上就不发数据」
 /// 的延迟探测类连接每条凭空加 180ms；60ms 足够覆盖正常 TLS ClientHello 到达。
 const SNI_WAIT_MS: u64 = 60;
-/// 单次 TUN 可读事件最多连续读取的包数，避免饿死其他 select 分支。
-const MAX_RX_BURST: usize = 64;
+/// 每轮主循环从 TUN 连续读取的包数上限。
+/// 64 档在跑量时读侧先见底：RX 一停，ACK 回填就慢，反过来把下行窗口压住。
+/// 抬到 512 与写侧对齐；读取是非阻塞的，读到 WouldBlock 立刻停，不会长时间占住单轮。
+const MAX_RX_BURST: usize = 512;
 /// 每轮主循环从 relay 通道搬入 pending 的最大块数。
 /// 太小会把单连接吞吐压成「块数 × 块大小 / 轮询间隔」，太大则单连接 pending 占内存。
 const RELAY_DRAIN_BURST: usize = 32;
@@ -838,6 +849,14 @@ fn add_listener(sockets: &mut SocketSet<'_>, addr: IpAddress, port: u16) -> Opti
         tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER]),
         tcp::SocketBuffer::new(vec![0u8; TCP_SOCKET_BUFFER]),
     );
+    // 这个 TUN 数据面是「一条 TCP 连接就是一条本地 smoltcp 连接」，监听 socket 直接
+    // 转成已建立连接（state != Listen 后原地复用），所以在这里设一次即全程生效。
+    // 关 Nagle：小包（TLS 握手、请求头、交互式请求）被合并就是固定的 RTT 级等待，
+    // 这里换不到「少发几个包」的收益，只剩延迟成本。
+    socket.set_nagle_enabled(false);
+    // 延迟 ACK：smoltcp 默认 10ms，压到 5ms。ACK 回填更快，下行窗口不会因为
+    // 等 ACK 而断流；多出来的纯 ACK 包走本机 TUN 上行，几乎没有成本。
+    socket.set_ack_delay(Some(Duration::from_millis(ACK_DELAY_MS).into()));
     // 监听 socket 上设一次，accept 出来的连接自动继承：
     // keepalive 负责续住空闲长连接并配合 timeout 识别静默死亡的对端；
     // timeout 同时兜住「SYN 之后客户端消失」的半开连接，避免永久占用缓冲。
@@ -1317,11 +1336,13 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
         };
         // 事件驱动：TUN 可读、TUN 可写、UDP 响应、DNS 响应任一到达即唤醒。
         // backlog 达到高水位时暂停读 TUN，背压回内核，避免 pending_out 无界增长。
-        let mut read_guard = None;
         tokio::select! {
+            // readable 只负责唤醒并清掉就绪位；真正的读取在下方固定步骤执行，
+            // 不再「赌 select 选中这个分支」——边沿触发或漏唤醒会把 RX 停住，
+            // RX 一停 ACK 回填就慢，下行窗口跟着被压。
             r = async_fd.readable(), if !backlogged => {
-                if let Ok(g) = r {
-                    read_guard = Some(g);
+                if let Ok(mut g) = r {
+                    g.clear_ready();
                 }
             }
             r = async_fd.writable(), if write_blocked => {
@@ -1351,7 +1372,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             _ = tokio::time::sleep(wait) => {}
         }
 
-        if let Some(_g) = read_guard.as_mut() {
+        // 读 TUN 是每轮固定步骤：非阻塞读到 WouldBlock 即止，单轮最多 MAX_RX_BURST 包。
+        // backlog 到高水位时仍然跳过，把背压留给上行（避免 pending_out 无界增长）。
+        if !backlogged {
             let mut rounds = 0;
             loop {
                 rounds += 1;
@@ -2576,10 +2599,14 @@ mod tests {
 
     #[test]
     fn latency_plan_caps_queueing_and_sniff_wait() {
-        // 下行排队上限 256×2048B≈512KB：100Mbps 下排队时延 ~40ms 量级；
-        // 1024 档（2MB）会到 ~170ms，测速满载时延迟/抖动直接被队列抬高。
-        assert_eq!(MAX_PENDING_OUT, 256);
-        assert!(MAX_PENDING_OUT * MAX_TUN_PACKET <= 512 * 1024);
+        // 下行排队上限 512×2048B≈1MB：跑量时 256 档长期顶满并触发背压，故放宽一档；
+        // 1024 档（2MB）会到 ~170ms 排队，仍不要。
+        assert_eq!(MAX_PENDING_OUT, 512);
+        assert!(MAX_PENDING_OUT * MAX_TUN_PACKET <= 1024 * 1024);
+        // 单轮批量与队列成对抬到同一档：一轮可清空整个 pending_out。
+        assert_eq!(MAX_TX_WRITE_BURST, 512);
+        assert_eq!(MAX_TX_QUEUE, MAX_PENDING_OUT);
+        assert!(MAX_TX_WRITE_BURST * MAX_TUN_PACKET >= 1024 * 1024);
         // 首包等待不能回到 180ms：延迟探测类连接连上不发数据，等待即纯延迟。
         assert!(SNI_WAIT_MS <= 60);
     }
