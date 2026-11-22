@@ -28,9 +28,9 @@ use ca::MitmCa;
 use http1::{Buffered, Framing, Headers, RequestHead, TINY_GIF};
 use loon::{BodyOp, HeaderOp, MockSpec, RejectKind};
 use std::io;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 /// 同时参与 h2 正文改写的内存预算。
@@ -40,6 +40,15 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 /// 其余流在额度不足时直接原样流式转发，避免多流叠加把 PSS 推高。
 pub const REWRITE_BUFFER_COPIES: usize = 3;
 pub const MAX_CONCURRENT_REWRITE_STREAMS: usize = 2;
+
+/// 单条 MITM 连接的观测计数：请求数 / 无规则命中数 / 是否已记录过首条无规则请求。
+/// h2 与 h1 共用同一份，连接结束时汇总一条日志，避免逐请求刷屏。
+#[derive(Default)]
+pub struct ConnTrace {
+    pub reqs: AtomicU64,
+    pub no_rule: AtomicU64,
+    pub noted: AtomicBool,
+}
 
 pub struct RewriteBudget {
     total: usize,
@@ -200,6 +209,7 @@ impl MitmState {
                     timeout_ms: rule.timeout_ms,
                     allow_private_network: false,
                     arguments: rule.arguments.clone(),
+                    argument_types: rule.argument_types.clone(),
                     argument_text: rule.argument_text.clone(),
                     store: Some(store.clone()),
                     script_name: rule.name.clone(),
@@ -307,6 +317,11 @@ fn plan_loon_request(
         response_body_ops: Vec::new(),
     };
     for rule in hits {
+        // 新版 Loon 条件可引用请求头/参数；旧规则 cond=None，行为不变。
+        // URL 可能被前一条 url.replace 改写，所以每条都用当前 url 重新求值。
+        if !rule.applies(&url_now, &req.headers) {
+            continue;
+        }
         match &rule.action {
             LoonAction::UrlReplace(template) => {
                 let Some(caps) = rule.url.captures(&url_now) else { continue };
@@ -620,6 +635,57 @@ where
     Ok(Some(body))
 }
 
+/// 本地 TLS 握手错误是否只是客户端提前断开（cronet 等连接池预热后弃用）。
+/// 这类断开绝不能触发 mark_bypass：一次弃连会让整个域名在 fail_open_ttl 内
+/// 完全不解密，正是「B 站首页改写有时失效」的成因。证书/告警类失败优先判定，
+/// 保留真正的证书绑定兜底放行语义。
+fn is_client_tls_abort(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    const CERT: [&str; 6] = [
+        "certificate",
+        "unknown ca",
+        "unknownissuer",
+        "handshake failure",
+        "alert",
+        "decrypt",
+    ];
+    if CERT.iter().any(|k| m.contains(k)) {
+        return false;
+    }
+    const ABORT: [&str; 10] = [
+        "close_notify",
+        "unexpected eof",
+        "unexpected-eof",
+        "connection reset",
+        "broken pipe",
+        "connection aborted",
+        "connection closed",
+        "not connected",
+        "early eof",
+        "stream closed",
+    ];
+    ABORT.iter().any(|k| m.contains(k))
+}
+
+fn log_conn_summary(conn_id: u64, host: &str, trace: &ConnTrace, t0: Instant) {
+    let reqs = trace.reqs.load(Ordering::Relaxed);
+    if reqs == 0 {
+        return;
+    }
+    let no_rule = trace.no_rule.load(Ordering::Relaxed);
+    logging::info(
+        "mitm",
+        format!(
+            "#{} {} MITM 结束：请求 {}，无规则 {}，耗时 {}s",
+            conn_id,
+            host,
+            reqs,
+            no_rule,
+            t0.elapsed().as_secs()
+        ),
+    );
+}
+
 /// 单条 MITM 连接的生命周期。client 是来自 TUN 协议栈的字节流（含原始 ClientHello）。
 pub async fn handle<S>(
     client: S,
@@ -644,6 +710,18 @@ pub async fn handle<S>(
     let tls = match tokio::time::timeout(Duration::from_secs(10), acceptor.accept(client)).await {
         Ok(Ok(t)) => t,
         Ok(Err(e)) => {
+            // 客户端在本地 TLS 握手中途直接断开：cronet 等连接池会大量预热后弃用，
+            // 这类断开与证书绑定无关。绝不能据此拉黑整个域名——否则一次弃连就让
+            // 该域名在 fail_open_ttl（默认 300s）内完全不解密，表现为「改写有时失效」。
+            let msg = e.to_string();
+            if is_client_tls_abort(&msg) {
+                ctx.stats.mitm_tls_aborted.fetch_add(1, Ordering::Relaxed);
+                logging::info(
+                    "mitm",
+                    format!("#{} {} 客户端 TLS 握手中途断开（连接池弃连），按回收处理", conn_id, host),
+                );
+                return;
+            }
             state.engine.mark_bypass(&host);
             ctx.stats.mitm_failed.fetch_add(1, Ordering::Relaxed);
             logging::warn(
@@ -653,28 +731,34 @@ pub async fn handle<S>(
             return;
         }
         Err(_) => {
-            state.engine.mark_bypass(&host);
-            ctx.stats.mitm_failed.fetch_add(1, Ordering::Relaxed);
-            logging::warn("mitm", format!("#{} {} 本地 TLS 握手超时，临时放行", conn_id, host));
+            // 完成 TCP 但迟迟不做 TLS：同样多为预热/备用连接。真正的证书绑定会
+            // 明确回 alert，不会静默挂死，所以超时也不拉黑域名。
+            ctx.stats.mitm_tls_aborted.fetch_add(1, Ordering::Relaxed);
+            logging::info("mitm", format!("#{} {} TLS 握手未开始，空闲连接回收", conn_id, host));
             return;
         }
     };
     ctx.stats.mitm_conns.fetch_add(1, Ordering::Relaxed);
+    let t0 = Instant::now();
+    let trace = Arc::new(ConnTrace::default());
     // ALPN 协商到 h2 时走 HTTP/2 分流；HTTP/1.1 继续走原有解析/改写路径。
     if tls.get_ref().1.alpn_protocol() == Some(b"h2".as_slice()) {
-        if let Err(e) = h2::serve(
+        let h2_res = h2::serve(
             tls,
-            host,
+            host.clone(),
             target,
             action,
-            ctx,
+            ctx.clone(),
             state,
             conn_id,
+            trace.clone(),
         )
-        .await
-        {
-            logging::warn("mitm", format!("#{} h2 连接处理失败: {}", conn_id, e));
+        .await;
+        if let Err(e) = h2_res {
+            ctx.stats.mitm_h2_failed.fetch_add(1, Ordering::Relaxed);
+            logging::warn("mitm", format!("#{} {} h2 连接处理失败: {}", conn_id, host, e));
         }
+        log_conn_summary(conn_id, &host, &trace, t0);
         return;
     }
     let mut cio = Buffered::new(tls);
@@ -733,6 +817,28 @@ pub async fn handle<S>(
         let script_url = format!("https://{}{}", plan.host, req.path);
         let request_scripts = state.engine.scripts.has_phase(&script_url, ScriptPhase::Request);
         let script_needs_body = request_scripts && state.engine.scripts.needs_request_body(&script_url);
+        trace.reqs.fetch_add(1, Ordering::Relaxed);
+        ctx.stats.mitm_reqs.fetch_add(1, Ordering::Relaxed);
+        // 与 h2 路径一致：响应阶段规则/脚本也算命中，避免把响应体改写误报为无规则。
+        let response_scripts = state.engine.scripts.has_phase(&script_url, ScriptPhase::Response);
+        let matched = !hits.is_empty()
+            || !loon_hits.is_empty()
+            || request_scripts
+            || response_scripts
+            || !plan.response_headers.is_empty()
+            || !plan.response_body_ops.is_empty()
+            || plan.request_mock.is_some()
+            || plan.terminal.is_some();
+        if !matched {
+            trace.no_rule.fetch_add(1, Ordering::Relaxed);
+            ctx.stats.mitm_no_rule.fetch_add(1, Ordering::Relaxed);
+            if !trace.noted.swap(true, Ordering::Relaxed) {
+                logging::info(
+                    "mitm",
+                    format!("#{} {} 请求与响应均未命中规则: {}", conn_id, host, http1::redact_path(&req.path)),
+                );
+            }
+        }
         if let Some(term) = &plan.terminal {
             // Loon `reject` 是直接断开连接，不是返回 204；不能给客户端伪造响应。
             if matches!(term, Terminal::Reject(RejectKind::Drop)) {
@@ -869,6 +975,7 @@ pub async fn handle<S>(
         }
     }
     let _ = cio.stream.shutdown().await;
+    log_conn_summary(conn_id, &host, &trace, t0);
 }
 
 /// 转发单个请求并按需改写响应。返回客户端连接是否可继续复用。
@@ -1153,4 +1260,43 @@ where
         }
     }
     Ok(keep)
+}
+
+#[cfg(test)]
+mod tls_abort_tests {
+    use super::is_client_tls_abort;
+
+    /// cronet 连接池预热后弃连：绝不能据此拉黑整个域名。
+    #[test]
+    fn pool_abort_is_not_cert_failure() {
+        for m in [
+            "peer closed connection without sending TLS close_notify: https://docs.rs/rustls",
+            "unexpected eof while reading",
+            "Connection reset by peer (os error 104)",
+            "Broken pipe (os error 32)",
+            "connection aborted",
+            "connection closed",
+        ] {
+            assert!(is_client_tls_abort(m), "应判为弃连: {}", m);
+        }
+    }
+
+    /// 真正的证书绑定/告警失败仍要保留临时放行兜底。
+    #[test]
+    fn real_cert_failure_keeps_bypass() {
+        for m in [
+            "invalid peer certificate: UnknownIssuer",
+            "peer sent fatal alert: bad_certificate",
+            "received fatal alert: handshake_failure",
+            "decrypt error",
+        ] {
+            assert!(!is_client_tls_abort(m), "应判为真失败: {}", m);
+        }
+    }
+
+    /// 未知错误保守起见按真失败处理，不放宽拉黑条件。
+    #[test]
+    fn unknown_error_is_not_abort() {
+        assert!(!is_client_tls_abort("some other failure"));
+    }
 }

@@ -270,7 +270,7 @@ class NamuVpnService : VpnService() {
                     return@Thread
                 }
                 val json = try {
-                    ConfigStore.buildNative(this, cfg)
+                    ConfigStore.buildNative(this, settings.current())
                 } catch (t: Throwable) {
                     pfd.close()
                     throw t
@@ -389,9 +389,19 @@ class NamuVpnService : VpnService() {
     }
 
     private fun establishTun(cfg: AppConfig): ParcelFileDescriptor? {
+        val mtu = cfg.mtu.coerceIn(1280, 9000)
+        val pfd = buildTun(cfg, mtu)
+        if (pfd != null || mtu == 1500) return pfd
+        // 个别 TUN 驱动不支持巨帧：回退 1500 并写回配置，
+        // 保证壳 setMtu 与内核 iface 永远取同一值（否则写侧超 MTU 静默丢包）。
+        settings.update { it.copy(mtu = 1500) }
+        return buildTun(cfg, 1500)
+    }
+
+    private fun buildTun(cfg: AppConfig, mtu: Int): ParcelFileDescriptor? {
         val builder = Builder()
             .setSession("NamuDNS")
-            .setMtu(1500)
+            .setMtu(mtu)
             .addAddress("10.10.10.1", 24)
             .addRoute("10.10.10.53", 32)
             .addDnsServer("10.10.10.53")
@@ -565,7 +575,7 @@ class NamuVpnService : VpnService() {
                     val pfd = establishTun(cfg)
                     if (pfd != null) {
                         val rebuiltJson = try {
-                            ConfigStore.buildNative(this, cfg)
+                            ConfigStore.buildNative(this, settings.current())
                         } catch (_: Throwable) {
                             null
                         }

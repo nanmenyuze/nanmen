@@ -93,6 +93,9 @@ pub struct ScriptRuleConf {
     /// `$argument` 键值（插件 [Argument] 形式）。
     #[serde(default)]
     pub arguments: HashMap<String, String>,
+    /// 参数声明类型（string / number / boolean）；缺省按 string。
+    #[serde(default)]
+    pub argument_types: HashMap<String, String>,
     /// Loon 单条 `argument=` 的原始字符串；非空且无 arguments 时 `$argument` 为字符串。
     #[serde(default)]
     pub argument_text: Option<String>,
@@ -116,6 +119,7 @@ pub struct CompiledScriptRule {
     pub url: Regex,
     pub source: String,
     pub arguments: HashMap<String, String>,
+    pub argument_types: HashMap<String, String>,
     pub argument_text: Option<String>,
     pub timeout_ms: u64,
     pub max_size: usize,
@@ -166,6 +170,7 @@ impl ScriptEngine {
                 url,
                 source: c.source.clone(),
                 arguments: c.arguments.clone(),
+                argument_types: c.argument_types.clone(),
                 argument_text: c.argument_text.clone(),
                 timeout_ms: c.timeout_ms.max(50).min(MAX_TIMEOUT_MS),
                 max_size: c.max_size.clamp(4096, 8 * 1024 * 1024),
@@ -201,6 +206,7 @@ pub struct ScriptOptions {
     pub timeout_ms: u64,
     pub allow_private_network: bool,
     pub arguments: HashMap<String, String>,
+    pub argument_types: HashMap<String, String>,
     pub argument_text: Option<String>,
     pub store: Option<Arc<ScriptStore>>,
     /// 当前脚本名，供 `$script.name` 和默认存储 key 使用。
@@ -909,7 +915,22 @@ fn run_script_with_runtime(
             } else {
                 let args = Object::new(ctx.clone())?;
                 for (k, v) in &options.arguments {
-                    args.set(k.as_str(), v.as_str())?;
+                    // Loon [Argument] 声明类型：number/boolean 必须按真类型注入，
+                    // 否则脚本里 `$argument.price > 5`、`$argument.enabled === true` 全部失效。
+                    match options.argument_types.get(k).map(|t| t.as_str()).unwrap_or("string") {
+                        "number" => match v.trim().parse::<f64>() {
+                            Ok(n) => args.set(k.as_str(), n)?,
+                            Err(_) => args.set(k.as_str(), v.as_str())?,
+                        },
+                        "boolean" => {
+                            let b = matches!(
+                                v.trim().to_ascii_lowercase().as_str(),
+                                "1" | "true" | "yes" | "on"
+                            );
+                            args.set(k.as_str(), b)?
+                        }
+                        _ => args.set(k.as_str(), v.as_str())?,
+                    }
                 }
                 globals.set("$argument", args)?;
             }
@@ -1416,6 +1437,43 @@ mod tests {
             &ScriptOptions { arguments: args, ..Default::default() },
         );
         assert_eq!(out.message.body, "cn");
+    }
+
+    #[test]
+    fn argument_object_keeps_declared_types() {
+        let mut args = HashMap::new();
+        args.insert("price".into(), "9.99".into());
+        args.insert("enabled".into(), "true".into());
+        args.insert("region".into(), "CN".into());
+        let mut types = HashMap::new();
+        types.insert("price".into(), "number".into());
+        types.insert("enabled".into(), "boolean".into());
+        types.insert("region".into(), "string".into());
+        let out = run_script(
+            r#"$done({body:[typeof $argument.price, typeof $argument.enabled, typeof $argument.region, $argument.price, $argument.enabled, $argument.region].join("|")});"#,
+            ScriptPhase::Response,
+            &req(),
+            &ScriptOptions { arguments: args, argument_types: types, ..Default::default() },
+        );
+        assert_eq!(out.message.body, "number|boolean|string|9.99|true|CN");
+        assert!(out.error.is_none(), "{:?}", out.error);
+    }
+
+    #[test]
+    fn argument_object_json_roundtrip_preserves_types() {
+        let mut args = HashMap::new();
+        args.insert("level".into(), "2".into());
+        args.insert("enabled".into(), "false".into());
+        let mut types = HashMap::new();
+        types.insert("level".into(), "number".into());
+        types.insert("enabled".into(), "boolean".into());
+        let out = run_script(
+            r#"$done({body:($argument.level > 1 && $argument.enabled === false) ? "ok" : "bad"});"#,
+            ScriptPhase::Response,
+            &req(),
+            &ScriptOptions { arguments: args, argument_types: types, ..Default::default() },
+        );
+        assert_eq!(out.message.body, "ok");
     }
 
     #[test]

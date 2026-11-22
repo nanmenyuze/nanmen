@@ -67,6 +67,138 @@ impl AsyncWrite for PrefixedStream {
     }
 }
 
+/// 上游调优全局开关与统计入口：engine 启动/热更时下发，避免给每个 dial 路径传参。
+static TUNE_BBR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static TUNE_STATS: std::sync::RwLock<Option<Arc<crate::stats::Stats>>> = std::sync::RwLock::new(None);
+
+pub fn set_tuning(bbr: bool, stats: Arc<crate::stats::Stats>) {
+    TUNE_BBR.store(bbr, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut g) = TUNE_STATS.write() {
+        *g = Some(stats);
+    }
+}
+
+fn tune_stats() -> Option<Arc<crate::stats::Stats>> {
+    TUNE_STATS.read().ok().and_then(|g| g.clone())
+}
+
+fn get_sockopt_int(fd: std::os::fd::RawFd, level: libc::c_int, name: libc::c_int) -> Option<libc::c_int> {
+    let mut v: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            level,
+            name,
+            &mut v as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc == 0 {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+fn get_congestion(fd: std::os::fd::RawFd) -> Option<String> {
+    let mut buf = [0u8; 16];
+    let mut len = buf.len() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let n = (len as usize).min(buf.len());
+    let end = buf[..n].iter().position(|&b| b == 0).unwrap_or(n);
+    String::from_utf8(buf[..end].to_vec()).ok()
+}
+
+/// 采样上游内核 socket 的收/发缓冲（自动调窗后的真实值），记观测最大值进诊断。
+/// 不锁 SO_RCVBUF/SNDBUF：锁死会关掉内核自动调窗，高 BDP 单流反而被压低。
+fn sample_sock_bufs(fd: std::os::fd::RawFd, stats: &Option<Arc<crate::stats::Stats>>) {
+    let Some(st) = stats else { return };
+    if let Some(v) = get_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_RCVBUF) {
+        st.upstream_rcvbuf_max.fetch_max(v as i64, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(v) = get_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_SNDBUF) {
+        st.upstream_sndbuf_max.fetch_max(v as i64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// 直连/代理出口 TCP 的包装流：每 10s 采样一次内核缓冲真实值（看自动调窗天花板），
+/// 读写本身零拷贝委托，不引入额外缓冲或延迟。
+pub struct MeteredStream {
+    inner: TcpStream,
+    stats: Option<Arc<crate::stats::Stats>>,
+    last: std::time::Instant,
+}
+
+impl MeteredStream {
+    pub fn new(inner: TcpStream) -> Self {
+        Self {
+            inner,
+            stats: tune_stats(),
+            last: std::time::Instant::now(),
+        }
+    }
+
+    fn maybe_sample(&mut self) {
+        if self.last.elapsed() >= Duration::from_secs(10) {
+            self.last = std::time::Instant::now();
+            use std::os::fd::AsRawFd;
+            sample_sock_bufs(self.inner.as_raw_fd(), &self.stats);
+        }
+    }
+}
+
+impl AsyncRead for MeteredStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if r.is_ready() {
+            self.maybe_sample();
+        }
+        r
+    }
+}
+
+impl AsyncWrite for MeteredStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let r = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if r.is_ready() {
+            self.maybe_sample();
+        }
+        r
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 pub async fn connect(
     action: &Action,
     nodes: &[Node],
@@ -166,12 +298,12 @@ async fn direct(target: &Target, dns: Option<&Arc<DnsEngine>>) -> io::Result<Box
         // 已有真实 IP 就直接连该地址，不再重复解析（避免连到 CDN 的另一个节点）
         connect_any(&[SocketAddr::new(target.ip, target.port)]).await?
     };
-    Ok(Box::new(sock))
+    Ok(Box::new(MeteredStream::new(sock)))
 }
 
-pub async fn tcp_connect(host: &str, port: u16) -> io::Result<TcpStream> {
+pub async fn tcp_connect(host: &str, port: u16) -> io::Result<BoxStream> {
     let addrs = resolve_all(host, port).await?;
-    connect_any(&addrs).await
+    Ok(Box::new(MeteredStream::new(connect_any(&addrs).await?)))
 }
 
 pub async fn resolve(host: &str, port: u16) -> io::Result<SocketAddr> {
@@ -258,6 +390,29 @@ pub fn tune_tcp(stream: &TcpStream) {
         set_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, UPSTREAM_KEEPALIVE_PROBES);
         set_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, UPSTREAM_USER_TIMEOUT_MS);
     }
+    // WAN 腿 per-socket BBR：丢包 Wi-Fi/WAN 上不等丢包信号就维持速率（gVisor 也给不了这条）。
+    // 内核无 bbr 时 setsockopt 失败静默回退 cubic；getsockopt 复核真实生效算法并计数。
+    if TUNE_BBR.load(std::sync::atomic::Ordering::Relaxed) {
+        let name = b"bbr\0";
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_CONGESTION,
+                name.as_ptr() as *const libc::c_void,
+                name.len() as libc::socklen_t,
+            )
+        };
+        let ok = rc == 0 && get_congestion(fd).map(|s| s == "bbr").unwrap_or(false);
+        if let Some(st) = tune_stats() {
+            if ok {
+                st.tcp_bbr_ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                st.tcp_bbr_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    sample_sock_bufs(fd, &tune_stats());
 }
 
 /// 双地址并发竞速（happy-eyeballs 的简化版）：两边同时发起，先成功者胜出。
@@ -450,7 +605,7 @@ static TLS_INSECURE: once_cell::sync::Lazy<Arc<rustls::ClientConfig>> = once_cel
     )
 });
 
-pub async fn tls_connect(host: &str, port: u16, sni: &str, insecure: bool) -> io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+pub async fn tls_connect(host: &str, port: u16, sni: &str, insecure: bool) -> io::Result<tokio_rustls::client::TlsStream<BoxStream>> {
     let tcp = tcp_connect(host, port).await?;
     let config = if insecure { TLS_INSECURE.clone() } else { TLS_SECURE.clone() };
     let connector = tokio_rustls::TlsConnector::from(config);

@@ -638,6 +638,12 @@ impl DnsEngine {
     }
 
     pub async fn resolve(self: &Arc<Self>, req_bytes: &[u8]) -> Option<Vec<u8>> {
+        self.resolve_impl(req_bytes, true).await
+    }
+
+    /// count_query=false 供 ANY 拆分的内部子查询使用：查询计数只在顶层记一次，
+    /// 缓存/过滤/熔断/备用等路径与普通查询完全共用。
+    async fn resolve_impl(self: &Arc<Self>, req_bytes: &[u8], count_query: bool) -> Option<Vec<u8>> {
         let req = match Message::from_vec(req_bytes) {
             Ok(m) => m,
             Err(_) => return None,
@@ -651,7 +657,9 @@ impl DnsEngine {
         let id = req.id();
         let qtype_label = format!("{:?}", qtype);
         let started = Instant::now();
-        self.stats.dns_queries.fetch_add(1, Ordering::Relaxed);
+        if count_query {
+            self.stats.dns_queries.fetch_add(1, Ordering::Relaxed);
+        }
 
         // 缓存与并发合并必须区分 qclass、DO、CD：带 DO 的查询要求 DNSSEC 记录，
         // 与普通查询共用条目会把无签名应答回给校验方；CD 影响上游是否做校验。
@@ -722,6 +730,11 @@ impl DnsEngine {
                 dns_log::add(&qname, &qtype_label, "放行", "Fake-IP", started.elapsed().as_millis() as u64);
             }
             return Some(self.fake_response(&req, qtype, &qname));
+        }
+
+        // ANY 不再转发上游：本地拆 A+AAAA 并行查询再合并应答（见 resolve_any）。
+        if qtype == RecordType::ANY {
+            return Some(self.resolve_any(&req, &qname, id, started).await);
         }
 
         self.stats.dns_cache_lookups.fetch_add(1, Ordering::Relaxed);
@@ -856,6 +869,87 @@ impl DnsEngine {
         Some(resp)
     }
 
+    /// ANY 本地拆分合并：很多上游（含运营商 DNS）对 ANY 不应答，旧逻辑重试 1-5 次
+    /// 白等 3-5s，把平均延迟拖到数百 ms。拆成 A+AAAA 并行（子查询各走缓存/过滤/
+    /// 熔断/备用全路径）后合并：任一 NoError 合并记录；都 NXDOMAIN 回 NXDOMAIN；
+    /// 都无响应回 SERVFAIL——绝不回空答/NXDOMAIN，否则 App 以为域名不存在。
+    async fn resolve_any(self: &Arc<Self>, req: &Message, qname: &str, id: u16, started: Instant) -> Vec<u8> {
+        use hickory_proto::op::ResponseCode;
+        self.stats.dns_any_split.fetch_add(1, Ordering::Relaxed);
+        let mut a_req = req.clone();
+        a_req.queries_mut()[0].set_query_type(RecordType::A);
+        let mut aaaa_req = req.clone();
+        aaaa_req.queries_mut()[0].set_query_type(RecordType::AAAA);
+        let a_bytes = a_req.to_vec().unwrap_or_default();
+        let aaaa_bytes = aaaa_req.to_vec().unwrap_or_default();
+        let (a, aaaa) = tokio::join!(
+            Box::pin(self.resolve_impl(&a_bytes, false)),
+            Box::pin(self.resolve_impl(&aaaa_bytes, false)),
+        );
+        let ma = a.as_deref().and_then(|b| Message::from_vec(b).ok());
+        let mb = aaaa.as_deref().and_then(|b| Message::from_vec(b).ok());
+        let ok_a = ma.as_ref().map(|m| m.response_code() == ResponseCode::NoError).unwrap_or(false);
+        let ok_b = mb.as_ref().map(|m| m.response_code() == ResponseCode::NoError).unwrap_or(false);
+        let nx_a = ma.as_ref().map(|m| m.response_code() == ResponseCode::NXDomain).unwrap_or(false);
+        let nx_b = mb.as_ref().map(|m| m.response_code() == ResponseCode::NXDomain).unwrap_or(false);
+        let mut out = Message::new();
+        out.set_id(id);
+        out.set_message_type(MessageType::Response);
+        out.set_op_code(OpCode::Query);
+        out.set_recursion_desired(req.recursion_desired());
+        out.set_recursion_available(true);
+        out.add_query(req.queries()[0].clone());
+        let rcode = if ok_a || ok_b {
+            for m in [ma.as_ref(), mb.as_ref()].into_iter().flatten() {
+                if m.response_code() == ResponseCode::NoError {
+                    out.add_answers(m.answers().iter().cloned());
+                }
+            }
+            ResponseCode::NoError
+        } else if nx_a || nx_b {
+            for m in [ma.as_ref(), mb.as_ref()].into_iter().flatten() {
+                if m.response_code() == ResponseCode::NXDomain {
+                    out.add_name_servers(m.name_servers().iter().cloned());
+                }
+            }
+            ResponseCode::NXDomain
+        } else {
+            ResponseCode::ServFail
+        };
+        out.set_response_code(rcode);
+        // 合并应答不写 ANY 缓存键：让 A/AAAA 各自命中自己的缓存，避免 TTL 混。
+        let mut bytes = out.to_vec().unwrap_or_default();
+        let limit = req
+            .extensions()
+            .as_ref()
+            .map(|e| e.max_payload() as usize)
+            .unwrap_or(512)
+            .max(512);
+        if bytes.len() > limit {
+            // UDP 口径：超限截断置 TC，客户端走 TCP 重试（DNS TCP 路径已有）。
+            while bytes.len() > limit && out.answers().len() > 1 {
+                out.answers_mut().pop();
+                bytes = out.to_vec().unwrap_or_default();
+            }
+            out.set_truncated(true);
+            if bytes.len() > limit {
+                out.answers_mut().clear();
+            }
+            bytes = out.to_vec().unwrap_or_default();
+        }
+        self.stats.record_dns_ms(started.elapsed().as_millis() as u64);
+        if self.query_log {
+            dns_log::add(
+                qname,
+                "ANY",
+                if rcode == ResponseCode::ServFail { "失败" } else { "放行" },
+                "本地拆分",
+                started.elapsed().as_millis() as u64,
+            );
+        }
+        bytes
+    }
+
     fn spawn_refresh(self: &Arc<Self>, key: &str, qname: &str, req: &Message) {
         let should = self
             .cache
@@ -947,6 +1041,11 @@ impl DnsEngine {
     }
 
     fn record_breaker(&self, ok: bool) {
+        if !ok {
+            // 上游无响应必须计失败：进熔断/备用判定与诊断，
+            // 否则「备用查询 0、失败一堆」是统计黑洞。
+            self.stats.dns_upstream_fail.fetch_add(1, Ordering::Relaxed);
+        }
         if let Ok(mut b) = self.breaker.lock() {
             if ok {
                 b.fails = 0;

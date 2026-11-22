@@ -27,6 +27,8 @@ data class ScriptConfig(
     val pattern: String = "",
     val source: String = "",
     val arguments: Map<String, String> = emptyMap(),
+    /** [Argument] 声明类型：string / number / boolean。内核据此把 $argument 注入成对应 JS 类型。 */
+    val argumentTypes: Map<String, String> = emptyMap(),
     val timeoutMs: Int = 5000,
     val maxSize: Int = 2 * 1024 * 1024,
     val requiresBody: Boolean = false,
@@ -42,6 +44,7 @@ data class ScriptConfig(
         put("pattern", pattern)
         put("source", source)
         put("arguments", JSONObject(arguments as Map<*, *>))
+        if (argumentTypes.isNotEmpty()) put("argumentTypes", JSONObject(argumentTypes as Map<*, *>))
         put("timeoutMs", timeoutMs)
         put("maxSize", maxSize)
         put("requiresBody", requiresBody)
@@ -58,6 +61,11 @@ data class ScriptConfig(
             arguments = buildMap {
                 o.optJSONObject("arguments")?.let { a ->
                     a.keys().forEach { k -> put(k, a.optString(k, "")) }
+                }
+            },
+            argumentTypes = buildMap {
+                o.optJSONObject("argumentTypes")?.let { a ->
+                    a.keys().forEach { k -> put(k, a.optString(k, "string")) }
                 }
             },
             timeoutMs = o.optInt("timeoutMs", 5000),

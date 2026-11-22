@@ -33,6 +33,10 @@ class SettingsViewModel(
         settings.update { it.copy(autoDisablePrivateDns = enabled) }
     }
 
+    fun setFinanceProtect(enabled: Boolean) {
+        settings.update { it.copy(financeProtect = enabled) }
+    }
+
     fun setThemeMode(mode: String) {
         if (mode != "system" && mode != "light" && mode != "dark") return
         settings.update { it.copy(themeMode = mode) }

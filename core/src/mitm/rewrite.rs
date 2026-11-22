@@ -90,6 +90,9 @@ pub struct MitmConfig {
     /// app_mode 使用的 UID 列表；壳层把用户选的包名解析成 UID 后下发。
     #[serde(default)]
     pub app_uids: Vec<u32>,
+    /// 金融连接保护：支付/银行/账号安全连接在 MITM 判定之前排除。
+    #[serde(default)]
+    pub finance: crate::finance::FinanceConf,
 }
 
 impl Default for MitmConfig {
@@ -110,6 +113,7 @@ impl Default for MitmConfig {
             upstream_insecure: false,
             app_mode: String::new(),
             app_uids: Vec::new(),
+            finance: crate::finance::FinanceConf::default(),
         }
     }
 }
@@ -272,6 +276,8 @@ pub struct MitmEngine {
     pub upstream_insecure: bool,
     /// 该配置对哪些应用生效；all 时与旧行为完全一致。
     pub app_scope: AppScope,
+    /// 金融保护判定，优先级高于 hosts 命中与 app_scope。
+    pub finance: crate::finance::FinanceProtect,
     /// 编译失败被跳过的规则数（模块预览/日志用）。
     pub skipped_rules: usize,
     fail_open_ttl: Duration,
@@ -360,6 +366,7 @@ impl MitmEngine {
             skipped_rules: skipped,
             fail_open_ttl: Duration::from_secs(cfg.fail_open_ttl.max(1)),
             app_scope: AppScope::parse(&cfg.app_mode, &cfg.app_uids),
+            finance: crate::finance::FinanceProtect::from_config(&cfg.finance),
             bypass: Mutex::new(HashMap::new()),
         }
     }
@@ -370,9 +377,17 @@ impl MitmEngine {
         self.should_mitm_uid(host, None)
     }
 
-    /// 带 App 归属的判定：先过 App 范围，再过域名规则。
+    /// 带 App 归属的判定：先过 App 范围与金融保护，再过域名规则。
     pub fn should_mitm_uid(&self, host: &str, uid: Option<u32>) -> bool {
-        self.app_scope.allows(uid) && self.should_mitm_host(host)
+        self.app_scope.allows(uid)
+            && self.finance_bypass(uid, Some(host)).is_none()
+            && self.should_mitm_host(host)
+    }
+
+    /// 金融保护排除原因；返回 Some 时调用方不得进入 MITM。
+    /// 单独暴露是为了让连接日志能写清「这条为什么没劫持」。
+    pub fn finance_bypass(&self, uid: Option<u32>, host: Option<&str>) -> Option<&'static str> {
+        self.finance.bypass_reason(uid, host)
     }
 
     /// App 范围是否放行该 UID（不做域名判定，供壳层统计“因按 App 跳过”）。
@@ -409,6 +424,42 @@ impl MitmEngine {
         let now = Instant::now();
         g.retain(|_, until| *until > now);
         g.insert(host.to_ascii_lowercase(), now + self.fail_open_ttl);
+    }
+
+    /// 该域名当前是否处于临时放行（fail-open）窗口；返回剩余秒数。
+    /// 单独暴露是为了让连接日志与诊断能直接说清「这条为什么没解密」。
+    pub fn bypass_remaining(&self, host: &str) -> Option<u64> {
+        let g = match self.bypass.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let until = *g.get(&host.to_ascii_lowercase())?;
+        let now = Instant::now();
+        if until > now {
+            Some((until - now).as_secs().max(1))
+        } else {
+            None
+        }
+    }
+
+    /// 当前处于临时放行窗口的域名快照，格式 `host(剩Ns)`，按域名排序。
+    pub fn bypass_snapshot(&self) -> String {
+        let mut g = match self.bypass.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let now = Instant::now();
+        g.retain(|_, until| *until > now);
+        let mut items: Vec<(String, u64)> = g
+            .iter()
+            .map(|(h, until)| (h.clone(), (*until - now).as_secs().max(1)))
+            .collect();
+        items.sort();
+        items
+            .iter()
+            .map(|(h, s)| format!("{}(剩{}s)", h, s))
+            .collect::<Vec<_>>()
+            .join("、")
     }
 
     /// 命中该 URL 的全部规则（reject 优先判断，body 可叠加）。
@@ -1007,5 +1058,30 @@ DOMAIN-SUFFIX,ads.example.com,REJECT
         assert_eq!(engine.rules_for("https://x.ads.com/api").len(), 1);
         assert!(engine.should_mitm("x.ads.com"));
         assert!(!engine.should_mitm("bank.example.com"));
+    }
+}
+
+#[cfg(test)]
+mod bypass_snapshot_tests {
+    use super::*;
+
+    /// 放行窗口必须可查询、可快照，否则诊断看不到「谁被停了解密」。
+    #[test]
+    fn bypass_remaining_and_snapshot() {
+        let cfg = MitmConfig {
+            enabled: true,
+            hostnames: vec!["app.bilibili.com".into()],
+            fail_open_ttl: 300,
+            ..Default::default()
+        };
+        let e = MitmEngine::from_config(&cfg);
+        assert!(e.bypass_remaining("app.bilibili.com").is_none());
+        assert_eq!(e.bypass_snapshot(), "");
+        e.mark_bypass("app.bilibili.com");
+        let left = e.bypass_remaining("APP.BILIBILI.COM").expect("应在放行窗口");
+        assert!(left >= 299 && left <= 300, "剩余 {}", left);
+        assert!(e.bypass_snapshot().contains("app.bilibili.com(剩"));
+        // 放行窗口内该域名不得进入 MITM。
+        assert!(!e.should_mitm("app.bilibili.com"));
     }
 }

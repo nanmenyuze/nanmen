@@ -138,9 +138,41 @@ object Diagnostics {
             sb.appendLine("DoT/DoQ 拦截：${statsJson.optLong("dotBlocked")} 次")
             sb.appendLine("直连熔断抑制拨号：${statsJson.optLong("dialBreakerRejected")} 次")
             sb.appendLine(
+                "MITM：连接 ${statsJson.optLong("mitmConns")}，失败 ${statsJson.optLong("mitmFailed")}，" +
+                    "改写 ${statsJson.optLong("mitmRewritten")}，请求 ${statsJson.optLong("mitmReqs")}，" +
+                    "无规则 ${statsJson.optLong("mitmNoRule")}，h2 失败 ${statsJson.optLong("mitmH2Failed")}，" +
+                    "QUIC 迫降 ${statsJson.optLong("mitmQuicBlocked")}",
+            )
+            sb.appendLine("金融保护跳过 MITM：${statsJson.optLong("mitmFinanceSkipped")} 次")
+            sb.appendLine(
+                "MITM 未送达：客户端取消 ${statsJson.optLong("mitmCanceled")}，" +
+                    "TLS 弃连 ${statsJson.optLong("mitmTlsAborted")}，" +
+                    "临时放行跳过 ${statsJson.optLong("mitmBypassed")}",
+            )
+            val bypassHosts = statsJson.optString("mitmBypassHosts")
+            if (bypassHosts.isNotEmpty()) {
+                sb.appendLine("MITM 临时放行域名（此间完全不解密）：$bypassHosts")
+            }
+            sb.appendLine(
+                "主循环耗时：上轮 ${statsJson.optLong("loopRoundMsLast")} ms，峰值 ${statsJson.optLong("loopRoundMsMax")} ms；" +
+                    "缓冲池未命中 ${statsJson.optLong("tunPoolMiss")} 次",
+            )
+            sb.appendLine(
                 "TUN 发送：队列表满丢包 ${statsJson.optLong("tunTxDrop")}，backlog 溢出 ${statsJson.optLong("tunPendingDrop")}，" +
                     "背压 ${statsJson.optLong("tunTxBackpressure")}，写阻塞 ${statsJson.optLong("tunWriteWouldBlock")}，" +
                     "写错误 ${statsJson.optLong("tunWriteError")}，backlog 峰值 ${statsJson.optLong("tunPendingPeak")}",
+            )
+            val tunMtu = statsJson.optLong("tunMtu")
+            val bbrOk = statsJson.optLong("tcpBbrOk")
+            val bbrFail = statsJson.optLong("tcpBbrFail")
+            sb.appendLine(
+                "TUN 实际 MTU：$tunMtu（壳 setMtu 与内核 iface 同值）；" +
+                    "上游 socket 增益：SO_RCVBUF 峰值 ${formatBytes(statsJson.optLong("upstreamRcvbufMax"))}，" +
+                    "SO_SNDBUF 峰值 ${formatBytes(statsJson.optLong("upstreamSndbufMax"))}",
+            )
+            sb.appendLine(
+                "上游 BBR：生效 $bbrOk 条，回退 cubic $bbrFail 条" +
+                    if (bbrFail > 0) "（部分内核不支持 TCP_CONGESTION=bbr，自动回落不影响连通）" else "",
             )
             val lat = statsJson.optJSONObject("dnsLatency")
             if (lat != null) {

@@ -82,6 +82,17 @@ fun SettingsScreen(onRestart: () -> Unit, onOpenLogs: () -> Unit, onOpenMitm: ()
                 onClick = onOpenMitm,
             )
             SettingsRow(
+                title = "金融连接保护",
+                subtitle = "支付、银行、账号安全连接不走 MITM；银行类 App 整包跳过，微信支付宝按域名排除",
+                icon = Icons.Rounded.Security,
+                rightContent = {
+                    IosSwitch(
+                        checked = cfg.financeProtect,
+                        onCheckedChange = { vm.setFinanceProtect(it) },
+                    )
+                },
+            )
+            SettingsRow(
                 title = "诊断",
                 subtitle = "查看内核运行日志与 DNS 查询记录",
                 icon = Icons.Rounded.BugReport,
@@ -156,7 +167,7 @@ fun SettingsScreen(onRestart: () -> Unit, onOpenLogs: () -> Unit, onOpenMitm: ()
             )
             SettingsRow(
                 title = "隧道",
-                subtitle = "TUN 接管全部 DNS，MTU 1500",
+                subtitle = "TUN 接管全部 DNS，MTU 跟随配置（默认 9000）",
                 value = if (cfg.fakeIp) "Fake-IP" else "直连",
                 icon = Icons.Rounded.Lan,
                 chevron = false,
@@ -219,7 +230,7 @@ fun SettingsScreen(onRestart: () -> Unit, onOpenLogs: () -> Unit, onOpenMitm: ()
         SectionHeader("关于")
         GroupCard {
             SettingsRow("版本", value = BuildConfig.VERSION_NAME)
-            SettingsRow("内核", value = "nanmen_core · 1.13.4")
+            SettingsRow("内核", value = "nanmen_core · 1.13.13")
             SettingsRow("代理协议", value = "SS · Trojan · VLESS")
             SettingsRow("DNS", value = "DoH · DoT · UDP")
             SettingsRow(

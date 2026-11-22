@@ -1,4 +1,4 @@
-# 南门DNS 2.6.3
+# 南门DNS 2.7
 
 > 内核 crate / JNI：`nanmen_core` / `libnanmen_core.so`；许可证：**GPL-3.0-only**（见 `LICENSE`、`NOTICE`、`THIRD_PARTY_NOTICES.md`）。
 
@@ -17,7 +17,18 @@
 > 2.6.3 正式版（内核 1.13.3，只修 2.6.2 的口径问题，无新增功能面）：大档名额改「并发」口径（`TCP_SOCKETS` 随 socket 关闭立刻归还，新连接可补位，不再被开机早期的推送/IM 长连接长期占满），新增 `bigTierInUse` 诊断；判别仪表从「次数」改为「条件成立期间累计毫秒」（`tcpRecvFull` = 接收缓冲满且 relay 仍有余量积压，`tcpSendStalled` = 待发非空但对端零窗口，超 3s 打一条告警），每连接速率改由内核 10s 采样写进快照（`upBps`/`downBps`）并打 top-5 日志；QUIC 黑洞判定改为按 (目的 IP, 端口)、仅在有上行活动时计时（纯空闲不判死）、收到该会话任何下行包即清除，并新增 `quicBlackholed` 计数与切网清空（壳层 `nativeClearQuicBlackhole`）。
 
 > 2.6.4 正式版：规则集载体兼容与 CSV 拆分修复。`RuleSetExpander` 不再只认 Surge 文本，新增 Clash `payload:` YAML 与 sing-box source JSON 解析（`domain`/`domain_suffix`/`domain_keyword`/`domain_regex`），含 `ip_cidr`、端口等非域名条件的规则整条跳过（AND 语义，不误杀）；二进制 `.srs` 明确提示端上不解析；空内容、未缓存、整集一条都没展开都会写进 `modules_mitm.json` 的 `ruleSetIssues`，模块页可见，不再静默失效。`parseRuleLine` 改走统一的 `RuleLineParser`：按策略位置切分，`DOMAIN-REGEX,^ads{1,3}\.x\.com$` 的 `{m,n}` 不再被逗号截断，`IP-CIDR,x,DIRECT,no-resolve` 的尾随选项也不会顶掉动作；规则集行允许省略策略，由集合策略覆盖。内核保持 1.13.4，未改动数据面。
-> 2.6.3 热修（内核 1.13.4，版本号不动）：修掉 `TCP_SOCKETS` 在「正常关闭（FIN 走完 state==Closed）」路径上的漏减——该路径原先用裸 `sockets.remove`，没归还大档计数，导致计数单调上涨、`next_tcp_buffer_bytes` 对之后所有新监听器永久返回 128K，把 512K 修复整条废掉；改为统一走 `release_tcp_socket`。`tcpBufferDenied` 接线：水位降级分支真正计数。速率 top-5 日志加 `512K`/`128K` 档位标签，便于下一份诊断直接闭环。`bigTierInUse` 刷新移出 QUIC 开关分支，关掉 QUIC 回落时仪表不再冻结。## 壳设计文档
+> 2.6.3 热修（内核 1.13.4，版本号不动）：修掉 `TCP_SOCKETS` 在「正常关闭（FIN 走完 state==Closed）」路径上的漏减——该路径原先用裸 `sockets.remove`，没归还大档计数，导致计数单调上涨、`next_tcp_buffer_bytes` 对之后所有新监听器永久返回 128K，把 512K 修复整条废掉；改为统一走 `release_tcp_socket`。`tcpBufferDenied` 接线：水位降级分支真正计数。速率 top-5 日志加 `512K`/`128K` 档位标签，便于下一份诊断直接闭环。`bigTierInUse` 刷新移出 QUIC 开关分支，关掉 QUIC 回落时仪表不再冻结。
+
+> 2.7 正式版（内核 1.13.13）：这一版把数据面从「调参数」推到「换基线 + 加能力」。
+> - 内核依赖 smoltcp 0.11 → 0.14，TCP 栈行为与 0.14 对齐后再叠加本项目的档位/守卫。
+> - TUN 巨帧 MTU 9000（壳 `setMtu` 与内核 `iface` 取同一配置值，`establish` 失败回退 1500 并写回配置）；队列不再按包数写死，而是按 1MB 字节预算随 MTU 换算（1500 档仍 512 包，9000 档约 116 包，排队字节量与背压口径不漂移）；单包上限抬到 9216。
+> - 上游 per-socket `TCP_CONGESTION=bbr`（`tcpBbrOk`/`tcpBbrFail` 计数，内核不支持时静默回退 cubic）；同时采样 SO_RCVBUF/SO_SNDBUF 自动调窗真实值（`upstreamRcvbufMax`/`upstreamSndbufMax`），不锁死缓冲以免关掉自动调窗。
+> - 金融连接保护（默认开，设置页可关）：银行/证券/云闪付等独立 App 整包不 MITM；微信/支付宝/QQ 按域名硬排除（`finance.rs` 内置 tenpay/wechatpay/alipay 支付与账号域名）+ 域名分词金融关键字启发，只豁免混合 App 的关键字启发，硬排除优先；命中计入 `mitmFinanceSkipped`。
+> - QUIC Initial 解析（`quic.rs`）：从 Initial 包取 SNI，补上「DNS 映射缺失时 QUIC 无域名可判」的空档。
+> - 脚本 `$argument` 按声明类型注入（string/number/boolean），Rewrite/Script 条件与动作里的 `${参数}` 按默认值先展开；参数类型随模块一起下发内核。
+> - MITM 诊断补齐：`mitmReqs`/`mitmNoRule`/`mitmH2Failed`/`mitmTlsAborted`/`mitmCanceled`/`mitmBypassed` 与临时放行域名快照 `mitmBypassHosts`；DNS 侧新增 `dnsAnySplit`（ANY 拆 A+AAAA 本地合并）与 `dnsUpstreamFail`；主循环新增 `loopRoundMsLast`/`loopRoundMsMax` 与 `tunPoolMiss`；诊断页展示实际 MTU、上游 socket 缓冲峰值与 BBR 生效/回退条数。
+> - 保留 2.6.3 的正常关闭计数漏减热修与 2.6.4 的规则集/CSV 解析修复。版本 2.7 / versionCode 95。
+## 壳设计文档
 
 - Android 12+ 应用壳设计：`docs/UI_SHELL_ANDROID12.md`
 
@@ -590,8 +601,7 @@ Kotlin 壳 + 自研 Rust 内核（`core/`，crate `nanmen_core`，JNI `libnanmen
 
 ## 测试
 
-`cd core && cargo test`：8 个内核单测（应答校验 / ECS 剥离 / 负缓存 / 乐观缓存 / sing-box 规则接入）
-+ 13 个集成测试（拦截应答、Fake-IP 反向映射、嗅探、SS UDP、订阅解析等）。
+`cd core && cargo test`：195 个内核单测 + 集成测试（应答校验 / ECS 剥离 / 负缓存 / 乐观缓存 / sing-box 规则接入 / 拦截应答 / Fake-IP 反向映射 / 嗅探 / SS UDP / 订阅解析 / MITM 脚本与 TLS / 巨帧队列 / 金融排除等）。
 ## 自愿打赏（可选）
 
 南门DNS 以 **GPL-3.0-only** 开源，**全部功能完整开放，无任何付费内容、会员或功能解锁**。如果它对你有帮助，可以自愿请作者喝杯咖啡。打赏前请知悉：

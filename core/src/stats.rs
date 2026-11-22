@@ -60,6 +60,19 @@ pub struct Stats {
     pub mitm_quic_blocked: AtomicU64,
     /// 域名命中但 App 不在 MITM 允许范围（或属于跳过列表）而放行的连接数。
     pub mitm_app_skipped: AtomicU64,
+    /// 金融保护放行的连接数（整包 UID / 金融域名硬排除 / 混合 App 关键字）。
+    pub mitm_finance_skipped: AtomicU64,
+    /// MITM 内解析到的请求总数 / 请求与响应两阶段都没有任何规则脚本命中的请求数。
+    pub mitm_reqs: AtomicU64,
+    pub mitm_no_rule: AtomicU64,
+    /// 客户端在本地 TLS 握手中途弃连（连接池预热），不计失败、不拉黑域名。
+    pub mitm_tls_aborted: AtomicU64,
+    /// 响应改写完成前客户端已取消该 h2 stream（RST/弃流），改写无法送达。
+    pub mitm_canceled: AtomicU64,
+    /// 因域名处于临时放行（fail-open）窗口而跳过 MITM 的次数。
+    pub mitm_bypassed: AtomicU64,
+    /// h2 连接级处理失败次数（服务端提前断开等，整条连接的请求都会失效）。
+    pub mitm_h2_failed: AtomicU64,
     /// TUN 出口诊断：TxToken 队列满静默丢包 / pending_out 硬上限丢弃 /
     /// 历史 backlog 峰值 / transmit() 因高水位返回 None 的背压次数 /
     /// write(2) 返回 WouldBlock 的次数 / 其他写错误。
@@ -86,12 +99,27 @@ pub struct Stats {
     /// QUIC 假活回落：累计判为黑洞的目标数。
     pub quic_fallback: AtomicU64,
     pub tcp_limit_evicted: AtomicU64,
+    /// 主循环处理耗时（select 返回到下一轮 select 前）：last / max，毫秒。
+    pub loop_round_ms_last: AtomicU64,
+    pub loop_round_ms_max: AtomicU64,
     /// 直连拨号熔断：冷却期内被抑制拨号的连接数。
     pub dial_breaker_rejected: AtomicU64,
     /// App 归属解析：成功查到 UID 的 TCP 连接数 / 有 UID 规则但查不到归属的连接数。
     /// 后者持续增长通常意味着无 root 或壳层轮询没跟上。
     pub uid_resolved: AtomicU64,
     pub uid_unknown: AtomicU64,
+    /// DNS ANY 本地拆分：拆成 A+AAAA 并行查询并合并应答的次数（不再转发上游）。
+    pub dns_any_split: AtomicU64,
+    /// DNS 上游无响应（超时/无回包）次数：进熔断与备用判定，不再是统计黑洞。
+    pub dns_upstream_fail: AtomicU64,
+    /// 上游内核 socket 收/发缓冲观测最大值（getsockopt 采样，看自动调窗天花板）。
+    pub upstream_rcvbuf_max: AtomicI64,
+    pub upstream_sndbuf_max: AtomicI64,
+    /// per-socket BBR：设置成功 / 回退 cubic 的次数。
+    pub tcp_bbr_ok: AtomicU64,
+    pub tcp_bbr_fail: AtomicU64,
+    /// 本次运行 TUN 实际 MTU（壳 setMtu 与内核 iface 取同一配置值）。
+    pub tun_mtu: AtomicI64,
 }
 
 impl Stats {
@@ -142,6 +170,10 @@ impl Stats {
         s
     }
     pub fn to_json(&self) -> String {
+        self.to_json_with("")
+    }
+    /// bypass_hosts：当前处于临时放行窗口的域名快照，供诊断直接看到「谁被停了解密」。
+    pub fn to_json_with(&self, bypass_hosts: &str) -> String {
         let start = self.started_at.load(Ordering::Relaxed);
         let stopped = self.stopped_at.load(Ordering::Relaxed);
         let end = if stopped > 0 { stopped } else { now_ms() as i64 };
@@ -150,7 +182,7 @@ impl Stats {
         let avg = if n == 0 { 0 } else { self.dns_ms_sum.load(Ordering::Relaxed) / n };
         let local_n = self.dns_local_ms_count.load(Ordering::Relaxed);
         let local_avg = if local_n == 0 { 0 } else { self.dns_local_ms_sum.load(Ordering::Relaxed) / local_n };
-        json!({
+        let mut v = json!({
             "up": self.up_bytes.load(Ordering::Relaxed),
             "down": self.down_bytes.load(Ordering::Relaxed),
             "dnsQueries": self.dns_queries.load(Ordering::Relaxed),
@@ -190,6 +222,13 @@ impl Stats {
             "mitmFailed": self.mitm_failed.load(Ordering::Relaxed),
             "mitmQuicBlocked": self.mitm_quic_blocked.load(Ordering::Relaxed),
             "mitmAppSkipped": self.mitm_app_skipped.load(Ordering::Relaxed),
+            "mitmFinanceSkipped": self.mitm_finance_skipped.load(Ordering::Relaxed),
+            "mitmReqs": self.mitm_reqs.load(Ordering::Relaxed),
+            "mitmNoRule": self.mitm_no_rule.load(Ordering::Relaxed),
+            "mitmTlsAborted": self.mitm_tls_aborted.load(Ordering::Relaxed),
+            "mitmCanceled": self.mitm_canceled.load(Ordering::Relaxed),
+            "mitmBypassed": self.mitm_bypassed.load(Ordering::Relaxed),
+            "mitmH2Failed": self.mitm_h2_failed.load(Ordering::Relaxed),
             "tunTxDrop": self.tun_tx_drop.load(Ordering::Relaxed),
             "tunPendingDrop": self.tun_pending_drop.load(Ordering::Relaxed),
             "tunPendingPeak": self.tun_pending_peak.load(Ordering::Relaxed),
@@ -207,9 +246,20 @@ impl Stats {
             "dialBreakerRejected": self.dial_breaker_rejected.load(Ordering::Relaxed),
             "uidResolved": self.uid_resolved.load(Ordering::Relaxed),
             "uidUnknown": self.uid_unknown.load(Ordering::Relaxed),
+            "dnsAnySplit": self.dns_any_split.load(Ordering::Relaxed),
+            "dnsUpstreamFail": self.dns_upstream_fail.load(Ordering::Relaxed),
+            "upstreamRcvbufMax": self.upstream_rcvbuf_max.load(Ordering::Relaxed),
+            "upstreamSndbufMax": self.upstream_sndbuf_max.load(Ordering::Relaxed),
+            "tcpBbrOk": self.tcp_bbr_ok.load(Ordering::Relaxed),
+            "tcpBbrFail": self.tcp_bbr_fail.load(Ordering::Relaxed),
+            "tunMtu": self.tun_mtu.load(Ordering::Relaxed),
+            "tunPoolMiss": crate::netstack::pool_misses(),
+            "loopRoundMsLast": self.loop_round_ms_last.load(Ordering::Relaxed),
+            "loopRoundMsMax": self.loop_round_ms_max.load(Ordering::Relaxed),
             "uptime": uptime,
-        })
-        .to_string()
+        });
+        v["mitmBypassHosts"] = json!(bypass_hosts);
+        v.to_string()
     }
 }
 

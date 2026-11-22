@@ -142,8 +142,8 @@ async fn read_chunk<R: AsyncReadExt + Unpin>(
 }
 
 async fn pump(
-    mut sr: tokio::net::tcp::OwnedReadHalf,
-    mut sw: tokio::net::tcp::OwnedWriteHalf,
+    mut sr: tokio::io::ReadHalf<crate::outbound::BoxStream>,
+    mut sw: tokio::io::WriteHalf<crate::outbound::BoxStream>,
     master: Vec<u8>,
     method: String,
     key_len: usize,
@@ -285,7 +285,7 @@ pub async fn connect(node: &Node, target: Target) -> io::Result<BoxStream> {
     let key_len = key_len_for(&method)?;
     let master = evp_bytes_to_key(password.as_bytes(), key_len);
     let sock = crate::outbound::tcp_connect(&node.server, node.port).await?;
-    let (sr, mut sw) = sock.into_split();
+    let (sr, mut sw) = tokio::io::split(sock);
 
     let mut salt = vec![0u8; key_len];
     rand::thread_rng().fill_bytes(&mut salt);

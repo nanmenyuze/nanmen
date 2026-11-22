@@ -4,12 +4,14 @@ pub mod config;
 pub mod dns;
 pub mod dns_log;
 pub mod engine;
+pub mod finance;
 pub mod logging;
 pub mod mitm;
 pub mod script;
 pub mod netstack;
 pub mod outbound;
 pub mod proto;
+pub mod quic;
 pub mod stats;
 pub mod sniff;
 pub mod udp;
@@ -126,6 +128,7 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStart<'local>(
             }
         }
         let stats: Arc<Stats> = Arc::new(Stats::new());
+        crate::outbound::set_tuning(cfg.bbr, stats.clone());
         stats.filter_rules.store(filter.rule_count() as u64, Ordering::Relaxed);
         stats.filter_skipped.store(filter.skipped as u64, Ordering::Relaxed);
         let mut dns = DnsEngine::new(
@@ -294,7 +297,10 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStats<'local>(
             Err(p) => p.into_inner(),
         };
         match guard.as_ref() {
-            Some(engine) => engine.stats.to_json(),
+            Some(engine) => {
+                let snapshot = engine.ctx.mitm().engine.bypass_snapshot();
+                engine.stats.to_json_with(&snapshot)
+            }
             // 停止后返回本次会话的最终统计（uptime 已冻结），不再清空。
             None => ENGINE_STATS.lock().unwrap_or_else(|p| p.into_inner()).to_json(),
         }
@@ -461,6 +467,7 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeReloadRules<'local>(
             Err(p) => p.into_inner(),
         };
         let Some(engine) = guard.as_ref() else { return false };
+        crate::outbound::set_tuning(cfg.bbr, engine.stats.clone());
         let filter = Arc::new(build_filter(&cfg));
         let rules = Arc::new(RuleEngine::from_config(&cfg));
         let strategy = Arc::new(strategy::StrategySet::from_config(&cfg));
@@ -795,7 +802,7 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeVersion<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
-    to_jstring(&mut env, "1.13.4".into())
+    to_jstring(&mut env, "1.13.13".into())
 }
 
 #[cfg(test)]

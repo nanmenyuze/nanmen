@@ -54,6 +54,13 @@ pub struct Config {
     /// MITM 去广告（HTTPS 解密 + URL 拦截 + 响应体改写），默认关闭。
     #[serde(default)]
     pub mitm: crate::mitm::MitmConfig,
+    /// TUN MTU：App↔VPN 是纯本机内存拷贝，巨帧把包数降约 6 倍（syscall/拷贝/耗电同降）。
+    /// 壳 setMtu 取同一值；establish 失败时壳回退 1500 并写回配置，保证两侧一致。
+    #[serde(default = "default_mtu")]
+    pub mtu: usize,
+    /// 上游（WAN 腿）per-socket TCP_CONGESTION=bbr；内核不支持时静默回退 cubic。
+    #[serde(default = "default_true")]
+    pub bbr: bool,
 }
 
 fn default_mode() -> String {
@@ -67,6 +74,9 @@ fn default_true() -> bool {
 }
 fn default_block_mode() -> String {
     "nxdomain".into()
+}
+fn default_mtu() -> usize {
+    9000
 }
 
 impl Default for Config {
@@ -93,6 +103,8 @@ impl Default for Config {
             sniff: true,
             block_dot: true,
             mitm: crate::mitm::MitmConfig::default(),
+            mtu: default_mtu(),
+            bbr: true,
         }
     }
 }

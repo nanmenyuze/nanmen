@@ -14,7 +14,7 @@ use smoltcp::wire::{
     HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, IpProtocol, Ipv4Address,
     Ipv4Packet, Ipv6Address, Ipv6Packet, TcpPacket, UdpPacket,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::IpAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -90,6 +90,9 @@ struct TunDevice {
     rx_pool: Arc<Mutex<Vec<Vec<u8>>>>,
     tx_pool: Arc<Mutex<Vec<Vec<u8>>>>,
     mtu: usize,
+    queue_cap: usize,
+    pending_cap: usize,
+    write_burst: usize,
     stats: Arc<Stats>,
 }
 
@@ -97,27 +100,31 @@ struct TunDevice {
 /// 在高带宽链路上一旦窗口被 ACK 节奏卡住，表现就是瞬时速率上不去、抖动变大。
 /// 5ms 是「少发几个纯 ACK 包」和「窗口不断流」之间的折中。
 const ACK_DELAY_MS: u64 = 5;
-/// 单次 iface.poll 允许暂存的 TxToken 包数；达到高水位后 transmit() 返回 None，
-/// 让 smoltcp 保留在 socket 缓冲里，而不是在这里静默丢包。
-/// 512×2048B≈1MB：与 pending_out 上限对齐，避免 tx 队列先于 pending 见顶。
+/// 1500 档的包数上限参考值（测试与默认口径）；运行时按实际 MTU 由 queue_caps 换算。
+#[cfg(test)]
 const MAX_TX_QUEUE: usize = 512;
-/// pending_out 的高水位：达到后暂停从 tx 队列取包并暂停读 TUN，形成端到端背压。
-/// 这是背压信号，不是丢包点；不再 truncate。
-/// 512×2048B≈1MB：实测 256 档在跑量时长期顶满（backlog 峰值 = 上限、伴背压），
-/// 说明下行消费速度被批量写卡住而不是链路饱和，故放宽一档。
+/// 1500 档参考值（测试口径）；运行时上限见 queue_caps / device.pending_cap。
+#[cfg(test)]
+const MAX_PENDING_OUT: usize = 512;
+/// TUN tx 队列 / pending_out 的字节预算（≈1MB）：按实际 MTU 换算成包数上限，
+/// 背压口径不随巨帧漂移（1500 档仍 512 包，9000 档约 116 包，字节总量不变）。
 /// 1MB 在 100Mbps 满载的理论排队时延约 85ms，但队列只在瞬时突发时堆积，
 /// 稳态由写 TUN 的消费速度决定；多余的长期积压仍由 TCP 窗口流控回压，不丢包。
-const MAX_PENDING_OUT: usize = 512;
-/// 每轮主循环写 TUN 的包数上限。旧逻辑一口气写完 pending_out（最多 256 包），
-/// 高吞吐时单轮几十 ms，同 worker 的拨号/DNS 任务被饿死（排队尖刺 795/1109/4344ms）。
-/// 封顶后剩余包留在 pending_out，等待逻辑见其非空即 1ms 兜底，吞吐不降、单轮有界。
-/// 128 档（≈256KB/轮）在跑量时把队列推到顶格并触发背压，故与队列上限成对放宽到 512 档：
-/// 一轮可清空整个 pending_out（≈1MB），单轮写入是 memcpy 级（512 次 write，约 1–2ms），
+const TUN_QUEUE_BYTES: usize = 1024 * 1024;
+/// 由字节预算按 MTU 换算的包数上限三元组：(tx 队列, pending_out, 单轮写 burst)。
+/// 写 burst 与 pending_out 同档：一轮可清空整个队列，单轮写入是 memcpy 级，
 /// 仍远低于旧逻辑「一口气 + 慢写」导致的几十 ms 饿死区间。
-const MAX_TX_WRITE_BURST: usize = 512;
+fn queue_caps(mtu: usize) -> (usize, usize, usize) {
+    let per = (TUN_QUEUE_BYTES / mtu.max(1)).clamp(64, 512);
+    (per, per, per)
+}
 /// QUIC 假活探测窗口：客户端发了 443/UDP 包，这么久没有任何回包就判定该目标
 /// UDP 不可用（蜂窝网上的 QUIC 黑洞），之后对同一目标丢弃 QUIC 让客户端回退 TCP。
 const QUIC_PROBE_WAIT_MS: u64 = 2500;
+/// 握手无回包判黑洞的窗口：比 QUIC_PROBE_WAIT_MS 长，覆盖 Initial 丢包后
+/// PTO 重传的正常握手耗时（2.5s 会把加载期/弱网握手误判成黑洞）。
+/// 只对「从未见过下行」的流生效；见过下行=握手已完成，豁免判死。
+const QUIC_HANDSHAKE_WAIT_MS: u64 = 5000;
 /// 判定为 UDP 黑洞后的压制时长；到期会重新试探，避免网络恢复后一直走 TCP。
 const QUIC_BLACKHOLE_TTL_SECS: u64 = 600;
 /// 直连拨号熔断：首次失败容忍（瞬时抖动），第 2 次连续失败起冷却 10s，
@@ -131,15 +138,18 @@ const SNI_WAIT_MS: u64 = 60;
 /// 64 档在跑量时读侧先见底：RX 一停，ACK 回填就慢，反过来把下行窗口压住。
 /// 抬到 512 与写侧对齐；读取是非阻塞的，读到 WouldBlock 立刻停，不会长时间占住单轮。
 const MAX_RX_BURST: usize = 512;
-/// 每轮主循环从 relay 通道搬入 pending 的最大块数。
+/// 每轮主循环从 relay 通道搬入 pending 的最大块数（128×16K≈2MB/轮，实际受 pending 字节上限约束）。
 /// 太小会把单连接吞吐压成「块数 × 块大小 / 轮询间隔」，太大则单连接 pending 占内存。
-const RELAY_DRAIN_BURST: usize = 32;
+const RELAY_DRAIN_BURST: usize = 128;
 /// 非空闲时的兜底轮询间隔。出站数据由 Notify 事件唤醒，兜底只管「万一漏唤醒」，
 /// 因此保持 20ms：挂着的空闲长连接不该被更密的定时器反复空转，那是纯耗电。
 const IDLE_SAFETY_WAIT_MS: u64 = 20;
-/// 收发缓冲池上限；每个缓冲最多 2048 字节。
-const MAX_POOL: usize = 128;
-const MAX_TUN_PACKET: usize = 2048;
+/// 收发缓冲池上限；每个缓冲最多 MAX_TUN_PACKET 字节（巨帧档 9216）。
+/// 512 档换更少的每包分配（虚拟 worst-case 约 9MB，物理按实际写入增长）。
+const MAX_POOL: usize = 512;
+/// TUN 单包上限：必须 ≥ 壳 setMtu 的最大档（9000）+ 余量，否则巨帧包在读侧被截断。
+/// 池缓冲走惰性零页，物理内存按真实写入增长，虚拟worst-case 128×9216×2≈2.3MB。
+const MAX_TUN_PACKET: usize = 9216;
 /// 每条 TCP 连接在 smoltcp 内的收发缓冲（每方向 512K）。
 /// 关键不只是缓冲大小：smoltcp 0.11 的接收窗口缩放 shift = log2(rx_cap) - 16，
 /// 512K 时 shift=3、通告窗口 ~512K，单流上限从「128K / RTT」抬到「512K / RTT」：
@@ -147,25 +157,35 @@ const MAX_TUN_PACKET: usize = 2048;
 /// RTT 抖一下下载就掉」的主因，只放宽 TUN 队列治不了它（积压只是从 pending
 /// 挪回 socket 缓冲，窗口该关的时候照样关）。
 const TCP_SOCKET_BUFFER: usize = 512 * 1024;
+/// 大档发送方向（smoltcp→App，本机腿）单独缩到 256K：这条腿 RTT 亚毫秒，
+/// 256K 的突发吸收绰绰有余；下游真正的突发吸收由 TCP_PENDING_CAP(2MB)＋滞回承担。
+/// 接收方向不缩：它是上行对调度抖动的突发闸门（单轮循环搬多少受 recv 缓冲约束），
+/// 对称缩会把「调度尖刺→上行掉速」的老病 reintroduce。
+const TCP_SOCKET_BUFFER_TX: usize = 256 * 1024;
 /// 内存水位降级档：活跃 TCP socket 超过 `TCP_BUFFER_HIGH_TIER_MAX` 后新建的用 128K。
 /// 不设这条守卫，1024 条连接每条双向 1MB，最坏会顶到 1GB，VPN 进程会被 LMK 直接杀。
 const TCP_SOCKET_BUFFER_MIN: usize = 128 * 1024;
-/// 用 512K 档的「当前并发」socket 数量上限（不是历史前 128 条）：
+/// 用大档的「当前并发」socket 数量上限（不是历史前 128 条）：
 /// 大档名额随 socket 关闭立刻释放，新连接可以补位——否则开机早期的推送/IM 长连接
 /// 会把大档占满，后面真正跑量的下载只能拿 128K。
+/// 名额按真实大档占用（BIG_TIER_IN_USE）判定，不再用 socket 总数代理：
+/// 总数含 listener/降级档/关闭中，代理口径会把名额虚占满、也会骗诊断仪表。
 /// 内存口径：vec![0u8; N] 走 alloc_zeroed→calloc 的惰性零页，物理页按真实写入增长，
-/// 所以 352MB 是虚拟 worst-case，PSS 只随真实流量涨，LMK 风险比纸面小。
+/// 所以纸面 worst-case 是虚拟口径，PSS 只随真实流量涨，LMK 风险比纸面小。
 const TCP_BUFFER_HIGH_TIER_MAX: usize = 128;
 /// 判别仪表的采样节拍（毫秒），计数按「条件成立期间累计 ms」记。
 const METER_TICK_MS: u64 = 500;
 /// 活跃 smoltcp TCP socket 数（listener 与已建连接共用同一个 socket，只算一次）。
 /// 只用于决定新 socket 用哪一档缓冲；漏减只会让后续连接降级，不会造成内存越界。
 static TCP_SOCKETS: AtomicUsize = AtomicUsize::new(0);
+/// 真实大档占用数：add_listener 拿大档时 +1，release_tcp_socket 按 recv 容量判档 -1。
+/// 既是名额判定依据，也是诊断 bigTierInUse 的唯一口径（不再 min(总数,128) 代理）。
+static BIG_TIER_IN_USE: AtomicUsize = AtomicUsize::new(0);
 
-/// 返回 (缓冲字节, 是否因水位降级)。降级要记进 `tcpBufferDenied`，
+/// 返回 (接收缓冲字节, 是否因水位降级)。降级要记进 `tcpBufferDenied`，
 /// 否则「守卫悄悄把大档收走了」在诊断里完全看不出来。
 fn next_tcp_buffer_bytes() -> (usize, bool) {
-    if TCP_SOCKETS.load(Ordering::Relaxed) < TCP_BUFFER_HIGH_TIER_MAX {
+    if BIG_TIER_IN_USE.load(Ordering::Relaxed) < TCP_BUFFER_HIGH_TIER_MAX {
         (TCP_SOCKET_BUFFER, false)
     } else {
         (TCP_SOCKET_BUFFER_MIN, true)
@@ -174,19 +194,27 @@ fn next_tcp_buffer_bytes() -> (usize, bool) {
 
 /// 所有 TCP socket 的销毁都必须走这里：abort + remove + 归还计数。
 fn release_tcp_socket(sockets: &mut SocketSet<'_>, handle: SocketHandle) {
+    // 先读容量判档再 remove：大档 recv=512K、降级档 recv=128K，可区分。
+    let big = sockets
+        .get::<tcp::Socket>(handle)
+        .recv_capacity()
+        == TCP_SOCKET_BUFFER;
     sockets.get_mut::<tcp::Socket>(handle).abort();
     let _ = sockets.remove(handle);
     TCP_SOCKETS.fetch_sub(1, Ordering::Relaxed);
+    if big {
+        BIG_TIER_IN_USE.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 /// MITM 本地双工管道容量；DNS TCP 管道同档 64K。
 const MITM_DUPLEX_CAP: usize = 128 * 1024;
 const DNS_TCP_DUPLEX_CAP: usize = 64 * 1024;
-/// 每个 UDP 目的端点的单方向缓冲。QUIC 包约 1400 字节，
-/// 8192 只装得下 5 个包，而 UDP 没有背压语义——缓冲满即丢，
-/// 大流量 QUIC 会先被这个缓冲卡住，而不是被协议栈算力卡住。
-const UDP_DST_BUF: usize = 32 * 1024;
+/// 每个 UDP 目的端点的单方向缓冲。QUIC 包约 1400 字节，巨帧档 App 可能发更大的
+/// UDP 数据报；32K 旧档在 9000 MTU 下只装得下 3 个大包，满即丢；64K 在跑量时
+/// 仍会因瞬时突发顶格，故抬到 256K（虚拟内存，物理按实际包增长）。
+const UDP_DST_BUF: usize = 256 * 1024;
 /// metadata 槽位必须跟缓冲容量匹配：槽位先耗尽会提前丢包，缓冲再大也没用。
-const UDP_META_SLOTS: usize = 64;
+const UDP_META_SLOTS: usize = 256;
 
 /// TCP keep-alive 探测间隔。运营商 NAT / 家用路由器的空闲映射通常 3~5 分钟就被静默清掉，
 /// 不主动探测的话长连接会「看着还连着、实际已经死了」：推送延迟、消息半天不到、游戏掉线。
@@ -208,8 +236,15 @@ const MAX_PENDING_ACCEPT: usize = 512;
 /// smoltcp 发送缓冲塞满后若继续无脑从 relay 通道搬运，pending 会无界增长，
 /// 一条卡住的大下载就能吃几百 MB，最终 LMK 杀进程表现为「随机全断」。
 /// 达到上限即停止搬运 → 通道填满 → relay 暂停读上游 → 真实 TCP 窗口自然收紧。
-/// 取 512K（4 倍 smoltcp 发送缓冲）：健康连接永远到不了上限，吞吐不受影响。
-const TCP_PENDING_CAP: usize = 512 * 1024;
+/// 取 2MB（4 倍 recv 缓冲 / 8 倍 tx 缓冲）：512K 旧档恰等于一个 smoltcp 缓冲，
+/// 高 BDP 单流一次 RTT 抖动就填满 pending→停搬→上游暂停→吞吐反复触顶；
+/// 2MB 给出足够的突发吸收。停搬带滞回（≥2MB 暂停、≤1MB 恢复，见 TCP_PENDING_RESUME），
+/// 单阈值会在门槛处开/关振荡（2.3.12 滞回修复的同款教训）。
+/// 内存守卫：pending 是真实字节（非惰性零页），但每流封顶 2MB × 活跃流数，
+/// 另有 1024 连接上限与空闲回收兜底，风险可控。
+const TCP_PENDING_CAP: usize = 2 * 1024 * 1024;
+/// 滞回恢复水位：暂停后必须排空到 ≤1MB 才恢复搬运，避免阈值处振荡。
+const TCP_PENDING_RESUME: usize = 1024 * 1024;
 
 struct TunRxToken {
     data: Option<Vec<u8>>,
@@ -218,7 +253,15 @@ struct TunRxToken {
 struct TunTxToken {
     tx: Arc<Mutex<VecDeque<Vec<u8>>>>,
     pool: Arc<Mutex<Vec<Vec<u8>>>>,
+    cap: usize,
     stats: Arc<Stats>,
+}
+
+/// 池未命中（不得不新分配）的次数：判断池是否还偏小。
+static POOL_MISS: AtomicUsize = AtomicUsize::new(0);
+/// 供诊断输出读取池未命中次数。
+pub fn pool_misses() -> usize {
+    POOL_MISS.load(Ordering::Relaxed)
 }
 
 fn pool_take(pool: &Mutex<Vec<Vec<u8>>>, capacity: usize) -> Vec<u8> {
@@ -226,7 +269,13 @@ fn pool_take(pool: &Mutex<Vec<Vec<u8>>>, capacity: usize) -> Vec<u8> {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    g.pop().unwrap_or_else(|| Vec::with_capacity(capacity))
+    match g.pop() {
+        Some(b) => b,
+        None => {
+            POOL_MISS.fetch_add(1, Ordering::Relaxed);
+            Vec::with_capacity(capacity)
+        }
+    }
 }
 
 fn pool_put(pool: &Mutex<Vec<Vec<u8>>>, buf: Vec<u8>) {
@@ -244,12 +293,16 @@ fn pool_put(pool: &Mutex<Vec<Vec<u8>>>, buf: Vec<u8>) {
 
 impl TunDevice {
     fn new(mtu: usize, stats: Arc<Stats>) -> Self {
+        let (queue_cap, pending_cap, write_burst) = queue_caps(mtu);
         Self {
             rx: VecDeque::with_capacity(MAX_RX_BURST),
-            tx: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_TX_QUEUE))),
+            tx: Arc::new(Mutex::new(VecDeque::with_capacity(queue_cap))),
             rx_pool: Arc::new(Mutex::new(Vec::with_capacity(MAX_POOL))),
             tx_pool: Arc::new(Mutex::new(Vec::with_capacity(MAX_POOL))),
             mtu,
+            queue_cap,
+            pending_cap,
+            write_burst,
             stats,
         }
     }
@@ -321,6 +374,7 @@ impl Device for TunDevice {
             TunTxToken {
                 tx: self.tx.clone(),
                 pool: self.tx_pool.clone(),
+                cap: self.queue_cap,
                 stats: self.stats.clone(),
             },
         ))
@@ -332,7 +386,7 @@ impl Device for TunDevice {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
-            if g.len() >= MAX_TX_QUEUE {
+            if g.len() >= self.queue_cap {
                 // 高水位返回 None，smoltcp 会把报文保留在 socket 发送缓冲，
                 // 下一次 poll 再试；这是背压，不是丢包。
                 self.stats.tun_tx_backpressure.fetch_add(1, Ordering::Relaxed);
@@ -342,6 +396,7 @@ impl Device for TunDevice {
         Some(TunTxToken {
             tx: self.tx.clone(),
             pool: self.tx_pool.clone(),
+            cap: self.queue_cap,
             stats: self.stats.clone(),
         })
     }
@@ -358,10 +413,10 @@ impl Device for TunDevice {
 impl RxToken for TunRxToken {
     fn consume<R, F>(mut self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
-        let mut data = self.data.take().expect("TunRxToken consumed twice");
-        let r = f(&mut data);
+        let data = self.data.take().expect("TunRxToken consumed twice");
+        let r = f(&data);
         pool_put(&self.pool, data);
         r
     }
@@ -388,7 +443,7 @@ impl TxToken for TunTxToken {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        if g.len() < MAX_TX_QUEUE {
+        if g.len() < self.cap {
             g.push_back(buf);
         } else {
             // transmit() 已做高水位检查；这里只是最后一道保护，正常不应命中。
@@ -510,6 +565,9 @@ struct TcpConn {
     pending: VecDeque<Vec<u8>>,
     /// pending 中的总字节数，与 TCP_PENDING_CAP 配对形成下行背压。
     pending_bytes: usize,
+    /// 下行背压滞回标志：pending ≥2MB 置位停搬，≤1MB 清零恢复。
+    /// 没有它，单阈值会在门槛处每轮开/关振荡，relay 读上游跟着抖。
+    relay_paused: bool,
     /// 主循环搬走 pending/通道数据后通知 relay 恢复读上游。
     /// 没有它，relay 在通道满时会永久停读（mpsc 不会因容量释放唤醒发送方）。
     read_wake: Arc<Notify>,
@@ -536,13 +594,26 @@ struct TcpConn {
 /// 用于把兜底轮询收紧到 1ms：Notify 只保证「有新数据」时唤醒，
 /// 但被背压打断的一轮可能只搬了一部分，这里保证剩余部分不等到兜底间隔。
 fn has_relay_backlog(conns: &[TcpConn]) -> bool {
-    conns.iter().any(|c| !c.from_relay.is_empty())
+    // 滞回暂停中的连接不算 backlog：它是故意停搬，1ms 兜底轮询围着它空转是纯耗电；
+    // 恢复由主循环每轮的 drain_relay_to_pending 按低水位判定，不依赖兜底间隔。
+    conns.iter().any(|c| !c.relay_paused && !c.from_relay.is_empty())
 }
 
 /// 把下行数据从 relay 通道搬入 pending，受 TCP_PENDING_CAP 字节上限约束。
 /// 返回是否搬到了数据（调用方据此更新活跃时间）。搬到数据即唤醒 relay：
 /// 通道腾出了容量，它可以恢复读上游了。
 fn drain_relay_to_pending(conn: &mut TcpConn) -> bool {
+    // 滞回：≥2MB 暂停、≤1MB 恢复。暂停期间不搬也不唤醒 relay，
+    // 让通道保持满、上游窗口保持收紧，直到 pending 真正排空到低水位。
+    if !conn.relay_paused && conn.pending_bytes >= TCP_PENDING_CAP {
+        conn.relay_paused = true;
+    }
+    if conn.relay_paused && conn.pending_bytes <= TCP_PENDING_RESUME {
+        conn.relay_paused = false;
+    }
+    if conn.relay_paused {
+        return false;
+    }
     let mut drained = false;
     while conn.pending_bytes < TCP_PENDING_CAP {
         match conn.from_relay.try_recv() {
@@ -896,6 +967,27 @@ fn lookup_udp_flow(pkt: &[u8]) -> Option<(IpEndpoint, IpEndpoint)> {
     }
 }
 
+/// 取 UDP 载荷（QUIC Initial 嗅探用）。解析失败一律 None，不影响转发路径。
+fn udp_payload(pkt: &[u8]) -> Option<&[u8]> {
+    match *pkt.first()? >> 4 {
+        4 => {
+            let ip = Ipv4Packet::new_checked(pkt).ok()?;
+            if ip.next_header() != IpProtocol::Udp {
+                return None;
+            }
+            Some(UdpPacket::new_checked(ip.payload()).ok()?.payload())
+        }
+        6 => {
+            let ip = Ipv6Packet::new_checked(pkt).ok()?;
+            if ip.next_header() != IpProtocol::Udp {
+                return None;
+            }
+            Some(UdpPacket::new_checked(ip.payload()).ok()?.payload())
+        }
+        _ => None,
+    }
+}
+
 fn add_listener(
     sockets: &mut SocketSet<'_>,
     addr: IpAddress,
@@ -906,9 +998,12 @@ fn add_listener(
     if downgraded {
         stats.tcp_buffer_denied.fetch_add(1, Ordering::Relaxed);
     }
+    // 非对称缓冲：recv 512K 保住上行突发闸门；tx 大档 256K（本机腿足够），
+    // 降级档双向同 128K。
+    let tx_bytes = if downgraded { buf_bytes } else { TCP_SOCKET_BUFFER_TX };
     let mut socket = tcp::Socket::new(
         tcp::SocketBuffer::new(vec![0u8; buf_bytes]),
-        tcp::SocketBuffer::new(vec![0u8; buf_bytes]),
+        tcp::SocketBuffer::new(vec![0u8; tx_bytes]),
     );
     // 这个 TUN 数据面是「一条 TCP 连接就是一条本地 smoltcp 连接」，监听 socket 直接
     // 转成已建立连接（state != Listen 后原地复用），所以在这里设一次即全程生效。
@@ -933,6 +1028,9 @@ fn add_listener(
         return None;
     }
     TCP_SOCKETS.fetch_add(1, Ordering::Relaxed);
+    if !downgraded {
+        BIG_TIER_IN_USE.fetch_add(1, Ordering::Relaxed);
+    }
     Some(sockets.add(socket))
 }
 
@@ -1288,7 +1386,14 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
     let async_fd = unsafe { tokio::io::unix::AsyncFd::register(owned)? };
     STACK_READY.store(true, Ordering::Release);
 
-    let mut device = TunDevice::new(1500, ctx.stats.clone());
+    let mtu = ctx
+        .cfg
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .mtu
+        .clamp(1280, 9000);
+    ctx.stats.tun_mtu.store(mtu as i64, Ordering::Relaxed);
+    let mut device = TunDevice::new(mtu, ctx.stats.clone());
     let mut iface_cfg = IfaceConfig::new(HardwareAddress::Ip);
     iface_cfg.random_seed = rand::random();
     let mut iface = Interface::new(iface_cfg, &mut device, smol_now(Instant::now()));
@@ -1356,11 +1461,17 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
     // 任意目的地址的 53 端口：按目的地址动态建 socket，应答源地址才能保持 8.8.8.8:53 等原值。
     let mut dns_udp_dsts: HashMap<(IpAddress, u16), (SocketHandle, Instant)> = HashMap::new();
 
-    let mut listeners: HashMap<(IpAddress, u16), (SocketHandle, Instant)> = HashMap::new();
+    // 同一 endpoint 允许挂多个 listener：smoltcp 的 listen() 不做全局 endpoint 唯一性校验，
+    // process_tcp 按插入顺序取第一个 accepts() 的 socket，Listen socket 遇到带 ACK 的包会让位。
+    let mut listeners: HashMap<(IpAddress, u16), Vec<(SocketHandle, Instant)>> = HashMap::new();
+    // 本轮 RX burst 里已被某个 SYN 认领的 listener。poll 在 burst 之后才跑，
+    // 期间所有 listener 都还是 Listen，按状态判据会全部命中同一个 socket，
+    // 第二条 SYN 无人认领会被 iface 直接 RST（不是静默等重传）。
+    let mut claimed: HashSet<SocketHandle> = HashSet::new();
     // QUIC 假活探测：(目标 IP, 目标端口) → (首次上行时刻, 最近上行时刻)。
     // 只有「持续有上行、却一个回包都没见到」才算假活；纯空闲会话不判死，
     // 否则 keepalive 间隔长的 QUIC 会被误杀。
-    let mut quic_probe: HashMap<(IpAddress, u16), (Instant, Instant)> = HashMap::new();
+    let mut quic_probe: HashMap<(IpAddress, u16), (Instant, Instant, bool)> = HashMap::new();
     // 判为 UDP 黑洞的目标 + 判定时刻；冷却按 (IP, port)，有效期 10 分钟。
     let mut quic_blackhole: HashMap<(IpAddress, u16), Instant> = HashMap::new();
     let mut pending_accept: Vec<(IpAddress, u16, SocketHandle, Instant)> = Vec::new();
@@ -1390,9 +1501,17 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
         "用户态协议栈已启动 (10.10.10.1/24, fd00:1::1/64, DNS 10.10.10.53 + fd00:1::53)",
     );
 
+    // 主循环耗时仪表：结算「select 返回 → 本轮处理完、下一轮 select 前」的时间。
+    // 长轮会饿死同循环里的其他连接，这个数比主观体感可靠。
+    let mut round_started: Option<Instant> = None;
     loop {
         if ctx.shutdown.load(Ordering::Relaxed) {
             break;
+        }
+        if let Some(t) = round_started.take() {
+            let ms = t.elapsed().as_millis() as u64;
+            ctx.stats.loop_round_ms_last.store(ms, Ordering::Relaxed);
+            ctx.stats.loop_round_ms_max.fetch_max(ms, Ordering::Relaxed);
         }
         // 切网（蜂窝↔Wi-Fi）后旧网络的 QUIC 假活结论必须失效：壳层置位，这里整表清空。
         if ctx.quic_clear.swap(false, Ordering::Relaxed) {
@@ -1407,7 +1526,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
         // 空闲时降低唤醒频率；有 tx backlog 或写阻塞时保持 1ms 兜底。
         // 新报文到达、TUN 可写、出站数据入队都会立即唤醒，这里的兜底只防漏唤醒。
         let idle = conns.is_empty() && udp_clients.is_empty();
-        let backlogged = pending_out.len() >= MAX_PENDING_OUT;
+        let backlogged = pending_out.len() >= device.pending_cap;
         let wait = if write_blocked || !pending_out.is_empty() || has_relay_backlog(&conns) {
             Duration::from_millis(1)
         } else if idle {
@@ -1434,9 +1553,13 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             }
             r = udp_resp_rx.recv() => {
                 if let Some((client, remote, data)) = r {
-                    // 该会话任何下行包（含 ACK/PING）都算活着：清掉探测与黑洞标记。
+                    // 该会话任何下行包（含 ACK/PING）都算握手活着：标记已建立
+                    // （豁免黑洞判定），不再直接删探测记录——删记录会丢「见过下行」
+                    // 的信息，纯上传流下一轮上行又会被当成握手无回包误判。
                     let key = (remote.addr, remote.port);
-                    quic_probe.remove(&key);
+                    if let Some(p) = quic_probe.get_mut(&key) {
+                        p.2 = true;
+                    }
                     quic_blackhole.remove(&key);
                     if udp_replies.len() < 512 {
                         udp_replies.push_back((remote, client, data));
@@ -1457,6 +1580,8 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             _ = tokio::time::sleep(wait) => {}
         }
 
+        round_started = Some(Instant::now());
+        claimed.clear();
         // 读 TUN 是每轮固定步骤：非阻塞读到 WouldBlock 即止，单轮最多 MAX_RX_BURST 包。
         // backlog 到高水位时仍然跳过，把背压留给上行（避免 pending_out 无界增长）。
         if !backlogged {
@@ -1474,16 +1599,34 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         // ICMP echo 本地代答：不进 smoltcp（它不路由非本机目的地址，
                         // 转发型 ping 会被静默丢弃），直接合成应答写回 TUN。
                         if let Some(reply) = icmp_echo_reply(&pkt) {
-                            if pending_out.len() < MAX_PENDING_OUT {
+                            if pending_out.len() < device.pending_cap {
                                 pending_out.push_back(reply);
                             }
                             continue;
                         }
                         if let Some((port, addr)) = lookup_tcp_dst(&pkt) {
-                            if !listeners.contains_key(&(addr, port)) {
-                                if let Some(h) = add_listener(&mut sockets, addr, port, &ctx.stats) {
-                                    listeners.insert((addr, port), (h, Instant::now()));
+                            let key = (addr, port);
+                            // 每条 SYN 独占一个未被认领的 Listen socket；没有就新建。
+                            let mut reuse = None;
+                            if let Some(v) = listeners.get(&key) {
+                                for (h, _) in v {
+                                    if !claimed.contains(h)
+                                        && sockets.get::<tcp::Socket>(*h).state() == tcp::State::Listen
+                                    {
+                                        reuse = Some(*h);
+                                        break;
+                                    }
                                 }
+                            }
+                            let handle = match reuse {
+                                Some(h) => Some(h),
+                                None => add_listener(&mut sockets, addr, port, &ctx.stats).map(|h| {
+                                    listeners.entry(key).or_default().push((h, Instant::now()));
+                                    h
+                                }),
+                            };
+                            if let Some(h) = handle {
+                                claimed.insert(h);
                             }
                         }
                         if let Some((src, dst)) = lookup_udp_flow(&pkt) {
@@ -1510,6 +1653,27 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                     }
                                 }
                             } else {
+                                // QUIC 精确迫降：共享 CDN IP 上反查必然 ambiguous，旧门永不开，
+                                // App 走 HTTP/3 就整条绕过 MITM。这里直接解 Initial 的 SNI，
+                                // 命中 MITM 清单才丢包；同 IP 的非 MITM 域名不受连坐。
+                                if dst.port == 443 {
+                                    if let Some(payload) = udp_payload(&pkt) {
+                                        if let Some(sni) = crate::quic::initial_sni(payload) {
+                                            let client_uid = ctx.uid_map.read().ok().and_then(|m| {
+                                                m.lookup_flow(
+                                                    IpAddr::from(src.addr),
+                                                    src.port,
+                                                    IpAddr::from(dst.addr),
+                                                    dst.port,
+                                                )
+                                            });
+                                            if ctx.mitm().should_mitm_uid(&sni, client_uid) {
+                                                ctx.stats.mitm_quic_blocked.fetch_add(1, Ordering::Relaxed);
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                }
                                 let domain = ctx
                                     .dns()
                                     .reverse
@@ -1563,8 +1727,8 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                     let now_up = Instant::now();
                                     quic_probe
                                         .entry(key)
-                                        .and_modify(|(_, last)| *last = now_up)
-                                        .or_insert((now_up, now_up));
+                                        .and_modify(|(_, last, _)| *last = now_up)
+                                        .or_insert((now_up, now_up, false));
                                 }
                                 if !matches!(mode, UdpMode::Unsupported(_)) {
                                     if !udp_dsts.contains_key(&(dst.addr, dst.port)) {
@@ -1612,17 +1776,26 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
         let _ = iface.poll(now, &mut device, &mut sockets);
 
         // TCP 监听器 -> 已建立连接
-        let mut lost: Vec<(IpAddress, u16)> = Vec::new();
+        let mut lost: Vec<(IpAddress, u16, SocketHandle)> = Vec::new();
         let mut accepted: Vec<(IpAddress, u16, SocketHandle, Instant)> = Vec::new();
-        for (key, (handle, _)) in listeners.iter() {
-            let state = sockets.get::<tcp::Socket>(*handle).state();
-            if state != tcp::State::Listen {
-                lost.push(*key);
-                accepted.push((key.0, key.1, *handle, Instant::now()));
+        for (key, v) in listeners.iter() {
+            for (handle, _) in v {
+                let state = sockets.get::<tcp::Socket>(*handle).state();
+                if state != tcp::State::Listen {
+                    lost.push((key.0, key.1, *handle));
+                    accepted.push((key.0, key.1, *handle, Instant::now()));
+                }
             }
         }
-        for key in lost {
-            listeners.remove(&key);
+        for (addr, port, handle) in lost {
+            let mut empty = false;
+            if let Some(v) = listeners.get_mut(&(addr, port)) {
+                v.retain(|(h, _)| *h != handle);
+                empty = v.is_empty();
+            }
+            if empty {
+                listeners.remove(&(addr, port));
+            }
         }
         for (addr, port, handle, accepted_at) in accepted {
             // 半开连接也要封顶：每个 socket 带 256K 缓冲，只靠 listeners 上限兜不住。
@@ -1637,20 +1810,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             }
             pending_accept.push((addr, port, handle, accepted_at));
         }
-        // 保证每个已消费的端口仍有监听器（后续新连接）
-        let mut new_listeners: Vec<(IpAddress, u16, SocketHandle)> = Vec::new();
-        for (addr, port, h, _) in pending_accept.iter() {
-            if sockets.get::<tcp::Socket>(*h).state() == tcp::State::Established
-                && !listeners.contains_key(&(*addr, *port))
-            {
-                if let Some(nh) = add_listener(&mut sockets, *addr, *port, &ctx.stats) {
-                    new_listeners.push((*addr, *port, nh));
-                }
-            }
-        }
-        for (addr, port, h) in new_listeners {
-            listeners.insert((addr, port), (h, Instant::now()));
-        }
+        // 不再为已消费端口预建 standby listener：收包路径只在 SYN&&!ACK 时按需建，
+        // 下一条新连接的 SYN 自己会拿到 socket。预建的 standby 每个白占 512K+256K 大档，
+        // 挂到过期才释放，会把大档名额挤给空气、让真连接触发降级。
 
         // 新连接建立
         let mut still_pending = Vec::new();
@@ -1785,7 +1947,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                     to_relay: None,
                                     from_relay: srx,
                                     pending: VecDeque::new(),
-                                    pending_bytes: 0,
+                                    pending_bytes: 0, relay_paused: false,
                                     read_wake: Arc::new(Notify::new()),
                                     relay_closed: false,
                                     client_closed: false,
@@ -1892,7 +2054,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 to_relay: None,
                                 from_relay: srx,
                                 pending: VecDeque::new(),
-                                pending_bytes: 0,
+                                pending_bytes: 0, relay_paused: false,
                                 read_wake: Arc::new(Notify::new()),
                                 relay_closed: false,
                                 client_closed: false,
@@ -1919,12 +2081,43 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         }
                     }
                     // MITM：SNI/反向映射命中域名列表的 443 连接改走本地 TLS 终止 + 规则改写。
+                    // 金融保护先于一切命中：支付/银行连接被劫持不是「解不开」，而是被弄断。
                     let mitm_state = ctx.mitm();
+                    if let Some(reason) = mitm_state
+                        .engine
+                        .finance_bypass(client_uid, mitm_host.as_deref())
+                    {
+                        ctx.stats.mitm_finance_skipped.fetch_add(1, Ordering::Relaxed);
+                        logging::info(
+                            "mitm",
+                            format!(
+                                "#{} 金融保护跳过 {}（{}，uid={}）",
+                                conn_id,
+                                mitm_host.clone().unwrap_or_default(),
+                                reason,
+                                client_uid.map(|u| u.to_string()).unwrap_or_else(|| "未知".into())
+                            ),
+                        );
+                    }
+                    // 临时放行窗口内该域名完全不解密：这是「改写突然失效」的直接来源，
+                    // 必须逐条可见，否则诊断只能看到改写数不涨却找不到原因。
+                    if !dns_conn && port == 443 {
+                        if let Some(d) = mitm_host.as_deref() {
+                            if let Some(left) = mitm_state.engine.bypass_remaining(d) {
+                                ctx.stats.mitm_bypassed.fetch_add(1, Ordering::Relaxed);
+                                logging::info(
+                                    "mitm",
+                                    format!("#{} {} 处于临时放行窗口（剩 {}s），本条不解密", conn_id, d, left),
+                                );
+                            }
+                        }
+                    }
                     let mitm_hit = !dns_conn
                         && port == 443
+                        && mitm_state.engine.finance_bypass(client_uid, mitm_host.as_deref()).is_none()
                         && mitm_host
                             .as_deref()
-                            .map(|d| mitm_state.should_mitm(d))
+                            .map(|d| mitm_state.should_mitm_uid(d, client_uid))
                             .unwrap_or(false);
                     if mitm_hit {
                         let (a, b) = tokio::io::duplex(MITM_DUPLEX_CAP);
@@ -1959,7 +2152,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             to_relay: Some(tx),
                             from_relay: srx,
                             pending: VecDeque::new(),
-                            pending_bytes: 0,
+                            pending_bytes: 0, relay_paused: false,
                             read_wake,
                             relay_closed: false,
                             client_closed: false,
@@ -1990,7 +2183,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             to_relay: Some(tx),
                             from_relay: srx,
                             pending: VecDeque::new(),
-                            pending_bytes: 0,
+                            pending_bytes: 0, relay_paused: false,
                             read_wake,
                             relay_closed: false,
                             client_closed: false,
@@ -2113,7 +2306,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             to_relay: Some(tx),
                             from_relay: srx,
                             pending: VecDeque::new(),
-                            pending_bytes: 0,
+                            pending_bytes: 0, relay_paused: false,
                             read_wake,
                             relay_closed: false,
                             client_closed: false,
@@ -2188,6 +2381,8 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             if drain_relay_to_pending(conn) {
                 touched = true;
             }
+            // best-fit：send_slice 返回实际入队字节数，头块写不完就部分写入、
+            // 剩余留在队头下轮续写——字节流顺序不变，也不因单块装不下而整环停摆。
             while sock.can_send() {
                 match conn.pending.front_mut() {
                     Some(front) => match sock.send_slice(front) {
@@ -2199,6 +2394,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             }
                             conn.pending.pop_front();
                         }
+                        Ok(0) => break,
                         Ok(n) => {
                             touched = true;
                             conn.pending_bytes -= n;
@@ -2468,12 +2664,17 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             {
                 let mut judged: Vec<(IpAddress, u16)> = Vec::new();
                 let mut idle: Vec<(IpAddress, u16)> = Vec::new();
-                for (key, (first, last)) in quic_probe.iter() {
+                for (key, (first, last, saw_down)) in quic_probe.iter() {
                     if now_i.duration_since(*last) >= Duration::from_millis(QUIC_PROBE_WAIT_MS) {
                         // 已经静默了：纯空闲会话不判死，只丢掉探测记录，下次上行重新计时。
                         idle.push(*key);
-                    } else if now_i.duration_since(*first) >= Duration::from_millis(QUIC_PROBE_WAIT_MS) {
-                        // 窗口内一直有上行，却一次下行包都没见到 → 判假活。
+                    } else if !saw_down
+                        && now_i.duration_since(*first)
+                            >= Duration::from_millis(QUIC_HANDSHAKE_WAIT_MS)
+                    {
+                        // 窗口内一直有上行、却从头到尾没见过任何下行 = 握手无回包 → 判黑洞。
+                        // 已建立流（saw_down）豁免：纯上传阶段（同步/备份/上报）本来就没有
+                        // 下行，判死会把健康 QUIC 白拆成 TCP。
                         judged.push(*key);
                     }
                 }
@@ -2488,8 +2689,8 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         logging::warn(
                             "tun",
                             format!(
-                                "QUIC 假活：{}:{} 持续 {}ms 有上行但无任何回包，{}s 内丢弃它的 QUIC 让客户端回落 TCP",
-                                key.0, key.1, QUIC_PROBE_WAIT_MS, QUIC_BLACKHOLE_TTL_SECS
+                                "QUIC 握手无回包：{}:{} 持续 {}ms 有上行但无任何下行回包（握手未完成），{}s 内丢弃它的 QUIC 让客户端回落 TCP；已建立流豁免此判定",
+                                key.0, key.1, QUIC_HANDSHAKE_WAIT_MS, QUIC_BLACKHOLE_TTL_SECS
                             ),
                         );
                     }
@@ -2505,10 +2706,11 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                 }
             }
 
-            // 诊断口径：大档是并发名额，这里刷新当前占用数。
+            // 诊断口径：真实大档占用（分配/释放处维护），不再用 min(socket 总数,128)
+            // 代理——总数含 listener/降级档/关闭中，既虚占名额也骗仪表。
             // 必须放在 QUIC 开关之外——否则关掉 QUIC 回落，这个仪表就冻住了。
             ctx.stats.big_tier_in_use.store(
-                TCP_SOCKETS.load(Ordering::Relaxed).min(TCP_BUFFER_HIGH_TIER_MAX) as i64,
+                BIG_TIER_IN_USE.load(Ordering::Relaxed) as i64,
                 Ordering::Relaxed,
             );
 
@@ -2592,28 +2794,42 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                 }
             }
 
-            let mut expired_listeners: Vec<(IpAddress, u16)> = Vec::new();
-            for (key, (handle, created)) in listeners.iter() {
-                let listening = sockets.get::<tcp::Socket>(*handle).state() == tcp::State::Listen;
-                if listening && now_i.duration_since(*created) > Duration::from_secs(25) {
-                    expired_listeners.push(*key);
+            let mut expired_listeners: Vec<((IpAddress, u16), SocketHandle)> = Vec::new();
+            for (key, v) in listeners.iter() {
+                for (handle, created) in v {
+                    let listening = sockets.get::<tcp::Socket>(*handle).state() == tcp::State::Listen;
+                    if listening && now_i.duration_since(*created) > Duration::from_secs(25) {
+                        expired_listeners.push((*key, *handle));
+                    }
                 }
             }
-            if listeners.len() > 1200 {
-                let mut olds: Vec<((IpAddress, u16), Instant)> = listeners
-                    .iter()
-                    .filter(|(_, (h, _))| sockets.get::<tcp::Socket>(*h).state() == tcp::State::Listen)
-                    .map(|(k, (_, c))| (*k, *c))
-                    .collect();
-                olds.sort_by_key(|(_, c)| *c);
-                let need = listeners.len().saturating_sub(1200);
-                for (key, _) in olds.into_iter().take(need) {
-                    expired_listeners.push(key);
+            let total_listeners: usize = listeners.values().map(|v| v.len()).sum();
+            if total_listeners > 1200 {
+                let mut olds: Vec<((IpAddress, u16), SocketHandle, Instant)> = Vec::new();
+                for (key, v) in listeners.iter() {
+                    for (handle, created) in v {
+                        if sockets.get::<tcp::Socket>(*handle).state() == tcp::State::Listen {
+                            olds.push((*key, *handle, *created));
+                        }
+                    }
+                }
+                olds.sort_by_key(|(_, _, c)| *c);
+                let need = total_listeners.saturating_sub(1200);
+                for (key, handle, _) in olds.into_iter().take(need) {
+                    expired_listeners.push((key, handle));
                 }
             }
-            for key in expired_listeners {
-                if let Some((handle, _)) = listeners.remove(&key) {
-                    release_tcp_socket(&mut sockets, handle);
+            for (key, handle) in expired_listeners {
+                let mut empty = false;
+                if let Some(v) = listeners.get_mut(&key) {
+                    if let Some(pos) = v.iter().position(|(h, _)| *h == handle) {
+                        let (h, _) = v.remove(pos);
+                        release_tcp_socket(&mut sockets, h);
+                    }
+                    empty = v.is_empty();
+                }
+                if empty {
+                    listeners.remove(&key);
                 }
             }
         }
@@ -2688,8 +2904,8 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
 
         // 发送到 TUN
         let _ = iface.poll(smol_now(start), &mut device, &mut sockets);
-        if pending_out.len() < MAX_PENDING_OUT {
-            let room = MAX_PENDING_OUT - pending_out.len();
+        if pending_out.len() < device.pending_cap {
+            let room = device.pending_cap - pending_out.len();
             device.drain_tx_into(&mut pending_out, room);
         }
         note_pending_out(&pending_out, &ctx.stats);
@@ -2703,7 +2919,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                     tx_written += 1;
                     // 每轮封顶：剩余包留在 pending_out，等待逻辑见其非空即 1ms 兜底，
                     // 吞吐不降，但单轮时长有界，拨号/DNS 不再被长轮压住。
-                    if tx_written >= MAX_TX_WRITE_BURST {
+                    if tx_written >= device.write_burst {
                         break;
                     }
                 }
@@ -2892,16 +3108,18 @@ mod tests {
 
     #[test]
     fn buffer_plan_uses_512k_tcp_and_memory_guard() {
-        // 512K 让 smoltcp 窗口缩放 shift=3（通告窗口 ~512K），单流上限 512K/RTT；
-        // 128K 档只有 128K/RTT，RTT 一抖就掉到 25Mbps 量级。
+        // recv 512K 保住上行突发闸门（窗口缩放 shift=3）；tx 大档 256K，
+        // 本机腿亚毫秒 RTT 足够，下游突发吸收交给 pending 2MB＋滞回。
         assert_eq!(TCP_SOCKET_BUFFER, 512 * 1024);
-        // 水位守卫：高价位档只给前 128 条 socket，其余降级 128K。
+        assert_eq!(TCP_SOCKET_BUFFER_TX, 256 * 1024);
+        assert!(TCP_SOCKET_BUFFER_TX < TCP_SOCKET_BUFFER);
+        // 水位守卫：大档只给当前并发前 128 条 socket，其余降级 128K。
         assert_eq!(TCP_SOCKET_BUFFER_MIN, 128 * 1024);
         assert!(TCP_BUFFER_HIGH_TIER_MAX >= 64);
-        // 最坏内存：128×1MB + (1024-128)×0.25MB ≈ 352MB，
-        // 远低于「裸提 1024 条全 512K」的 1GB。
+        // 最坏内存：128×(512K+256K) + (1024-128)×256K ≈ 352MB 虚拟口径，
+        // 远低于「裸提 1024 条全 512K 双向」的 1GB；惰性零页下 PSS 只随真实流量涨。
         assert!(
-            TCP_BUFFER_HIGH_TIER_MAX * 2 * TCP_SOCKET_BUFFER
+            TCP_BUFFER_HIGH_TIER_MAX * (TCP_SOCKET_BUFFER + TCP_SOCKET_BUFFER_TX)
                 + (1024 - TCP_BUFFER_HIGH_TIER_MAX) * 2 * TCP_SOCKET_BUFFER_MIN
                 <= 384 * 1024 * 1024
         );
@@ -2914,20 +3132,22 @@ mod tests {
         // 探测窗口要覆盖蜂窝 RTT（太短会把正常 QUIC 误判成假活），也不能拖太久。
         assert!(QUIC_PROBE_WAIT_MS >= 1000);
         assert!(QUIC_PROBE_WAIT_MS <= 4000);
+        // 握手无回包窗口必须比静默窗口长（覆盖 PTO 重传），又不至于拖到分钟级。
+        assert!(QUIC_HANDSHAKE_WAIT_MS > QUIC_PROBE_WAIT_MS);
+        assert!(QUIC_HANDSHAKE_WAIT_MS <= 10_000);
         // 黑洞有效期至少几分钟，否则客户端每轮都要重新踩一次假活。
         assert!(QUIC_BLACKHOLE_TTL_SECS >= 300);
     }
 
     #[test]
     fn latency_plan_caps_queueing_and_sniff_wait() {
-        // 下行排队上限 512×2048B≈1MB：跑量时 256 档长期顶满并触发背压，故放宽一档；
-        // 1024 档（2MB）会到 ~170ms 排队，仍不要。
-        assert_eq!(MAX_PENDING_OUT, 512);
-        assert!(MAX_PENDING_OUT * MAX_TUN_PACKET <= 1024 * 1024);
-        // 单轮批量与队列成对抬到同一档：一轮可清空整个 pending_out。
-        assert_eq!(MAX_TX_WRITE_BURST, 512);
-        assert_eq!(MAX_TX_QUEUE, MAX_PENDING_OUT);
-        assert!(MAX_TX_WRITE_BURST * MAX_TUN_PACKET >= 1024 * 1024);
+        // 字节预算 ≈1MB：1500 档仍 512 包；巨帧 9000 档按字节换算，背压口径不漂移。
+        assert_eq!(queue_caps(1500), (512, 512, 512));
+        let (q, p, b) = queue_caps(9000);
+        assert_eq!(q, p);
+        assert_eq!(b, p);
+        assert!(p >= 64);
+        assert!(p * 9000 <= TUN_QUEUE_BYTES + 9000);
         // 首包等待不能回到 180ms：延迟探测类连接连上不发数据，等待即纯延迟。
         assert!(SNI_WAIT_MS <= 60);
     }
@@ -2944,12 +3164,13 @@ mod tests {
 
     #[test]
     fn pending_cap_bounds_downstream_memory() {
-        // 上限必须明显大于 smoltcp 发送缓冲（健康连接不受影响），
-        // 又必须远小于「无界增长」：单连接下行堆积封顶在 1MB 内。
-        // pending 上限至少覆盖一个 socket 缓冲，否则一屏数据都放不下就开始背压；
-        // 同时单连接下行堆积仍封顶在 1MB 内。
-        assert!(TCP_PENDING_CAP >= TCP_SOCKET_BUFFER);
-        assert!(TCP_PENDING_CAP <= 1024 * 1024);
+        // 上限必须明显大于 smoltcp 缓冲（健康连接不受影响）：2MB = 4×recv / 8×tx，
+        // 高 BDP 单流一次 RTT 抖动不会填满 pending 就停搬。
+        assert!(TCP_PENDING_CAP >= 4 * TCP_SOCKET_BUFFER);
+        assert!(TCP_PENDING_CAP <= 2 * 1024 * 1024);
+        // 滞回恢复水位必须严格低于暂停水位，否则门槛处开/关振荡。
+        assert!(TCP_PENDING_RESUME < TCP_PENDING_CAP);
+        assert!(TCP_PENDING_RESUME >= TCP_SOCKET_BUFFER);
     }
 
     fn dummy_handle() -> SocketHandle {
@@ -2963,14 +3184,14 @@ mod tests {
 
     #[tokio::test]
     async fn drain_stops_at_pending_cap_and_wakes_relay() {
-        let (stx, srx) = mpsc::channel::<Vec<u8>>(64);
+        let (stx, srx) = mpsc::channel::<Vec<u8>>(200);
         let mut conn = TcpConn {
             handle: dummy_handle(),
             snap: None,
             to_relay: None,
             from_relay: srx,
             pending: VecDeque::new(),
-            pending_bytes: 0,
+            pending_bytes: 0, relay_paused: false,
             read_wake: Arc::new(Notify::new()),
             relay_closed: false,
             client_closed: false,
@@ -2983,26 +3204,40 @@ mod tests {
             rate_prev_up: 0,
             rate_prev_down: 0,
         };
-        // 灌 640K（40×16K），超过 512K 上限。
-        for _ in 0..40 {
+        // 灌 2.24MB（140×16K），超过 2MB 上限；单轮最多搬 RELAY_DRAIN_BURST 块，
+        // 循环搬到滞回暂停为止。
+        for _ in 0..140 {
             stx.send(vec![7u8; 16384]).await.unwrap();
         }
-        assert!(drain_relay_to_pending(&mut conn));
+        let mut moved = false;
+        while drain_relay_to_pending(&mut conn) {
+            moved = true;
+        }
+        assert!(moved);
         // 搬运在达到上限后停止：最多超出一个块（先检查后搬运）。
         assert!(conn.pending_bytes >= TCP_PENDING_CAP);
         assert!(conn.pending_bytes <= TCP_PENDING_CAP + 16384);
-        assert!(conn.pending.len() <= RELAY_DRAIN_BURST);
+        assert!(conn.relay_paused);
         assert!(!conn.relay_closed);
         // 搬到数据必须唤醒 relay（permit 已存，立即就绪）。
         assert!(tokio::time::timeout(Duration::from_millis(50), conn.read_wake.notified())
             .await
             .is_ok());
-        // 上限期间继续搬运无效：通道里还有数据但 pending 已满。
+        // 暂停期间继续搬运无效：通道里还有数据但 pending 未到低水位。
         assert!(!drain_relay_to_pending(&mut conn));
-        // 模拟发送 loop 把 pending 写进 smoltcp 后，下一轮恢复搬运。
+        // 滞回：只排空到 1.5MB（高于 1MB 恢复水位）不得恢复搬运，
+        // 单阈值实现会在这里立刻恢复→门槛处振荡。
+        while conn.pending_bytes > 1_500_000 {
+            let f = conn.pending.pop_front().unwrap();
+            conn.pending_bytes -= f.len();
+        }
+        assert!(!drain_relay_to_pending(&mut conn));
+        assert!(conn.relay_paused);
+        // 模拟发送 loop 把 pending 写进 smoltcp 排空到低水位以下，下一轮恢复搬运。
         conn.pending.clear();
         conn.pending_bytes = 0;
         assert!(drain_relay_to_pending(&mut conn));
+        assert!(!conn.relay_paused);
         assert!(conn.pending_bytes > 0);
     }
 
@@ -3162,9 +3397,13 @@ mod tests {
     #[test]
     fn tx_write_burst_bounds_round_length() {
         // 封顶必须不大于 pending_out 容量（否则上限无意义），
-        // 又不能太小（单轮搬运量过低会抬高调度开销）。
-        assert!(MAX_TX_WRITE_BURST <= MAX_PENDING_OUT);
-        assert!(MAX_TX_WRITE_BURST >= 64);
+        // 又不能太小（单轮搬运量过低会抬高调度开销）；巨帧档同口径换算。
+        for mtu in [1500, 9000] {
+            let (q, p, b) = queue_caps(mtu);
+            assert!(b <= p);
+            assert!(b >= 64);
+            assert_eq!(q, p);
+        }
     }
 
     #[test]
@@ -3188,6 +3427,7 @@ mod tests {
         let token = TunTxToken {
             tx: tx.clone(),
             pool: pool.clone(),
+            cap: MAX_TX_QUEUE,
             stats: stats.clone(),
         };
         let len = token.consume(4, |buf| {
@@ -3216,6 +3456,7 @@ mod tests {
         let token = TunTxToken {
             tx: tx.clone(),
             pool,
+            cap: MAX_TX_QUEUE,
             stats: stats.clone(),
         };
         let _ = token.consume(4, |buf| {

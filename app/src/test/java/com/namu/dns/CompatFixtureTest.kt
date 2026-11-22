@@ -170,4 +170,54 @@ class CompatFixtureTest {
         assertEquals("block", legacy.rules[0].action)
     }
 
+
+    @Test
+    fun `loon argument declarations carry types into scripts and rewrite expansion`() {
+        val parsed = ModuleParser.parse(
+            """
+            [Argument]
+            enabled = switch,true
+            ratio = input,9.99,type=number
+            region = select,"CN","US",type=string
+            broken = input,abc,type=number
+            [Rewrite]
+            request if ${'$'}{url} ~= /^https:\/\/api\.example\.com\/x/ && ${'$'}{enabled} == true then request.header.add("X-Test","1")
+            [Script]
+            request if ${'$'}{url} ~= /^https:\/\/api\.example\.com\/feed/ then script("https://cdn.example.com/feed.js", {${'$'}{enabled}}) with requires_body=true, timeout=5, tag="feed"
+            """.trimIndent(),
+        )
+        assertEquals("true", parsed.arguments["enabled"])
+        assertEquals("9.99", parsed.arguments["ratio"])
+        assertEquals("CN", parsed.arguments["region"])
+        assertEquals("abc", parsed.arguments["broken"])
+        assertEquals("boolean", parsed.argumentTypes["enabled"])
+        assertEquals("number", parsed.argumentTypes["ratio"])
+        assertEquals("string", parsed.argumentTypes["region"])
+        // number 默认值非法时降为 string，避免内核注入 NaN。
+        assertEquals("string", parsed.argumentTypes["broken"])
+        // Rewrite 里的 ${'$'}{enabled} 按默认值展开，交由内核条件树执行。
+        assertTrue(parsed.loonRewrites.single().contains("&& true == true"))
+        val script = parsed.scripts.single()
+        assertEquals("request", script.phase)
+        assertEquals("""^https:\/\/api\.example\.com\/feed""", script.pattern)
+        assertEquals("feed", script.name)
+        assertTrue(script.requiresBody)
+        assertEquals(5000, script.timeoutMs)
+        assertEquals("boolean", script.argumentTypes["enabled"])
+    }
+
+    @Test
+    fun `loon script v2 cron and compound conditions are reported not silently dropped`() {
+        val parsed = ModuleParser.parse(
+            """
+            [Script]
+            cron "0 8 * * *" script("https://cdn.example.com/daily.js")
+            request if ${'$'}{url} ~= /^https:\/\/api\.example\.com\/x/ && ${'$'}{request.header['X']} == "1" then script("https://cdn.example.com/x.js")
+            """.trimIndent(),
+        )
+        assertEquals(0, parsed.scripts.size)
+        assertEquals(2, parsed.scriptIssues.size)
+        assertTrue(parsed.scriptIssues.any { it.contains("调度器") })
+        assertTrue(parsed.scriptIssues.any { it.contains("复合条件") })
+    }
 }

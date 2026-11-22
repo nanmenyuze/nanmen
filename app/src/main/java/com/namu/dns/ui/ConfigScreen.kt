@@ -496,6 +496,23 @@ fun ConfigDetailScreen(onRestart: () -> Unit, onOpenModules: () -> Unit, onOpenM
                 if (runtime.current().connected) onRestart()
             }
             SwitchRow(
+                title = "巨帧 MTU 9000",
+                subtitle = "App↔VPN 是本机内存拷贝，巨帧把包数降约 6 倍（吞吐/耗电同受益）；" +
+                    "出公网 MSS 由系统 TCP 自协商不受影响。个别 App 异常时关闭回 1500，重连生效",
+                checked = cfg.mtu == 9000,
+            ) {
+                settings.update { current -> current.copy(mtu = if (it) 9000 else 1500) }
+                if (runtime.current().connected) onRestart()
+            }
+            SwitchRow(
+                title = "上游 BBR 拥塞控制",
+                subtitle = "直连/节点出口按 socket 设 BBR：丢包 Wi-Fi/跨省长 RTT 上不等丢包信号维持速率；" +
+                    "内核不支持时自动回退 cubic，诊断可见生效计数",
+                checked = cfg.bbr,
+            ) {
+                settings.update { current -> current.copy(bbr = it) }
+            }
+            SwitchRow(
                 title = "TLS / HTTP 域名嗅探",
                 subtitle = "没有 DNS 映射时，从首包读取 SNI / Host",
                 checked = cfg.sniff,

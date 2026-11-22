@@ -1746,6 +1746,7 @@ async fn h2_idle_client_preface_is_reclaimed_quietly() {
     let target = Target { ip: "127.0.0.1".parse().unwrap(), port: 443, domain: Some("idle.test.local".into()) };
     let res = nanmen_core::mitm::h2::serve_with_preface_timeout(
         server_tls, "idle.test.local".into(), target, Action::Direct, ctx, state, 1,
+        Arc::new(nanmen_core::mitm::ConnTrace::default()),
         std::time::Duration::from_millis(200),
     ).await;
     assert!(res.is_ok(), "空闲连接应安静回收，实际: {:?}", res.err());

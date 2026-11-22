@@ -73,12 +73,90 @@ pub enum LoonAction {
     ResponseMock(MockSpec),
 }
 
+/// Loon 新版 `request/response if ...` 的条件树。
+/// 旧语法规则的条件为 None，行为与原来完全一致。
+#[derive(Debug, Clone)]
+pub enum LoonCond {
+    /// `${url} ~= /re/`
+    Url(Regex),
+    /// `${request.header['X']} == value`；None 表示与 null 比较（头不存在）
+    HeaderEq { name: String, value: Option<String> },
+    /// `${request.header['X']} ~= /re/`
+    HeaderRegex { name: String, re: Regex },
+    /// 参数展开后的布尔常量（`${enabled} == true` → `true == true`）
+    Bool(bool),
+    And(Vec<LoonCond>),
+    Or(Vec<LoonCond>),
+    Not(Box<LoonCond>),
+}
+
+impl LoonCond {
+    pub fn matches(&self, url: &str, headers: &[(String, String)]) -> bool {
+        match self {
+            LoonCond::Url(re) => re.is_match(url),
+            LoonCond::HeaderEq { name, value } => {
+                let got = header_values(headers, name);
+                match value {
+                    None => got.is_empty(),
+                    Some(v) => got.iter().any(|g| g == v),
+                }
+            }
+            LoonCond::HeaderRegex { name, re } => {
+                header_values(headers, name).iter().any(|g| re.is_match(g))
+            }
+            LoonCond::Bool(b) => *b,
+            LoonCond::And(v) => v.iter().all(|c| c.matches(url, headers)),
+            LoonCond::Or(v) => v.iter().any(|c| c.matches(url, headers)),
+            LoonCond::Not(c) => !c.matches(url, headers),
+        }
+    }
+
+    /// 预筛 URL 正则：And 取任一 URL 条件（都命中才真匹配），Or 取并集，
+    /// 其余没有 URL 条件时用 `.*`，由条件树在求值时兜底。
+    fn prefilter(&self) -> Option<String> {
+        match self {
+            LoonCond::Url(re) => Some(re.as_str().to_string()),
+            LoonCond::And(v) => v.iter().filter_map(|c| c.prefilter()).next(),
+            LoonCond::Or(v) => {
+                // 任一分支没有 URL 条件（如纯 header/参数条件）时可匹配任意 URL，
+                // 预筛必须放宽到 .*，否则会把该分支整体漏掉。
+                let mut parts = Vec::new();
+                for c in v {
+                    match c.prefilter() {
+                        Some(p) => parts.push(p),
+                        None => return None,
+                    }
+                }
+                if parts.is_empty() { None } else { Some(format!("(?:{})", parts.join(")|(?:"))) }
+            }
+            LoonCond::Not(_) | LoonCond::Bool(_) | LoonCond::HeaderEq { .. } | LoonCond::HeaderRegex { .. } => None,
+        }
+    }
+}
+
+fn header_values<'a>(headers: &'a [(String, String)], name: &str) -> Vec<&'a str> {
+    headers
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct LoonRule {
     pub phase: LoonPhase,
+    /// 预筛 URL 正则；复合条件还会在 plan 阶段用 [LoonCond] 精确求值。
     pub url: Regex,
+    pub cond: Option<LoonCond>,
     pub action: LoonAction,
     pub raw: String,
+}
+
+impl LoonRule {
+    pub fn applies(&self, url: &str, headers: &[(String, String)]) -> bool {
+        self.url.is_match(url)
+            && self.cond.as_ref().map(|c| c.matches(url, headers)).unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -323,7 +401,7 @@ fn parse_old(line: &str) -> Option<Vec<LoonRule>> {
 /// 按 `url action params` 构造规则；动作不认识就返回 None，由调用方换另一种顺序重试。
 fn build_old_rule(url: &Regex, action: &str, params: &[String], line: &str) -> Option<Vec<LoonRule>> {
     let req = |a: LoonAction| {
-        Some(vec![LoonRule { phase: LoonPhase::Request, url: url.clone(), action: a, raw: line.into() }])
+        Some(vec![LoonRule { phase: LoonPhase::Request, url: url.clone(), cond: None, action: a, raw: line.into() }])
     };
     if action == "header" {
         return req(LoonAction::UrlReplace(params.first()?.clone()));
@@ -348,6 +426,7 @@ fn build_old_rule(url: &Regex, action: &str, params: &[String], line: &str) -> O
         return Some(ops.into_iter().map(|op| LoonRule {
             phase,
             url: url.clone(),
+            cond: None,
             action: if is_request { LoonAction::RequestHeader(op) } else { LoonAction::ResponseHeader(op) },
             raw: line.into(),
         }).collect());
@@ -357,6 +436,7 @@ fn build_old_rule(url: &Regex, action: &str, params: &[String], line: &str) -> O
         return Some(ops.into_iter().map(|op| LoonRule {
             phase,
             url: url.clone(),
+            cond: None,
             action: if is_request { LoonAction::RequestBody(op) } else { LoonAction::ResponseBody(op) },
             raw: line.into(),
         }).collect());
@@ -637,6 +717,191 @@ fn parse_new_action(call: &str, default_phase: LoonPhase) -> Option<(LoonPhase, 
     }
 }
 
+
+/// 顶层运算符切分：跳过引号、括号与 `/regex/` 内的 `&&`/`||`。
+fn split_top<'a>(s: &'a str, op: &str) -> Vec<&'a str> {
+    let b = s.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut quote = 0u8;
+    let mut depth = 0i32;
+    let mut in_re = false;
+    let mut esc = false;
+    let mut expect_re = false;
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if quote != 0 {
+            if esc { esc = false; }
+            else if c == b'\\' { esc = true; }
+            else if c == quote { quote = 0; }
+            i += 1;
+            continue;
+        }
+        if in_re {
+            if esc { esc = false; }
+            else if c == b'\\' { esc = true; }
+            else if c == b'/' { in_re = false; }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' | b'"' => quote = c,
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'/' if expect_re => { in_re = true; expect_re = false; }
+            b'=' if i > 0 && b[i - 1] == b'~' => expect_re = true,
+            b'~' if i > 0 && b[i - 1] == b'!' => expect_re = true,
+            _ => {}
+        }
+        if depth == 0 && quote == 0 && !in_re && b[i..].starts_with(op.as_bytes()) {
+            let part = s[start..i].trim();
+            if !part.is_empty() { parts.push(part); }
+            start = i + op.len();
+            i = start;
+            continue;
+        }
+        i += 1;
+    }
+    let tail = s[start..].trim();
+    if !tail.is_empty() { parts.push(tail); }
+    parts
+}
+
+fn strip_outer_parens(s: &str) -> &str {
+    let t = s.trim();
+    if !t.starts_with('(') || !t.ends_with(')') { return t; }
+    let b = t.as_bytes();
+    let mut quote = 0u8;
+    let mut depth = 0i32;
+    let mut in_re = false;
+    let mut esc = false;
+    let mut expect_re = false;
+    for (i, &c) in b.iter().enumerate() {
+        if quote != 0 {
+            if esc { esc = false; }
+            else if c == b'\\' { esc = true; }
+            else if c == quote { quote = 0; }
+            continue;
+        }
+        if in_re {
+            if esc { esc = false; }
+            else if c == b'\\' { esc = true; }
+            else if c == b'/' { in_re = false; }
+            continue;
+        }
+        match c {
+            b'\'' | b'"' => quote = c,
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 && i != b.len() - 1 { return t; }
+            }
+            b'/' if expect_re => { in_re = true; expect_re = false; }
+            b'=' if i > 0 && b[i - 1] == b'~' => expect_re = true,
+            b'~' if i > 0 && b[i - 1] == b'!' => expect_re = true,
+            _ => {}
+        }
+    }
+    if depth == 0 { &t[1..t.len() - 1] } else { t }
+}
+
+fn parse_bool_literal(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// 解析新版条件表达式；不支持的形式返回 None，由调用方整条报 unsupported。
+fn parse_condition(s: &str) -> Option<LoonCond> {
+    let t = strip_outer_parens(s.trim());
+    if t.is_empty() { return None; }
+    if t != s.trim() { return parse_condition(t); }
+    let ors = split_top(t, "||");
+    if ors.len() > 1 {
+        let mut v = Vec::new();
+        for p in ors { v.push(parse_condition(p)?); }
+        return Some(LoonCond::Or(v));
+    }
+    let ands = split_top(t, "&&");
+    if ands.len() > 1 {
+        let mut v = Vec::new();
+        for p in ands { v.push(parse_condition(p)?); }
+        return Some(LoonCond::And(v));
+    }
+    parse_condition_atom(t)
+}
+
+fn parse_condition_atom(t: &str) -> Option<LoonCond> {
+    let t = t.trim();
+    if let Some(rest) = t.strip_prefix("${url}") {
+        let rest = rest.trim();
+        let (neg, lit) = if let Some(r) = rest.strip_prefix("~=") {
+            (false, r.trim())
+        } else if let Some(r) = rest.strip_prefix("!~") {
+            (true, r.trim())
+        } else {
+            return None;
+        };
+        let lit = lit.split(" as ").next().unwrap_or(lit).trim();
+        let (re, _) = parse_regex_literal(lit)?;
+        let c = LoonCond::Url(re);
+        return Some(if neg { LoonCond::Not(Box::new(c)) } else { c });
+    }
+    // ${request.header['X']} / ${request.headers['X']}
+    let header_prefix = t
+        .strip_prefix("${request.header[")
+        .or_else(|| t.strip_prefix("${request.headers["));
+    if let Some(rest) = header_prefix {
+        let close = rest.find(']')?;
+        let name = rest[..close].trim().trim_matches(|c| c == '\'' || c == '"').to_string();
+        if name.is_empty() { return None; }
+        // rest 以 `]}` 收尾：跳过 ] 后再去掉 }，才是运算符起点。
+        let tail = rest[close + 1..].trim().trim_start_matches('}').trim();
+        if let Some(r) = tail.strip_prefix("~=") {
+            let (re, _) = parse_regex_literal(r.trim())?;
+            return Some(LoonCond::HeaderRegex { name, re });
+        }
+        if let Some(r) = tail.strip_prefix("!~") {
+            let (re, _) = parse_regex_literal(r.trim())?;
+            return Some(LoonCond::Not(Box::new(LoonCond::HeaderRegex { name, re })));
+        }
+        if let Some(r) = tail.strip_prefix("!=") {
+            let value = r.trim();
+            let eq = if value.eq_ignore_ascii_case("null") {
+                None
+            } else {
+                Some(value.trim_matches(|c| c == '\'' || c == '"').to_string())
+            };
+            return Some(LoonCond::Not(Box::new(LoonCond::HeaderEq { name, value: eq })));
+        }
+        if let Some(r) = tail.strip_prefix("==") {
+            let value = r.trim();
+            let eq = if value.eq_ignore_ascii_case("null") {
+                None
+            } else {
+                Some(value.trim_matches(|c| c == '\'' || c == '"').to_string())
+            };
+            return Some(LoonCond::HeaderEq { name, value: eq });
+        }
+        return None;
+    }
+    // 参数展开后可能剩下 `true == true` / `false == true`，直接算常量。
+    if let Some((a, b)) = t.split_once("==") {
+        if let (Some(x), Some(y)) = (parse_bool_literal(a), parse_bool_literal(b)) {
+            return Some(LoonCond::Bool(x == y));
+        }
+    }
+    if let Some((a, b)) = t.split_once("!=") {
+        if let (Some(x), Some(y)) = (parse_bool_literal(a), parse_bool_literal(b)) {
+            return Some(LoonCond::Bool(x != y));
+        }
+    }
+    parse_bool_literal(t).map(LoonCond::Bool)
+}
+
 fn parse_new(line: &str) -> Option<Vec<LoonRule>> {
     let lower = line.to_ascii_lowercase();
     let phase = if lower.starts_with("request if ") {
@@ -655,34 +920,28 @@ fn parse_new(line: &str) -> Option<Vec<LoonRule>> {
         .or_else(|| condition.strip_prefix("request IF "))
         .unwrap_or(condition)
         .trim();
-    // 只接受单条 ${url} ~= /regex/ 条件；&&、|| 与 header 变量不猜测执行。
-    if cond.starts_with("${url}") {
-        let rest = cond["${url}".len()..].trim();
-        if !rest.starts_with("~=") {
-            return None;
+    let cond_ast = parse_condition(cond)?;
+    let prefilter = cond_ast.prefilter().unwrap_or_else(|| ".*".to_string());
+    let url = Regex::new(&prefilter).ok()?;
+    let mut rules = Vec::new();
+    for call in actions.split(';') {
+        let call = call.trim();
+        if call.is_empty() {
+            continue;
         }
-        let literal = rest[2..].trim();
-        // `as urlMatch` 只是命名，不影响匹配。
-        if literal.contains("&&") || literal.contains("||") || literal.contains("${") {
-            return None;
-        }
-        let literal = literal.split(" as ").next().unwrap_or(literal).trim();
-        let (url, _) = parse_regex_literal(literal)?;
-        let mut rules = Vec::new();
-        for call in actions.split(';') {
-            let call = call.trim();
-            if call.is_empty() {
-                continue;
-            }
-            let (p, a) = parse_new_action(call, phase)?;
-            rules.push(LoonRule { phase: p, url: url.clone(), action: a, raw: line.into() });
-        }
-        if rules.is_empty() {
-            return None;
-        }
-        return Some(rules);
+        let (p, a) = parse_new_action(call, phase)?;
+        rules.push(LoonRule {
+            phase: p,
+            url: url.clone(),
+            cond: Some(cond_ast.clone()),
+            action: a,
+            raw: line.into(),
+        });
     }
-    None
+    if rules.is_empty() {
+        return None;
+    }
+    Some(rules)
 }
 
 pub fn parse_loon_rewrites(lines: &[String]) -> LoonSet {
@@ -1085,5 +1344,53 @@ mod tests {
         assert_eq!(m.body, br#"{"ok":1}"#);
         let t = tokenize(r#"mock-response-body data-type=json data-path=response_body.json"#);
         assert!(parse_mock(&t, true).is_none());
+    }
+
+    #[test]
+    fn new_syntax_compound_conditions_are_evaluated() {
+        let lines = vec![
+            r#"request if ${url} ~= /^https:\/\/api\.x\.com\/feed/ && ${request.header['X-Test']} == "yes" then request.header.add("X-A", "1")"#.to_string(),
+        ];
+        let set = parse_loon_rewrites(&lines);
+        assert_eq!(set.unsupported.len(), 0, "{:?}", set.unsupported);
+        assert_eq!(set.rules.len(), 1);
+        let rule = &set.rules[0];
+        let h = vec![("X-Test".to_string(), "yes".to_string())];
+        assert!(rule.applies("https://api.x.com/feed/index", &h));
+        assert!(!rule.applies("https://api.x.com/feed/index", &[("X-Test".into(), "no".into())]));
+        assert!(!rule.applies("https://api.x.com/other", &h));
+    }
+
+    #[test]
+    fn new_syntax_header_regex_and_or() {
+        let lines = vec![
+            r#"response if ${request.header['Content-Type']} ~= /json/ || ${request.header['X-Mode']} == "legacy" then response.header.add("X-R", "1")"#.to_string(),
+        ];
+        let set = parse_loon_rewrites(&lines);
+        assert_eq!(set.unsupported.len(), 0, "{:?}", set.unsupported);
+        let rule = &set.rules[0];
+        assert!(rule.applies("https://x.com/a", &[("Content-Type".into(), "application/json".into())]));
+        assert!(rule.applies("https://x.com/a", &[("X-Mode".into(), "legacy".into())]));
+        assert!(!rule.applies("https://x.com/a", &[("Content-Type".into(), "text/html".into())]));
+    }
+
+    #[test]
+    fn new_syntax_boolean_argument_constant() {
+        let lines = vec![
+            r#"request if false == true then request.header.add("X-Never", "1")"#.to_string(),
+        ];
+        let set = parse_loon_rewrites(&lines);
+        assert_eq!(set.unsupported.len(), 0, "{:?}", set.unsupported);
+        assert!(!set.rules[0].applies("https://x.com/a", &[]));
+    }
+
+    #[test]
+    fn unsupported_new_condition_is_reported_not_executed() {
+        let lines = vec![
+            r#"request if ${request.header['X']} > 3 then request.header.add("X-A", "1")"#.to_string(),
+        ];
+        let set = parse_loon_rewrites(&lines);
+        assert_eq!(set.rules.len(), 0);
+        assert_eq!(set.unsupported.len(), 1);
     }
 }

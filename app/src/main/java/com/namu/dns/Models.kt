@@ -229,6 +229,8 @@ data class StatsData(
     val mitmQuicBlocked: Long = 0,
     /** 域名命中但因「按 App MITM」范围而放行的连接数。 */
     val mitmAppSkipped: Long = 0,
+    /** 金融保护放行的连接数（整包 UID / 金融域名 / 混合 App 关键字）。 */
+    val mitmFinanceSkipped: Long = 0,
     // 按 App 分流：成功解析归属的连接数 / 有 UID 规则但归属未知的连接数
     val uidResolved: Long = 0,
     val uidUnknown: Long = 0,
@@ -294,6 +296,7 @@ data class StatsData(
                     mitmFailed = o.optLong("mitmFailed"),
                     mitmQuicBlocked = o.optLong("mitmQuicBlocked"),
                     mitmAppSkipped = o.optLong("mitmAppSkipped"),
+                    mitmFinanceSkipped = o.optLong("mitmFinanceSkipped"),
                     uidResolved = o.optLong("uidResolved"),
                     uidUnknown = o.optLong("uidUnknown"),
                     tunTxDrop = o.optLong("tunTxDrop"),
@@ -558,6 +561,8 @@ data class AppConfig(
     var rulesUrl: String = "",
     var customAds: List<String> = emptyList(),
     var autoUpdateRules: Boolean = true,
+    /** 金融连接保护：支付/银行/账号安全连接不走 MITM，默认开启。 */
+    var financeProtect: Boolean = true,
     var rulesUpdatedAt: Long = 0L,
     var allowDnsFallback: Boolean = true,
     var blockWhenNoNode: Boolean = true,
@@ -579,6 +584,10 @@ data class AppConfig(
     var dnsOnlyFullRoute: Boolean = true,
     /** 蜂窝 UDP 假活（QUIC 黑洞）自动回落 TCP：长时间无回包即对同一目标丢弃 QUIC。 */
     var quicFallback: Boolean = true,
+    /** TUN MTU：巨帧把本机腿包数降约 6 倍；壳与内核取同一值，establish 失败自动回退 1500。 */
+    var mtu: Int = 9000,
+    /** 上游 per-socket BBR（WAN 腿）；内核不支持时静默回退 cubic。 */
+    var bbr: Boolean = true,
     /** system / light / dark；仅影响外壳配色，不进入内核配置。 */
     var themeMode: String = "system",
     /** 开机或默认网络恢复时自动启动 VPN。 */
@@ -622,6 +631,7 @@ data class AppConfig(
         put("rulesUrl", rulesUrl)
         put("customAds", JSONArray().apply { customAds.forEach { put(it) } })
         put("autoUpdateRules", autoUpdateRules)
+        put("financeProtect", financeProtect)
         put("rulesUpdatedAt", rulesUpdatedAt)
         put("allowDnsFallback", allowDnsFallback)
         put("blockWhenNoNode", blockWhenNoNode)
@@ -629,6 +639,8 @@ data class AppConfig(
         put("blockAaaa", blockAaaa)
         put("dnsOnlyFullRoute", dnsOnlyFullRoute)
         put("quicFallback", quicFallback)
+        put("mtu", mtu)
+        put("bbr", bbr)
         put("sniff", sniff)
         put("autoSelectNode", autoSelectNode)
         put("autoClearLogs", autoClearLogs)
@@ -662,10 +674,11 @@ data class AppConfig(
             "fallbackGeoCheck", "dnsQueryLog", "remoteConfigUrl", "remoteConfigName",
             "remoteConfigUpdatedAt", "remoteConfigInterval", "ruleSources", "moduleSources",
             "blockEnabled", "blockMode", "cnDirect", "finalPolicy", "subscription", "rulesUrl",
-            "customAds", "autoUpdateRules", "rulesUpdatedAt", "allowDnsFallback", "blockWhenNoNode",
+            "customAds", "autoUpdateRules", "financeProtect", "rulesUpdatedAt", "allowDnsFallback", "blockWhenNoNode",
             "fakeIp", "blockAaaa", "sniff", "autoSelectNode", "autoClearLogs",
             "autoDisablePrivateDns", "themeMode", "autoConnect", "pingMethod", "subscriptionInfo",
-            "rules", "proxyGroups", "groupSelections", "mitm",
+            "rules", "proxyGroups", "groupSelections", "mitm", "mtu", "bbr", "quicFallback",
+            "dnsOnlyFullRoute",
         )
 
         fun defaultRules() = listOf(
@@ -755,6 +768,7 @@ data class AppConfig(
                     rulesUrl = o.optString("rulesUrl", def.rulesUrl),
                     customAds = customAds.distinct(),
                     autoUpdateRules = o.optBoolean("autoUpdateRules", true),
+                    financeProtect = o.optBoolean("financeProtect", true),
                     rulesUpdatedAt = o.optLong("rulesUpdatedAt", 0L),
                     allowDnsFallback = o.optBoolean("allowDnsFallback", true),
                     blockWhenNoNode = o.optBoolean("blockWhenNoNode", true),
@@ -762,6 +776,8 @@ data class AppConfig(
                     blockAaaa = o.optBoolean("blockAaaa", false),
                     dnsOnlyFullRoute = o.optBoolean("dnsOnlyFullRoute", true),
                     quicFallback = o.optBoolean("quicFallback", true),
+                    mtu = o.optInt("mtu", 9000).coerceIn(1280, 9000),
+                    bbr = o.optBoolean("bbr", true),
                     sniff = o.optBoolean("sniff", true),
                     autoSelectNode = o.optBoolean("autoSelectNode", false),
                     autoClearLogs = o.optBoolean("autoClearLogs", true),

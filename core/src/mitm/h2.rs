@@ -7,7 +7,7 @@ use crate::engine::Action;
 use crate::logging;
 use crate::netstack::Ctx;
 use crate::outbound;
-use super::{MitmState, RewriteAction, RewriteRule, ScriptMessage, ScriptPhase};
+use super::{ConnTrace, MitmState, RewriteAction, RewriteRule, ScriptMessage, ScriptPhase};
 use super::loon::{self, BodyOp, HeaderOp};
 use super::http1::{BodyKind, RequestHead};
 use bytes::Bytes;
@@ -35,6 +35,24 @@ pub fn is_grpc(headers: &HeaderMap) -> bool {
         .and_then(|v| v.to_str().ok())
         .map(|v| v.trim().to_ascii_lowercase().starts_with("application/grpc"))
         .unwrap_or(false)
+}
+
+/// h2 stream 错误是否只是客户端提前取消。`unexpected frame type` 来自 h2
+/// 状态机：stream 已被对端 RST/关闭后我们再发响应头就会报它，属于弃流而非协议错。
+fn is_client_cancel(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    const KEYS: [&str; 9] = [
+        "unexpected frame type",
+        "close_notify",
+        "unexpected eof",
+        "unexpected-eof",
+        "broken pipe",
+        "connection reset",
+        "connection aborted",
+        "stream closed",
+        "reset by peer",
+    ];
+    KEYS.iter().any(|k| m.contains(k))
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -234,11 +252,23 @@ pub async fn serve<S>(
     ctx: Arc<Ctx>,
     state: Arc<MitmState>,
     conn_id: u64,
+    trace: Arc<ConnTrace>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    serve_with_preface_timeout(tls, host, target, action, ctx, state, conn_id, H2_CLIENT_PREFACE_TIMEOUT).await
+    serve_with_preface_timeout(
+        tls,
+        host,
+        target,
+        action,
+        ctx,
+        state,
+        conn_id,
+        trace,
+        H2_CLIENT_PREFACE_TIMEOUT,
+    )
+    .await
 }
 
 /// 可指定客户端 preface 等待时长的入口（测试用短超时；生产 serve 用 60s）。
@@ -250,6 +280,7 @@ pub async fn serve_with_preface_timeout<S>(
     ctx: Arc<Ctx>,
     state: Arc<MitmState>,
     conn_id: u64,
+    trace: Arc<ConnTrace>,
     preface_timeout: Duration,
 ) -> io::Result<()>
 where
@@ -257,7 +288,19 @@ where
 {
     let mut conn = match tokio::time::timeout(preface_timeout, ::h2::server::handshake(tls)).await {
         Ok(Ok(conn)) => conn,
-        Ok(Err(e)) => return Err(outbound::io_err(format!("h2 服务端握手失败: {}", e))),
+        Ok(Err(e)) => {
+            // 客户端在 h2 preface 前直接断开：多为连接池预热/弃用（cronet 等）。
+            // 这不算 MITM 失败，按空闲回收记 info，避免 mitmFailed/告警被噪声污染。
+            let msg = e.to_string();
+            if msg.contains("close_notify") || msg.contains("unexpected eof") {
+                logging::info(
+                    "mitm",
+                    format!("#{} {} h2 客户端提前断开（连接池弃连），按回收处理", conn_id, host),
+                );
+                return Ok(());
+            }
+            return Err(outbound::io_err(format!("h2 服务端握手失败: {}", e)));
+        }
         Err(_) => {
             // 客户端完成 TLS 但迟迟未发 h2 preface：多为连接池预热/备用连接。
             // 按空闲连接安静回收，不当错误 warn（避免日志噪声与误报）。
@@ -280,6 +323,7 @@ where
         let ctx = ctx.clone();
         let state = state.clone();
         let upstream = upstream.clone();
+        let trace = trace.clone();
         tokio::spawn(async move {
             let mut responder = Responder::new(respond);
             if let Err(e) = handle_stream(
@@ -290,9 +334,20 @@ where
                 &state,
                 upstream,
                 conn_id,
+                trace,
             )
             .await
             {
+                if is_client_cancel(&e) {
+                    // 客户端在改写送达前就 RST/弃流（splash、feed 这类紧超时接口常见）。
+                    // 不是我们协议出错，不计失败、不刷 warn，单独计数便于定位真实漏改。
+                    ctx.stats.mitm_canceled.fetch_add(1, Ordering::Relaxed);
+                    logging::info(
+                        "mitm",
+                        format!("#{} {} 客户端在响应送达前取消（弃流），改写未送达", conn_id, host),
+                    );
+                    return;
+                }
                 logging::warn("mitm", format!("#{} {} h2 stream 失败: {}", conn_id, host, e));
                 if !responder.sent {
                     let _ = send_status(&mut responder, 502);
@@ -314,6 +369,7 @@ async fn handle_stream(
     state: &Arc<MitmState>,
     upstream_handle: Arc<UpstreamHandle>,
     conn_id: u64,
+    trace: Arc<ConnTrace>,
 ) -> Result<(), String> {
     let url = url_for(host, &req);
     let hits = state.engine.rules_for(&url);
@@ -387,6 +443,34 @@ async fn handle_stream(
     let script_url = format!("https://{}{}", plan.host, rh.path);
     let request_scripts = state.engine.scripts.has_phase(&script_url, ScriptPhase::Request);
     let script_needs_body = request_scripts && state.engine.scripts.needs_request_body(&script_url);
+    trace.reqs.fetch_add(1, Ordering::Relaxed);
+    ctx.stats.mitm_reqs.fetch_add(1, Ordering::Relaxed);
+    // 响应阶段的规则/脚本同样算命中：B 站首页这类改写全在响应体阶段，
+    // 只看请求阶段会把「改写成功」误报成「无规则」，诊断口径必须两阶段一起算。
+    let response_scripts = state.engine.scripts.has_phase(&script_url, ScriptPhase::Response);
+    let matched = !hits.is_empty()
+        || !loon_hits.is_empty()
+        || request_scripts
+        || response_scripts
+        || !plan.response_headers.is_empty()
+        || !plan.response_body_ops.is_empty()
+        || plan.request_mock.is_some()
+        || plan.terminal.is_some();
+    if !matched {
+        trace.no_rule.fetch_add(1, Ordering::Relaxed);
+        ctx.stats.mitm_no_rule.fetch_add(1, Ordering::Relaxed);
+        if !trace.noted.swap(true, Ordering::Relaxed) {
+            logging::info(
+                "mitm",
+                format!(
+                    "#{} {} 请求与响应均未命中规则: {}",
+                    conn_id,
+                    host,
+                    http1_redact(&path_for_log)
+                ),
+            );
+        }
+    }
     if let Some(term) = &plan.terminal {
         send_terminal(responder, term, &plan.response_headers)?;
         ctx.stats.mitm_rejected.fetch_add(1, Ordering::Relaxed);
@@ -1273,6 +1357,24 @@ fn http1_redact(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 客户端 RST 后再发响应头会得到 unexpected frame type，属弃流不是协议错。
+    #[test]
+    fn client_cancel_classification() {
+        for m in [
+            "h2 响应头发送失败: user error: unexpected frame type",
+            "h2 响应体结束失败: broken pipe",
+            "peer closed connection without sending TLS close_notify",
+        ] {
+            assert!(is_client_cancel(m), "应判为客户端取消: {}", m);
+        }
+        for m in [
+            "h2 上游连接失败（已重试 1 次）: 连接超时",
+            "h2 响应体读取失败: invalid frame",
+        ] {
+            assert!(!is_client_cancel(m), "不应判为取消: {}", m);
+        }
+    }
 
     fn grpc_headers() -> HeaderMap {
         let mut h = HeaderMap::new();

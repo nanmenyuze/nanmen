@@ -56,8 +56,10 @@ data class ParsedModule(
     val ruleSets: List<RuleSetRef> = emptyList(),
     /** Loon [Rewrite] 原始行（旧版/新版），由内核解析执行。 */
     val loonRewrites: List<String> = emptyList(),
-    /** [Argument] 参数定义（仅记录，内核不执行运行时替换）。 */
+    /** [Argument] 参数定义；键 → 默认值。 */
     val arguments: Map<String, String> = emptyMap(),
+    /** [Argument] 声明类型（string / number / boolean）；内核据此注入正确的 JS 类型。 */
+    val argumentTypes: Map<String, String> = emptyMap(),
     /** [Host] 域名映射（仅记录，当前内核没有 Host 覆盖能力）。 */
     val hostMappings: Map<String, String> = emptyMap(),
     /** [Script] 原始行。 */
@@ -100,6 +102,7 @@ object ModuleParser {
         val headerRewrites = mutableListOf<String>()
         val loonRewrites = mutableListOf<String>()
         val arguments = linkedMapOf<String, String>()
+        val argumentTypes = linkedMapOf<String, String>()
         val hostMappings = linkedMapOf<String, String>()
         val scriptLines = mutableListOf<String>()
         val scripts = mutableListOf<ScriptConfig>()
@@ -191,9 +194,10 @@ object ModuleParser {
                 }
                 section == "argument" -> {
                     acc(section).lines++
-                    val key = line.substringBefore('=', "").trim()
-                    if (key.isNotBlank() && line.contains('=')) {
-                        arguments[key] = line.substringAfter('=').trim()
+                    val decl = parseArgumentDecl(line)
+                    if (decl != null) {
+                        arguments[decl.first] = decl.second.first
+                        argumentTypes[decl.first] = decl.second.second
                     }
                     ignore("runtime_argument")
                 }
@@ -211,7 +215,8 @@ object ModuleParser {
                 section == "script" -> {
                     acc(section).lines++
                     scriptLines.add(line)
-                    val parsed = parseScriptLine(line, arguments)
+                    val parsed = parseScriptV2(line, arguments, argumentTypes)
+                        ?: parseScriptLine(line, arguments, argumentTypes)
                     if (parsed.first != null) {
                         scripts.add(parsed.first!!)
                         acc(section).ok++
@@ -226,11 +231,19 @@ object ModuleParser {
                 }
             }
         }
+        // [Argument] 可能出现在 [Rewrite]/[Script] 之后：统一按默认值展开参数引用，
+        // 保留 ${url} 等运行时变量。声明无编辑入口，因此编译期展开与 Loon 默认值语义一致。
+        loonRewrites.replaceAll { expandArguments(it, arguments) }
+        urlRewrites.replaceAll { expandArguments(it, arguments) }
+        headerRewrites.replaceAll { expandArguments(it, arguments) }
         // [Argument] 可能出现在 [Script] 之后；统一把最终参数并入每条脚本。
         scripts.replaceAll { rule ->
             val merged = LinkedHashMap(rule.arguments)
             arguments.forEach { (k, v) -> if (!merged.containsKey(k)) merged[k] = v }
-            rule.copy(arguments = merged)
+            rule.copy(
+                arguments = merged,
+                argumentTypes = argumentTypes.filterKeys { merged.containsKey(it) },
+            )
         }
         val statuses = sectionAcc.map { (key, a) ->
             val name = when (key) {
@@ -271,7 +284,7 @@ object ModuleParser {
         val dependencies = buildList {
             if (scripts.isNotEmpty()) add("QuickJS 脚本运行时（内置，Promise/async 微任务已支持）；binary-body-mode/Uint8Array 已支持，require/本地文件读取不支持，setTimeout 按 Loon 语义只执行一次")
             if (scriptLines.isNotEmpty() && scripts.isEmpty()) add("脚本规则（未解析，[Script] 不执行）")
-            if (arguments.isNotEmpty()) add("参数替换（未实现，\${argument} 不展开）")
+            if (arguments.isNotEmpty()) add("参数替换：\$argument 按声明类型注入；Rewrite/Script 条件与动作里的 \${参数} 按默认值展开")
             if (hostMappings.isNotEmpty()) add("Host 映射（未实现）")
             if (sectionAcc["general"]?.lines ?: 0 > 0) add("General 全局项（仅记录）")
         }
@@ -290,6 +303,7 @@ object ModuleParser {
             lostRouteTargets = lostTargets.toList(),
             loonRewrites = loonRewrites.distinct(),
             arguments = arguments,
+            argumentTypes = argumentTypes,
             hostMappings = hostMappings,
             scriptLines = scriptLines.toList(),
             scripts = scripts.distinctBy { "${it.phase}|${it.pattern}|${it.scriptPath}|${it.name}" },
@@ -401,7 +415,9 @@ object ModuleParser {
     private fun loonRewriteSupported(line: String): Boolean {
         val lower = line.lowercase()
         if (lower.startsWith("request if ") || lower.startsWith("response if ")) {
-            if (lower.contains("&&") || lower.contains("||") || lower.contains(" script(")) return false
+            // 复合条件（&&/||、header/参数比较）由内核 LoonCond 条件树求值；
+            // 壳层只拒绝 rewrite 段里混入 script 动作的行。
+            if (lower.contains(" script(")) return false
             val thenPart = lower.substringAfter(" then ", "")
             if (thenPart.isBlank()) return false
             val supportedFns = listOf(
@@ -577,7 +593,149 @@ object ModuleParser {
      * 以及 `type=request, pattern=..., script-path=...` 形式。
      * 不认识的键只会被忽略，不会把整条脚本当成可执行。
      */
-    private fun parseScriptLine(raw: String, moduleArgs: Map<String, String>): Pair<ScriptConfig?, String?> {
+    /** 展开插件参数：`${region}` → 默认值；保留 `${url}` 与 `${request...}` 等运行时变量。 */
+    private fun expandArguments(text: String, args: Map<String, String>): String {
+        if (args.isEmpty()) return text
+        val re = Regex("""\$\{([A-Za-z_][A-Za-z0-9_.-]*)\}""")
+        return re.replace(text) { m ->
+            val name = m.groupValues[1]
+            if (name == "url" || name.startsWith("request") || name.startsWith("response")) {
+                m.value
+            } else {
+                args[name] ?: m.value
+            }
+        }
+    }
+
+    private fun indexOfIgnoreCase(text: String, needle: String, start: Int = 0): Int =
+        text.lowercase().indexOf(needle.lowercase(), start)
+
+    /**
+     * Loon 3.5.1 Script v2：
+     * `request if ${url} ~= /re/ then script("a.js", {${x}}) with requires_body=true, timeout=5, tag="x"`
+     * 只接受单条 `${url} ~= /re/` 条件；`&&`/`||`/header 条件明确报不支持，
+     * 避免按旧语法误解析成「看起来生效、实际不执行」。cron 无调度器，明确拒绝。
+     */
+    private fun parseScriptV2(
+        raw: String,
+        moduleArgs: Map<String, String>,
+        moduleTypes: Map<String, String>,
+    ): Pair<ScriptConfig?, String?>? {
+        val lower = raw.trim().lowercase()
+        if (!lower.startsWith("request if ") && !lower.startsWith("response if ") && !lower.startsWith("cron ")) {
+            return null
+        }
+        if (lower.startsWith("cron ")) {
+            return null to "cron 定时脚本暂不支持（内核无调度器）: ${raw.take(60)}"
+        }
+        val line = expandArguments(raw.trim(), moduleArgs)
+        val thenIdx = indexOfIgnoreCase(line, " then ")
+        if (thenIdx <= 0) return null to "Script v2 缺少 then: ${line.take(80)}"
+        val phase = if (line.lowercase().startsWith("request if ")) "request" else "response"
+        val condRaw = line.substring(line.indexOf(" if ") + 4, thenIdx).trim()
+        if (condRaw.contains("&&") || condRaw.contains("||")) {
+            return null to "Script v2 复合条件暂不支持: ${condRaw.take(80)}"
+        }
+        val cond = condRaw.substringBefore(" as ").trim()
+        if (!cond.startsWith("\${url}")) {
+            return null to "Script v2 仅支持 \${url} 条件: ${cond.take(80)}"
+        }
+        val rest = cond.removePrefix("\${url}").trim()
+        if (!rest.startsWith("~=")) return null to "Script v2 条件运算符不支持: ${cond.take(80)}"
+        val literal = rest.removePrefix("~=").trim()
+        val pattern = regexLiteral(literal) ?: return null to "Script v2 URL 正则非法: ${literal.take(80)}"
+        val actionRaw = line.substring(thenIdx + 6).trim()
+        val call = Regex("""^script\s*\(\s*"([^"]+)"\s*(?:,\s*\{[^}]*\})?\s*\)""").find(actionRaw)
+            ?: return null to "Script v2 动作只支持 script(\"http(s)://...\"): ${actionRaw.take(80)}"
+        val scriptPath = call.groupValues[1].trim()
+        val withRaw = actionRaw.substring(call.range.last + 1).trim().removePrefix("with").trim()
+        var requiresBody = false
+        var binaryBody = false
+        var timeoutMs = 5000
+        var tag = ""
+        var enabled = true
+        for (opt in splitTopLevel(withRaw)) {
+            val i = opt.indexOf('=')
+            if (i <= 0) continue
+            val key = opt.substring(0, i).trim().lowercase()
+            val value = opt.substring(i + 1).trim().trim('"', '\'')
+            when (key) {
+                "requires_body", "requires-body" -> requiresBody = value.lowercase() in setOf("1", "true", "yes", "on")
+                "binary_body_mode", "binary-body-mode" -> binaryBody = value.lowercase() in setOf("1", "true", "yes", "on")
+                "timeout" -> {
+                    val n = value.toIntOrNull() ?: 0
+                    timeoutMs = if (n in 1..60) n * 1000 else n.coerceAtLeast(50)
+                }
+                "tag", "name" -> tag = value
+                "enable", "enabled" -> enabled = value.lowercase() !in setOf("0", "false", "no", "off")
+            }
+        }
+        if (!enabled) return null to null
+        if (!scriptPath.startsWith("http://") && !scriptPath.startsWith("https://")) {
+            return null to "script-path 只支持 http/https: $scriptPath"
+        }
+        val args = LinkedHashMap(moduleArgs)
+        return ScriptConfig(
+            name = tag.ifBlank { scriptPath.substringAfterLast('/').ifBlank { pattern.take(48) } },
+            phase = phase,
+            pattern = pattern,
+            source = "",
+            arguments = args,
+            argumentTypes = moduleTypes.filterKeys { args.containsKey(it) },
+            timeoutMs = timeoutMs.coerceIn(50, 10_000),
+            maxSize = 2 * 1024 * 1024,
+            requiresBody = requiresBody || binaryBody,
+            binaryBodyMode = binaryBody,
+            scriptPath = scriptPath,
+        ) to null
+    }
+
+    /** 提取 `/regex/` 字面量；内部允许转义斜杠，取最后一个未转义 `/` 收尾。 */
+    private fun regexLiteral(raw: String): String? {
+        val t = raw.trim()
+        if (!t.startsWith("/")) return null
+        var end = -1
+        var escaped = false
+        for (i in 1 until t.length) {
+            val c = t[i]
+            if (escaped) { escaped = false; continue }
+            if (c == '\\') { escaped = true; continue }
+            if (c == '/') end = i
+        }
+        if (end <= 0) return null
+        return t.substring(1, end).ifBlank { null }
+    }
+
+    /** 按顶层逗号切分，尊重引号与 {} 嵌套。 */
+    private fun splitTopLevel(raw: String): List<String> {
+        val out = mutableListOf<String>()
+        val cur = StringBuilder()
+        var depth = 0
+        var quote = '\u0000'
+        for (ch in raw) {
+            when {
+                quote != '\u0000' -> {
+                    cur.append(ch)
+                    if (ch == quote) quote = '\u0000'
+                }
+                ch == '"' || ch == '\'' -> {
+                    quote = ch
+                    cur.append(ch)
+                }
+                ch == '{' || ch == '(' -> { depth++; cur.append(ch) }
+                ch == '}' || ch == ')' -> { depth--; cur.append(ch) }
+                ch == ',' && depth == 0 -> {
+                    if (cur.isNotBlank()) out.add(cur.toString().trim())
+                    cur.clear()
+                }
+                else -> cur.append(ch)
+            }
+        }
+        if (cur.isNotBlank()) out.add(cur.toString().trim())
+        return out
+    }
+
+    private fun parseScriptLine(raw: String, moduleArgs: Map<String, String>, moduleTypes: Map<String, String> = emptyMap()): Pair<ScriptConfig?, String?> {
         val line = raw.trim()
         if (line.isEmpty()) return null to "空脚本行"
         val tokens = splitScriptTokens(line)
@@ -647,6 +805,7 @@ object ModuleParser {
             pattern = pattern,
             source = "",
             arguments = args,
+            argumentTypes = moduleTypes.filterKeys { args.containsKey(it) },
             timeoutMs = timeoutMs.coerceIn(50, 10_000),
             maxSize = if (maxSize <= 0) 2 * 1024 * 1024 else maxSize.coerceIn(4096, 8 * 1024 * 1024),
             requiresBody = requiresBody || binaryBody,
@@ -657,6 +816,51 @@ object ModuleParser {
     }
 
     /** 逗号/空白分隔，但保留引号内的空格和逗号。 */
+    /**
+     * 解析 Loon [Argument] 声明，返回 key -> (默认值, 类型)。
+     * 支持 `input,"Loon",type=string`、`select,"CN","US",type=string`、
+     * `input,9.99,type=number`、`switch,true,type=boolean`；未写 type 时
+     * switch 判 boolean，其余按 string。number 解析失败降为 string，不注入 NaN。
+     */
+    private fun parseArgumentDecl(raw: String): Pair<String, Pair<String, String>>? {
+        val line = raw.trim()
+        val eq = line.indexOf('=')
+        if (eq <= 0) return null
+        val key = line.substring(0, eq).trim()
+        if (key.isEmpty()) return null
+        val tokens = splitScriptTokens(line.substring(eq + 1))
+        if (tokens.isEmpty()) return null
+        val control = tokens[0].lowercase()
+        val hasControl = control in setOf("input", "select", "switch", "checkbox", "text", "password", "slider")
+        var declared = ""
+        val candidates = mutableListOf<String>()
+        for (token in if (hasControl) tokens.drop(1) else tokens) {
+            val i = token.indexOf('=')
+            if (i > 0) {
+                val k = token.substring(0, i).trim().lowercase()
+                if (k == "type") declared = token.substring(i + 1).trim().trim('"', '\'').lowercase()
+                // tag / desc / enable 等展示字段不参与取值
+                continue
+            }
+            candidates.add(token.trim().trim('"', '\''))
+        }
+        val value = candidates.firstOrNull() ?: ""
+        var type = when {
+            declared in setOf("string", "number", "boolean") -> declared
+            control == "switch" -> "boolean"
+            else -> "string"
+        }
+        val normalized = when (type) {
+            "boolean" -> if (value.lowercase() in setOf("1", "true", "yes", "on")) "true" else "false"
+            "number" -> if (value.toDoubleOrNull() != null) value else {
+                type = "string"
+                value
+            }
+            else -> value
+        }
+        return key to (normalized to type)
+    }
+
     private fun splitScriptTokens(line: String): List<String> {
         val out = mutableListOf<String>()
         val cur = StringBuilder()

@@ -142,6 +142,8 @@ object ConfigStore {
         // Fake-IP 映射落盘（内核 1.1.0：mihomo/sing-box cache_file 同款），重启后连接层仍能反查域名
         root.put("fake_ip_file", File(context.filesDir, "namu_fakeip.json").absolutePath)
         root.put("sniff", cfg.sniff)
+        root.put("mtu", cfg.mtu.coerceIn(1280, 9000))
+        root.put("bbr", cfg.bbr)
         root.put("block_dot", true)
         // 「system」表示手机当前底层网络的 DNS；下发前转成内核可用的 UDP 地址。
         val sysDns = SystemDns.selection(context)
@@ -259,6 +261,8 @@ object ConfigStore {
             val mitmUids = AppUidResolver.resolveUids(context, cfg.mitm.apps).first
             put("app_mode", cfg.mitm.appMode)
             put("app_uids", JSONArray(mitmUids))
+            // 金融保护：支付/银行连接在 MITM 判定之前排除，默认开启。
+            put("finance", FinanceProtect.toJson(context, cfg.financeProtect))
         })
         root.put(
             "ads_files",

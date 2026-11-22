@@ -4,7 +4,7 @@ use base64::Engine;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 
 pub async fn connect_socks5(node: &Node, target: Target) -> io::Result<BoxStream> {
     let mut sock = tcp_connect(&node.server, node.port).await?;
@@ -68,7 +68,7 @@ pub async fn connect_socks5(node: &Node, target: Target) -> io::Result<BoxStream
 
 /// SOCKS5 UDP ASSOCIATE：控制连接保活，数据走 UDP relay，每包带 RSV/FRAG + 目标地址。
 pub struct Socks5Udp {
-    pub control: TcpStream,
+    pub control: BoxStream,
     pub socket: UdpSocket,
 }
 
