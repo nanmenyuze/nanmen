@@ -215,6 +215,49 @@ object Actions {
         }
     }
 
+    /** 解析订阅里的策略组；Clash 的 load-balance 类型与 strategy 必须保留。 */
+    internal fun importedProxyGroup(g: JSONObject): ProxyGroup? {
+        val name = g.optString("name", "").trim()
+        val members = mutableListOf<String>()
+        g.optJSONArray("members")?.let { ms ->
+            for (j in 0 until ms.length()) {
+                ms.optString(j, "").trim().takeIf { it.isNotBlank() }?.let { members.add(it) }
+            }
+        }
+        if (name.isBlank() || members.isEmpty()) return null
+        val type = g.optString("type", "select").trim().lowercase().let {
+            when (it) {
+                "url-test", "urltest" -> "url-test"
+                "fallback" -> "fallback"
+                "load-balance", "loadbalance", "balance" -> "load-balance"
+                else -> "select"
+            }
+        }
+        val lb = g.optString("lb_mode", "")
+            .ifBlank { g.optString("lbMode", "") }
+            .ifBlank { g.optString("strategy", "") }
+            .trim().lowercase()
+        val lbMode = when (lb) {
+            "consistent-hash", "consistenthash", "ch" -> "consistent-hash"
+            // Clash 的 load-balance 默认 strategy 是 round-robin；缺失时不能反选成 hash。
+            else -> "round-robin"
+        }
+        return ProxyGroup(
+            name = name,
+            type = type,
+            members = members,
+            testUrl = g.optString("test_url", g.optString("testUrl", "http://www.gstatic.com/generate_204")),
+            interval = g.optInt("interval", 600),
+            timeout = g.optInt("timeout", 5000),
+            tolerance = g.optInt("tolerance", 50),
+            failureThreshold = g.optInt("failure_threshold", g.optInt("failureThreshold", 3)),
+            recoveryThreshold = g.optInt("recovery_threshold", g.optInt("recoveryThreshold", 2)),
+            noNodeAction = g.optString("no_node_action", g.optString("noNodeAction", "global")),
+            lbMode = lbMode,
+            switchInterval = g.optInt("switch_interval", g.optInt("switchInterval", 30)),
+        )
+    }
+
     suspend fun importSubscription(
         rawInput: String,
         append: Boolean = false,
@@ -249,33 +292,7 @@ object Actions {
         obj.optJSONArray("proxy_groups")?.let { arr ->
             for (i in 0 until arr.length()) {
                 val g = arr.optJSONObject(i) ?: continue
-                val name = g.optString("name", "").trim()
-                val members = mutableListOf<String>()
-                g.optJSONArray("members")?.let { ms ->
-                    for (j in 0 until ms.length()) {
-                        ms.optString(j, "").trim().takeIf { it.isNotBlank() }?.let { members.add(it) }
-                    }
-                }
-                if (name.isBlank() || members.isEmpty()) continue
-                groups.add(
-                    ProxyGroup(
-                        name = name,
-                        type = g.optString("type", "select").lowercase().let {
-                            when (it) {
-                                "url-test", "urltest", "fallback" -> it.replace("urltest", "url-test")
-                                else -> "select"
-                            }
-                        },
-                        members = members,
-                        testUrl = g.optString("test_url", "http://www.gstatic.com/generate_204"),
-                        interval = g.optInt("interval", 600),
-                        timeout = g.optInt("timeout", 5000),
-                        tolerance = g.optInt("tolerance", 50),
-                        failureThreshold = g.optInt("failure_threshold", 3),
-                        recoveryThreshold = g.optInt("recovery_threshold", 2),
-                        noNodeAction = g.optString("no_node_action", "global"),
-                    )
-                )
+                importedProxyGroup(g)?.let { groups.add(it) }
             }
         }
         val warnings = mutableListOf<String>()
@@ -368,13 +385,23 @@ object Actions {
     }
 
     /** 下拉刷新/周期任务：重新拉取订阅并保留已有节点（同名覆盖），同时刷新 userinfo。 */
-    suspend fun refreshSubscription(): Boolean = withContext(Dispatchers.IO) {
+    suspend fun refreshSubscription(): ImportResult = withContext(Dispatchers.IO) {
         val url = settings.current().subscription.trim()
         if (!url.startsWith("http://") && !url.startsWith("https://")) {
             throw RuntimeException("当前配置没有订阅链接")
         }
         importSubscription(url, append = true)
-        true
+    }
+
+    /** 刷新结果必须带回 UI/后台：零节点不能再说「已刷新」。 */
+    internal fun subscriptionRefreshMessage(result: ImportResult): String {
+        if (result.nodes == 0) {
+            val reason = result.diagnostics.firstOrNull()?.reason?.takeIf { it.isNotBlank() }
+            return "订阅未解析到可用节点，已保留上次节点" +
+                (reason?.let { "：$it" } ?: "")
+        }
+        val skipped = if (result.skipped > 0) "，跳过 ${result.skipped} 个" else ""
+        return "订阅已刷新：可用 ${result.nodes} 个$skipped"
     }
 
     data class RuleSyncResult(
@@ -601,17 +628,13 @@ object Actions {
     /** 从 URL 导入一个小火箭式模块；同一个 URL 再次导入会更新原模块。 */
     suspend fun importModule(url: String, displayName: String = ""): ModuleResult = withContext(Dispatchers.IO) {
         val target = url.trim()
-        if (!target.startsWith("http://") && !target.startsWith("https://")) {
-            throw RuntimeException("模块地址必须是 http/https URL")
-        }
+        ModuleFetchPolicy.urlError(target, allowLocal = true)?.let { throw RuntimeException(it) }
         val text = fetchText(
             target,
-            maxBytes = 4 * 1024 * 1024,
+            maxBytes = ModuleFetchPolicy.MAX_BYTES,
             headers = headerMapFor(settings.current(), target),
         )
-        if (text.any { it.code < 0x09 || (it.code in 0x0E..0x1F) }) {
-            throw RuntimeException("模块包含异常控制字符")
-        }
+        ModuleFetchPolicy.controlCharError(text)?.let { throw RuntimeException(it) }
         val parsed = hydrateScripts(ModuleParser.parse(text), refresh = true)
         if (!hasUsableRules(parsed)) {
             throw RuntimeException("模块里没有可用的 DNS/分流或 MITM/重写规则")
@@ -631,10 +654,8 @@ object Actions {
     /** 导入前预览：只下载和解析，不落盘；同时统计与现有模块重复的规则条数。 */
     suspend fun previewModule(url: String, displayName: String = ""): ModulePreview = withContext(Dispatchers.IO) {
         val target = url.trim()
-        if (!target.startsWith("http://") && !target.startsWith("https://")) {
-            throw RuntimeException("模块地址必须是 http/https URL")
-        }
-        val text = fetchText(target, maxBytes = 4 * 1024 * 1024, headers = headerMapFor(settings.current(), target))
+        ModuleFetchPolicy.urlError(target, allowLocal = true)?.let { throw RuntimeException(it) }
+        val text = fetchText(target, maxBytes = ModuleFetchPolicy.MAX_BYTES, headers = headerMapFor(settings.current(), target))
         previewModuleText(target, text, displayName)
     }
 
@@ -650,10 +671,8 @@ object Actions {
         val target = source.trim()
         if (target.isBlank()) throw RuntimeException("模块来源为空")
         val text = rawText.removePrefix("\uFEFF")
-        if (text.toByteArray().size > 4 * 1024 * 1024) throw RuntimeException("模块超过 4MB")
-        if (text.any { it.code < 0x09 || (it.code in 0x0E..0x1F) }) {
-            throw RuntimeException("模块包含异常控制字符")
-        }
+        ModuleFetchPolicy.sizeError(text.toByteArray().size.toLong())?.let { throw RuntimeException(it) }
+        ModuleFetchPolicy.controlCharError(text)?.let { throw RuntimeException(it) }
         val parsed = hydrateScripts(ModuleParser.parse(text), refresh = false)
         if (!hasUsableRules(parsed)) {
             throw RuntimeException("模块里没有可用的 DNS/分流或 MITM/重写规则")
@@ -720,7 +739,12 @@ object Actions {
             allowRules = parsed.allowLines.size,
             ignored = parsed.ignored,
             error = "",
-
+            intervalSeconds = existing?.intervalSeconds ?: 21600L,
+            lastAttemptAt = System.currentTimeMillis(),
+            etag = existing?.etag ?: "",
+            lastModified = existing?.lastModified ?: "",
+            stale = false,
+            cacheBytes = text.toByteArray().size.toLong(),
         )
         withContext(Dispatchers.Main) {
             val current = settings.current()
@@ -743,46 +767,126 @@ object Actions {
 
     data class ModuleSyncResult(val updated: Int, val errors: List<String>)
 
+    /**
+     * 同步结果写回时以「当前模块对象」为准，只合并下载/解析产出的字段。
+     * 同步是慢操作：用户可能在下载期间手动关闭模块、改周期或改 URL。若直接
+     * 用入队时的整条 [synced] 覆盖，会把 enabled=true 的旧状态复活，或把新
+     * URL 的模块写回旧地址。enabled/intervalSeconds/url 等用户字段一律保留。
+     */
+    internal fun mergeModuleSyncState(current: ModuleSource, synced: ModuleSource): ModuleSource =
+        current.copy(
+            name = synced.name,
+            app = synced.app,
+            updatedAt = synced.updatedAt,
+            blockRules = synced.blockRules,
+            routeRules = synced.routeRules,
+            mitmRules = synced.mitmRules,
+            allowRules = synced.allowRules,
+            ignored = synced.ignored,
+            error = synced.error,
+            lastAttemptAt = synced.lastAttemptAt,
+            etag = synced.etag,
+            lastModified = synced.lastModified,
+            stale = synced.stale,
+            cacheBytes = synced.cacheBytes,
+        )
+
+    /** 同一 id 但 URL 已在同步期间被用户改掉时，旧下载结果必须丢弃。 */
+    internal fun mergeModuleSyncResults(
+        current: List<ModuleSource>,
+        results: Map<String, ModuleSource>,
+    ): List<ModuleSource> = current.map { cur ->
+        val synced = results[cur.id]
+        if (synced == null || synced.url != cur.url) cur
+        else mergeModuleSyncState(cur, synced)
+    }
+
     /** 重新拉取所有启用模块；单个失败保留上一份文件。 */
+    /**
+     * 拉取启用模块：HTTPS → 条件请求 → 校验 → 原子落盘。
+     * 失败/解析失败/类型不合法时保留上一份 good 文件，只标 stale，不清空。
+     */
     suspend fun syncModules(): ModuleSyncResult = withContext(Dispatchers.IO) {
         var updated = 0
         val errors = mutableListOf<String>()
         val results = mutableMapOf<String, ModuleSource>()
-        settings.current().moduleSources.filter { it.enabled && it.url.startsWith("http") }.forEach { src ->
+        settings.current().moduleSources.filter { it.enabled }.forEach { src ->
+            if (!src.url.startsWith("https://")) {
+                results[src.id] = src.copy(
+                    error = "远程模块只允许 HTTPS，已保留旧缓存",
+                    stale = ConfigStore.moduleFile(App.context, src.id).let { it.exists() && it.length() > 0 },
+                    lastAttemptAt = System.currentTimeMillis(),
+                )
+                errors.add("${src.name}: 非 HTTPS 源未更新")
+                return@forEach
+            }
+            val file = ConfigStore.moduleFile(App.context, src.id)
+            val now = System.currentTimeMillis()
             try {
-                val text = fetchText(
+                val conditional = buildMap {
+                    if (src.etag.isNotBlank()) put("If-None-Match", src.etag)
+                    if (src.lastModified.isNotBlank()) put("If-Modified-Since", src.lastModified)
+                }
+                val fetched = fetchTextResult(
                     src.url,
                     maxBytes = 4 * 1024 * 1024,
-                    headers = headerMapFor(settings.current(), src.url),
+                    headers = headerMapFor(settings.current(), src.url) + conditional,
                 )
-                val parsed = hydrateScripts(ModuleParser.parse(text), refresh = true)
-                if (!hasUsableRules(parsed)) {
-                    throw RuntimeException("没有可用的 DNS/分流或 MITM/重写规则")
+                if (fetched.status == 304) {
+                    if (!file.exists() || file.length() == 0L) throw RuntimeException("304 但没有本地缓存")
+                    results[src.id] = src.copy(
+                        lastAttemptAt = now, error = "", stale = false,
+                        cacheBytes = file.length(),
+                        etag = fetched.headers["etag"] ?: src.etag,
+                        lastModified = fetched.headers["last-modified"] ?: src.lastModified,
+                    )
+                    updated++
+                    return@forEach
                 }
+                ModuleFetchPolicy.contentTypeError(fetched.headers["content-type"])
+                    ?.let { throw RuntimeException(it) }
+                val text = fetched.text
+                ModuleFetchPolicy.sizeError(text.toByteArray().size.toLong())?.let { throw RuntimeException(it) }
+                ModuleFetchPolicy.controlCharError(text)?.let { throw RuntimeException(it) }
+                val parsed = hydrateScripts(ModuleParser.parse(text), refresh = true)
+                if (!hasUsableRules(parsed)) throw RuntimeException("没有可用的 DNS/分流或 MITM/重写规则")
+                if (file.exists()) file.copyTo(File(file.parentFile, file.name + ".bak"), overwrite = true)
                 saveModuleFile(src.id, text)
                 fetchRuleSets(parsed)
                 results[src.id] = src.copy(
                     name = src.name.ifBlank { parsed.name },
                     app = parsed.app.ifBlank { src.app },
-                    updatedAt = System.currentTimeMillis(),
+                    updatedAt = now,
+                    lastAttemptAt = now,
                     blockRules = parsed.blockLines.size,
                     routeRules = parsed.routeRules.size,
                     mitmRules = mitmRuleCount(parsed),
                     allowRules = parsed.allowLines.size,
                     ignored = parsed.ignored,
                     error = "",
+                    stale = false,
+                    cacheBytes = file.length(),
+                    etag = fetched.headers["etag"] ?: "",
+                    lastModified = fetched.headers["last-modified"] ?: "",
                 )
                 updated++
             } catch (e: Exception) {
                 val msg = "${src.name}: ${e.message ?: "下载失败"}"
                 errors.add(msg)
-                results[src.id] = src.copy(error = e.message ?: "下载失败")
+                val cached = file.exists() && file.length() > 0
+                results[src.id] = src.copy(
+                    lastAttemptAt = now,
+                    error = e.message ?: "下载失败",
+                    stale = cached,
+                    cacheBytes = if (cached) file.length() else 0,
+                )
             }
         }
         withContext(Dispatchers.Main) {
             val current = settings.current()
             val next = current.copy(
-                moduleSources = current.moduleSources.map { results[it.id] ?: it },
+                // 只合并同步字段，不在写回时复活用户刚关闭的模块。
+                moduleSources = mergeModuleSyncResults(current.moduleSources, results),
             )
             settings.set(next)
             ConfigStore.rebuildModules(App.context, next)
@@ -1047,12 +1151,36 @@ object Actions {
     /** 永不 MITM 的跳过域名（银行/支付等）。 */
     suspend fun setMitmSkip(hostnames: List<String>) = updateMitm { it.copy(skipHostnames = hostnames) }
 
+    /** 灰度：MITM 上游连接池；默认关闭，只影响新连接。 */
+    suspend fun setMitmPoolEnabled(on: Boolean) =
+        updateMitm { it.copy(poolEnabled = on, poolIdleSecs = it.poolIdleSecs) }
+
     /**
      * 按 App MITM：mode = all / allow / deny，apps 是包名列表。
      * 写配置后重建模块并热重载；包名到 UID 的展开在下发内核时完成。
      */
     suspend fun setMitmApps(mode: String, apps: List<String>) =
         updateMitm { it.copy(appMode = mode, apps = apps) }
+
+    /**
+     * 脚本参数当前值：写配置后只把新值推给运行中的内核，不重建 MITM/不重编译脚本。
+     * 下一次启动会通过 buildNative 下发同一份覆盖值。
+     */
+    suspend fun setMitmScriptArguments(script: com.namu.dns.core.config.ScriptConfig, values: Map<String, String>) =
+        withContext(Dispatchers.IO) {
+            val key = ConfigStore.scriptArgumentKey(script)
+            val next = settings.update { cfg ->
+                cfg.copy(mitm = cfg.mitm.copy(scriptArguments = cfg.mitm.scriptArguments + (key to values)))
+            }
+            if (runtime.current().connected) {
+                val payload = JSONObject().apply {
+                    put("key", key)
+                    put("values", JSONObject(values as Map<*, *>))
+                }
+                NativeCore.nativeSetScriptArguments(payload.toString())
+            }
+            next
+        }
 
     private suspend fun updateMitm(transform: (MitmConfig) -> MitmConfig) = withContext(Dispatchers.IO) {
         val next = settings.update { cfg -> cfg.copy(mitm = transform(cfg.mitm)) }

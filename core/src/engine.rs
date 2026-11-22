@@ -103,7 +103,10 @@ impl FilterEngine {
                     ),
                 );
             }
-            Err(e) => logging::warn("filter", format!("读取规则失败 {}: {}", short_path(path), e)),
+            Err(e) => logging::warn(
+                "filter",
+                format!("读取规则失败 {}: {}", short_path(path), e),
+            ),
         }
     }
 
@@ -124,11 +127,10 @@ impl FilterEngine {
         // 判断不了的条件，整条规则都必须跳过，绝不能只留域名条件继续拦截（会误杀）。
         let supported_keys = ["domain", "domain_suffix", "domain_keyword", "domain_regex"];
         for rule in rules {
-            let Some(obj) = rule.as_object() else { continue };
-            if obj
-                .keys()
-                .any(|k| !supported_keys.contains(&k.as_str()))
-            {
+            let Some(obj) = rule.as_object() else {
+                continue;
+            };
+            if obj.keys().any(|k| !supported_keys.contains(&k.as_str())) {
                 skipped_rules += 1;
                 self.skipped += 1;
                 self.skipped_other += 1;
@@ -174,7 +176,10 @@ impl FilterEngine {
         if skipped_rules > 0 {
             logging::warn(
                 "filter",
-                format!("sing-box source 跳过 {} 条含不支持条件的规则（端口/取反/进程等）", skipped_rules),
+                format!(
+                    "sing-box source 跳过 {} 条含不支持条件的规则（端口/取反/进程等）",
+                    skipped_rules
+                ),
             );
         }
         logging::info("filter", format!("sing-box source 规则生效 {} 条", added));
@@ -196,8 +201,11 @@ impl FilterEngine {
             return;
         }
         // 元素隐藏/脚本注入等规则不是 DNS 层能表达的，直接跳过，绝不能被截成主域名。
-        if line.contains("##") || line.contains("#@#") || line.contains("#$#")
-            || line.contains("#%#") || line.contains("#?#")
+        if line.contains("##")
+            || line.contains("#@#")
+            || line.contains("#$#")
+            || line.contains("#%#")
+            || line.contains("#?#")
         {
             self.skipped += 1;
             self.skipped_cosmetic += 1;
@@ -431,7 +439,10 @@ impl FilterEngine {
                 {
                     Ok(ac) => Some(ac),
                     Err(e) => {
-                        logging::warn("filter", format!("关键词自动机构造失败，回退逐条匹配: {}", e));
+                        logging::warn(
+                            "filter",
+                            format!("关键词自动机构造失败，回退逐条匹配: {}", e),
+                        );
                         None
                     }
                 }
@@ -513,7 +524,11 @@ impl Action {
 
 /// 规则动作分类：策略组名优先于节点名；`node:` 强制按节点解析。
 /// 找不到任何对象的动作变成 Missing，运行时会报“引用已失效”，不再静默回落。
-pub fn classify_action(raw: &str, group_names: &HashSet<String>, node_names: &HashSet<String>) -> Action {
+pub fn classify_action(
+    raw: &str,
+    group_names: &HashSet<String>,
+    node_names: &HashSet<String>,
+) -> Action {
     let t = raw.trim();
     let lower = t.to_ascii_lowercase();
     match lower.as_str() {
@@ -646,7 +661,10 @@ impl RuleEngine {
                     "TCP" => RuleKind::Protocol(ConnKind::Tcp),
                     "UDP" => RuleKind::Protocol(ConnKind::Udp),
                     other => {
-                        logging::warn("rule", format!("拒绝 PROTOCOL 值 {}（仅支持 TCP/UDP）", other));
+                        logging::warn(
+                            "rule",
+                            format!("拒绝 PROTOCOL 值 {}（仅支持 TCP/UDP）", other),
+                        );
                         continue;
                     }
                 },
@@ -656,7 +674,10 @@ impl RuleEngine {
                 "UID" => match rc.value.trim().parse::<u32>() {
                     Ok(u) => RuleKind::Uid(u),
                     Err(_) => {
-                        logging::warn("rule", format!("拒绝 UID 规则值 {}：不是合法整数", rc.value));
+                        logging::warn(
+                            "rule",
+                            format!("拒绝 UID 规则值 {}：不是合法整数", rc.value),
+                        );
                         continue;
                     }
                 },
@@ -671,19 +692,28 @@ impl RuleEngine {
                     continue;
                 }
                 _ => {
-                    logging::warn("rule", format!("拒绝未实现规则类型 {}（值 {}）", rc.kind, rc.value));
+                    logging::warn(
+                        "rule",
+                        format!("拒绝未实现规则类型 {}（值 {}）", rc.kind, rc.value),
+                    );
                     continue;
                 }
             };
             let value = match kind {
                 RuleKind::Domain => normalize_domain(&rc.value),
-                RuleKind::DomainSuffix => rc.value.trim().trim_start_matches('.').to_ascii_lowercase(),
+                RuleKind::DomainSuffix => {
+                    rc.value.trim().trim_start_matches('.').to_ascii_lowercase()
+                }
                 RuleKind::DomainKeyword => rc.value.trim().to_ascii_lowercase(),
                 RuleKind::Protocol(_) => rc.value.trim().to_ascii_uppercase(),
                 _ => rc.value.clone(),
             };
             let action = classify_action(&rc.action, &group_names, &node_names);
-            let action = if filter_only { proxy_to_direct(action) } else { action };
+            let action = if filter_only {
+                proxy_to_direct(action)
+            } else {
+                action
+            };
             rules.push(RouteRule {
                 kind,
                 value,
@@ -692,7 +722,11 @@ impl RuleEngine {
             });
         }
         let final_action = classify_action(&cfg.final_policy, &group_names, &node_names);
-        let final_action = if filter_only { proxy_to_direct(final_action) } else { final_action };
+        let final_action = if filter_only {
+            proxy_to_direct(final_action)
+        } else {
+            final_action
+        };
         if !rules.iter().any(|r| matches!(r.kind, RuleKind::Final)) {
             rules.push(RouteRule {
                 kind: RuleKind::Final,
@@ -752,7 +786,13 @@ impl RuleEngine {
     }
 
     /// 与 decide 同一套逻辑，另返回命中说明（供「测试规则」展示，保证单一事实来源）。
-    pub fn decide_detail(&self, domain: Option<&str>, ip: IpAddr, port: u16, kind: ConnKind) -> (Action, String) {
+    pub fn decide_detail(
+        &self,
+        domain: Option<&str>,
+        ip: IpAddr,
+        port: u16,
+        kind: ConnKind,
+    ) -> (Action, String) {
         // 没有 UID 数据源的调用方（测试规则、UDP 早期路径）按「归属未知」处理。
         self.decide_input(&MatchInput {
             domain,
@@ -789,12 +829,15 @@ impl RuleEngine {
                     .map(|d| !r.value.is_empty() && d.contains(r.value.as_str()))
                     .unwrap_or(false),
                 RuleKind::DomainRegex(re) => dom.as_ref().map(|d| re.is_match(d)).unwrap_or(false),
-                RuleKind::DomainWildcard(re) => dom.as_ref().map(|d| re.is_match(d)).unwrap_or(false),
+                RuleKind::DomainWildcard(re) => {
+                    dom.as_ref().map(|d| re.is_match(d)).unwrap_or(false)
+                }
                 RuleKind::GeoIp(code) => {
-                    code == "CN" && match input.ip {
-                        IpAddr::V4(v4) => self.cn_ip_contains(v4),
-                        IpAddr::V6(_) => false,
-                    }
+                    code == "CN"
+                        && match input.ip {
+                            IpAddr::V4(v4) => self.cn_ip_contains(v4),
+                            IpAddr::V6(_) => false,
+                        }
                 }
                 RuleKind::IpCidr(net) => net.contains(&input.ip),
                 RuleKind::Port(p) => input.port == *p,
@@ -827,12 +870,18 @@ impl RuleEngine {
         if self.cn_direct {
             if let Some(d) = &dom {
                 if self.cn_domains.contains(d) {
-                    return (Action::Direct, format!("国内直连：域名 {} 命中 CN 域名库", d));
+                    return (
+                        Action::Direct,
+                        format!("国内直连：域名 {} 命中 CN 域名库", d),
+                    );
                 }
             }
             if let IpAddr::V4(v4) = input.ip {
                 if self.cn_ip_contains(v4) {
-                    return (Action::Direct, format!("国内直连：IP {} 命中 CN IP 库", input.ip));
+                    return (
+                        Action::Direct,
+                        format!("国内直连：IP {} 命中 CN IP 库", input.ip),
+                    );
                 }
             }
         }
@@ -846,7 +895,10 @@ impl RuleEngine {
             }
         }
         let label = self.decision_label(&self.final_action);
-        (self.final_action.clone(), format!("未命中任何规则，走最终策略：{}", label))
+        (
+            self.final_action.clone(),
+            format!("未命中任何规则，走最终策略：{}", label),
+        )
     }
 
     fn cn_ip_contains(&self, ip: Ipv4Addr) -> bool {
@@ -906,7 +958,9 @@ fn wildcard_regex(value: &str) -> Result<Regex, regex::Error> {
         }
     }
     pattern.push('$');
-    regex::RegexBuilder::new(&pattern).case_insensitive(true).build()
+    regex::RegexBuilder::new(&pattern)
+        .case_insensitive(true)
+        .build()
 }
 
 pub(crate) fn load_cn_ips(path: &str) -> Vec<(u32, u32)> {
@@ -978,7 +1032,10 @@ pub fn build_filter(cfg: &Config) -> FilterEngine {
         }
     }
     if route_blocked > 0 {
-        logging::info("filter", format!("分流 REJECT 已并入 DNS 拦截 {} 条", route_blocked));
+        logging::info(
+            "filter",
+            format!("分流 REJECT 已并入 DNS 拦截 {} 条", route_blocked),
+        );
     }
     if !cfg.block_enabled {
         return filter;
@@ -1054,7 +1111,10 @@ mod tests {
         assert!(f.is_blocked("suffix.example.com"));
         assert!(f.is_blocked("a.suffix.example.com"));
         assert!(f.is_blocked("exact.example.net"));
-        assert!(!f.is_blocked("a.exact.example.net"), "单竖线精确规则不能误伤子域名");
+        assert!(
+            !f.is_blocked("a.exact.example.net"),
+            "单竖线精确规则不能误伤子域名"
+        );
         assert!(!f.is_blocked("allowed.example.org"));
         assert!(!f.is_blocked("a.allowed.example.org"));
         assert!(!f.is_blocked("allowed.example.net"));
@@ -1085,7 +1145,10 @@ mod tests {
         let cfg = uid_cfg();
         let engine = RuleEngine::from_config(&cfg);
         assert!(engine.has_uid_rules());
-        assert_eq!(engine.rule_count, 3, "两条配置规则 + 自动补的 FINAL，UID 规则不能被丢弃");
+        assert_eq!(
+            engine.rule_count, 3,
+            "两条配置规则 + 自动补的 FINAL，UID 规则不能被丢弃"
+        );
     }
 
     #[test]
@@ -1101,7 +1164,11 @@ mod tests {
             kind: ConnKind::Tcp,
             uid: Some(10100),
         });
-        assert!(matches!(a, Action::Block), "uid 10100 应命中 BLOCK，实际 {:?}", a);
+        assert!(
+            matches!(a, Action::Block),
+            "uid 10100 应命中 BLOCK，实际 {:?}",
+            a
+        );
         assert!(why.contains("UID"), "命中说明应标明来源规则：{}", why);
         // 微信同域名不受影响
         let (a2, _) = engine.decide_input(&MatchInput {
@@ -1111,7 +1178,11 @@ mod tests {
             kind: ConnKind::Tcp,
             uid: Some(10200),
         });
-        assert!(!matches!(a2, Action::Block), "uid 10200 不应被 B 站规则影响，实际 {:?}", a2);
+        assert!(
+            !matches!(a2, Action::Block),
+            "uid 10200 不应被 B 站规则影响，实际 {:?}",
+            a2
+        );
     }
 
     #[test]
@@ -1127,7 +1198,11 @@ mod tests {
             kind: ConnKind::Tcp,
             uid: None,
         });
-        assert!(matches!(a, Action::Proxy), "归属未知时应回落到最终策略(proxy)，实际 {:?}", a);
+        assert!(
+            matches!(a, Action::Proxy),
+            "归属未知时应回落到最终策略(proxy)，实际 {:?}",
+            a
+        );
     }
 
     #[test]
@@ -1151,27 +1226,54 @@ mod tests {
         cfg.mode = "filter_only".into();
         cfg.final_policy = "proxy".into();
         cfg.rules = vec![
-            crate::config::RuleConf { kind: "DOMAIN-SUFFIX".into(), value: "via-proxy.example".into(), action: "proxy".into(), source: None },
-            crate::config::RuleConf { kind: "DOMAIN-SUFFIX".into(), value: "blocked.example".into(), action: "block".into(), source: None },
+            crate::config::RuleConf {
+                kind: "DOMAIN-SUFFIX".into(),
+                value: "via-proxy.example".into(),
+                action: "proxy".into(),
+                source: None,
+            },
+            crate::config::RuleConf {
+                kind: "DOMAIN-SUFFIX".into(),
+                value: "blocked.example".into(),
+                action: "block".into(),
+                source: None,
+            },
         ];
         let engine = RuleEngine::from_config(&cfg);
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         // 没有节点也不打算代理：代理意图降级直连，不能命中「无节点兜底拦截」断网。
         let (a, _) = engine.decide_input(&MatchInput {
             domain: Some("cdn.via-proxy.example"),
-            ip, port: 443, kind: ConnKind::Tcp, uid: None,
+            ip,
+            port: 443,
+            kind: ConnKind::Tcp,
+            uid: None,
         });
-        assert!(matches!(a, Action::Direct), "代理规则应降级为直连，实际 {:?}", a);
+        assert!(
+            matches!(a, Action::Direct),
+            "代理规则应降级为直连，实际 {:?}",
+            a
+        );
         // FINAL 也降级
         let (f, _) = engine.decide_input(&MatchInput {
             domain: Some("unknown.example"),
-            ip, port: 443, kind: ConnKind::Tcp, uid: None,
+            ip,
+            port: 443,
+            kind: ConnKind::Tcp,
+            uid: None,
         });
-        assert!(matches!(f, Action::Direct), "final=proxy 应降级为直连，实际 {:?}", f);
+        assert!(
+            matches!(f, Action::Direct),
+            "final=proxy 应降级为直连，实际 {:?}",
+            f
+        );
         // 拦截规则必须原样保留
         let (b, why) = engine.decide_input(&MatchInput {
             domain: Some("x.blocked.example"),
-            ip, port: 443, kind: ConnKind::Tcp, uid: None,
+            ip,
+            port: 443,
+            kind: ConnKind::Tcp,
+            uid: None,
         });
         assert!(matches!(b, Action::Block), "拦截不能被降级，实际 {:?}", b);
         assert!(why.contains("DOMAIN-SUFFIX"));
@@ -1185,7 +1287,11 @@ mod tests {
         let engine = RuleEngine::from_config(&cfg);
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         let (a, _) = engine.decide_input(&MatchInput {
-            domain: Some("example.com"), ip, port: 443, kind: ConnKind::Tcp, uid: None,
+            domain: Some("example.com"),
+            ip,
+            port: 443,
+            kind: ConnKind::Tcp,
+            uid: None,
         });
         // 对照：普通规则模式下 final=proxy 保持原样，由运行时无节点兜底处理。
         assert!(matches!(a, Action::Proxy), "实际 {:?}", a);
@@ -1195,22 +1301,58 @@ mod tests {
     fn route_reject_rules_feed_dns_filter() {
         let mut cfg = Config::default();
         cfg.rules = vec![
-            crate::config::RuleConf { kind: "DOMAIN".into(), value: "ad.example.com".into(), action: "block".into(), source: None },
-            crate::config::RuleConf { kind: "DOMAIN-SUFFIX".into(), value: "tracker.example".into(), action: "BLOCK".into(), source: None },
-            crate::config::RuleConf { kind: "DOMAIN-KEYWORD".into(), value: "adserv".into(), action: "reject".into(), source: None },
-            crate::config::RuleConf { kind: "DOMAIN-REGEX".into(), value: "^ads\\d+\\.foo\\.com$".into(), action: "block".into(), source: None },
-            crate::config::RuleConf { kind: "DOMAIN-WILDCARD".into(), value: "*.banner.example".into(), action: "block".into(), source: None },
-            crate::config::RuleConf { kind: "DOMAIN".into(), value: "allow.example.com".into(), action: "direct".into(), source: None },
+            crate::config::RuleConf {
+                kind: "DOMAIN".into(),
+                value: "ad.example.com".into(),
+                action: "block".into(),
+                source: None,
+            },
+            crate::config::RuleConf {
+                kind: "DOMAIN-SUFFIX".into(),
+                value: "tracker.example".into(),
+                action: "BLOCK".into(),
+                source: None,
+            },
+            crate::config::RuleConf {
+                kind: "DOMAIN-KEYWORD".into(),
+                value: "adserv".into(),
+                action: "reject".into(),
+                source: None,
+            },
+            crate::config::RuleConf {
+                kind: "DOMAIN-REGEX".into(),
+                value: "^ads\\d+\\.foo\\.com$".into(),
+                action: "block".into(),
+                source: None,
+            },
+            crate::config::RuleConf {
+                kind: "DOMAIN-WILDCARD".into(),
+                value: "*.banner.example".into(),
+                action: "block".into(),
+                source: None,
+            },
+            crate::config::RuleConf {
+                kind: "DOMAIN".into(),
+                value: "allow.example.com".into(),
+                action: "direct".into(),
+                source: None,
+            },
         ];
         let f = build_filter(&cfg);
         // DNS-only 下连接层不会执行 REJECT，这五类拦截必须在 DNS 层生效。
         assert!(f.is_blocked("ad.example.com"), "DOMAIN 精确");
-        assert!(!f.is_blocked("sub.ad.example.com"), "精确规则不能误伤子域名");
+        assert!(
+            !f.is_blocked("sub.ad.example.com"),
+            "精确规则不能误伤子域名"
+        );
         assert!(f.is_blocked("x.tracker.example"), "DOMAIN-SUFFIX");
         assert!(f.is_blocked("cdn.adserv.io"), "DOMAIN-KEYWORD");
         assert!(f.is_blocked("ads12.foo.com"), "DOMAIN-REGEX");
         assert!(f.is_blocked("a.banner.example"), "DOMAIN-WILDCARD");
-        assert!(!f.is_blocked("allow.example.com"), "DIRECT 规则不能被当成拦截");
+        assert!(
+            !f.is_blocked("allow.example.com"),
+            "DIRECT 规则不能被当成拦截"
+        );
     }
 
     #[test]

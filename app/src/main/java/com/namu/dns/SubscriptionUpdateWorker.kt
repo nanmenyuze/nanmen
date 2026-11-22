@@ -18,7 +18,14 @@ class SubscriptionUpdateWorker(
         val url = runCatching { App.container.settings.current().subscription }.getOrDefault("")
         if (url.isBlank()) return Result.success()
         return try {
-            Actions.refreshSubscription()
+            val result = Actions.refreshSubscription()
+            if (result.nodes == 0) {
+                // 后台没有 UI 提示，至少把零节点原因写进日志，避免「已刷新」假成功。
+                android.util.Log.w(
+                    "NamuSubscription",
+                    Actions.subscriptionRefreshMessage(result),
+                )
+            }
             Result.success()
         } catch (_: Exception) {
             Result.retry()

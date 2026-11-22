@@ -117,9 +117,13 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
         }
         // 2.5：配置改动只写当前 active .conf，不再刷新全局 default.json。
         // DataStore 里的 CONFIG 仍保存含 nodes 的设备快照，用于启动时兜底合并。
+        //
+        // 入队时必须同时冻结文件名和配置快照：用户改完 A 立刻切到 B 时，
+        // activeConfigCache 已经变成 B；若任务执行时才读 active，会把 A 的内容
+        // 写进 B，A 反而保留旧版本。ConfigStore 是单线程队列，冻结后顺序仍可靠。
+        val activeSnapshot = activeConfigCache
         ConfigStore.submitFileIo {
-            val active = activeConfigCache
-            runCatching { ConfigFileStore.save(context, active, cfg) }
+            runCatching { ConfigFileStore.save(context, activeSnapshot, cfg) }
         }
     }
 

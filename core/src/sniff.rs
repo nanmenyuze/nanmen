@@ -19,7 +19,10 @@ fn clean_host(host: &str) -> Option<String> {
     if h.is_empty() || h.len() > 253 || h.parse::<IpAddr>().is_ok() || !h.contains('.') {
         return None;
     }
-    if !h.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_')) {
+    if !h
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    {
         return None;
     }
     Some(h)
@@ -109,7 +112,10 @@ fn http_host(d: &[u8]) -> Option<String> {
     let request = lines.next()?;
     let mut parts = request.split_whitespace();
     let method = parts.next()?;
-    if !matches!(method, "GET" | "POST" | "HEAD" | "PUT" | "DELETE" | "OPTIONS" | "PATCH" | "CONNECT") {
+    if !matches!(
+        method,
+        "GET" | "POST" | "HEAD" | "PUT" | "DELETE" | "OPTIONS" | "PATCH" | "CONNECT"
+    ) {
         return None;
     }
     let authority = parts.next();

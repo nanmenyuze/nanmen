@@ -1,16 +1,23 @@
 package com.namu.dns.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material.icons.rounded.Shield
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
@@ -18,8 +25,11 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -44,15 +54,19 @@ fun MitmScreen() {
     val statsState by container.stats.state.collectAsStateWithLifecycle()
     val stats = statsState.stats
     val ctx = LocalContext.current
+    val clipboard = LocalClipboardManager.current
     val vm: MitmViewModel = viewModel(factory = MitmViewModel.factory(container, ctx))
     val busy by vm.busy.collectAsStateWithLifecycle()
     val caExists by vm.caExists.collectAsStateWithLifecycle()
     val caFingerprint by vm.caFingerprint.collectAsStateWithLifecycle()
     val systemCertInstalled by vm.systemCertInstalled.collectAsStateWithLifecycle()
+    val trust by vm.trust.collectAsStateWithLifecycle()
     val mitm = cfg.mitm
     var showHosts by remember { mutableStateOf(false) }
     var showSkip by remember { mutableStateOf(false) }
     var showApps by remember { mutableStateOf(false) }
+    var showScriptArgs by remember { mutableStateOf(false) }
+    var confirmRemoveCa by remember { mutableStateOf(false) }
     var hostsText by remember { mutableStateOf("") }
     var skipText by remember { mutableStateOf("") }
 
@@ -75,6 +89,22 @@ fun MitmScreen() {
                 (o.optJSONArray("urlRewrites")?.length() ?: 0) +
                 (o.optJSONArray("headerRewrites")?.length() ?: 0)
         }.getOrDefault(0)
+    }
+    // 参数编辑覆盖 active 脚本 + 启用模块脚本；键与内核 CompiledScriptRule.key 一致。
+    val scriptsForArgs = remember(mitm, cfg.moduleSources) {
+        val out = LinkedHashMap<String, com.namu.dns.core.config.ScriptConfig>()
+        mitm.scripts.forEach { out[ConfigStore.scriptKey(it)] = it }
+        runCatching {
+            JSONObject(ConfigStore.moduleMitmFile(ctx).readText()).optJSONArray("scripts")?.let { a ->
+                for (i in 0 until a.length()) {
+                    a.optJSONObject(i)?.let {
+                        val sc = com.namu.dns.core.config.ScriptConfig.fromJsonObject(it)
+                        out.putIfAbsent(ConfigStore.scriptKey(sc), sc)
+                    }
+                }
+            }
+        }
+        out.values.toList()
     }
 
     Column(
@@ -108,10 +138,37 @@ fun MitmScreen() {
                 title = "系统证书区（模块）",
                 value = when {
                     !caExists -> "未生成"
+                    trust.status.done && trust.status.state != "ok" -> "注入失败"
                     systemCertInstalled -> "已检测到"
+                    trust.moduleInstalled && trust.moduleCertMatches -> "已安装"
+                    trust.conflict -> "挂载冲突"
+                    trust.moduleInstalled -> "需更新"
                     else -> "未检测到"
                 },
-                subtitle = "装好系统信任模块并重启后，按 DER 比对 APEX 证书目录；模块方式重启不丢",
+                subtitle = when {
+                    !caExists -> "生成 CA 后可一键安装系统信任模块"
+                    trust.status.done && trust.status.state != "ok" ->
+                        "上次注入失败：${trust.status.lines["error"].orEmpty().ifBlank { "请查看 ${com.namu.dns.RootCaManager.LOG_FILE}" }}；可点下方「一键安装/更新」重试"
+                    systemCertInstalled -> "当前 CA 已在系统证书区生效；模块方式重启不丢"
+                    trust.conflict -> "目标证书库最上层不是南门DNS：${trust.topSources.joinToString().ifBlank { "未知来源" }}，请点下方「重新注入」"
+                    trust.moduleInstalled && !trust.moduleCertMatches -> "模块内证书与当前 CA 不一致，请一键更新模块"
+                    trust.moduleInstalled -> "模块已写入并注入 Zygote；新启动的 App 直接信任，已运行 App 请强杀重开"
+                    else -> "尚未安装模块；有 Root 可一键写入并立即注入"
+                },
+                showDivider = true,
+            )
+            SettingsRow(
+                title = "Root / 模块管理器",
+                value = when (trust.root.kind) {
+                    com.namu.dns.RootCaManager.RootKind.MAGISK -> "Magisk"
+                    com.namu.dns.RootCaManager.RootKind.KERNELSU -> "KernelSU"
+                    com.namu.dns.RootCaManager.RootKind.APATCH -> "APatch"
+                    com.namu.dns.RootCaManager.RootKind.NONE ->
+                        if (trust.root.available) "未识别" else "未授权"
+                },
+                subtitle = trust.root.detail.take(120).ifBlank {
+                    "一键安装需要 Root；未授权时只导出模块 zip，手动安装"
+                },
                 showDivider = false,
             )
         }
@@ -119,14 +176,35 @@ fun MitmScreen() {
         SectionHeader("证书安装")
         GroupCard {
             SettingsRow(
-                title = "安装步骤",
-                subtitle = "① 生成系统信任模块 ② 在 KernelSU/Magisk 安装 ③ 重启设备 ④ 回到本页核对「已检测到」和 SHA-256 指纹",
-                showDivider = false,
+                title = "一键安装 / 更新系统 CA",
+                subtitle = "有 Root：写入 /data/adb/modules/namu_mitm_ca，按 staging + bind 幂等注入 Zygote；无 Root：自动导出模块 zip 手动装",
+                icon = Icons.Rounded.Shield,
+                value = when {
+                    busy -> "处理中…"
+                    trust.conflict || (trust.moduleInstalled && !trust.moduleCertMatches) -> "需要更新"
+                    else -> null
+                },
+                chevron = true,
+                onClick = { vm.installSystemCa() },
             )
             SettingsRow(
-                title = "生成系统信任模块（KernelSU/Magisk）",
-                subtitle = "生成含本机 CA 的模块 zip 到「下载/NamuDNS」，用 KernelSU/Magisk 安装后重启，全 App 信任、重启不丢",
-                icon = Icons.Rounded.Shield,
+                title = "移除系统 CA",
+                subtitle = "只 unmount source 指向南门DNS staging 的层，再删模块/日志/状态；不碰 APEX 自身或其他模块",
+                icon = Icons.Rounded.Security,
+                value = when {
+                    trust.moduleInstalled -> "可移除"
+                    systemCertInstalled -> "手动安装"
+                    else -> "未安装"
+                },
+                chevron = trust.moduleInstalled,
+                onClick = {
+                    if (trust.moduleInstalled) confirmRemoveCa = true
+                },
+            )
+            SettingsRow(
+                title = "仅导出模块 zip（手动安装）",
+                subtitle = "导出到「下载/NamuDNS」，文件名带 CA 指纹前 8 位；适合没有 Root 或想自己管理模块的情况",
+                icon = Icons.Rounded.Download,
                 value = if (busy) "处理中…" else null,
                 chevron = true,
                 onClick = { vm.generateTrustModule() },
@@ -175,6 +253,29 @@ fun MitmScreen() {
                 },
             )
             SettingsRow(
+                title = "脚本参数",
+                value = if (scriptsForArgs.isEmpty()) "无脚本" else "${scriptsForArgs.size} 个",
+                subtitle = "修改 \$argument 当前值，立即生效，不重编译脚本；number/boolean 按声明类型注入",
+                chevron = true,
+                onClick = { showScriptArgs = true },
+            )
+            SettingsRow(
+                title = "上游连接复用（实验）",
+                subtitle = "默认关闭；开启后 h1 独占复用、h2 按服务器 SETTINGS 共享。灰度失败可随时关闭，只影响新连接",
+                rightContent = {
+                    IosSwitch(
+                        checked = mitm.poolEnabled,
+                        onCheckedChange = { vm.setPoolEnabled(it) },
+                    )
+                },
+            )
+            SettingsRow(
+                title = "手动触发 generic 脚本",
+                subtitle = "仅手动执行 trigger=generic 的脚本，与 cron/network-changed 共用串行执行",
+                chevron = true,
+                onClick = { vm.triggerGeneric() },
+            )
+            SettingsRow(
                 title = "模块 MITM 规则",
                 value = "$moduleMitmCount 条",
                 subtitle = "「策略 → 模块」导入含 [MITM]/[URL Rewrite]/[Header Rewrite] 的模块后自动合并去重",
@@ -201,8 +302,50 @@ fun MitmScreen() {
                 "按 App 跳过",
                 value = stats.mitmAppSkipped.toString(),
                 subtitle = "域名命中但不在「按 App MITM」范围内、按原样直通的连接数",
+                showDivider = true,
+            )
+            SettingsRow(
+                "正文提前直通",
+                value = stats.mitmBodyBypassed.toString(),
+                subtitle = "命中正文规则但属于视频/音频/二进制，或超过 2 MiB，直接流式透传，避免大缓冲",
                 showDivider = false,
             )
+        }
+
+        SectionHeader("MITM 域名观测")
+        GroupCard {
+            if (stats.mitmFailedTop.isEmpty() && stats.mitmNoRuleTop.isEmpty()) {
+                SettingsRow(
+                    title = "暂无数据",
+                    subtitle = "按 host 统计连接、失败、取消、无规则与改写，最多保留 256 条；只在本机内存，不上报",
+                    showDivider = false,
+                )
+            } else {
+                Text(
+                    "失败 Top10",
+                    fontSize = 11.sp,
+                    color = NamuColors.TextSub,
+                    modifier = Modifier.padding(start = 16.dp, top = 10.dp, bottom = 2.dp),
+                )
+                HostTopRows(
+                    rows = stats.mitmFailedTop,
+                    skipHosts = mitm.skipHostnames,
+                    onSkip = { host -> vm.saveSkip(MitmManager.toggleSkip(mitm.skipHostnames, host)) },
+                    onCopy = { host -> clipboard.setText(AnnotatedString(host)) },
+                )
+                Text(
+                    "无规则 Top10",
+                    fontSize = 11.sp,
+                    color = NamuColors.TextSub,
+                    modifier = Modifier.padding(start = 16.dp, top = 10.dp, bottom = 2.dp),
+                )
+                HostTopRows(
+                    rows = stats.mitmNoRuleTop,
+                    skipHosts = mitm.skipHostnames,
+                    onSkip = { host -> vm.saveSkip(MitmManager.toggleSkip(mitm.skipHostnames, host)) },
+                    onCopy = { host -> clipboard.setText(AnnotatedString(host)) },
+                )
+            }
         }
 
         FooterText(
@@ -249,5 +392,60 @@ fun MitmScreen() {
         ) {
             NamuTextField(skipText, { skipText = it }, "*.bank.example.com")
         }
+    }
+    if (showScriptArgs) {
+        ScriptArgumentsDialog(
+            scripts = scriptsForArgs,
+            saved = mitm.scriptArguments,
+            onSave = { script, values -> vm.setScriptArguments(script, values) },
+            onDismiss = { showScriptArgs = false },
+        )
+    }
+    if (confirmRemoveCa) {
+        NamuDialog(
+            title = "移除系统 CA？",
+            message = "将卸载南门DNS 自己注入的证书层，并删除模块、日志和状态。不会碰 APEX 自身或其他模块。移除后已运行 App 可能仍缓存旧证书，建议强杀重开。",
+            confirmText = "移除",
+            onConfirm = {
+                confirmRemoveCa = false
+                vm.removeSystemCa()
+            },
+            onDismiss = { confirmRemoveCa = false },
+        ) {
+            Text("卸载即恢复系统原证书库。", fontSize = 12.sp, color = NamuColors.TextSub)
+        }
+    }
+}
+
+private fun noRulePercent(row: com.namu.dns.MitmHostRow): String =
+    if (row.reqs <= 0) "—" else String.format(java.util.Locale.US, "%.0f%%", row.noRule * 100.0 / row.reqs)
+
+@Composable
+private fun HostTopRows(
+    rows: List<com.namu.dns.MitmHostRow>,
+    skipHosts: List<String>,
+    onSkip: (String) -> Unit,
+    onCopy: (String) -> Unit,
+) {
+    rows.forEachIndexed { index, row ->
+        SettingsRow(
+            title = row.host,
+            value = "无规则 ${row.noRule}/${row.reqs}（${noRulePercent(row)}） · 失败 ${row.failed}",
+            subtitle = "连接 ${row.conns} · 取消 ${row.canceled} · 改写 ${row.rewritten}",
+            showDivider = index != rows.lastIndex,
+            rightContent = {
+                Row(horizontalArrangement = Arrangement.spacedBy(2.dp)) {
+                    TextButton(onClick = { onSkip(row.host) }) {
+                        Text(
+                            if (skipHosts.contains(row.host)) "取消跳过" else "加入跳过",
+                            fontSize = 11.sp,
+                        )
+                    }
+                    TextButton(onClick = { onCopy(row.host) }) {
+                        Text("复制", fontSize = 11.sp)
+                    }
+                }
+            },
+        )
     }
 }

@@ -67,6 +67,28 @@ data class NodeInfo(
                 flow?.takeIf { it.isNotBlank() }?.let { append("&flow=${enc(it)}") }
                 append("#$n")
             }
+            "vmess" -> {
+                val ws = !wsPath.isNullOrBlank() || !wsHost.isNullOrBlank()
+                val json = JSONObject().apply {
+                    put("v", "2")
+                    put("ps", name)
+                    put("add", server)
+                    put("port", port)
+                    put("id", uuid ?: "")
+                    put("aid", 0)
+                    put("scy", method ?: "auto")
+                    put("net", if (ws) "ws" else "tcp")
+                    put("type", "none")
+                    if (ws) {
+                        put("path", wsPath ?: "/")
+                        wsHost?.takeIf { it.isNotBlank() }?.let { put("host", it) }
+                    }
+                    put("tls", if (tls) "tls" else "")
+                    sni?.takeIf { it.isNotBlank() }?.let { put("sni", it) }
+                    if (insecure) put("allowInsecure", true)
+                }
+                "vmess://" + Base64.encodeToString(json.toString().toByteArray(), Base64.NO_WRAP)
+            }
             "socks5" -> {
                 val auth = if (!uuid.isNullOrBlank()) {
                     val u = enc(uuid!!)
@@ -109,6 +131,7 @@ data class NodeInfo(
             "ss" -> "SS"
             "trojan" -> "Trojan"
             "vless" -> "VLESS"
+            "vmess" -> "VMess"
             "socks5" -> "SOCKS5"
             "http" -> if (tls) "HTTPS" else "HTTP"
             else -> type.uppercase()
@@ -189,6 +212,36 @@ data class DnsLogEntry(
     val count: Long = 1,
 )
 
+/** 策略组单个成员的最近健康状态，来自内核 HealthRegistry 的 stats 导出。 */
+data class GroupMemberHealth(
+    val name: String,
+    val node: Boolean,
+    val tcpLatencyMs: Long? = null,
+    val tcpStatus: String = "unknown",
+    val udpLatencyMs: Long? = null,
+    val udpStatus: String = "unknown",
+)
+
+/** 策略组健康快照；仅组页面可见时由 stats 轮询刷新。 */
+data class GroupHealth(
+    val name: String,
+    val type: String,
+    val lbMode: String = "consistent-hash",
+    val switchInterval: Int = 30,
+    val current: String? = null,
+    val members: List<GroupMemberHealth> = emptyList(),
+)
+
+data class MitmHostRow(
+    val host: String = "",
+    val conns: Long = 0,
+    val reqs: Long = 0,
+    val failed: Long = 0,
+    val canceled: Long = 0,
+    val noRule: Long = 0,
+    val rewritten: Long = 0,
+)
+
 data class StatsData(
     val up: Long = 0,
     val down: Long = 0,
@@ -216,6 +269,11 @@ data class StatsData(
     val dnsFallbackBreaker: Long = 0,
     val dnsFallbackRace: Long = 0,
     val dnsFallbackReview: Long = 0,
+    /** DNS 动态 socket 被淘汰后，按 generation 丢弃的旧异步回包数。 */
+    val dnsStaleReply: Long = 0,
+    /** 普通+DNS 动态 UDP 目标数；以及这些 socket 的预分配缓冲容量（KiB，物理页懒提交）。 */
+    val udpTargets: Long = 0,
+    val udpTargetBufKb: Long = 0,
     val activeConns: Long = 0,
     val totalConns: Long = 0,
     val filterRules: Long = 0,
@@ -231,6 +289,11 @@ data class StatsData(
     val mitmAppSkipped: Long = 0,
     /** 金融保护放行的连接数（整包 UID / 金融域名 / 混合 App 关键字）。 */
     val mitmFinanceSkipped: Long = 0,
+    /** 命中正文规则但按 Content-Type/大小提前直通的响应数。 */
+    val mitmBodyBypassed: Long = 0,
+    /** host 维度失败/无规则 top10；数据只在本机内存，不上报。 */
+    val mitmFailedTop: List<MitmHostRow> = emptyList(),
+    val mitmNoRuleTop: List<MitmHostRow> = emptyList(),
     // 按 App 分流：成功解析归属的连接数 / 有 UID 规则但归属未知的连接数
     val uidResolved: Long = 0,
     val uidUnknown: Long = 0,
@@ -253,6 +316,8 @@ data class StatsData(
     val quicBlackholed: Long = 0,
     // 当前占着 512K 大档的 TCP socket 数（并发名额）
     val bigTierInUse: Long = 0,
+    /** 策略组健康快照；内核 stats 的 groups 字段。 */
+    val groupHealth: List<GroupHealth> = emptyList(),
 ) {
     companion object {
         fun fromJson(text: String): StatsData {
@@ -285,6 +350,9 @@ data class StatsData(
                     dnsFallbackBreaker = o.optLong("dnsFallbackBreaker"),
                     dnsFallbackRace = o.optLong("dnsFallbackRace"),
                     dnsFallbackReview = o.optLong("dnsFallbackReview"),
+                    dnsStaleReply = o.optLong("dnsStaleReply"),
+                    udpTargets = o.optLong("udpTargets"),
+                    udpTargetBufKb = o.optLong("udpTargetBufKb"),
                     activeConns = o.optLong("activeConns"),
                     totalConns = o.optLong("totalConns"),
                     filterRules = o.optLong("filterRules"),
@@ -297,6 +365,9 @@ data class StatsData(
                     mitmQuicBlocked = o.optLong("mitmQuicBlocked"),
                     mitmAppSkipped = o.optLong("mitmAppSkipped"),
                     mitmFinanceSkipped = o.optLong("mitmFinanceSkipped"),
+                    mitmBodyBypassed = o.optLong("mitmBodyBypassed"),
+                    mitmFailedTop = parseMitmHosts(o.optJSONObject("mitmHosts")?.optJSONArray("failedTop")),
+                    mitmNoRuleTop = parseMitmHosts(o.optJSONObject("mitmHosts")?.optJSONArray("noRuleTop")),
                     uidResolved = o.optLong("uidResolved"),
                     uidUnknown = o.optLong("uidUnknown"),
                     tunTxDrop = o.optLong("tunTxDrop"),
@@ -312,6 +383,42 @@ data class StatsData(
                     quicFallback = o.optLong("quicFallback"),
                     quicBlackholed = o.optLong("quicBlackholed"),
                     bigTierInUse = o.optLong("bigTierInUse"),
+                    groupHealth = o.optJSONArray("groups")?.let { arr ->
+                        buildList {
+                            for (i in 0 until arr.length()) {
+                                val g = arr.optJSONObject(i) ?: continue
+                                val members = mutableListOf<GroupMemberHealth>()
+                                g.optJSONArray("members")?.let { ms ->
+                                    for (j in 0 until ms.length()) {
+                                        val m = ms.optJSONObject(j) ?: continue
+                                        val h = m.optJSONObject("health")
+                                        val tcp = h?.optJSONObject("tcp")
+                                        val udp = h?.optJSONObject("udp")
+                                        members.add(
+                                            GroupMemberHealth(
+                                                name = m.optString("name", ""),
+                                                node = m.optBoolean("node", false),
+                                                tcpLatencyMs = tcp?.optLong("latencyMs")?.takeIf { tcp.has("latencyMs") && !tcp.isNull("latencyMs") },
+                                                tcpStatus = tcp?.optString("status", "unknown") ?: "unknown",
+                                                udpLatencyMs = udp?.optLong("latencyMs")?.takeIf { udp.has("latencyMs") && !udp.isNull("latencyMs") },
+                                                udpStatus = udp?.optString("status", "unknown") ?: "unknown",
+                                            ),
+                                        )
+                                    }
+                                }
+                                add(
+                                    GroupHealth(
+                                        name = g.optString("name", ""),
+                                        type = g.optString("type", "select"),
+                                        lbMode = g.optString("lbMode", "consistent-hash"),
+                                        switchInterval = g.optInt("switchInterval", 30),
+                                        current = g.optString("current", "").takeIf { it.isNotBlank() },
+                                        members = members,
+                                    ),
+                                )
+                            }
+                        }
+                    } ?: emptyList(),
                 )
             } catch (_: Exception) {
                 StatsData()
@@ -351,6 +458,10 @@ data class ProxyGroup(
     val recoveryThreshold: Int = 2,
     /** global：沿全局无节点策略；block：拦截；direct：直连。 */
     val noNodeAction: String = "global",
+    /** load-balance 选路方式：consistent-hash（默认）/ round-robin。 */
+    val lbMode: String = "consistent-hash",
+    /** 自动切换最短间隔，秒；当前节点不可用时立即切换。 */
+    val switchInterval: Int = 30,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("name", name)
@@ -363,6 +474,8 @@ data class ProxyGroup(
         put("failureThreshold", failureThreshold)
         put("recoveryThreshold", recoveryThreshold)
         put("noNodeAction", noNodeAction)
+        put("lbMode", lbMode)
+        put("switchInterval", switchInterval)
     }
 
     companion object {
@@ -376,6 +489,7 @@ data class ProxyGroup(
                 type = o.optString("type", "select").trim().lowercase().let {
                     when (it) {
                         "url-test", "urltest", "fallback" -> it.replace("urltest", "url-test")
+                        "load-balance", "loadbalance", "balance" -> "load-balance"
                         else -> "select"
                     }
                 },
@@ -391,6 +505,10 @@ data class ProxyGroup(
                 noNodeAction = o.optString("noNodeAction", "global").let {
                     if (it == "block" || it == "direct") it else "global"
                 },
+                lbMode = o.optString("lbMode", "consistent-hash").trim().lowercase().let {
+                    if (it == "round-robin" || it == "roundrobin" || it == "rr") "round-robin" else "consistent-hash"
+                },
+                switchInterval = o.optInt("switchInterval", 30).coerceIn(1, 86_400),
             )
         }
     }
@@ -463,6 +581,14 @@ data class ModuleSource(
     val mitmRules: Int = 0,
     /** AdBlock @@ 例外条数（放在末尾，兼容旧 JSON/旧位置参数）。 */
     val allowRules: Int = 0,
+    /** 更新周期（秒）；0 表示只手动。 */
+    val intervalSeconds: Long = 21600,
+    val lastAttemptAt: Long = 0L,
+    val etag: String = "",
+    val lastModified: String = "",
+    /** 上次拉取失败但本地旧缓存仍可用。 */
+    val stale: Boolean = false,
+    val cacheBytes: Long = 0L,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id)
@@ -477,6 +603,12 @@ data class ModuleSource(
         put("allowRules", allowRules)
         put("ignored", ignored)
         put("error", error)
+        put("intervalSeconds", intervalSeconds)
+        put("lastAttemptAt", lastAttemptAt)
+        put("etag", etag)
+        put("lastModified", lastModified)
+        put("stale", stale)
+        put("cacheBytes", cacheBytes)
     }
 
     companion object {
@@ -493,6 +625,12 @@ data class ModuleSource(
             allowRules = o.optInt("allowRules", 0),
             ignored = o.optInt("ignored", 0),
             error = o.optString("error", ""),
+            intervalSeconds = o.optLong("intervalSeconds", 21600L),
+            lastAttemptAt = o.optLong("lastAttemptAt", 0L),
+            etag = o.optString("etag", ""),
+            lastModified = o.optString("lastModified", ""),
+            stale = o.optBoolean("stale", false),
+            cacheBytes = o.optLong("cacheBytes", 0L),
         )
     }
 }
@@ -800,4 +938,24 @@ data class AppConfig(
             }
         }
     }
+}
+
+private fun parseMitmHosts(arr: JSONArray?): List<MitmHostRow> {
+    if (arr == null) return emptyList()
+    val out = ArrayList<MitmHostRow>(arr.length())
+    for (i in 0 until arr.length()) {
+        val o = arr.optJSONObject(i) ?: continue
+        val host = o.optString("host")
+        if (host.isBlank()) continue
+        out += MitmHostRow(
+            host = host,
+            conns = o.optLong("conns"),
+            reqs = o.optLong("reqs"),
+            failed = o.optLong("failed"),
+            canceled = o.optLong("canceled"),
+            noRule = o.optLong("noRule"),
+            rewritten = o.optLong("rewritten"),
+        )
+    }
+    return out
 }

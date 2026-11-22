@@ -1,24 +1,25 @@
 #![recursion_limit = "512"]
 
 pub mod config;
+pub mod conns;
+pub mod cron;
 pub mod dns;
 pub mod dns_log;
 pub mod engine;
 pub mod finance;
 pub mod logging;
 pub mod mitm;
-pub mod script;
 pub mod netstack;
 pub mod outbound;
 pub mod proto;
 pub mod quic;
-pub mod stats;
+pub mod script;
 pub mod sniff;
-pub mod udp;
-pub mod subscribe;
+pub mod stats;
 pub mod strategy;
+pub mod subscribe;
+pub mod udp;
 pub mod uidmap;
-pub mod conns;
 
 use crate::config::Config;
 use crate::dns::DnsEngine;
@@ -51,10 +52,21 @@ fn stop_engine() {
     if let Some(engine) = guard.take() {
         logging::info("core", "正在停止：通知协议栈释放 TUN");
         engine.shutdown.store(true, Ordering::Relaxed);
-        engine.ctx.dns.read().unwrap_or_else(|p| p.into_inner()).save_state();
+        engine
+            .ctx
+            .dns
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .save_state();
         // 冻结统计时点：停止后 nativeStats 仍返回本次会话的汇总，uptime 不再增长。
-        engine.stats.stopped_at.store(crate::stats::now_ms() as i64, Ordering::Relaxed);
-        ENGINE_STATS.lock().unwrap_or_else(|p| p.into_inner()).clone_from(&engine.stats);
+        engine
+            .stats
+            .stopped_at
+            .store(crate::stats::now_ms() as i64, Ordering::Relaxed);
+        ENGINE_STATS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone_from(&engine.stats);
         engine.rt.shutdown_timeout(Duration::from_secs(3));
         logging::info("core", "已停止：运行时与 TUN 资源已释放");
     }
@@ -120,8 +132,16 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStart<'local>(
                     "strategy",
                     format!(
                         "策略诊断 {}{}：{}",
-                        if issue.group.is_empty() { "全局".to_string() } else { issue.group.clone() },
-                        if issue.code.is_empty() { "".to_string() } else { format!("/{}", issue.code) },
+                        if issue.group.is_empty() {
+                            "全局".to_string()
+                        } else {
+                            issue.group.clone()
+                        },
+                        if issue.code.is_empty() {
+                            "".to_string()
+                        } else {
+                            format!("/{}", issue.code)
+                        },
                         issue.message
                     ),
                 );
@@ -129,8 +149,12 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStart<'local>(
         }
         let stats: Arc<Stats> = Arc::new(Stats::new());
         crate::outbound::set_tuning(cfg.bbr, stats.clone());
-        stats.filter_rules.store(filter.rule_count() as u64, Ordering::Relaxed);
-        stats.filter_skipped.store(filter.skipped as u64, Ordering::Relaxed);
+        stats
+            .filter_rules
+            .store(filter.rule_count() as u64, Ordering::Relaxed);
+        stats
+            .filter_skipped
+            .store(filter.skipped as u64, Ordering::Relaxed);
         let mut dns = DnsEngine::new(
             &cfg.dns,
             filter.clone(),
@@ -167,7 +191,9 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStart<'local>(
         let nodes = cfg.nodes.clone();
         let selected = cfg.selected.clone();
         let health = Arc::new(strategy::HealthRegistry::new());
-        let mitm_state = Arc::new(std::sync::RwLock::new(Arc::new(mitm::MitmState::build(&cfg.mitm))));
+        let mitm_state = Arc::new(std::sync::RwLock::new(Arc::new(
+            mitm::MitmState::build_with_stats(&cfg.mitm, Some(stats.clone())),
+        )));
         // 壳层可能在 nativeStart 之前就下发过 UID 表（服务启动顺序不保证），
         // 这里把最后一份 pending 表应用到新会话，避免刚启动的窗口期 UID 规则失效。
         let uid_map = Arc::new(std::sync::RwLock::new(crate::uidmap::UidMap::default()));
@@ -230,6 +256,12 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStart<'local>(
         rt.spawn(async move {
             strategy::run_health_loop(hs, hstrat, hnodes, hhealth).await;
         });
+        // cron / network-changed / generic 共用同一个随 VPN 生命周期存活的调度循环。
+        let cron_shutdown = ctx.shutdown.clone();
+        let cron_mitm = ctx.mitm.clone();
+        rt.spawn(async move {
+            cron::run_cron_loop(cron_shutdown, cron_mitm).await;
+        });
         // 等协议栈真正就绪再返回 true，避免界面先显示「已连接」但流量还没人接。
         let mut waited = 0u32;
         while !netstack::STACK_READY.load(Ordering::Acquire) && waited < 300 {
@@ -250,7 +282,11 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStart<'local>(
                 if shut_flush.load(Ordering::Relaxed) {
                     break;
                 }
-                ctx_flush.dns.read().unwrap_or_else(|p| p.into_inner()).save_state();
+                ctx_flush
+                    .dns
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .save_state();
             }
         });
 
@@ -299,10 +335,26 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStats<'local>(
         match guard.as_ref() {
             Some(engine) => {
                 let snapshot = engine.ctx.mitm().engine.bypass_snapshot();
-                engine.stats.to_json_with(&snapshot)
+                let stats_json = engine.stats.to_json_with(&snapshot);
+                let groups = engine
+                    .ctx
+                    .strategy_snapshot()
+                    .health_json(&engine.ctx.health);
+                match serde_json::from_str::<serde_json::Value>(&stats_json) {
+                    Ok(mut value) => {
+                        if let Some(obj) = value.as_object_mut() {
+                            obj.insert("groups".to_string(), groups);
+                        }
+                        serde_json::to_string(&value).unwrap_or(stats_json)
+                    }
+                    Err(_) => stats_json,
+                }
             }
             // 停止后返回本次会话的最终统计（uptime 已冻结），不再清空。
-            None => ENGINE_STATS.lock().unwrap_or_else(|p| p.into_inner()).to_json(),
+            None => ENGINE_STATS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .to_json(),
         }
     };
     to_jstring(&mut env, json)
@@ -415,7 +467,7 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeConnections<'local>(
             Some(engine) => engine
                 .ctx
                 .conns
-                .read()
+                .write()
                 .unwrap_or_else(|p| p.into_inner())
                 .json_since(since.max(0) as u64),
             None => "{\"items\":[],\"last\":0,\"total\":0}".to_string(),
@@ -466,7 +518,9 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeReloadRules<'local>(
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let Some(engine) = guard.as_ref() else { return false };
+        let Some(engine) = guard.as_ref() else {
+            return false;
+        };
         crate::outbound::set_tuning(cfg.bbr, engine.stats.clone());
         let filter = Arc::new(build_filter(&cfg));
         let rules = Arc::new(RuleEngine::from_config(&cfg));
@@ -479,10 +533,21 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeReloadRules<'local>(
                 );
             }
         }
-        engine.stats.filter_rules.store(filter.rule_count() as u64, Ordering::Relaxed);
-        engine.stats.filter_skipped.store(filter.skipped as u64, Ordering::Relaxed);
+        engine
+            .stats
+            .filter_rules
+            .store(filter.rule_count() as u64, Ordering::Relaxed);
+        engine
+            .stats
+            .filter_skipped
+            .store(filter.skipped as u64, Ordering::Relaxed);
         // 旧引擎状态先落盘，新引擎从盘加载，Fake-IP 与缓存都不丢
-        engine.ctx.dns.read().unwrap_or_else(|p| p.into_inner()).save_state();
+        engine
+            .ctx
+            .dns
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .save_state();
         let mut new_dns = DnsEngine::new(
             &cfg.dns,
             filter.clone(),
@@ -529,7 +594,10 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeReloadRules<'local>(
         }
         // MITM 引擎与 CA 一并热更：规则/域名列表改动不中断现有连接。
         if let Ok(mut m) = engine.ctx.mitm.write() {
-            *m = Arc::new(mitm::MitmState::build(&cfg.mitm));
+            *m = Arc::new(mitm::MitmState::build_with_stats(
+                &cfg.mitm,
+                Some(engine.stats.clone()),
+            ));
         }
         if let Ok(mut c) = engine.ctx.cfg.write() {
             *c = cfg;
@@ -540,6 +608,85 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeReloadRules<'local>(
     match result {
         Ok(true) => 1,
         _ => 0,
+    }
+}
+
+/// 脚本参数运行期热更新：只替换 `$argument` 注入值，不重编译脚本，
+/// 也不替换 MITM 引擎；已进入执行队列的脚本持有自己的参数快照。
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeSetScriptArguments<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    payload_json: JString<'local>,
+) -> jboolean {
+    let result = catch_unwind(AssertUnwindSafe(|| -> bool {
+        let Some(json) = read_string(&mut env, &payload_json) else {
+            return false;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else {
+            logging::warn("script", "参数热更新 JSON 解析失败");
+            return false;
+        };
+        let Some(key) = v.get("key").and_then(|x| x.as_str()) else {
+            return false;
+        };
+        let Some(values) = v.get("values").and_then(|x| x.as_object()) else {
+            return false;
+        };
+        let map: std::collections::HashMap<String, String> = values
+            .iter()
+            .filter_map(|(k, x)| x.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect();
+        let guard = match ENGINE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let Some(engine) = guard.as_ref() else {
+            return false;
+        };
+        let mitm = engine.ctx.mitm();
+        mitm.engine.scripts.set_argument_values(key, map);
+        logging::info("script", format!("脚本参数已热更新: {}", key));
+        true
+    }));
+    match result {
+        Ok(true) => 1,
+        _ => 0,
+    }
+}
+
+/// network-changed / generic 手动触发：与 cron 共用同一套串行执行设施。
+/// network-changed 由壳层在网络稳定后调用；这里再做 4 秒去抖兜底。
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeTriggerScripts<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    kind: JString<'local>,
+) -> jint {
+    let result = catch_unwind(AssertUnwindSafe(|| -> i32 {
+        let Some(kind) = read_string(&mut env, &kind) else {
+            return -1;
+        };
+        let debounce = if kind.eq_ignore_ascii_case("network-changed") {
+            4
+        } else {
+            1
+        };
+        let guard = match ENGINE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let Some(engine) = guard.as_ref() else {
+            return -1;
+        };
+        let started =
+            cron::trigger_scripts(&kind, &engine.ctx.mitm, &engine.ctx.shutdown, debounce);
+        logging::info("cron", format!("触发 {}：启动 {} 条脚本", kind, started));
+        started as i32
+    }));
+    match result {
+        Ok(v) => v,
+        _ => -1,
     }
 }
 
@@ -588,7 +735,11 @@ fn resolve_rule_transport(
                 note = format!(
                     "策略组解析失败：{}（链：{}）；无可用节点 → {}",
                     e.message,
-                    if e.chain.is_empty() { "无".to_string() } else { e.chain.join(" → ") },
+                    if e.chain.is_empty() {
+                        "无".to_string()
+                    } else {
+                        e.chain.join(" → ")
+                    },
                     final_label
                 );
                 action = match policy {
@@ -781,14 +932,16 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeMitmExportCa<'local>(
     out_dir: JString<'local>,
 ) -> jstring {
     let json = catch_unwind(AssertUnwindSafe(|| {
-        let (Some(ca_path), Some(out)) =
-            (read_string(&mut env, &ca_file), read_string(&mut env, &out_dir))
-        else {
+        let (Some(ca_path), Some(out)) = (
+            read_string(&mut env, &ca_file),
+            read_string(&mut env, &out_dir),
+        ) else {
             return r#"{"ok":false,"error":"读取参数失败"}"#.to_string();
         };
         match mitm::ca::export_ca(&ca_path, &out) {
             Ok((pem, der, name)) => {
-                serde_json::json!({"ok": true, "pem": pem, "der": der, "system_name": name}).to_string()
+                serde_json::json!({"ok": true, "pem": pem, "der": der, "system_name": name})
+                    .to_string()
             }
             Err(e) => serde_json::json!({"ok": false, "error": e}).to_string(),
         }
@@ -802,7 +955,7 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeVersion<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
-    to_jstring(&mut env, "1.13.13".into())
+    to_jstring(&mut env, "1.13.22".into())
 }
 
 #[cfg(test)]

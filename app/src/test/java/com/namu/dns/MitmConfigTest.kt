@@ -232,4 +232,17 @@ class MitmConfigTest {
         assertEquals(listOf("*.example.com"), parsed.mitmHostnames)
         assertEquals(1, parsed.urlRewrites.size)
     }
+
+    @Test
+    fun `host skip toggle is reversible and normalized`() {
+        val base = listOf("api.example.com", "*.bank.com")
+        assertEquals(
+            listOf("api.example.com", "*.bank.com", "ads.example.com"),
+            MitmManager.toggleSkip(base, "Ads.Example.com."),
+        )
+        assertEquals(
+            listOf("*.bank.com"),
+            MitmManager.toggleSkip(base, "API.EXAMPLE.COM"),
+        )
+    }
 }

@@ -8,13 +8,17 @@
 //! hostname 语义与 Surge 一致：`*.example.com` 匹配 example.com 及其全部子域，
 //! 裸域名只精确匹配。握手失败的域名进入临时放行名单（fail-open），不断网。
 
-use regex::Regex;
-use serde::{Deserialize, Serialize};
 use crate::mitm::loon::LoonRule;
 use crate::script::{ScriptEngine, ScriptRuleConf};
+use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+fn default_pool_idle() -> u64 {
+    30
+}
 
 fn default_body_limit() -> usize {
     2 * 1024 * 1024
@@ -69,12 +73,27 @@ pub struct MitmConfig {
     /// Loon `[Rewrite]` 原始行（旧版与新版语法混排），由 loon 解析器编译。
     #[serde(default)]
     pub loon_rewrites: Vec<String>,
+    /// Surge `[Body Rewrite]` 原始行：http-request/http-response <url> <regex> <replacement>。
+    #[serde(default, alias = "bodyRewrites")]
+    pub body_rewrites: Vec<String>,
+    /// `[WebSocket Rewrite]` 原始行（南门自有语法 ws-block / ws-text-replace）。
+    #[serde(default, alias = "websocketRewrites")]
+    pub websocket_rewrites: Vec<String>,
     /// 请求/响应脚本；正文由外壳下载后写入，内核用 QuickJS 执行。
     #[serde(default)]
     pub scripts: Vec<ScriptRuleConf>,
     /// `$persistentStore` 落盘路径；空 = 仅在进程内保存。
     #[serde(default)]
     pub script_store_file: String,
+    /// Map Local `data-path` / `file` 的基准目录；相对路径相对此目录解析。
+    #[serde(default)]
+    pub mock_base_dir: String,
+    /// `$notification` 系统通知队列（JSONL）；空 = 只保留诊断。
+    #[serde(default)]
+    pub notification_file: String,
+    /// `$environment` 注入字段（app/appVersion/system/device/language/timezone 等）。
+    #[serde(default)]
+    pub environment: std::collections::HashMap<String, String>,
     /// 响应体改写上限（字节），超过则原样透传，防内存失控。
     #[serde(default = "default_body_limit")]
     pub body_limit: usize,
@@ -84,6 +103,12 @@ pub struct MitmConfig {
     /// 调试用：跳过对真实服务器的证书校验。正常使用必须为 false。
     #[serde(default)]
     pub upstream_insecure: bool,
+    /// 灰度：MITM 上游连接池。默认关闭；开启后 h1 独占复用、h2 按对端 SETTINGS 共享。
+    #[serde(default)]
+    pub pool_enabled: bool,
+    /// 池化连接空闲上限（秒）。
+    #[serde(default = "default_pool_idle")]
+    pub pool_idle_secs: u64,
     /// 按 App MITM：`all`（全部应用）/ `allow`（仅 app_uids 内）/ `deny`（app_uids 内跳过）。
     #[serde(default)]
     pub app_mode: String,
@@ -106,11 +131,18 @@ impl Default for MitmConfig {
             url_rewrites: Vec::new(),
             header_rewrites: Vec::new(),
             loon_rewrites: Vec::new(),
+            body_rewrites: Vec::new(),
+            websocket_rewrites: Vec::new(),
             scripts: Vec::new(),
             script_store_file: String::new(),
+            mock_base_dir: String::new(),
+            notification_file: String::new(),
+            environment: std::collections::HashMap::new(),
             body_limit: default_body_limit(),
             fail_open_ttl: default_fail_open_ttl(),
             upstream_insecure: false,
+            pool_enabled: false,
+            pool_idle_secs: default_pool_idle(),
             app_mode: String::new(),
             app_uids: Vec::new(),
             finance: crate::finance::FinanceConf::default(),
@@ -233,7 +265,11 @@ impl HostMatcher {
                 exact.insert(p);
             }
         }
-        Self { exact, suffix, globs }
+        Self {
+            exact,
+            suffix,
+            globs,
+        }
     }
 
     pub fn matches(&self, host: &str) -> bool {
@@ -270,8 +306,13 @@ pub struct MitmEngine {
     /// Loon [Rewrite] 规则（与 Surge [URL Rewrite] 分开，避免语法互相推导）。
     pub loon_rules: Vec<LoonRule>,
     pub loon_unsupported: Vec<String>,
+    /// h1 WebSocket Upgrade 的帧改写规则；空时调用方保持 copy_bidirectional。
+    pub ws_rules: crate::mitm::ws::WsRules,
     /// 脚本规则（QuickJS）。脚本执行失败只回退该脚本，不影响隧道。
     pub scripts: ScriptEngine,
+    pub mock_base_dir: String,
+    pub notification_file: String,
+    pub environment: std::collections::HashMap<String, String>,
     pub body_limit: usize,
     pub upstream_insecure: bool,
     /// 该配置对哪些应用生效；all 时与旧行为完全一致。
@@ -351,7 +392,11 @@ impl MitmEngine {
         }
         let mut loon_lines = cfg.loon_rewrites.clone();
         loon_lines.extend(extra_loon);
-        let loon = crate::mitm::loon::parse_loon_rewrites(&loon_lines);
+        let mut loon = crate::mitm::loon::parse_loon_rewrites(&loon_lines);
+        let body_loon = crate::mitm::loon::parse_body_rewrites(&cfg.body_rewrites);
+        loon.rules.extend(body_loon.rules);
+        loon.unsupported.extend(body_loon.unsupported);
+        let ws_rules = crate::mitm::ws::WsRules::parse(&cfg.websocket_rewrites);
         let scripts = ScriptEngine::from_config(&cfg.scripts, &cfg.script_store_file);
         Self {
             enabled: cfg.enabled,
@@ -360,7 +405,11 @@ impl MitmEngine {
             rules,
             loon_rules: loon.rules,
             loon_unsupported: loon.unsupported,
+            ws_rules,
             scripts,
+            mock_base_dir: cfg.mock_base_dir.clone(),
+            notification_file: cfg.notification_file.clone(),
+            environment: cfg.environment.clone(),
             body_limit: cfg.body_limit.max(4096),
             upstream_insecure: cfg.upstream_insecure,
             skipped_rules: skipped,
@@ -469,7 +518,10 @@ impl MitmEngine {
 
     /// 命中该 URL 的 Loon 规则；按声明顺序执行，不把 Surge 规则混进来。
     pub fn loon_rules_for(&self, url: &str) -> Vec<&LoonRule> {
-        self.loon_rules.iter().filter(|r| r.url.is_match(url)).collect()
+        self.loon_rules
+            .iter()
+            .filter(|r| r.url.is_match(url))
+            .collect()
     }
 }
 
@@ -637,7 +689,10 @@ fn surge_rewrite_to_loon(t: &[String], _last: &str, raw: &str) -> Option<String>
         }
     }
     // mock 族：动作在 t[1]，body 在 t[2..]。
-    if !matches!(action.as_str(), "mock" | "mock-request-body" | "mock-response-body") {
+    if !matches!(
+        action.as_str(),
+        "mock" | "mock-request-body" | "mock-response-body"
+    ) {
         return None;
     }
     let dir = if action == "mock-request-body" {
@@ -663,7 +718,10 @@ fn surge_rewrite_to_loon(t: &[String], _last: &str, raw: &str) -> Option<String>
         "text"
     };
     let escaped = body.replace('\\', "\\\\").replace('"', "\\\"");
-    Some(format!("{} {} data-type={} data=\"{}\"", t[0], dir, data_type, escaped))
+    Some(format!(
+        "{} {} data-type={} data=\"{}\"",
+        t[0], dir, data_type, escaped
+    ))
 }
 
 /// 解析 .sgmodule 中的 [MITM] / [URL Rewrite] / [Header Rewrite] 段。
@@ -676,7 +734,11 @@ pub fn parse_surge_module(text: &str) -> SurgeMitm {
     let mut section = String::new();
     for raw in text.lines() {
         let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('!') || line.starts_with(';') {
+        if line.is_empty()
+            || line.starts_with('#')
+            || line.starts_with('!')
+            || line.starts_with(';')
+        {
             continue;
         }
         if line.starts_with('[') && line.ends_with(']') {
@@ -717,7 +779,9 @@ pub fn parse_surge_module(text: &str) -> SurgeMitm {
                 }
                 if let Some(action) = RewriteAction::parse(&last) {
                     match action {
-                        RewriteAction::Reject | RewriteAction::Reject200 | RewriteAction::RejectTinyGif => {
+                        RewriteAction::Reject
+                        | RewriteAction::Reject200
+                        | RewriteAction::RejectTinyGif => {
                             rules.push(MitmRuleConf {
                                 pattern: t[0].clone(),
                                 action: last.clone(),
@@ -772,7 +836,10 @@ pub fn parse_surge_module(text: &str) -> SurgeMitm {
                 let t = tokenize(line);
                 // url header-replace|header-add field value
                 if t.len() == 4
-                    && matches!(t[1].to_ascii_lowercase().as_str(), "header-replace" | "header-add")
+                    && matches!(
+                        t[1].to_ascii_lowercase().as_str(),
+                        "header-replace" | "header-add"
+                    )
                 {
                     rules.push(MitmRuleConf {
                         pattern: t[0].clone(),
@@ -791,7 +858,12 @@ pub fn parse_surge_module(text: &str) -> SurgeMitm {
     }
     hostnames.sort();
     hostnames.dedup();
-    SurgeMitm { hostnames, rules, loon, ignored }
+    SurgeMitm {
+        hostnames,
+        rules,
+        loon,
+        ignored,
+    }
 }
 
 #[cfg(test)]
@@ -825,7 +897,10 @@ mod tests {
             set.rules[0].action,
             crate::mitm::loon::LoonAction::Redirect { status: 302, .. }
         ));
-        assert!(matches!(set.rules[1].action, crate::mitm::loon::LoonAction::UrlReplace(_)));
+        assert!(matches!(
+            set.rules[1].action,
+            crate::mitm::loon::LoonAction::UrlReplace(_)
+        ));
         match &set.rules[2].action {
             crate::mitm::loon::LoonAction::ResponseMock(m) => {
                 assert_eq!(m.body, b"{\"code\":0}".to_vec());
@@ -888,7 +963,6 @@ mod tests {
         assert!(!e.should_mitm_uid("x.ads.com", Some(10010)));
         // 归属未知时不解密：宁可漏抓，不可误解银行/支付。
         assert!(!e.should_mitm_uid("x.ads.com", None));
-
     }
 
     #[test]
@@ -980,7 +1054,10 @@ mod tests {
         let cfg = MitmConfig {
             enabled: true,
             hostnames: vec!["x.com".into()],
-            rules: vec![conf("(unclosed", "reject"), conf("^https://x.com/ok", "reject")],
+            rules: vec![
+                conf("(unclosed", "reject"),
+                conf("^https://x.com/ok", "reject"),
+            ],
             ..Default::default()
         };
         let e = MitmEngine::from_config(&cfg);
@@ -1008,7 +1085,10 @@ hostname = *.example.com, api.foo.cn
 DOMAIN-SUFFIX,ads.example.com,REJECT
 "#;
         let p = parse_surge_module(text);
-        assert_eq!(p.hostnames, vec!["*.example.com".to_string(), "api.foo.cn".to_string()]);
+        assert_eq!(
+            p.hostnames,
+            vec!["*.example.com".to_string(), "api.foo.cn".to_string()]
+        );
         assert_eq!(p.rules.len(), 5);
         // 302 现在翻译成 Loon redirect，不再计入不支持
         assert_eq!(p.ignored, 0);
@@ -1078,7 +1158,9 @@ mod bypass_snapshot_tests {
         assert!(e.bypass_remaining("app.bilibili.com").is_none());
         assert_eq!(e.bypass_snapshot(), "");
         e.mark_bypass("app.bilibili.com");
-        let left = e.bypass_remaining("APP.BILIBILI.COM").expect("应在放行窗口");
+        let left = e
+            .bypass_remaining("APP.BILIBILI.COM")
+            .expect("应在放行窗口");
         assert!(left >= 299 && left <= 300, "剩余 {}", left);
         assert!(e.bypass_snapshot().contains("app.bilibili.com(剩"));
         // 放行窗口内该域名不得进入 MITM。

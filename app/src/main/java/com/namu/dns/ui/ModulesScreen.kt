@@ -173,6 +173,7 @@ fun ModulesScreen(onRestart: () -> Unit) {
                         if (module.allowRules > 0) append("，${module.allowRules} 条例外")
                         if (module.mitmRules > 0) append("，${module.mitmRules} 条 MITM")
                         if (module.ignored > 0) append("，${module.ignored} 条不支持")
+                        if (module.stale) append(" · 上次更新失败，继续使用旧缓存")
                         if (module.error.isNotBlank()) append("\n${module.error}")
                     }
                     SettingsRow(
@@ -198,8 +199,9 @@ fun ModulesScreen(onRestart: () -> Unit) {
                 "IP-CIDR / IP-CIDR6 / PORT；AdBlock 支持 ||domain^ 后缀、|domain| 精确和 @@ 例外。" +
                 "带 $ 选项、通配路径与 PROCESS-NAME 的规则会跳过，并在导入预览按原因列出。" +
                 "[MITM] 域名与 [URL Rewrite] / [Header Rewrite] / Loon [Rewrite] / [Script] 会在「设置 → MITM 去广告」启用并安装 CA 证书后生效；" +
-                "脚本运行在 QuickJS 沙箱内，支持 \$request/\$response/\$done/\$httpClient/\$persistentStore/\$argument；\$notification 只记录日志，不弹系统通知；" +
-                "setTimeout/setInterval 按 Loon 语义只执行一次，Promise/async 已驱动微任务，binary-body-mode/Uint8Array 已支持，require/本地文件读取不支持，导入预览会逐条标出；" +
+                "脚本运行在 QuickJS 沙箱内，支持 \$request/\$response/\$done/\$httpClient/\$persistentStore/\$argument/\$environment/\$utils；" +
+                "\$notification 已接系统通知（需通知权限），require 提供 crypto/base64/util 内置模块；" +
+                "setTimeout/setInterval 按 Loon 语义只执行一次，Promise/async 已驱动微任务，binary-body-mode/Uint8Array 已支持，本地文件读取仍不开放，导入预览会逐条标出；" +
                 "当前 DNS 过滤按域名生效，模块按 App 分组管理，不是系统级按 UID 隔离。",
         )
         Spacer(Modifier.height(LocalDockClearance.current + 34.dp))
@@ -365,7 +367,7 @@ private fun AddModuleDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
                     buildString {
                         val mitmCount = p.parsed.mitmHostnames.size +
                             p.parsed.urlRewrites.size + p.parsed.headerRewrites.size +
-                            p.parsed.loonRewrites.size + p.parsed.scripts.size
+                            p.parsed.loonRewrites.size + p.parsed.bodyRewrites.size + p.parsed.hostMappings.size + p.parsed.scripts.size
                         val lost = p.parsed.lostRouteTargets.size
                         val supported = p.parsed.blockLines.size + p.parsed.routeRules.size + mitmCount
                         append("完整支持 $supported 条 · 部分支持 $lost 条 · 跳过 ${p.parsed.ignored} 条")
@@ -529,18 +531,18 @@ private fun scriptCapability(rule: com.namu.dns.core.config.ScriptConfig): Pair<
     if (rule.source.isBlank()) return "不可用" to "脚本正文未缓存"
     val gaps = mutableListOf<String>()
     val low = rule.source
-    if (Regex("\\brequire\\s*\\(").containsMatchIn(low)) gaps.add("require")
     if (Regex("\\bfetch\\s*\\(").containsMatchIn(low)) gaps.add("fetch")
     if (Regex("\\bXMLHttpRequest\\b").containsMatchIn(low)) gaps.add("XMLHttpRequest")
     if (Regex("\\bWebAssembly\\b").containsMatchIn(low)) gaps.add("WebAssembly")
-    if ("\$utils" in low) gaps.add("\$utils")
     if (gaps.isNotEmpty()) return "部分可用" to "未提供 ${gaps.joinToString("/")}，其余 API 可用"
     if (rule.binaryBodyMode) return "可用" to "Uint8Array 二进制正文"
-    if ("\$notification" in low) return "部分可用" to "\$notification 只记录到运行日志，不弹系统通知"
     val used = buildList {
         if ("\$httpClient" in low) add("\$httpClient")
         if ("\$persistentStore" in low) add("\$persistentStore")
         if ("\$argument" in low) add("\$argument")
+        if ("\$environment" in low) add("\$environment")
+        if ("\$utils" in low) add("\$utils")
+        if (Regex("\\brequire\\s*\\(").containsMatchIn(low)) add("require")
         if ("\$notification" in low) add("\$notification")
         if ("\$done" in low) add("\$done")
     }
@@ -564,6 +566,11 @@ private fun moduleSkipLabel(key: String): String = when (key) {
     "invalid_adblock" -> "AdBlock 语法无效"
     "invalid_domain" -> "域名无效"
     "invalid_mitm_host" -> "MITM 域名无效"
+    "host_mapping_invalid" -> "Host 映射无效"
+    "host_server_system_unsupported" -> "Host server:system 不支持"
+    "host_server_http_unsupported" -> "Host DoH 仅支持 HTTPS"
+    "host_server_scheme_unsupported" -> "Host 上游协议不支持"
+    "body_rewrite_invalid" -> "Body Rewrite 规则无效"
     "invalid_json_rule" -> "JSON 规则无效"
     else -> key
 }

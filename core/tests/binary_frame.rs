@@ -25,12 +25,20 @@ fn synthetic_binary_frame_roundtrip() {
         src,
         ScriptPhase::Response,
         &msg,
-        &ScriptOptions { binary_body_mode: true, timeout_ms: 10_000, ..Default::default() },
+        &ScriptOptions {
+            binary_body_mode: true,
+            timeout_ms: 10_000,
+            ..Default::default()
+        },
     );
     assert!(out.error.is_none(), "脚本报错: {:?}", out.error);
     let out_bytes = out.message.body_bytes();
     assert_eq!(out_bytes.len(), body.len());
     assert_eq!(out_bytes[0], 0, "输出帧必须保持未压缩");
     assert_eq!(out_bytes[5], 0x2a, "payload 的首字节应被脚本改写");
-    assert!(out.message.headers.iter().any(|(k, v)| k == "grpc-encoding" && v == "identity"));
+    assert!(out
+        .message
+        .headers
+        .iter()
+        .any(|(k, v)| k == "grpc-encoding" && v == "identity"));
 }

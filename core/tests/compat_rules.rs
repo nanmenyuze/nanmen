@@ -50,17 +50,32 @@ fn rule_runtime_matrix() {
         "R03 IP-CIDR"
     );
     assert_eq!(
-        engine.decide(Some("other.example.org"), "198.51.100.1".parse().unwrap(), 8443, ConnKind::Tcp),
+        engine.decide(
+            Some("other.example.org"),
+            "198.51.100.1".parse().unwrap(),
+            8443,
+            ConnKind::Tcp
+        ),
         Action::Proxy,
         "R04 PORT"
     );
     assert_eq!(
-        engine.decide(Some("ad123.example.com"), "198.51.100.1".parse().unwrap(), 443, ConnKind::Tcp),
+        engine.decide(
+            Some("ad123.example.com"),
+            "198.51.100.1".parse().unwrap(),
+            443,
+            ConnKind::Tcp
+        ),
         Action::Block,
         "R09 DOMAIN-REGEX"
     );
     assert_eq!(
-        engine.decide(Some("unmatched.example.org"), "198.51.100.1".parse().unwrap(), 443, ConnKind::Tcp),
+        engine.decide(
+            Some("unmatched.example.org"),
+            "198.51.100.1".parse().unwrap(),
+            443,
+            ConnKind::Tcp
+        ),
         Action::Proxy,
         "R10 FINAL"
     );

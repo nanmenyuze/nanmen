@@ -100,7 +100,8 @@ object Diagnostics {
             val resolver = context.contentResolver
             val mode = android.provider.Settings.Global.getString(resolver, "private_dns_mode")
             val host = android.provider.Settings.Global.getString(resolver, "private_dns_specifier")
-            sb.appendLine("系统 Private DNS：${mode ?: "未知"}${host?.let { " / $it" } ?: ""}")
+            // mode=off 时 specifier 可能还留着上次的域名；这是系统残留快照，不再展示。
+            sb.appendLine("系统 Private DNS：${mode ?: "未知"}${if (mode != "off") host?.let { " / $it" }.orEmpty() else ""}")
         }
         sb.appendLine()
 
@@ -143,11 +144,32 @@ object Diagnostics {
                     "无规则 ${statsJson.optLong("mitmNoRule")}，h2 失败 ${statsJson.optLong("mitmH2Failed")}，" +
                     "QUIC 迫降 ${statsJson.optLong("mitmQuicBlocked")}",
             )
+            val tcpMs = statsJson.optLong("outboundTcpMs")
+            val tcpCount = statsJson.optLong("outboundTcpOk") + statsJson.optLong("outboundTcpFail")
+            val tlsMs = statsJson.optLong("outboundTlsMs")
+            val tlsCount = statsJson.optLong("outboundTlsOk") + statsJson.optLong("outboundTlsFail")
+            sb.appendLine(
+                "出站拨号：TCP OK ${statsJson.optLong("outboundTcpOk")} / 失败 ${statsJson.optLong("outboundTcpFail")}，" +
+                    "平均 ${if (tcpCount > 0) tcpMs / tcpCount else 0} ms；TLS OK ${statsJson.optLong("outboundTlsOk")} / " +
+                    "失败 ${statsJson.optLong("outboundTlsFail")}，平均 ${if (tlsCount > 0) tlsMs / tlsCount else 0} ms",
+            )
+            sb.appendLine(
+                "MITM 上游池：h1 命中 ${statsJson.optLong("mitmPoolH1Hit")} / 未命中 ${statsJson.optLong("mitmPoolH1Miss")}，" +
+                    "放回 ${statsJson.optLong("mitmPoolH1Reuse")} / 淘汰 ${statsJson.optLong("mitmPoolH1Evict")}；" +
+                    "h2 命中 ${statsJson.optLong("mitmPoolH2Hit")} / 未命中 ${statsJson.optLong("mitmPoolH2Miss")}，" +
+                    "复用 ${statsJson.optLong("mitmPoolH2Reuse")} / 淘汰 ${statsJson.optLong("mitmPoolH2Evict")}",
+            )
+            sb.appendLine(
+                "MITM 证书缓存：命中 ${statsJson.optLong("mitmLeafCacheHit")} / 未命中 ${statsJson.optLong("mitmLeafCacheMiss")}，" +
+                    "单飞等待 ${statsJson.optLong("mitmLeafWait")}，等待超时 ${statsJson.optLong("mitmLeafWaitTimeout")}，" +
+                    "等待打满 ${statsJson.optLong("mitmLeafPendingFull")}，实际签发 ${statsJson.optLong("mitmLeafSign")}",
+            )
             sb.appendLine("金融保护跳过 MITM：${statsJson.optLong("mitmFinanceSkipped")} 次")
             sb.appendLine(
                 "MITM 未送达：客户端取消 ${statsJson.optLong("mitmCanceled")}，" +
                     "TLS 弃连 ${statsJson.optLong("mitmTlsAborted")}，" +
-                    "临时放行跳过 ${statsJson.optLong("mitmBypassed")}",
+                    "临时放行跳过 ${statsJson.optLong("mitmBypassed")}，" +
+                    "正文提前直通 ${statsJson.optLong("mitmBodyBypassed")}",
             )
             val bypassHosts = statsJson.optString("mitmBypassHosts")
             if (bypassHosts.isNotEmpty()) {
@@ -155,7 +177,12 @@ object Diagnostics {
             }
             sb.appendLine(
                 "主循环耗时：上轮 ${statsJson.optLong("loopRoundMsLast")} ms，峰值 ${statsJson.optLong("loopRoundMsMax")} ms；" +
-                    "缓冲池未命中 ${statsJson.optLong("tunPoolMiss")} 次",
+                    "缓冲池未命中 ${statsJson.optLong("tunPoolMiss")} 次（rx ${statsJson.optLong("tunPoolMissRx")} / tx ${statsJson.optLong("tunPoolMissTx")}）",
+            )
+            sb.appendLine(
+                "动态 UDP 目标：${statsJson.optLong("udpTargets")} 个（普通+DNS 合计数），" +
+                    "预分配缓冲容量 ${formatBytes(statsJson.optLong("udpTargetBufKb") * 1024)}（物理页按实际流量提交）；" +
+                    "DNS 旧回包按 generation 丢弃 ${statsJson.optLong("dnsStaleReply")} 次",
             )
             sb.appendLine(
                 "TUN 发送：队列表满丢包 ${statsJson.optLong("tunTxDrop")}，backlog 溢出 ${statsJson.optLong("tunPendingDrop")}，" +
@@ -165,14 +192,19 @@ object Diagnostics {
             val tunMtu = statsJson.optLong("tunMtu")
             val bbrOk = statsJson.optLong("tcpBbrOk")
             val bbrFail = statsJson.optLong("tcpBbrFail")
+            val bbrSupport = when (statsJson.optLong("tcpBbrSupport")) {
+                1L -> "支持"
+                2L -> "不支持（已停止逐连接尝试）"
+                else -> "未探测"
+            }
             sb.appendLine(
                 "TUN 实际 MTU：$tunMtu（壳 setMtu 与内核 iface 同值）；" +
                     "上游 socket 增益：SO_RCVBUF 峰值 ${formatBytes(statsJson.optLong("upstreamRcvbufMax"))}，" +
                     "SO_SNDBUF 峰值 ${formatBytes(statsJson.optLong("upstreamSndbufMax"))}",
             )
             sb.appendLine(
-                "上游 BBR：生效 $bbrOk 条，回退 cubic $bbrFail 条" +
-                    if (bbrFail > 0) "（部分内核不支持 TCP_CONGESTION=bbr，自动回落不影响连通）" else "",
+                "上游 BBR：本机$bbrSupport，生效 $bbrOk 条，失败 $bbrFail 条" +
+                    if (bbrFail > 0) "（不支持时只记一次探测失败，自动回落 cubic，不影响连通）" else "",
             )
             val lat = statsJson.optJSONObject("dnsLatency")
             if (lat != null) {

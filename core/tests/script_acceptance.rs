@@ -25,10 +25,19 @@ fn request_phase_script_rewrites_method_headers_body() {
         $request.body = JSON.stringify({ q: 1 });
         $done({});
     "#;
-    let out = run_script(src, ScriptPhase::Request, &msg("https://api.example.com/v1", ""), &ScriptOptions::default());
+    let out = run_script(
+        src,
+        ScriptPhase::Request,
+        &msg("https://api.example.com/v1", ""),
+        &ScriptOptions::default(),
+    );
     assert!(out.error.is_none(), "请求脚本报错: {:?}", out.error);
     assert_eq!(out.message.method, "POST");
-    assert!(out.message.headers.iter().any(|(k, v)| k == "x-injected" && v == "1"));
+    assert!(out
+        .message
+        .headers
+        .iter()
+        .any(|(k, v)| k == "x-injected" && v == "1"));
     assert_eq!(out.message.body, r#"{"q":1}"#);
 }
 
@@ -43,18 +52,28 @@ fn async_await_http_client_fetches_and_completes() {
         let (mut s, _) = listener.accept().unwrap();
         let mut buf = [0u8; 1024];
         let _ = s.read(&mut buf);
-        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nnetwork");
+        let _ = s
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nnetwork");
     });
-    let src = format!(r#"
+    let src = format!(
+        r#"
         (async function () {{
             const data = await new Promise(function (resolve) {{
                 $httpClient.get("http://{addr}/x", function (err, resp, d) {{ resolve(d); }});
             }});
             $done({{ body: "got:" + data }});
         }})();
-    "#);
-    let out = run_script(&src, ScriptPhase::Request, &msg("https://api.example.com/", ""),
-        &ScriptOptions { allow_private_network: true, ..Default::default() });
+    "#
+    );
+    let out = run_script(
+        &src,
+        ScriptPhase::Request,
+        &msg("https://api.example.com/", ""),
+        &ScriptOptions {
+            allow_private_network: true,
+            ..Default::default()
+        },
+    );
     assert!(out.error.is_none(), "async 网络脚本报错: {:?}", out.error);
     assert_eq!(out.message.body, "got:network");
     assert_eq!(out.http_calls, 1);
@@ -65,12 +84,24 @@ fn async_await_http_client_fetches_and_completes() {
 #[test]
 fn persistent_store_roundtrip_across_runs() {
     let store = Arc::new(ScriptStore::new(""));
-    let opts = ScriptOptions { store: Some(store.clone()), script_name: "acc".into(), ..Default::default() };
-    let w = run_script(r#"$persistentStore.write("hello", "k"); $done({});"#,
-        ScriptPhase::Response, &msg("https://x/", "{}"), &opts);
+    let opts = ScriptOptions {
+        store: Some(store.clone()),
+        script_name: "acc".into(),
+        ..Default::default()
+    };
+    let w = run_script(
+        r#"$persistentStore.write("hello", "k"); $done({});"#,
+        ScriptPhase::Response,
+        &msg("https://x/", "{}"),
+        &opts,
+    );
     assert!(w.error.is_none());
-    let r = run_script(r#"$done({ body: $persistentStore.read("k") });"#,
-        ScriptPhase::Response, &msg("https://x/", "{}"), &opts);
+    let r = run_script(
+        r#"$done({ body: $persistentStore.read("k") });"#,
+        ScriptPhase::Response,
+        &msg("https://x/", "{}"),
+        &opts,
+    );
     assert!(r.error.is_none(), "读取报错: {:?}", r.error);
     assert_eq!(r.message.body, "hello");
 }
@@ -91,8 +122,15 @@ fn large_body_json_filter_completes() {
         b.data.items = b.data.items.filter(function (it) { return it.card_goto !== "ad_av"; });
         $done({ body: JSON.stringify(b) });
     "#;
-    let out = run_script(src, ScriptPhase::Response, &msg("https://app.video.example.com/x/v2/feed/index", &body),
-        &ScriptOptions { timeout_ms: 8000, ..Default::default() });
+    let out = run_script(
+        src,
+        ScriptPhase::Response,
+        &msg("https://app.video.example.com/x/v2/feed/index", &body),
+        &ScriptOptions {
+            timeout_ms: 8000,
+            ..Default::default()
+        },
+    );
     assert!(out.error.is_none(), "大数据脚本报错: {:?}", out.error);
     let v: serde_json::Value = serde_json::from_str(&out.message.body).unwrap();
     let n = v["data"]["items"].as_array().unwrap().len();
@@ -103,7 +141,12 @@ fn large_body_json_filter_completes() {
 #[test]
 fn request_short_circuit_generates_local_response() {
     let src = r#"$done({ response: { status: 200, headers: {"content-type":"text/plain"}, body: "mocked" } });"#;
-    let out = run_script(src, ScriptPhase::Request, &msg("https://api.example.com/ad", ""), &ScriptOptions::default());
+    let out = run_script(
+        src,
+        ScriptPhase::Request,
+        &msg("https://api.example.com/ad", ""),
+        &ScriptOptions::default(),
+    );
     assert!(out.error.is_none(), "短路报错: {:?}", out.error);
     assert!(out.short_circuit_response);
     assert_eq!(out.message.body, "mocked");

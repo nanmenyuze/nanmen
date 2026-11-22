@@ -1,6 +1,16 @@
-# 南门DNS 2.7
+# 南门DNS 2.9.1
 
 > 内核 crate / JNI：`nanmen_core` / `libnanmen_core.so`；许可证：**GPL-3.0-only**（见 `LICENSE`、`NOTICE`、`THIRD_PARTY_NOTICES.md`）。
+
+> 2.9.1 正式版（内核 1.13.22，versionCode 105）：壳层与调度审计修复。
+> - 配置异步保存：入队时冻结 active 配置名和配置快照，改完 A 立刻切 B 不会再把 A 写进 B。
+> - TUN 参数：热重载比较 `mode + mtu + fullRoute` 完整 `TunnelSpec`，连接中改 MTU 或 DNS-only 全量接管会真正重建 TUN。
+> - 备份：导出/恢复 `files/modules/module_*.sgmodule`、`files/scripts/script_*.js`、`files/ruleset_*.txt`，新机恢复本地导入模块不再因为 `local://` 没有远程地址而失效；缺正文模块和规则集/脚本依赖问题回显到恢复结果。
+> - Clash 导入：`load-balance` 不再降级成 `select`，保留 `lb_mode`/`strategy`（缺省 round-robin）与 `switch_interval`。
+> - 模块同步：下载结束按当前模块对象合并，只写同步字段，保留用户刚改的 `enabled`、`intervalSeconds`、`url`；同 id URL 已变则丢弃旧结果。
+> - 订阅刷新：`refreshSubscription()` 返回 `ImportResult`，零节点提示“未解析到可用节点，已保留上次节点”，部分成功显示可用/跳过数量，不再一律说“已刷新”。
+> - cron：`CompiledScriptRule` 编译期缓存 `CronSpec`，调度键包含 cron 表达式，改时间后旧时间不再命中；延迟任务执行前回查脚本是否仍存在且 cron/trigger/正文未变；无解表达式 6 小时复查一次，不再每秒扫描 527040 分钟。
+> - 验收：Rust 256 lib + 全量集成测试、Kotlin 199/199、lint 0 error / 38 warning；两套 ABI 16K 对齐，V2 证书与 2.9 连续。
 
 > 2.6 = Android 12+ 应用壳（`minSdk 31`）+ 自研 MITM 去广告内核（1.13.0）。在 2.3.7 基础上补齐 M7 备份/恢复、迁移与崩溃报告、实时连接/网络状态、重载失败回滚，并把基础配置 DNS 改为跟随手机底层网络，新增 RULE-SET / DOMAIN-SET / PROTOCOL 规则能力，并修复 h2 空闲连接被误判握手超时；内核版本仍为 1.12.5。
 >
@@ -28,6 +38,36 @@
 > - 脚本 `$argument` 按声明类型注入（string/number/boolean），Rewrite/Script 条件与动作里的 `${参数}` 按默认值先展开；参数类型随模块一起下发内核。
 > - MITM 诊断补齐：`mitmReqs`/`mitmNoRule`/`mitmH2Failed`/`mitmTlsAborted`/`mitmCanceled`/`mitmBypassed` 与临时放行域名快照 `mitmBypassHosts`；DNS 侧新增 `dnsAnySplit`（ANY 拆 A+AAAA 本地合并）与 `dnsUpstreamFail`；主循环新增 `loopRoundMsLast`/`loopRoundMsMax` 与 `tunPoolMiss`；诊断页展示实际 MTU、上游 socket 缓冲峰值与 BBR 生效/回退条数。
 > - 保留 2.6.3 的正常关闭计数漏减热修与 2.6.4 的规则集/CSV 解析修复。版本 2.7 / versionCode 95。
+
+> 2.8 正式版（内核 1.13.19，versionCode 102）：MITM 证书与运行时观测补强，并调整自愿打赏入口。
+> - 系统 CA 支持一键安装/更新：检测 Magisk/KernelSU/APatch 后写入 `/data/adb/modules/namu_mitm_ca`，证书先落到常驻 `cacerts_staging`，再整目录 bind 到 Conscrypt APEX/legacy 证书库；bind 前 `cmp` 幂等，随后 `nsenter` 注入 init 与 zygote/zygote64 命名空间（PID 去重）。无 Root 时只导出带指纹前缀的模块 zip，不写半吊子模块。
+> - 新增「移除系统 CA」：只按 `/proc/mounts` 里 `source == 我们 staging` 精确 umount，逐层校验到无残留，再删模块/日志/状态；APEX 自身和其他模块的挂载一律不碰。
+> - CA 状态改为临时文件 + rename 原子写，结尾带 `done=1`；UI 轮询完成标记后回显。模块只含证书段，私钥不出 App 私有目录。
+> - 证书模块冲突检测：复用 Root 通道读 init/zygote 挂载栈，最上层不是我们时提示「重新注入」；无 Root 退化为 DER 不一致提示。
+> - MITM 大响应提前直通：非文本 Content-Type 且没有二进制脚本，或 `Content-Length > 2 MiB`，在响应头改写后直接流式透传；chunked 超限回退前先 flush 已缓冲前缀，不丢字节。新增 `mitmBodyBypassed`。
+> - MITM host 维度观测：按 host 记录 conns/failed/canceled/noRule/rewritten，256 条近似 LRU；stats 输出失败 Top10 与无规则 Top10，UI 支持复制域名与一键加入 skip（只影响新连接）。数据只在本机内存，不上报。
+> - 打赏入口移除微信收款码；支付宝改为个人收款码深链 `alipayqr://platformapi/startapp?saId=10000007&qrcode=<编码后的收款码链接>`，点一下直接进「向你付款」页，金额由付款人自填；未安装支付宝时回退 https，仍失败则显示收款码图片。
+> - 验收：Rust 236/236、Kotlin 178/178、lint 0 error、两套 ABI 16K 对齐。
+
+> 2.9 正式版（内核 1.13.21，versionCode 104）：六项维修与 A1/B2/B1。
+> - host 收敛：B站模块只保留实际有 rewrite/script 的 host，补大会员/开屏/满意度调研规则，DNS 规则补 `cm.bilibili.com`；Host 榜单“加入跳过”改为可逆 toggle，`skipHostnames` 移除即恢复，下一次热重载仅影响新连接；榜单无规则率改按请求数（不是连接数）统计。
+> - BBR：首条 WAN socket 试设 `TCP_CONGESTION=bbr` 并 getsockopt 复核，缓存支持/不支持；不支持后不再逐连接 setsockopt，`tcpBbrFail` 只保留探测失败/真实异常，手动总开关仍可强制关。
+> - 观测：缓冲池未命中拆 `tunPoolMissRx`/`tunPoolMissTx`；熔断日志改为“冷却中，本机按拨号失败时序收尾（未发 SYN）”；Private DNS `mode=off` 不再展示残留 specifier。
+> - A1：备份恢复成功后调用 `MitmManager.export` 复用/生成 CA，再用 `RootCaManager.inspect` 核对；同机同证书不提示，只有指纹变化或系统库/模块都没有匹配证书时才一键安装。
+> - B2：叶子证书按 host single-flight，并发首连只签一次；rcgen 放阻塞线程池，不压 async worker；等待有界（128）、4s 超时/打满回退直签，新增 `mitmLeafCacheHit/Miss`、等待/超时/打满/实际签发指标。
+> - B1：outbound tcp/tls 拨号与握手指标；MITM 上游池默认关闭，开启后 h1 独占租约、h2 按对端 `SETTINGS_MAX_CONCURRENT_STREAMS` 限流，池键含 host/port/scheme/ALPN/SNI/insecure + target/action；h2 仅在 header 未发出时重试，不盲重试已上传正文。
+> - 测试：Rust 252/252 lib + 全量集成、Kotlin 181/181、lint 0 error；两 ABI 16K 对齐。
+
+> 2.8.1 正式版（内核 1.13.20，versionCode 103）：补齐模块改写与脚本运行时的剩余缺口。
+> - jq 不再限定 mini 子集：新增自有 lexer/parser/evaluator，覆盖 `.a.b`/`.[]`、管道与逗号、数组/对象构造、`map`/`select`/`del`、比较与算术、`if`、`//`、赋值、`to_entries`/`from_entries`/`with_entries`、`sort`/`sort_by`/`unique`/`unique_by`、字符串函数与 `@base64/@json/@uri/@csv`；`json-jq`/`-jq` 导入不再拒绝。
+> - Map Local 除 `data=` 内联外，支持 `data-path=`/`file=`，运行时相对 App 私有目录读取，文件缺失回退 404；Map Remote 翻译为 URL 前缀改写，跨域后按新 host 重建目标并保留路径/查询串。
+> - Script v2 条件支持 method、status、request/response header、request/response body 与运行期 Argument 比较；请求正文条件自动触发正文缓冲。Argument 导入即按声明类型注入 `$argument`，运行期修改不重编译脚本。
+> - JS 新增 `$environment`（App/系统/设备/语言/时区/版本）与 `$utils`（字节长度、Base64、MD5/SHA1/SHA256/HMAC、URL escape/unescape、geoLookup/getNetworkInfo 占位对象）；`require` 仅开放 crypto/base64/util 内置纯函数模块，不开放文件系统/网络/进程。`$notification.post` 写入 JSONL 队列，由 VPN 前台服务轮询转成系统通知（Android 13+ 检查通知权限）。
+> - `[MITM]` 支持 `skip` 列表并合并进内核 `skip_hostnames`，其余细项保留审计；`[General]` 识别 skip-proxy/bypass/dns-server 等常用键，可执行项由壳层接入，TUN 路由项保留原文不虚假承诺。
+> - 验收：Rust 248/248 lib + 全量集成测试、Kotlin 179/179、lint 0 error、两套 ABI 16K 对齐。
+
+> 2.7.1 测试版（内核 1.13.13，versionCode 96）：Surge `[Header Rewrite]` 在请求侧 `set_header` 之后，同步把同一条规则追加到 `plan.response_headers`，h1/h2 的 terminal 与上游响应两条路都执行（保持双向兼容，避免只改响应头导致现有模块的请求头改写失效）。Kotlin 新增 `[Map Local]`：`data=` 内联正文翻译成 `mock-response-body`，`status-code=`/`header=` 一并透传，`data-path=`/`file=` 与 `[Map Remote]` 显式报不支持。Script v2 条件不再只限单条 `${url}`：Kotlin 原样透传条件表达式，内核复用 `LoonCond` 条件树，`pattern` 退化为 URL 预筛，实际执行前用 `ScriptMessage.headers` 精确求值；不认的条件继续显式报错。
+
 ## 壳设计文档
 
 - Android 12+ 应用壳设计：`docs/UI_SHELL_ANDROID12.md`
@@ -611,4 +651,4 @@ Kotlin 壳 + 自研 Rust 内核（`core/`，crate `nanmen_core`，JNI `libnanmen
 - 本项目仅供学习与研究，**不提供任何代理服务、节点订阅或跨境网络服务**，打赏不会改变这一性质，也不产生任何服务义务；
 - 请量力而行，学生与经济尚未独立的朋友尤其不建议打赏。
 
-打赏入口：App「设置 → 关于 → 支持作者」。支付宝与微信收款码均已配置在 `docs/donate/` 对应的 drawable 资源中。爱发电入口默认关闭，可在 `DonateDialog.kt` 的 `DonateInfo.AFDIAN_URL` 填写后显示。
+打赏入口：App「设置 → 关于 → 支持作者」。目前只保留支付宝个人收款入口：点击后通过 `alipayqr://platformapi/startapp?saId=10000007&qrcode=...` 深链直接进入支付宝「向你付款」页，金额由付款人自己填写；未安装支付宝时回退打开收款码网页，仍无法打开则显示收款码图片。爱发电入口默认关闭，可在 `DonateDialog.kt` 的 `DonateInfo.AFDIAN_URL` 填写后显示。

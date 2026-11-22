@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::IpAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -59,7 +59,11 @@ impl Ctx {
         self.dns.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
     pub fn mode(&self) -> String {
-        self.cfg.read().unwrap_or_else(|p| p.into_inner()).mode.clone()
+        self.cfg
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .mode
+            .clone()
     }
     pub fn block_dot(&self) -> bool {
         self.cfg.read().unwrap_or_else(|p| p.into_inner()).block_dot
@@ -68,16 +72,25 @@ impl Ctx {
         self.cfg.read().unwrap_or_else(|p| p.into_inner()).sniff
     }
     pub fn block_when_no_node(&self) -> bool {
-        self.cfg.read().unwrap_or_else(|p| p.into_inner()).block_when_no_node
+        self.cfg
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .block_when_no_node
     }
     pub fn nodes_snapshot(&self) -> Arc<Vec<Node>> {
         self.nodes.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
     pub fn selected_snapshot(&self) -> Option<String> {
-        self.selected.read().unwrap_or_else(|p| p.into_inner()).clone()
+        self.selected
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
     pub fn strategy_snapshot(&self) -> Arc<StrategySet> {
-        self.strategy.read().unwrap_or_else(|p| p.into_inner()).clone()
+        self.strategy
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
     pub fn mitm(&self) -> Arc<crate::mitm::MitmState> {
         self.mitm.read().unwrap_or_else(|p| p.into_inner()).clone()
@@ -195,10 +208,7 @@ fn next_tcp_buffer_bytes() -> (usize, bool) {
 /// 所有 TCP socket 的销毁都必须走这里：abort + remove + 归还计数。
 fn release_tcp_socket(sockets: &mut SocketSet<'_>, handle: SocketHandle) {
     // 先读容量判档再 remove：大档 recv=512K、降级档 recv=128K，可区分。
-    let big = sockets
-        .get::<tcp::Socket>(handle)
-        .recv_capacity()
-        == TCP_SOCKET_BUFFER;
+    let big = sockets.get::<tcp::Socket>(handle).recv_capacity() == TCP_SOCKET_BUFFER;
     sockets.get_mut::<tcp::Socket>(handle).abort();
     let _ = sockets.remove(handle);
     TCP_SOCKETS.fetch_sub(1, Ordering::Relaxed);
@@ -210,11 +220,19 @@ fn release_tcp_socket(sockets: &mut SocketSet<'_>, handle: SocketHandle) {
 const MITM_DUPLEX_CAP: usize = 128 * 1024;
 const DNS_TCP_DUPLEX_CAP: usize = 64 * 1024;
 /// 每个 UDP 目的端点的单方向缓冲。QUIC 包约 1400 字节，巨帧档 App 可能发更大的
-/// UDP 数据报；32K 旧档在 9000 MTU 下只装得下 3 个大包，满即丢；64K 在跑量时
-/// 仍会因瞬时突发顶格，故抬到 256K（虚拟内存，物理按实际包增长）。
-const UDP_DST_BUF: usize = 256 * 1024;
+/// UDP 数据报；64K 能容纳约 46 个 QUIC 包或 8 个 8K 巨帧，且不像 256K 那样在
+/// 目标表变大时把容量上限推到几百 MiB（虚拟内存，物理仍按实际包增长）。
+const UDP_DST_BUF: usize = 64 * 1024;
 /// metadata 槽位必须跟缓冲容量匹配：槽位先耗尽会提前丢包，缓冲再大也没用。
 const UDP_META_SLOTS: usize = 256;
+/// 普通/DNS 动态目标统一上限：两张表共用同一预算，避免一边 1024、一边 256
+/// 各自都能长，合计无界。按 64K+64K 缓冲算，512 个目标容量上限约 64MiB
+/// （物理页懒提交，真实 RSS 随流量增长）。
+const MAX_UDP_TARGETS: usize = 512;
+/// 空闲目标回收阈值；有活动会话的目标不按时间踢。
+const UDP_TARGET_IDLE_SECS: u64 = 90;
+/// 每次动态绑定递增，DNS 异步回包前用它确认 socket 槽位没有被复用。
+static UDP_TARGET_GEN: AtomicU64 = AtomicU64::new(1);
 
 /// TCP keep-alive 探测间隔。运营商 NAT / 家用路由器的空闲映射通常 3~5 分钟就被静默清掉，
 /// 不主动探测的话长连接会「看着还连着、实际已经死了」：推送延迟、消息半天不到、游戏掉线。
@@ -257,14 +275,18 @@ struct TunTxToken {
     stats: Arc<Stats>,
 }
 
-/// 池未命中（不得不新分配）的次数：判断池是否还偏小。
-static POOL_MISS: AtomicUsize = AtomicUsize::new(0);
-/// 供诊断输出读取池未命中次数。
-pub fn pool_misses() -> usize {
-    POOL_MISS.load(Ordering::Relaxed)
+/// 池未命中（不得不新分配）的次数：rx/tx 分开，先定位是读侧还是写侧在新鲜分配。
+static POOL_MISS_RX: AtomicUsize = AtomicUsize::new(0);
+static POOL_MISS_TX: AtomicUsize = AtomicUsize::new(0);
+
+/// 供诊断输出读取池未命中次数（总量 + rx/tx 分量）。
+pub fn pool_misses() -> (usize, usize, usize) {
+    let rx = POOL_MISS_RX.load(Ordering::Relaxed);
+    let tx = POOL_MISS_TX.load(Ordering::Relaxed);
+    (rx + tx, rx, tx)
 }
 
-fn pool_take(pool: &Mutex<Vec<Vec<u8>>>, capacity: usize) -> Vec<u8> {
+fn pool_take(pool: &Mutex<Vec<Vec<u8>>>, capacity: usize, rx: bool) -> Vec<u8> {
     let mut g = match pool.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
@@ -272,7 +294,11 @@ fn pool_take(pool: &Mutex<Vec<Vec<u8>>>, capacity: usize) -> Vec<u8> {
     match g.pop() {
         Some(b) => b,
         None => {
-            POOL_MISS.fetch_add(1, Ordering::Relaxed);
+            if rx {
+                POOL_MISS_RX.fetch_add(1, Ordering::Relaxed);
+            } else {
+                POOL_MISS_TX.fetch_add(1, Ordering::Relaxed);
+            }
             Vec::with_capacity(capacity)
         }
     }
@@ -309,18 +335,12 @@ impl TunDevice {
 
     /// 从池里取一个缓冲直接读 TUN；读满后 set_len，避免每包分配和清零。
     fn read_rx(&mut self, fd: RawFd) -> io::Result<Option<Vec<u8>>> {
-        let mut buf = pool_take(&self.rx_pool, MAX_TUN_PACKET);
+        let mut buf = pool_take(&self.rx_pool, MAX_TUN_PACKET, true);
         buf.clear();
         if buf.capacity() < MAX_TUN_PACKET {
             buf.reserve(MAX_TUN_PACKET - buf.capacity());
         }
-        let n = unsafe {
-            libc::read(
-                fd,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                MAX_TUN_PACKET,
-            )
-        };
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, MAX_TUN_PACKET) };
         if n < 0 {
             let err = io::Error::last_os_error();
             pool_put(&self.rx_pool, buf);
@@ -364,7 +384,10 @@ impl Device for TunDevice {
     type RxToken<'a> = TunRxToken;
     type TxToken<'a> = TunTxToken;
 
-    fn receive(&mut self, _timestamp: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+    fn receive(
+        &mut self,
+        _timestamp: SmolInstant,
+    ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let pkt = self.rx.pop_front()?;
         Some((
             TunRxToken {
@@ -389,7 +412,9 @@ impl Device for TunDevice {
             if g.len() >= self.queue_cap {
                 // 高水位返回 None，smoltcp 会把报文保留在 socket 发送缓冲，
                 // 下一次 poll 再试；这是背压，不是丢包。
-                self.stats.tun_tx_backpressure.fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .tun_tx_backpressure
+                    .fetch_add(1, Ordering::Relaxed);
                 return None;
             }
         }
@@ -435,7 +460,7 @@ impl TxToken for TunTxToken {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buf = pool_take(&self.pool, len.max(MAX_TUN_PACKET));
+        let mut buf = pool_take(&self.pool, len.max(MAX_TUN_PACKET), false);
         buf.clear();
         buf.resize(len, 0);
         let r = f(&mut buf);
@@ -559,7 +584,7 @@ fn probe_http_response(req: &[u8]) -> Option<Vec<u8>> {
 struct TcpConn {
     handle: SocketHandle,
     /// 连接快照 id；本地代答/熔断抑制/DNS over TCP 等没有真实出站的连接为 None。
-    snap: Option<u64>, 
+    snap: Option<u64>,
     to_relay: Option<mpsc::Sender<Vec<u8>>>,
     from_relay: mpsc::Receiver<Vec<u8>>,
     pending: VecDeque<Vec<u8>>,
@@ -596,7 +621,9 @@ struct TcpConn {
 fn has_relay_backlog(conns: &[TcpConn]) -> bool {
     // 滞回暂停中的连接不算 backlog：它是故意停搬，1ms 兜底轮询围着它空转是纯耗电；
     // 恢复由主循环每轮的 drain_relay_to_pending 按低水位判定，不依赖兜底间隔。
-    conns.iter().any(|c| !c.relay_paused && !c.from_relay.is_empty())
+    conns
+        .iter()
+        .any(|c| !c.relay_paused && !c.from_relay.is_empty())
 }
 
 /// 把下行数据从 relay 通道搬入 pending，受 TCP_PENDING_CAP 字节上限约束。
@@ -690,7 +717,11 @@ fn dial_breaker_active(fails: &DialFails, key: &DialKey, now: Instant) -> bool {
     if fails.suspend_until.map(|u| now < u).unwrap_or(false) {
         return false;
     }
-    fails.fails.get(key).map(|(_, until)| now < *until).unwrap_or(false)
+    fails
+        .fails
+        .get(key)
+        .map(|(_, until)| now < *until)
+        .unwrap_or(false)
 }
 
 /// 记录一次直连失败；返回 true 表示触发了链路自愈（调用方负责打日志）。
@@ -765,10 +796,145 @@ fn should_reap_idle(idle: Duration, busy: bool, closing: bool) -> bool {
     !closing && !busy && idle >= Duration::from_secs(TCP_IDLE_REAP_SECS)
 }
 
-
 struct UdpClient {
     tx: mpsc::Sender<(Target, Vec<u8>)>,
     last: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct UdpTarget {
+    handle: SocketHandle,
+    last: Instant,
+    generation: u64,
+}
+
+/// DNS 回包要投递到的绑定。固定 10.10.10.53/fd00:1::53 用 Fixed；
+/// 任意目的 :53 用 Dynamic，并带 generation 防止旧查询回包命中复用后的槽位。
+#[derive(Clone, Copy)]
+enum DnsReplyTarget {
+    Fixed(SocketHandle),
+    Dynamic {
+        key: (IpAddress, u16),
+        generation: u64,
+    },
+}
+
+fn dynamic_dns_handle(
+    dns: &HashMap<(IpAddress, u16), UdpTarget>,
+    key: (IpAddress, u16),
+    generation: u64,
+) -> Option<SocketHandle> {
+    dns.get(&key)
+        .filter(|t| t.generation == generation)
+        .map(|t| t.handle)
+}
+
+fn udp_target_has_session(
+    clients: &HashMap<(IpAddress, u16, IpAddress, u16), UdpClient>,
+    addr: IpAddress,
+    port: u16,
+) -> bool {
+    clients
+        .keys()
+        .any(|(_, _, dst_addr, dst_port)| *dst_addr == addr && *dst_port == port)
+}
+
+/// 目标 socket 的空闲判据：没有待收包、发送缓冲还有空间，且超过空闲阈值。
+/// 旧代码要求 `can_send() == false`（发送缓冲满）才回收，空闲目标永远不满足。
+fn udp_target_idle(
+    sockets: &SocketSet<'_>,
+    target: &UdpTarget,
+    now: Instant,
+    require_idle: bool,
+) -> bool {
+    let s = sockets.get::<udp::Socket>(target.handle);
+    if s.can_recv() || !s.can_send() {
+        return false;
+    }
+    !require_idle
+        || now.duration_since(target.last) >= Duration::from_secs(UDP_TARGET_IDLE_SECS)
+}
+
+/// 普通目标与 DNS 动态目标共用一个预算；满时优先淘汰最久空闲、无活动会话的 socket。
+fn evict_udp_target(
+    sockets: &mut SocketSet<'_>,
+    normal: &mut HashMap<(IpAddress, u16), UdpTarget>,
+    dns: &mut HashMap<(IpAddress, u16), UdpTarget>,
+    clients: &HashMap<(IpAddress, u16, IpAddress, u16), UdpClient>,
+    now: Instant,
+    require_idle: bool,
+) -> bool {
+    let mut victim: Option<((IpAddress, u16), bool, u128)> = None;
+    for (key, target) in normal.iter() {
+        if udp_target_has_session(clients, key.0, key.1) {
+            continue;
+        }
+        if !udp_target_idle(sockets, target, now, require_idle) {
+            continue;
+        }
+        let idle = now.duration_since(target.last).as_millis();
+        if victim.as_ref().map(|(_, _, v)| idle > *v).unwrap_or(true) {
+            victim = Some((*key, false, idle));
+        }
+    }
+    for (key, target) in dns.iter() {
+        if !udp_target_idle(sockets, target, now, require_idle) {
+            continue;
+        }
+        let idle = now.duration_since(target.last).as_millis();
+        if victim.as_ref().map(|(_, _, v)| idle > *v).unwrap_or(true) {
+            victim = Some((*key, true, idle));
+        }
+    }
+    let Some((key, is_dns, _)) = victim else {
+        return false;
+    };
+    let entry = if is_dns {
+        dns.remove(&key)
+    } else {
+        normal.remove(&key)
+    };
+    if let Some(target) = entry {
+        let _ = sockets.remove(target.handle);
+        true
+    } else {
+        false
+    }
+}
+
+/// 创建一个动态目标 socket；两张目标表共用 MAX_UDP_TARGETS，超限先淘汰空闲项。
+fn ensure_udp_target(
+    sockets: &mut SocketSet<'_>,
+    normal: &mut HashMap<(IpAddress, u16), UdpTarget>,
+    dns: &mut HashMap<(IpAddress, u16), UdpTarget>,
+    clients: &HashMap<(IpAddress, u16, IpAddress, u16), UdpClient>,
+    addr: IpAddress,
+    port: u16,
+    now: Instant,
+    is_dns: bool,
+) -> Option<SocketHandle> {
+    let key = (addr, port);
+    if let Some(t) = if is_dns { dns.get(&key) } else { normal.get(&key) } {
+        return Some(t.handle);
+    }
+    if normal.len() + dns.len() >= MAX_UDP_TARGETS
+        && !evict_udp_target(sockets, normal, dns, clients, now, false)
+    {
+        return None;
+    }
+    let handle = add_udp_dst_socket(sockets, addr, port)?;
+    let generation = UDP_TARGET_GEN.fetch_add(1, Ordering::Relaxed);
+    let target = UdpTarget {
+        handle,
+        last: now,
+        generation,
+    };
+    if is_dns {
+        dns.insert(key, target);
+    } else {
+        normal.insert(key, target);
+    }
+    Some(handle)
 }
 
 fn smol_now(start: Instant) -> SmolInstant {
@@ -1000,7 +1166,11 @@ fn add_listener(
     }
     // 非对称缓冲：recv 512K 保住上行突发闸门；tx 大档 256K（本机腿足够），
     // 降级档双向同 128K。
-    let tx_bytes = if downgraded { buf_bytes } else { TCP_SOCKET_BUFFER_TX };
+    let tx_bytes = if downgraded {
+        buf_bytes
+    } else {
+        TCP_SOCKET_BUFFER_TX
+    };
     let mut socket = tcp::Socket::new(
         tcp::SocketBuffer::new(vec![0u8; buf_bytes]),
         tcp::SocketBuffer::new(vec![0u8; tx_bytes]),
@@ -1179,19 +1349,35 @@ fn decide_detail_for(
     };
     // 策略组只在规则/最终策略真正引用它时展开；global 模式仍走当前选中节点。
     if let Action::Group(name) = action.clone() {
-        action = resolve_group_action(ctx, &name, kind, domain);
+        let target = format!(
+            "{}:{}",
+            domain
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| ip.to_string()),
+            port
+        );
+        action = resolve_group_action(ctx, &name, kind, Some(&target));
         detail = format!(
             "策略组 {} → {}",
             name,
-            ctx.rules.read().unwrap_or_else(|p| p.into_inner()).decision_label(&action)
+            ctx.rules
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .decision_label(&action)
         );
     }
     if let Action::Missing(name) = &action {
         logging::warn(
             "strategy",
-            format!("规则引用的目标已失效：{}；按拦截处理，不回落到当前选中节点", name),
+            format!(
+                "规则引用的目标已失效：{}；按拦截处理，不回落到当前选中节点",
+                name
+            ),
         );
-        return (Action::Block, format!("{}；目标 {} 已失效，按拦截处理", detail, name));
+        return (
+            Action::Block,
+            format!("{}；目标 {} 已失效，按拦截处理", detail, name),
+        );
     }
     if let Action::Node(name) = &action {
         if !ctx.nodes_snapshot().iter().any(|n| &n.name == name) {
@@ -1199,7 +1385,10 @@ fn decide_detail_for(
                 "strategy",
                 format!("节点已不存在：{}；按拦截处理，不回落到当前选中节点", name),
             );
-            return (Action::Block, format!("{}；节点 {} 已不存在，按拦截处理", detail, name));
+            return (
+                Action::Block,
+                format!("{}；节点 {} 已不存在，按拦截处理", detail, name),
+            );
         }
     }
     if matches!(action, Action::Proxy) && ctx.nodes_snapshot().is_empty() {
@@ -1211,7 +1400,11 @@ fn decide_detail_for(
         detail = format!(
             "{}；无可用节点，已降级为{}",
             detail,
-            if action == Action::Block { "拦截" } else { "直连" }
+            if action == Action::Block {
+                "拦截"
+            } else {
+                "直连"
+            }
         );
     }
     // HTTPS 连通性探测：直连时这些海外域名根本不可达，挂 4~7s 等超时只会让
@@ -1221,27 +1414,33 @@ fn decide_detail_for(
     if port == 443 && matches!(action, Action::Direct) {
         if let Some(d) = domain {
             if is_probe_host(d) {
-                logging::info("probe", format!("连通性探测快速拒绝 {}:{}（直连不可达）", d, port));
-                return (Action::Block, "连通性探测：直连不可达，快速拒绝".to_string());
+                logging::info(
+                    "probe",
+                    format!("连通性探测快速拒绝 {}:{}（直连不可达）", d, port),
+                );
+                return (
+                    Action::Block,
+                    "连通性探测：直连不可达，快速拒绝".to_string(),
+                );
             }
         }
     }
     (action, detail)
 }
 
-fn resolve_group_action(ctx: &Ctx, name: &str, kind: ConnKind, domain: Option<&str>) -> Action {
+fn resolve_group_action(ctx: &Ctx, name: &str, kind: ConnKind, target: Option<&str>) -> Action {
     let strategy = ctx.strategy_snapshot();
     let transport = match kind {
         ConnKind::Tcp => Transport::Tcp,
         ConnKind::Udp => Transport::Udp,
     };
-    match strategy.resolve_group(name, transport, &ctx.health) {
+    match strategy.resolve_group_with_target(name, transport, &ctx.health, target) {
         Ok(r) => {
             logging::info(
                 "strategy",
                 format!(
                     "{} [{}] 策略组解析：{}",
-                    domain.unwrap_or("-"),
+                    target.unwrap_or("-"),
                     if kind == ConnKind::Tcp { "TCP" } else { "UDP" },
                     r.chain.join(" -> ")
                 ),
@@ -1254,7 +1453,7 @@ fn resolve_group_action(ctx: &Ctx, name: &str, kind: ConnKind, domain: Option<&s
                 "strategy",
                 format!(
                     "{} [{}] 策略组解析失败：{}（链：{}）；无可用节点策略={:?}",
-                    domain.unwrap_or("-"),
+                    target.unwrap_or("-"),
                     if kind == ConnKind::Tcp { "TCP" } else { "UDP" },
                     e.message,
                     e.chain.join(" -> "),
@@ -1417,7 +1616,10 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
         if failed > 0 {
             logging::warn(
                 "netstack",
-                format!("TUN 地址容量不足，{} 个地址未加入（IPv6 可能不可用）", failed),
+                format!(
+                    "TUN 地址容量不足，{} 个地址未加入（IPv6 可能不可用）",
+                    failed
+                ),
             );
         }
     });
@@ -1456,10 +1658,10 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
         .map_err(|e| outbound::io_err(format!("绑定 IPv6 DNS 端口失败: {:?}", e)))?;
     let dns6_handle = sockets.add(dns6_socket);
 
-    let (dns_tx, mut dns_rx) = mpsc::channel::<(SocketHandle, IpEndpoint, Vec<u8>)>(128);
-    let mut dns_pending: VecDeque<(SocketHandle, IpEndpoint, Vec<u8>)> = VecDeque::new();
+    let (dns_tx, mut dns_rx) = mpsc::channel::<(DnsReplyTarget, IpEndpoint, Vec<u8>)>(128);
+    let mut dns_pending: VecDeque<(DnsReplyTarget, IpEndpoint, Vec<u8>)> = VecDeque::new();
     // 任意目的地址的 53 端口：按目的地址动态建 socket，应答源地址才能保持 8.8.8.8:53 等原值。
-    let mut dns_udp_dsts: HashMap<(IpAddress, u16), (SocketHandle, Instant)> = HashMap::new();
+    let mut dns_udp_dsts: HashMap<(IpAddress, u16), UdpTarget> = HashMap::new();
 
     // 同一 endpoint 允许挂多个 listener：smoltcp 的 listen() 不做全局 endpoint 唯一性校验，
     // process_tcp 按插入顺序取第一个 accepts() 的 socket，Listen socket 遇到带 ACK 的包会让位。
@@ -1484,7 +1686,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
     // 而不是只能等兜底定时器；否则单连接稳态吞吐被「每轮块数 / 轮询间隔」卡死。
     let relay_wake = Arc::new(Notify::new());
 
-    let mut udp_dsts: HashMap<(IpAddress, u16), (SocketHandle, Instant)> = HashMap::new();
+    let mut udp_dsts: HashMap<(IpAddress, u16), UdpTarget> = HashMap::new();
     let mut udp_clients: HashMap<(IpAddress, u16, IpAddress, u16), UdpClient> = HashMap::new();
     let (udp_resp_tx, mut udp_resp_rx) = mpsc::channel::<(IpEndpoint, IpEndpoint, Vec<u8>)>(256);
     let mut udp_replies: VecDeque<(IpEndpoint, IpEndpoint, Vec<u8>)> = VecDeque::new();
@@ -1567,9 +1769,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                 }
             }
             r = dns_rx.recv() => {
-                if let Some((handle, ep, data)) = r {
+                if let Some((binding, ep, data)) = r {
                     if dns_pending.len() < 256 {
-                        dns_pending.push_back((handle, ep, data));
+                        dns_pending.push_back((binding, ep, data));
                     }
                 }
             }
@@ -1611,7 +1813,8 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             if let Some(v) = listeners.get(&key) {
                                 for (h, _) in v {
                                     if !claimed.contains(h)
-                                        && sockets.get::<tcp::Socket>(*h).state() == tcp::State::Listen
+                                        && sockets.get::<tcp::Socket>(*h).state()
+                                            == tcp::State::Listen
                                     {
                                         reuse = Some(*h);
                                         break;
@@ -1620,10 +1823,12 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             }
                             let handle = match reuse {
                                 Some(h) => Some(h),
-                                None => add_listener(&mut sockets, addr, port, &ctx.stats).map(|h| {
-                                    listeners.entry(key).or_default().push((h, Instant::now()));
-                                    h
-                                }),
+                                None => {
+                                    add_listener(&mut sockets, addr, port, &ctx.stats).map(|h| {
+                                        listeners.entry(key).or_default().push((h, Instant::now()));
+                                        h
+                                    })
+                                }
                             };
                             if let Some(h) = handle {
                                 claimed.insert(h);
@@ -1634,23 +1839,17 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 // TUN 内所有 :53 一律交给本地 DNS 引擎（mihomo dns-hijack any:53）。
                                 // 本地 10.10.10.53/fd00:1::53 已有固定 socket；其他目的地址按地址动态建，
                                 // 这样应答源仍是 8.8.8.8:53、114.114.114.114:53，客户端不会因源地址不符丢弃。
-                                if !is_local_dns_endpoint(dst)
-                                    && !dns_udp_dsts.contains_key(&(dst.addr, dst.port))
-                                {
-                                    if dns_udp_dsts.len() >= 256 {
-                                        if let Some(oldest) = dns_udp_dsts
-                                            .iter()
-                                            .min_by_key(|(_, (_, t))| *t)
-                                            .map(|(k, _)| *k)
-                                        {
-                                            if let Some((h, _)) = dns_udp_dsts.remove(&oldest) {
-                                                let _ = sockets.remove(h);
-                                            }
-                                        }
-                                    }
-                                    if let Some(h) = add_udp_dst_socket(&mut sockets, dst.addr, dst.port) {
-                                        dns_udp_dsts.insert((dst.addr, dst.port), (h, Instant::now()));
-                                    }
+                                if !is_local_dns_endpoint(dst) {
+                                    let _ = ensure_udp_target(
+                                        &mut sockets,
+                                        &mut udp_dsts,
+                                        &mut dns_udp_dsts,
+                                        &udp_clients,
+                                        dst.addr,
+                                        dst.port,
+                                        Instant::now(),
+                                        true,
+                                    );
                                 }
                             } else {
                                 // QUIC 精确迫降：共享 CDN IP 上反查必然 ambiguous，旧门永不开，
@@ -1659,16 +1858,19 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 if dst.port == 443 {
                                     if let Some(payload) = udp_payload(&pkt) {
                                         if let Some(sni) = crate::quic::initial_sni(payload) {
-                                            let client_uid = ctx.uid_map.read().ok().and_then(|m| {
-                                                m.lookup_flow(
-                                                    IpAddr::from(src.addr),
-                                                    src.port,
-                                                    IpAddr::from(dst.addr),
-                                                    dst.port,
-                                                )
-                                            });
+                                            let client_uid =
+                                                ctx.uid_map.read().ok().and_then(|m| {
+                                                    m.lookup_flow(
+                                                        IpAddr::from(src.addr),
+                                                        src.port,
+                                                        IpAddr::from(dst.addr),
+                                                        dst.port,
+                                                    )
+                                                });
                                             if ctx.mitm().should_mitm_uid(&sni, client_uid) {
-                                                ctx.stats.mitm_quic_blocked.fetch_add(1, Ordering::Relaxed);
+                                                ctx.stats
+                                                    .mitm_quic_blocked
+                                                    .fetch_add(1, Ordering::Relaxed);
                                                 continue;
                                             }
                                         }
@@ -1691,10 +1893,8 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                     ctx.stats.mitm_quic_blocked.fetch_add(1, Ordering::Relaxed);
                                     continue;
                                 }
-                                let decision_guard = ctx
-                                    .decision
-                                    .read()
-                                    .unwrap_or_else(|p| p.into_inner());
+                                let decision_guard =
+                                    ctx.decision.read().unwrap_or_else(|p| p.into_inner());
                                 let action = decide_action_uid(
                                     &ctx,
                                     domain.as_deref(),
@@ -1706,7 +1906,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 let mode = udp_mode(&ctx, &action);
                                 drop(decision_guard);
                                 // QUIC 假活回落：这个目标已被判为 UDP 黑洞时，直接吞掉 QUIC
-                                    // 包（不发、也不建会话），让客户端自己的 Happy Eyeballs 回退 TCP。
+                                // 包（不发、也不建会话），让客户端自己的 Happy Eyeballs 回退 TCP。
                                 if dst.port == 443
                                     && ctx
                                         .cfg
@@ -1731,11 +1931,16 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                         .or_insert((now_up, now_up, false));
                                 }
                                 if !matches!(mode, UdpMode::Unsupported(_)) {
-                                    if !udp_dsts.contains_key(&(dst.addr, dst.port)) {
-                                        if let Some(h) = add_udp_dst_socket(&mut sockets, dst.addr, dst.port) {
-                                            udp_dsts.insert((dst.addr, dst.port), (h, Instant::now()));
-                                        }
-                                    }
+                                    let _ = ensure_udp_target(
+                                        &mut sockets,
+                                        &mut udp_dsts,
+                                        &mut dns_udp_dsts,
+                                        &udp_clients,
+                                        dst.addr,
+                                        dst.port,
+                                        Instant::now(),
+                                        false,
+                                    );
                                     // 同一客户端源端口访问不同目标时，必须使用独立会话，
                                     // 否则后续目标会沿用第一个目标的直连/代理模式。
                                     let key = (src.addr, src.port, dst.addr, dst.port);
@@ -1749,8 +1954,19 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                                 udp_clients.remove(&oldest);
                                             }
                                         }
-                                        if let Some(tx) = spawn_udp_client(src, mode, udp_resp_tx.clone(), ctx.dns()) {
-                                            udp_clients.insert(key, UdpClient { tx, last: Instant::now() });
+                                        if let Some(tx) = spawn_udp_client(
+                                            src,
+                                            mode,
+                                            udp_resp_tx.clone(),
+                                            ctx.dns(),
+                                        ) {
+                                            udp_clients.insert(
+                                                key,
+                                                UdpClient {
+                                                    tx,
+                                                    last: Instant::now(),
+                                                },
+                                            );
                                         }
                                     }
                                 }
@@ -1804,7 +2020,12 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                 let (a, p, h, _) = pending_accept.remove(0);
                 logging::warn(
                     "tun",
-                    format!("等待首包的连接过多({})，丢弃最早一条 {}:{}", MAX_PENDING_ACCEPT, IpAddr::from(a), p),
+                    format!(
+                        "等待首包的连接过多({})，丢弃最早一条 {}:{}",
+                        MAX_PENDING_ACCEPT,
+                        IpAddr::from(a),
+                        p
+                    ),
                 );
                 release_tcp_socket(&mut sockets, h);
             }
@@ -1853,7 +2074,10 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         } else {
                             logging::warn(
                                 "tun",
-                                format!("并发连接达到上限({})，暂无可淘汰连接，拒绝新连接", MAX_TCP_CONNS),
+                                format!(
+                                    "并发连接达到上限({})，暂无可淘汰连接，拒绝新连接",
+                                    MAX_TCP_CONNS
+                                ),
                             );
                             release_tcp_socket(&mut sockets, handle);
                             continue;
@@ -1873,7 +2097,12 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                     });
                     if client_uid.is_some() {
                         ctx.stats.uid_resolved.fetch_add(1, Ordering::Relaxed);
-                    } else if ctx.rules.read().unwrap_or_else(|p| p.into_inner()).has_uid_rules() {
+                    } else if ctx
+                        .rules
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .has_uid_rules()
+                    {
                         ctx.stats.uid_unknown.fetch_add(1, Ordering::Relaxed);
                     }
                     let mut domain = ctx
@@ -1921,7 +2150,13 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             continue;
                         }
                         if let Some(d) = domain.as_deref() {
-                            if let Ok(mut rev) = ctx.dns.read().unwrap_or_else(|p| p.into_inner()).reverse.lock() {
+                            if let Ok(mut rev) = ctx
+                                .dns
+                                .read()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .reverse
+                                .lock()
+                            {
                                 rev.insert(local_ip, d, 120);
                             }
                             logging::info("sniff", format!("{}:{} -> {}", local_ip, port, d));
@@ -1947,7 +2182,8 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                     to_relay: None,
                                     from_relay: srx,
                                     pending: VecDeque::new(),
-                                    pending_bytes: 0, relay_paused: false,
+                                    pending_bytes: 0,
+                                    relay_paused: false,
                                     read_wake: Arc::new(Notify::new()),
                                     relay_closed: false,
                                     client_closed: false,
@@ -1962,7 +2198,10 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 });
                                 ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                                 ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
-                                logging::info("probe", format!("连通性探测本地代答 {}:{}", local_ip, port));
+                                logging::info(
+                                    "probe",
+                                    format!("连通性探测本地代答 {}:{}", local_ip, port),
+                                );
                                 continue;
                             }
                             // 头部还没收全：最多再等 SNI_WAIT_MS，避免探测请求分包漏判。
@@ -1978,7 +2217,11 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         }
                     }
                     let route_domain = sni.clone().or_else(|| domain.clone());
-                    let mitm_host = if port == 443 { sni.clone() } else { route_domain.clone() };
+                    let mitm_host = if port == 443 {
+                        sni.clone()
+                    } else {
+                        route_domain.clone()
+                    };
                     let target = Target {
                         ip: local_ip,
                         port,
@@ -1986,10 +2229,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                     };
                     // 任意目的地址的 TCP/53 都由本地 DNS 服务端应答；
                     // 不能再走规则判定，否则命中外网规则会被 BLOCK 掉。
-                    let decision_guard = ctx
-                        .decision
-                        .read()
-                        .unwrap_or_else(|p| p.into_inner());
+                    let decision_guard = ctx.decision.read().unwrap_or_else(|p| p.into_inner());
                     let (action, rule_detail) = if dns_conn {
                         (Action::Direct, "DNS over TCP：本地应答".to_string())
                     } else {
@@ -2018,9 +2258,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             target_label,
                             port,
                             action_label,
-                            remote
-                                .map(|r| r.to_string())
-                                .unwrap_or_else(|| "-".into())
+                            remote.map(|r| r.to_string()).unwrap_or_else(|| "-".into())
                         ),
                     );
 
@@ -2043,7 +2281,8 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         if suppressed {
                             let (stx, srx) = mpsc::channel::<Vec<u8>>(1);
                             tokio::spawn(async move {
-                                tokio::time::sleep(Duration::from_secs(SUPPRESSED_DIAL_FAIL_SECS)).await;
+                                tokio::time::sleep(Duration::from_secs(SUPPRESSED_DIAL_FAIL_SECS))
+                                    .await;
                                 // 与拨号失败 Err 分支完全相同的收尾：drop sender →
                                 // 主循环 relay_closed → 正常四次挥手，而不是 RST。
                                 drop(stx);
@@ -2054,7 +2293,8 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 to_relay: None,
                                 from_relay: srx,
                                 pending: VecDeque::new(),
-                                pending_bytes: 0, relay_paused: false,
+                                pending_bytes: 0,
+                                relay_paused: false,
                                 read_wake: Arc::new(Notify::new()),
                                 relay_closed: false,
                                 client_closed: false,
@@ -2069,11 +2309,13 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             });
                             ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                             ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
-                            ctx.stats.dial_breaker_rejected.fetch_add(1, Ordering::Relaxed);
+                            ctx.stats
+                                .dial_breaker_rejected
+                                .fetch_add(1, Ordering::Relaxed);
                             logging::info(
                                 "conn",
                                 format!(
-                                    "#{} 熔断抑制拨号 {}:{}（{}s 后按原时序失败）",
+                                    "#{} 熔断冷却中，本机按拨号失败时序收尾（未发 SYN） {}:{}（{}s）",
                                     conn_id, target_label, port, SUPPRESSED_DIAL_FAIL_SECS
                                 ),
                             );
@@ -2087,7 +2329,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         .engine
                         .finance_bypass(client_uid, mitm_host.as_deref())
                     {
-                        ctx.stats.mitm_finance_skipped.fetch_add(1, Ordering::Relaxed);
+                        ctx.stats
+                            .mitm_finance_skipped
+                            .fetch_add(1, Ordering::Relaxed);
                         logging::info(
                             "mitm",
                             format!(
@@ -2095,7 +2339,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 conn_id,
                                 mitm_host.clone().unwrap_or_default(),
                                 reason,
-                                client_uid.map(|u| u.to_string()).unwrap_or_else(|| "未知".into())
+                                client_uid
+                                    .map(|u| u.to_string())
+                                    .unwrap_or_else(|| "未知".into())
                             ),
                         );
                     }
@@ -2107,14 +2353,20 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 ctx.stats.mitm_bypassed.fetch_add(1, Ordering::Relaxed);
                                 logging::info(
                                     "mitm",
-                                    format!("#{} {} 处于临时放行窗口（剩 {}s），本条不解密", conn_id, d, left),
+                                    format!(
+                                        "#{} {} 处于临时放行窗口（剩 {}s），本条不解密",
+                                        conn_id, d, left
+                                    ),
                                 );
                             }
                         }
                     }
                     let mitm_hit = !dns_conn
                         && port == 443
-                        && mitm_state.engine.finance_bypass(client_uid, mitm_host.as_deref()).is_none()
+                        && mitm_state
+                            .engine
+                            .finance_bypass(client_uid, mitm_host.as_deref())
+                            .is_none()
                         && mitm_host
                             .as_deref()
                             .map(|d| mitm_state.should_mitm_uid(d, client_uid))
@@ -2132,12 +2384,15 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             crate::mitm::handle(a, host, target2, action2, ctx2, ms, conn_id).await;
                         });
                         let read_wake = Arc::new(Notify::new());
-                        tokio::spawn(relay_stream(Box::new(b), rx, stx, relay_wake.clone(), read_wake.clone()));
-                        let (snap, meter) = ctx
-                            .conns
-                            .write()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .insert(
+                        tokio::spawn(relay_stream(
+                            Box::new(b),
+                            rx,
+                            stx,
+                            relay_wake.clone(),
+                            read_wake.clone(),
+                        ));
+                        let (snap, meter) =
+                            ctx.conns.write().unwrap_or_else(|p| p.into_inner()).insert(
                                 client_uid,
                                 mitm_host.clone(),
                                 local_ip.to_string(),
@@ -2152,7 +2407,8 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             to_relay: Some(tx),
                             from_relay: srx,
                             pending: VecDeque::new(),
-                            pending_bytes: 0, relay_paused: false,
+                            pending_bytes: 0,
+                            relay_paused: false,
                             read_wake,
                             relay_closed: false,
                             client_closed: false,
@@ -2176,14 +2432,21 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
                         let (stx, srx) = mpsc::channel::<Vec<u8>>(64);
                         let read_wake = Arc::new(Notify::new());
-                        tokio::spawn(relay_stream(Box::new(b), rx, stx, relay_wake.clone(), read_wake.clone()));
+                        tokio::spawn(relay_stream(
+                            Box::new(b),
+                            rx,
+                            stx,
+                            relay_wake.clone(),
+                            read_wake.clone(),
+                        ));
                         conns.push(TcpConn {
                             handle,
                             snap: None,
                             to_relay: Some(tx),
                             from_relay: srx,
                             pending: VecDeque::new(),
-                            pending_bytes: 0, relay_paused: false,
+                            pending_bytes: 0,
+                            relay_paused: false,
                             read_wake,
                             relay_closed: false,
                             client_closed: false,
@@ -2221,7 +2484,14 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             // 分段计时：排队（accept→任务首次执行）与拨号分开，
                             // 否则「耗时 7914ms」分不清是 2s 拨号超时还是任务被调度挂住。
                             let dial_start = Instant::now();
-                            let result = outbound::connect(&action2, &nodes, selected.as_deref(), target, Some(&dns)).await;
+                            let result = outbound::connect(
+                                &action2,
+                                &nodes,
+                                selected.as_deref(),
+                                target,
+                                Some(&dns),
+                            )
+                            .await;
                             let dial_ms = dial_start.elapsed().as_millis();
                             if let Action::Node(name) = &health_action {
                                 // 用真实连接结果更新 TCP 健康；UDP 状态绝不从这里推导。
@@ -2244,7 +2514,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                     // 直连成功即清除冷却计数：路径恢复后不该继续被熔断。
                                     if matches!(health_action, Action::Direct) {
                                         dial_breaker_clear(
-                                            &mut dial_fails2.lock().unwrap_or_else(|p| p.into_inner()),
+                                            &mut dial_fails2
+                                                .lock()
+                                                .unwrap_or_else(|p| p.into_inner()),
                                             &breaker_key,
                                         );
                                     }
@@ -2255,7 +2527,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                     // 多目标同时失败会触发链路自愈（判定为本机链路问题）。
                                     if matches!(health_action, Action::Direct) {
                                         let healed = dial_breaker_record(
-                                            &mut dial_fails2.lock().unwrap_or_else(|p| p.into_inner()),
+                                            &mut dial_fails2
+                                                .lock()
+                                                .unwrap_or_else(|p| p.into_inner()),
                                             breaker_key,
                                             Instant::now(),
                                         );
@@ -2287,11 +2561,8 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 }
                             }
                         });
-                        let (snap, meter) = ctx
-                            .conns
-                            .write()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .insert(
+                        let (snap, meter) =
+                            ctx.conns.write().unwrap_or_else(|p| p.into_inner()).insert(
                                 client_uid,
                                 route_domain.clone(),
                                 local_ip.to_string(),
@@ -2306,7 +2577,8 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             to_relay: Some(tx),
                             from_relay: srx,
                             pending: VecDeque::new(),
-                            pending_bytes: 0, relay_paused: false,
+                            pending_bytes: 0,
+                            relay_paused: false,
                             read_wake,
                             relay_closed: false,
                             client_closed: false,
@@ -2346,7 +2618,13 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                 continue;
             }
 
-            while sock.can_recv() && conn.to_relay.as_ref().map(|t| t.capacity() > 0).unwrap_or(false) {
+            while sock.can_recv()
+                && conn
+                    .to_relay
+                    .as_ref()
+                    .map(|t| t.capacity() > 0)
+                    .unwrap_or(false)
+            {
                 match sock.recv_slice(&mut tcp_scratch) {
                     Ok(n) if n > 0 => {
                         touched = true;
@@ -2412,7 +2690,10 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             if conn.relay_closed
                 && conn.pending.is_empty()
                 && !conn.closing
-                && matches!(sock.state(), tcp::State::Established | tcp::State::CloseWait)
+                && matches!(
+                    sock.state(),
+                    tcp::State::Established | tcp::State::CloseWait
+                )
             {
                 sock.close();
                 conn.closing = true;
@@ -2454,20 +2735,23 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                 let sq = sock.send_queue();
                 // H1 实锤：本地接收缓冲满，并且 relay 侧还有积压（上游数据已经躺在通道里）。
                 // 只满足前者可能是对端在灌包而我们正在搬；两个同时成立才是「收不下」。
-                let recv_pressure = rc > 0
-                    && rq >= rc
-                    && (!conn.from_relay.is_empty() || !conn.pending.is_empty());
+                let recv_pressure =
+                    rc > 0 && rq >= rc && (!conn.from_relay.is_empty() || !conn.pending.is_empty());
                 if recv_pressure && !conn.recv_full {
                     conn.recv_full = true;
                 } else if !recv_pressure {
                     conn.recv_full = false;
                 }
                 if recv_pressure {
-                    ctx.stats.tcp_recv_full.fetch_add(METER_TICK_MS, Ordering::Relaxed);
+                    ctx.stats
+                        .tcp_recv_full
+                        .fetch_add(METER_TICK_MS, Ordering::Relaxed);
                 }
                 // 发送侧：待发队列非空、对端通告窗口为 0 → 对端不收。
                 if sq > 0 && sc == 0 {
-                    ctx.stats.tcp_send_stalled.fetch_add(METER_TICK_MS, Ordering::Relaxed);
+                    ctx.stats
+                        .tcp_send_stalled
+                        .fetch_add(METER_TICK_MS, Ordering::Relaxed);
                     let since = *conn.send_stall_since.get_or_insert(now_m);
                     if !conn.send_stall_logged
                         && now_m.duration_since(since) >= Duration::from_secs(3)
@@ -2497,13 +2781,12 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             last_rate_sample = Instant::now();
             let secs = 10.0f64;
             let mut top: Vec<(u64, u64, &'static str)> = Vec::new();
-            let mut table = ctx
-                .conns
-                .write()
-                .unwrap_or_else(|p| p.into_inner());
+            let mut table = ctx.conns.write().unwrap_or_else(|p| p.into_inner());
             for conn in conns.iter_mut() {
                 let Some(id) = conn.snap else { continue };
-                let Some(m) = conn.meter.as_ref() else { continue };
+                let Some(m) = conn.meter.as_ref() else {
+                    continue;
+                };
                 let up = m.up.load(Ordering::Relaxed);
                 let down = m.down.load(Ordering::Relaxed);
                 let up_bps = ((up.saturating_sub(conn.rate_prev_up)) as f64 / secs) as u64;
@@ -2513,9 +2796,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                 table.set_rates(id, up_bps, down_bps);
                 if down_bps > 0 {
                     // 档位标签：诊断时要能一眼看出这条流是不是被降到了 128K。
-                    let tier = if sockets
-                        .get::<tcp::Socket>(conn.handle)
-                        .recv_capacity()
+                    let tier = if sockets.get::<tcp::Socket>(conn.handle).recv_capacity()
                         >= TCP_SOCKET_BUFFER
                     {
                         "512K"
@@ -2549,17 +2830,18 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
         // UDP 客户端 -> 远端：从每个目标地址的 smoltcp socket 收取数据
         {
             let mut incoming: Vec<(IpEndpoint, IpEndpoint, Vec<u8>)> = Vec::new();
-            for (dst_key, (handle, _)) in udp_dsts.iter() {
-                let s = sockets.get_mut::<udp::Socket>(*handle);
+            for (dst_key, target) in udp_dsts.iter() {
+                let s = sockets.get_mut::<udp::Socket>(target.handle);
                 while s.can_recv() {
-                    let mut buf = vec![0u8; 4096];
-                    match s.recv_slice(&mut buf) {
-                        Ok((n, meta)) => {
-                            buf.truncate(n);
+                    // recv() 直接借出实际长度的负载，再复制成 owned Vec；
+                    // 不再用固定 4096 的 recv_slice —— 超 4096 但能装进 MTU 9000
+                    // 的 UDP 报文会被 Truncated 整包丢弃。
+                    match s.recv() {
+                        Ok((payload, meta)) => {
                             incoming.push((
                                 IpEndpoint::new(dst_key.0, dst_key.1),
                                 meta.endpoint,
-                                buf,
+                                payload.to_vec(),
                             ));
                         }
                         Err(_) => break,
@@ -2568,6 +2850,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             }
             let mut dead_udp: Vec<(IpAddress, u16, IpAddress, u16)> = Vec::new();
             for (dst, client, data) in incoming {
+                if let Some(t) = udp_dsts.get_mut(&(dst.addr, dst.port)) {
+                    t.last = Instant::now();
+                }
                 let key = (client.addr, client.port, dst.addr, dst.port);
                 let domain = ctx
                     .dns()
@@ -2600,26 +2885,30 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
         // 远端 -> UDP 客户端：把响应写回透明 UDP socket（源地址保持为远端地址）
         while let Ok((client, remote, data)) = udp_resp_rx.try_recv() {
             let dst_key = (remote.addr, remote.port);
-            if !udp_dsts.contains_key(&dst_key) {
-                if udp_dsts.len() >= 1024 {
-                    if let Some(oldest) = udp_dsts.iter().min_by_key(|(_, (_, t))| *t).map(|(k, _)| *k) {
-                        if let Some((h, _)) = udp_dsts.remove(&oldest) {
-                            let _ = sockets.remove(h);
-                        }
+            let Some(target) = udp_dsts.get(&dst_key).copied().or_else(|| {
+                ensure_udp_target(
+                    &mut sockets,
+                    &mut udp_dsts,
+                    &mut dns_udp_dsts,
+                    &udp_clients,
+                    remote.addr,
+                    remote.port,
+                    Instant::now(),
+                    false,
+                )
+                .and_then(|_| udp_dsts.get(&dst_key).copied())
+            }) else {
+                continue;
+            };
+            let s = sockets.get_mut::<udp::Socket>(target.handle);
+            if s.can_send() {
+                if s.send_slice(&data, IpEndpoint::new(client.addr, client.port))
+                    .is_ok()
+                {
+                    if let Some(t) = udp_dsts.get_mut(&dst_key) {
+                        t.last = Instant::now();
                     }
-                }
-                if let Some(h) = add_udp_dst_socket(&mut sockets, remote.addr, remote.port) {
-                    udp_dsts.insert(dst_key, (h, Instant::now()));
-                } else {
                     continue;
-                }
-            }
-            if let Some((handle, _)) = udp_dsts.get(&dst_key) {
-                let s = sockets.get_mut::<udp::Socket>(*handle);
-                if s.can_send() {
-                    if s.send_slice(&data, IpEndpoint::new(client.addr, client.port)).is_ok() {
-                        continue;
-                    }
                 }
             }
             if udp_replies.len() < 512 {
@@ -2629,11 +2918,16 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
         while let Some((remote, client, data)) = udp_replies.front() {
             let dst_key = (remote.addr, remote.port);
             match udp_dsts.get(&dst_key) {
-                Some((handle, _)) => {
-                    let s = sockets.get_mut::<udp::Socket>(*handle);
+                Some(target) => {
+                    let s = sockets.get_mut::<udp::Socket>(target.handle);
                     if s.can_send() {
-                        if s.send_slice(data, IpEndpoint::new(client.addr, client.port)).is_ok() {
+                        if s.send_slice(data, IpEndpoint::new(client.addr, client.port))
+                            .is_ok()
+                        {
                             udp_replies.pop_front();
+                            if let Some(t) = udp_dsts.get_mut(&dst_key) {
+                                t.last = Instant::now();
+                            }
                         } else {
                             break;
                         }
@@ -2698,7 +2992,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                 // 过期黑洞重新试探。
                 let expired: Vec<(IpAddress, u16)> = quic_blackhole
                     .iter()
-                    .filter(|(_, t)| now_i.duration_since(**t) >= Duration::from_secs(QUIC_BLACKHOLE_TTL_SECS))
+                    .filter(|(_, t)| {
+                        now_i.duration_since(**t) >= Duration::from_secs(QUIC_BLACKHOLE_TTL_SECS)
+                    })
                     .map(|(k, _)| *k)
                     .collect();
                 for key in expired {
@@ -2736,9 +3032,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         .write()
                         .unwrap_or_else(|p| p.into_inner())
                         .remove(conn.snap);
-                    let idle_secs = now_i
-                        .saturating_duration_since(conn.last_active)
-                        .as_secs();
+                    let idle_secs = now_i.saturating_duration_since(conn.last_active).as_secs();
                     let ep = sockets
                         .get::<tcp::Socket>(conn.handle)
                         .remote_endpoint()
@@ -2766,38 +3060,43 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
 
             let expired_dst: Vec<(IpAddress, u16)> = udp_dsts
                 .iter()
-                .filter(|(_, (h, t))| {
-                    let s = sockets.get::<udp::Socket>(*h);
-                    (s.can_recv() == false && s.can_send() == false)
-                        && now_i.duration_since(*t) > Duration::from_secs(90)
+                .filter(|(key, target)| {
+                    !udp_target_has_session(&udp_clients, key.0, key.1)
+                        && udp_target_idle(&sockets, target, now_i, true)
                 })
                 .map(|(k, _)| *k)
                 .collect();
             for key in expired_dst {
-                if let Some((h, _)) = udp_dsts.remove(&key) {
-                    let _ = sockets.remove(h);
+                if let Some(target) = udp_dsts.remove(&key) {
+                    let _ = sockets.remove(target.handle);
                 }
             }
 
             let expired_dns_dst: Vec<(IpAddress, u16)> = dns_udp_dsts
                 .iter()
-                .filter(|(_, (h, t))| {
-                    let s = sockets.get::<udp::Socket>(*h);
-                    (s.can_recv() == false && s.can_send() == false)
-                        && now_i.duration_since(*t) > Duration::from_secs(90)
-                })
+                .filter(|(_, target)| udp_target_idle(&sockets, target, now_i, true))
                 .map(|(k, _)| *k)
                 .collect();
             for key in expired_dns_dst {
-                if let Some((h, _)) = dns_udp_dsts.remove(&key) {
-                    let _ = sockets.remove(h);
+                if let Some(target) = dns_udp_dsts.remove(&key) {
+                    let _ = sockets.remove(target.handle);
                 }
             }
+
+            ctx.stats.udp_targets.store(
+                (udp_dsts.len() + dns_udp_dsts.len()) as u64,
+                Ordering::Relaxed,
+            );
+            ctx.stats.udp_target_buf_bytes.store(
+                ((udp_dsts.len() + dns_udp_dsts.len()) * UDP_DST_BUF * 2) as u64,
+                Ordering::Relaxed,
+            );
 
             let mut expired_listeners: Vec<((IpAddress, u16), SocketHandle)> = Vec::new();
             for (key, v) in listeners.iter() {
                 for (handle, created) in v {
-                    let listening = sockets.get::<tcp::Socket>(*handle).state() == tcp::State::Listen;
+                    let listening =
+                        sockets.get::<tcp::Socket>(*handle).state() == tcp::State::Listen;
                     if listening && now_i.duration_since(*created) > Duration::from_secs(25) {
                         expired_listeners.push((*key, *handle));
                     }
@@ -2836,46 +3135,55 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
 
         // DNS UDP：固定 10.10.10.53/fd00:1::53 + 任意目的地址的动态 :53 socket
         {
-            let mut queries: Vec<(SocketHandle, IpEndpoint, Vec<u8>)> = Vec::new();
+            let mut queries: Vec<(DnsReplyTarget, IpEndpoint, Vec<u8>)> = Vec::new();
             for handle in [dns4_handle, dns6_handle] {
                 let s = sockets.get_mut::<udp::Socket>(handle);
                 while s.can_recv() {
-                    let mut buf = vec![0u8; 2048];
-                    match s.recv_slice(&mut buf) {
-                        Ok((n, meta)) => {
-                            buf.truncate(n);
-                            queries.push((handle, meta.endpoint, buf));
+                    // 按实际查询长度收包：EDNS0 允许 >2048 的查询，固定 2048
+                    // recv_slice 遇超长会 Truncated 整包丢弃。
+                    match s.recv() {
+                        Ok((payload, meta)) => {
+                            queries.push((
+                                DnsReplyTarget::Fixed(handle),
+                                meta.endpoint,
+                                payload.to_vec(),
+                            ));
                         }
                         Err(_) => break,
                     }
                 }
             }
-            for (_, (handle, last)) in dns_udp_dsts.iter_mut() {
-                let s = sockets.get_mut::<udp::Socket>(*handle);
+            for (key, target) in dns_udp_dsts.iter_mut() {
+                let s = sockets.get_mut::<udp::Socket>(target.handle);
                 let mut got = false;
                 while s.can_recv() {
-                    let mut buf = vec![0u8; 2048];
-                    match s.recv_slice(&mut buf) {
-                        Ok((n, meta)) => {
-                            buf.truncate(n);
-                            queries.push((*handle, meta.endpoint, buf));
+                    match s.recv() {
+                        Ok((payload, meta)) => {
+                            queries.push((
+                                DnsReplyTarget::Dynamic {
+                                    key: *key,
+                                    generation: target.generation,
+                                },
+                                meta.endpoint,
+                                payload.to_vec(),
+                            ));
                             got = true;
                         }
                         Err(_) => break,
                     }
                 }
                 if got {
-                    *last = Instant::now();
+                    target.last = Instant::now();
                 }
             }
-            for (handle, endpoint, buf) in queries {
+            for (binding, endpoint, buf) in queries {
                 let dns = ctx.dns.read().unwrap_or_else(|p| p.into_inner()).clone();
                 let tx = dns_tx.clone();
                 tokio::spawn(async move {
                     if let Some(resp) = dns.resolve(&buf).await {
                         // UDP 客户端按自身 EDNS 大小收包，超长回 TC 让客户端走 TCP
                         let resp = crate::dns::fit_udp_response(&buf, resp);
-                        let _ = tx.send((handle, endpoint, resp)).await;
+                        let _ = tx.send((binding, endpoint, resp)).await;
                     }
                 });
             }
@@ -2885,14 +3193,33 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                 break;
             }
             match dns_rx.try_recv() {
-                Ok((handle, ep, data)) => dns_pending.push_back((handle, ep, data)),
+                Ok((binding, ep, data)) => dns_pending.push_back((binding, ep, data)),
                 Err(_) => break,
             }
         }
-        while let Some((handle, ep, data)) = dns_pending.front() {
-            let s = sockets.get_mut::<udp::Socket>(*handle);
+        while let Some((binding, ep, data)) = dns_pending.front() {
+            let handle = match binding {
+                DnsReplyTarget::Fixed(handle) => Some(*handle),
+                DnsReplyTarget::Dynamic { key, generation } => {
+                    dynamic_dns_handle(&dns_udp_dsts, *key, *generation)
+                }
+            };
+            let Some(handle) = handle else {
+                // 动态 socket 已被淘汰/复用：旧查询回包必须丢弃，不能按旧句柄回包。
+                ctx.stats.dns_stale_reply.fetch_add(1, Ordering::Relaxed);
+                dns_pending.pop_front();
+                continue;
+            };
+            let s = sockets.get_mut::<udp::Socket>(handle);
             if s.can_send() {
                 if s.send_slice(data, *ep).is_ok() {
+                    if let DnsReplyTarget::Dynamic { key, generation } = binding {
+                        if let Some(t) = dns_udp_dsts.get_mut(key) {
+                            if t.generation == *generation {
+                                t.last = Instant::now();
+                            }
+                        }
+                    }
                     dns_pending.pop_front();
                 } else {
                     break;
@@ -2913,7 +3240,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
         while let Some(pkt) = pending_out.pop_front() {
             match write_tun(async_fd.get_ref().as_raw_fd(), &pkt) {
                 Ok(_) => {
-                    ctx.stats.down_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
+                    ctx.stats
+                        .down_bytes
+                        .fetch_add(pkt.len() as u64, Ordering::Relaxed);
                     device.recycle_tx(pkt);
                     write_blocked = false;
                     tx_written += 1;
@@ -2924,7 +3253,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    ctx.stats.tun_write_would_block.fetch_add(1, Ordering::Relaxed);
+                    ctx.stats
+                        .tun_write_would_block
+                        .fetch_add(1, Ordering::Relaxed);
                     pending_out.push_front(pkt);
                     write_blocked = true;
                     break;
@@ -2958,9 +3289,13 @@ mod tests {
     fn http_probe_gets_local_answer() {
         // Android/ROM 的 generate_204 探测：本地回 204
         let req = b"GET /generate_204 HTTP/1.1\r\nHost: connectivitycheck.gstatic.com\r\nUser-Agent: dalvik\r\n\r\n";
-        assert!(probe_http_response(req).unwrap().starts_with(b"HTTP/1.1 204"));
+        assert!(probe_http_response(req)
+            .unwrap()
+            .starts_with(b"HTTP/1.1 204"));
         let req2 = b"GET /generate_204 HTTP/1.1\r\nHost: www.google.com\r\n\r\n";
-        assert!(probe_http_response(req2).unwrap().starts_with(b"HTTP/1.1 204"));
+        assert!(probe_http_response(req2)
+            .unwrap()
+            .starts_with(b"HTTP/1.1 204"));
         // Apple 探测：回 Success 页面
         let req3 = b"GET /hotspot-detect.html HTTP/1.0\r\nHost: captive.apple.com\r\n\r\n";
         let r3 = probe_http_response(req3).unwrap();
@@ -2968,10 +3303,16 @@ mod tests {
         assert!(r3.windows(7).any(|w| w == b"Success"));
         // 微软探测
         let req4 = b"GET /connecttest.txt HTTP/1.1\r\nHost: www.msftconnecttest.com\r\n\r\n";
-        assert!(probe_http_response(req4).unwrap().windows(22).any(|w| w == b"Microsoft Connect Test"));
+        assert!(probe_http_response(req4)
+            .unwrap()
+            .windows(22)
+            .any(|w| w == b"Microsoft Connect Test"));
         // 正常路径 / 非探测域名：不代答，原样放行
         assert!(probe_http_response(b"GET / HTTP/1.1\r\nHost: www.google.com\r\n\r\n").is_none());
-        assert!(probe_http_response(b"GET /generate_204 HTTP/1.1\r\nHost: example.com\r\n\r\n").is_none());
+        assert!(
+            probe_http_response(b"GET /generate_204 HTTP/1.1\r\nHost: example.com\r\n\r\n")
+                .is_none()
+        );
         // 头部不完整 / 非明文 HTTP：不代答
         assert!(probe_http_response(b"GET /generate_204 HTTP/1.1\r\nHost: gstatic").is_none());
         assert!(probe_http_response(&[0x16, 0x03, 0x01, 0x00]).is_none());
@@ -3081,8 +3422,7 @@ mod tests {
     fn victim_rank_prefers_idle_and_oldest() {
         // 有堆积的连接排后面：正在传输的连接要优先保留。
         assert!(
-            victim_rank(Duration::from_secs(60), false)
-                < victim_rank(Duration::from_secs(0), true)
+            victim_rank(Duration::from_secs(60), false) < victim_rank(Duration::from_secs(0), true)
         );
         // 同为空闲时，越久没有业务数据越先淘汰。
         assert!(
@@ -3191,7 +3531,8 @@ mod tests {
             to_relay: None,
             from_relay: srx,
             pending: VecDeque::new(),
-            pending_bytes: 0, relay_paused: false,
+            pending_bytes: 0,
+            relay_paused: false,
             read_wake: Arc::new(Notify::new()),
             relay_closed: false,
             client_closed: false,
@@ -3220,9 +3561,11 @@ mod tests {
         assert!(conn.relay_paused);
         assert!(!conn.relay_closed);
         // 搬到数据必须唤醒 relay（permit 已存，立即就绪）。
-        assert!(tokio::time::timeout(Duration::from_millis(50), conn.read_wake.notified())
-            .await
-            .is_ok());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), conn.read_wake.notified())
+                .await
+                .is_ok()
+        );
         // 暂停期间继续搬运无效：通道里还有数据但 pending 未到低水位。
         assert!(!drain_relay_to_pending(&mut conn));
         // 滞回：只排空到 1.5MB（高于 1MB 恢复水位）不得恢复搬运，
@@ -3321,7 +3664,11 @@ mod tests {
         // 第二次连续失败：进入 10s 冷却。
         assert!(!dial_breaker_record(&mut f, key.clone(), now));
         assert!(dial_breaker_active(&f, &key, now));
-        assert!(!dial_breaker_active(&f, &key, now + Duration::from_secs(11)));
+        assert!(!dial_breaker_active(
+            &f,
+            &key,
+            now + Duration::from_secs(11)
+        ));
         // 成功即清除：路径恢复后不再被熔断。
         dial_breaker_clear(&mut f, &key);
         assert!(!dial_breaker_active(&f, &key, now));
@@ -3342,7 +3689,11 @@ mod tests {
         assert!(!dial_breaker_active(&f, &b, now));
         assert!(!dial_breaker_active(&f, &bare, now));
         // 同域名不同端口也是不同目标。
-        assert!(!dial_breaker_active(&f, &dial_key(Some("a.example.com"), ip, 80), now));
+        assert!(!dial_breaker_active(
+            &f,
+            &dial_key(Some("a.example.com"), ip, 80),
+            now
+        ));
         // 域名大小写归一：同一域名不因为大小写差异被当成两个目标。
         assert_eq!(
             dial_key(Some("A.Example.COM"), ip, 443),
@@ -3408,11 +3759,59 @@ mod tests {
 
     #[test]
     fn udp_dst_buffer_fits_real_quic_bursts() {
-        // QUIC 包约 1400 字节；8192 的旧档只装得下 5 个包，而 UDP 满即丢。
+        // QUIC 包约 1400 字节；64K 仍能装 40+ 个包，不会因为降内存把正常突发打穿。
         const QUIC_PKT: usize = 1400;
-        assert!(UDP_DST_BUF / QUIC_PKT >= 20);
+        assert!(UDP_DST_BUF / QUIC_PKT >= 40);
         // metadata 槽位不能先于缓冲耗尽，否则扩容缓冲毫无意义。
         assert!(UDP_META_SLOTS >= UDP_DST_BUF / QUIC_PKT);
+    }
+
+    #[test]
+    fn udp_target_tables_share_a_bounded_budget() {
+        // 普通表和 DNS 表各自都不该再单独无界增长；合起来最多 512 个目标，
+        // 每目标 rx+tx 预分配 128K，容量上限 64MiB（物理页懒提交）。
+        assert!(MAX_UDP_TARGETS <= 512);
+        assert!(MAX_UDP_TARGETS * UDP_DST_BUF * 2 <= 64 * 1024 * 1024);
+        assert!(UDP_DST_BUF >= 8 * 1024);
+    }
+
+    #[test]
+    fn udp_target_idle_no_longer_requires_full_send_buffer() {
+        let mut sockets = SocketSet::new(vec![]);
+        let mut s = udp::Socket::new(
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; UDP_META_SLOTS],
+                vec![0u8; UDP_DST_BUF],
+            ),
+            udp::PacketBuffer::new(
+                vec![udp::PacketMetadata::EMPTY; UDP_META_SLOTS],
+                vec![0u8; UDP_DST_BUF],
+            ),
+        );
+        s.bind(IpListenEndpoint {
+            addr: Some(IpAddress::Ipv4(Ipv4Address::new(8, 8, 8, 8))),
+            port: 53,
+        })
+        .unwrap();
+        let handle = sockets.add(s);
+        let key = (IpAddress::Ipv4(Ipv4Address::new(8, 8, 8, 8)), 53);
+        let target = UdpTarget {
+            handle,
+            last: Instant::now(),
+            generation: 7,
+        };
+        // 空闲且发送缓冲有空间：旧判据 can_send()==false 会把它永远留在表里。
+        assert!(udp_target_idle(&sockets, &target, Instant::now(), false));
+        assert!(!udp_target_idle(&sockets, &target, Instant::now(), true));
+        let old = UdpTarget {
+            last: Instant::now() - Duration::from_secs(UDP_TARGET_IDLE_SECS + 1),
+            ..target
+        };
+        assert!(udp_target_idle(&sockets, &old, Instant::now(), true));
+        let mut map = HashMap::new();
+        map.insert(key, target);
+        assert_eq!(dynamic_dns_handle(&map, key, 7), Some(handle));
+        assert_eq!(dynamic_dns_handle(&map, key, 8), None);
     }
 
     #[test]
@@ -3486,9 +3885,8 @@ mod tests {
     #[test]
     fn pending_out_peak_is_counted_without_truncation() {
         let stats = test_stats();
-        let mut pending: VecDeque<Vec<u8>> = (0..MAX_PENDING_OUT + 7)
-            .map(|i| vec![i as u8])
-            .collect();
+        let mut pending: VecDeque<Vec<u8>> =
+            (0..MAX_PENDING_OUT + 7).map(|i| vec![i as u8]).collect();
         note_pending_out(&pending, &stats);
         // 高水位是背压信号，不再截断 pending_out。
         assert_eq!(pending.len(), MAX_PENDING_OUT + 7);
@@ -3520,9 +3918,6 @@ mod tests {
         let mut pending = VecDeque::new();
         device.drain_tx_into(&mut pending, 3);
         assert_eq!(pending.len(), 3);
-        assert_eq!(
-            device.tx.lock().unwrap_or_else(|p| p.into_inner()).len(),
-            2
-        );
+        assert_eq!(device.tx.lock().unwrap_or_else(|p| p.into_inner()).len(), 2);
     }
 }

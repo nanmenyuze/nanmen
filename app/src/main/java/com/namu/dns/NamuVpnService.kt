@@ -1,11 +1,13 @@
 package com.namu.dns
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
@@ -18,6 +20,32 @@ import android.os.Looper
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
+import org.json.JSONObject
+import java.io.File
+
+/**
+ * 实际已应用到系统 TUN 的参数。MTU 和路由范围只在建立 TUN 时生效，
+ * 热重载不会改变它们；任何一项变化都必须重建隧道，不能只比 mode。
+ */
+internal data class TunnelSpec(
+    val mode: String,
+    val mtu: Int,
+    val fullRoute: Boolean,
+)
+
+internal fun tunnelSpec(cfg: AppConfig, appliedMtu: Int = cfg.mtu.coerceIn(1280, 9000)) =
+    TunnelSpec(
+        mode = cfg.mode,
+        mtu = appliedMtu,
+        // 代理/DNS-only 全量接管都是默认路由；普通 DNS-only 只路由两个本地 DNS 地址。
+        fullRoute = cfg.mode != "dns_only" || cfg.dnsOnlyFullRoute,
+    )
+
+private data class EstablishedTun(
+    val pfd: ParcelFileDescriptor,
+    val spec: TunnelSpec,
+)
 
 class NamuVpnService : VpnService() {
 
@@ -75,6 +103,8 @@ class NamuVpnService : VpnService() {
 
         private const val CHANNEL_ID = "namu_vpn_status"
         private const val NOTIF_ID = 1001
+        private const val SCRIPT_CHANNEL_ID = "namu_script_alerts"
+        private const val SCRIPT_NOTIF_ID = 2000
 
         /**
          * 切网确认窗口。Wi-Fi 的 VALIDATED 位会抖（门户复验/息屏/ROM 周期重验），
@@ -102,9 +132,13 @@ class NamuVpnService : VpnService() {
     @Volatile private var stopping = false
     @Volatile private var rebuilding = false
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    /** 网络稳定后再触发脚本，3–5 秒去抖；与 cron 共用内核串行闸。 */
+    private val networkTriggerRunnable = Runnable {
+        if (running && !stopping) NativeCore.nativeTriggerScripts("network-changed")
+    }
     @Volatile private var currentNetwork: Network? = null
     @Volatile private var pendingNetworkRebuild = false
-    @Volatile private var activeMode: String? = null
+    @Volatile private var activeTunnel: TunnelSpec? = null
     /** 最后一次成功下发给内核的 JSON，用于重载失败回滚。 */
     @Volatile private var lastGoodJson: String? = null
     @Volatile private var reloading = false
@@ -152,6 +186,16 @@ class NamuVpnService : VpnService() {
                 setShowBadge(false)
             }
             manager.createNotificationChannel(channel)
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    SCRIPT_CHANNEL_ID,
+                    "脚本通知",
+                    NotificationManager.IMPORTANCE_DEFAULT,
+                ).apply {
+                    description = "模块脚本通过 \$notification.post 发出的提醒"
+                    setShowBadge(true)
+                },
+            )
         }
     }
 
@@ -163,6 +207,7 @@ class NamuVpnService : VpnService() {
                 NotificationManagerCompat.from(this@NamuVpnService).notify(NOTIF_ID, buildNotification())
             } catch (_: SecurityException) {
             }
+            drainScriptNotifications()
             mainHandler.postDelayed(this, 2000)
         }
     }
@@ -174,6 +219,51 @@ class NamuVpnService : VpnService() {
 
     private fun stopNotifUpdates() {
         mainHandler.removeCallbacks(notifTick)
+    }
+
+    /** 读取内核脚本写出的 JSONL 队列，转成真实系统通知；先 rename 再消费，避免并发重复。 */
+    private fun drainScriptNotifications() {
+        val queue = File(filesDir, "script_notifications.jsonl")
+        if (!queue.exists() || queue.length() == 0L) return
+        val drain = File(filesDir, "script_notifications.drain")
+        runCatching { drain.delete() }
+        if (!queue.renameTo(drain)) return
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            drain.delete()
+            return
+        }
+        val openIntent = PendingIntent.getActivity(
+            this,
+            3,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        runCatching {
+            drain.forEachLine { line ->
+                val o = runCatching { JSONObject(line) }.getOrNull() ?: return@forEachLine
+                val title = o.optString("title").ifBlank { "脚本通知" }
+                val subtitle = o.optString("subtitle")
+                val body = o.optString("body")
+                val script = o.optString("script")
+                val text = listOf(subtitle, body).filter { it.isNotBlank() }.joinToString(" · ")
+                val notif = NotificationCompat.Builder(this, SCRIPT_CHANNEL_ID)
+                    .setSmallIcon(R.drawable.ic_notification)
+                    .setContentTitle(title.take(80))
+                    .setContentText(text.take(200))
+                    .setStyle(NotificationCompat.BigTextStyle().bigText(text.take(1000)))
+                    .setContentIntent(openIntent)
+                    .setAutoCancel(true)
+                    .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+                    .setSubText(script.ifBlank { "南门DNS 脚本" })
+                    .build()
+                val id = SCRIPT_NOTIF_ID + ((line.hashCode() and Int.MAX_VALUE) % 8)
+                NotificationManagerCompat.from(this).notify(id, notif)
+            }
+        }.onFailure { /* 通知权限/ROM 限制：静默，脚本主流程不受影响 */ }
+        drain.delete()
     }
 
     private fun buildNotification(): Notification {
@@ -256,8 +346,8 @@ class NamuVpnService : VpnService() {
                 } else if (PrivateDnsController.bypassing(this)) {
                     messages.show("系统私人 DNS 已开启，DNS 会被 DoT 绕过")
                 }
-                val pfd = establishTun(cfg)
-                if (pfd == null) {
+                val applied = establishTun(cfg)
+                if (applied == null) {
                     if (!stopping) {
                         messages.show("VPN 建立失败，请检查是否有其他 VPN 正在运行")
                         runtime.markStartFailed()
@@ -265,6 +355,7 @@ class NamuVpnService : VpnService() {
                     }
                     return@Thread
                 }
+                val pfd = applied.pfd
                 if (stopping) {
                     pfd.close()
                     return@Thread
@@ -287,7 +378,7 @@ class NamuVpnService : VpnService() {
                     return@Thread
                 }
                 tun = pfd
-                activeMode = cfg.mode
+                activeTunnel = applied.spec
                 lastGoodJson = json
                 running = true
                 alive = true
@@ -296,8 +387,9 @@ class NamuVpnService : VpnService() {
                 App.container.refreshRuntime()
                 startNetworkMonitor()
                 startNotifUpdates()
-                // 按 App 分流的数据源：VPN 起来后才开始读表下发。
-                UidTablePublisher.start()
+                // UID 表按需启动：纯 DNS / 无按 App 判断的配置不跑 su 轮询。
+                UidTablePublisher.setVpnRunning(true)
+                UidTablePublisher.setServiceDemand(needsUidMap(cfg))
             } catch (t: Throwable) {
                 messages.show("启动失败: ${t.message}")
                 runtime.markStartFailed()
@@ -314,8 +406,10 @@ class NamuVpnService : VpnService() {
         }
         val pfd = tun ?: return
         val cfg = settings.current()
-        if (activeMode != cfg.mode) {
-            // 模式变化会改变 TUN 路由，必须重建接口；其余设置只热重启内核。
+        UidTablePublisher.setServiceDemand(needsUidMap(cfg))
+        if (activeTunnel == null || activeTunnel != tunnelSpec(cfg)) {
+            // MTU、DNS-only 全量接管、mode 任一变化都会改系统隧道参数；
+            // 热重载只换内核配置，改不了已建立的 TUN，必须重建。
             rebuildTunnel()
             return
         }
@@ -370,7 +464,7 @@ class NamuVpnService : VpnService() {
     /** 在 nativeLock 内把上一版成功 JSON 重新下发；模式已变化时交给 rebuildTunnel。 */
     private fun rollbackToLastGood(pfd: ParcelFileDescriptor, failedMode: String): Boolean {
         val prev = lastGoodJson ?: return false
-        if (activeMode != failedMode) return false
+        if (activeTunnel?.mode != failedMode) return false
         return synchronized(nativeLock) {
             if (stopping || !running) return@synchronized false
             try {
@@ -388,14 +482,16 @@ class NamuVpnService : VpnService() {
         }
     }
 
-    private fun establishTun(cfg: AppConfig): ParcelFileDescriptor? {
+    private fun establishTun(cfg: AppConfig): EstablishedTun? {
         val mtu = cfg.mtu.coerceIn(1280, 9000)
         val pfd = buildTun(cfg, mtu)
-        if (pfd != null || mtu == 1500) return pfd
+        if (pfd != null) return EstablishedTun(pfd, tunnelSpec(cfg, mtu))
+        if (mtu == 1500) return null
         // 个别 TUN 驱动不支持巨帧：回退 1500 并写回配置，
         // 保证壳 setMtu 与内核 iface 永远取同一值（否则写侧超 MTU 静默丢包）。
         settings.update { it.copy(mtu = 1500) }
-        return buildTun(cfg, 1500)
+        val fallback = buildTun(cfg, 1500) ?: return null
+        return EstablishedTun(fallback, tunnelSpec(cfg, 1500))
     }
 
     private fun buildTun(cfg: AppConfig, mtu: Int): ParcelFileDescriptor? {
@@ -462,7 +558,11 @@ class NamuVpnService : VpnService() {
             .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
             .build()
         val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) = evaluateNetworks()
+            override fun onAvailable(network: Network) {
+                evaluateNetworks()
+                mainHandler.removeCallbacks(networkTriggerRunnable)
+                mainHandler.postDelayed(networkTriggerRunnable, 4000)
+            }
             override fun onLost(network: Network) = evaluateNetworks()
             override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) = evaluateNetworks()
         }
@@ -483,6 +583,7 @@ class NamuVpnService : VpnService() {
         networkCallback = null
         mainHandler.removeCallbacks(rebuildRunnable)
         mainHandler.removeCallbacks(confirmSwitchRunnable)
+        mainHandler.removeCallbacks(networkTriggerRunnable)
         try {
             getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(cb)
         } catch (_: Exception) {
@@ -572,8 +673,9 @@ class NamuVpnService : VpnService() {
                     App.container.stats.resetSession()
                     Thread.sleep(120)
                     if (!running || stopping) return@synchronized
-                    val pfd = establishTun(cfg)
-                    if (pfd != null) {
+                    val applied = establishTun(cfg)
+                    if (applied != null) {
+                        val pfd = applied.pfd
                         val rebuiltJson = try {
                             ConfigStore.buildNative(this, settings.current())
                         } catch (_: Throwable) {
@@ -587,7 +689,7 @@ class NamuVpnService : VpnService() {
                         }
                         if (ok && rebuiltJson != null && running && !stopping) {
                             tun = pfd
-                            activeMode = cfg.mode
+                            activeTunnel = applied.spec
                             lastGoodJson = rebuiltJson
                             success = true
                         } else {
@@ -638,7 +740,8 @@ class NamuVpnService : VpnService() {
         reloading = false
         stopNetworkMonitor()
         stopNotifUpdates()
-        UidTablePublisher.stop()
+        UidTablePublisher.setVpnRunning(false)
+        UidTablePublisher.setServiceDemand(false)
         mainHandler.removeCallbacks(rebuildRunnable)
         runtime.markStopping()
         // 先显示“正在关闭”，等 nativeStop 真正返回后再撤 TUN/服务，
@@ -656,7 +759,7 @@ class NamuVpnService : VpnService() {
             mainHandler.post {
                 try { oldTun?.close() } catch (_: Exception) {}
                 tun = null
-                activeMode = null
+                activeTunnel = null
                 runtime.markStopped()
                 App.container.refreshRuntime()
                 alive = false

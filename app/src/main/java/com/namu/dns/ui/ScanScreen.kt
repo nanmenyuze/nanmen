@@ -277,7 +277,7 @@ private fun ManualScanPanel(
         NamuTextField(
             value = text,
             onChange = onTextChange,
-            placeholder = "vless://… / ss://… / https://订阅地址",
+            placeholder = "vless://… / vmess://… / ss://… / https://订阅地址",
             maxLines = 4,
         )
         if (!granted) {

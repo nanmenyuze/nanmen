@@ -19,11 +19,11 @@ import org.json.JSONObject
  * mitm 分区，由内核 1.11+ 执行；内核未接入时外壳仅存储/展示，不生效。
  *
  * M5 起逐段解析 Loon 插件：[Argument]、[General]、[Rule]、[Rewrite]、[Host]、
- * [Script]、[MITM]。每段都记录「可执行 / 已存储 / 部分支持 / 不支持」状态与依赖；
+ * [Script]、[MITM]、[WebSocket Rewrite]。每段都记录「可执行 / 已存储 / 部分支持 / 不支持」状态与依赖；
  * [Rewrite] 的旧版与新版语法送入内核执行，Surge 的 [URL Rewrite] 仍走独立解析。
  *
- * 不支持 [Script]、[Host] 映射、参数替换等需要脚本引擎或运行时变量的能力；
- * 这些行仍计入 ignored，同时通过 sectionStatus / dependencies 明确展示功能缺口。
+ * [Script] 支持 v2 条件树、Argument 运行时注入与 $environment/$utils/require；
+ * 无法解析的行计入 ignored，并通过 sectionStatus / dependencies 明确展示功能缺口。
  */
 data class ModuleSectionStatus(
     val section: String,
@@ -42,6 +42,12 @@ data class ParsedModule(
     val ignored: Int,
     /** [MITM] hostname 列表（支持通配），合并进 active 配置 mitm.hostnames。 */
     val mitmHostnames: List<String> = emptyList(),
+    /** [MITM] skip 列表：显式排除、永不解密的域名。 */
+    val mitmSkipHostnames: List<String> = emptyList(),
+    /** [MITM] 已识别但不改变隧道的细项（tcp-connection/client-cert 等）。 */
+    val mitmOptions: Map<String, String> = emptyMap(),
+    /** [General] 已解析的全局项；DNS/TUN 类由壳层按能力选择性接入。 */
+    val generalOptions: Map<String, String> = emptyMap(),
     /** [URL Rewrite] 原始规则行，由内核解析执行。 */
     val urlRewrites: List<String> = emptyList(),
     /** [Header Rewrite] 原始规则行。 */
@@ -56,11 +62,15 @@ data class ParsedModule(
     val ruleSets: List<RuleSetRef> = emptyList(),
     /** Loon [Rewrite] 原始行（旧版/新版），由内核解析执行。 */
     val loonRewrites: List<String> = emptyList(),
+    /** Surge [Body Rewrite] 原始行：http-request/http-response <url> <regex> <replacement>。 */
+    val bodyRewrites: List<String> = emptyList(),
+    /** [WebSocket Rewrite] 原始行（南门自有语法），由内核 h1 Upgrade 帧改写执行。 */
+    val wsRewrites: List<String> = emptyList(),
     /** [Argument] 参数定义；键 → 默认值。 */
     val arguments: Map<String, String> = emptyMap(),
     /** [Argument] 声明类型（string / number / boolean）；内核据此注入正确的 JS 类型。 */
     val argumentTypes: Map<String, String> = emptyMap(),
-    /** [Host] 域名映射（仅记录，当前内核没有 Host 覆盖能力）。 */
+    /** [Host] 域名映射：直接 IP、CNAME 别名或 server:上游。 */
     val hostMappings: Map<String, String> = emptyMap(),
     /** [Script] 原始行。 */
     val scriptLines: List<String> = emptyList(),
@@ -98,9 +108,14 @@ object ModuleParser {
         val ruleSets = mutableListOf<RuleSetRef>()
         val lostTargets = LinkedHashSet<String>()
         val mitmHosts = LinkedHashSet<String>()
+        val mitmSkips = LinkedHashSet<String>()
+        val mitmOptions = linkedMapOf<String, String>()
+        val generalOptions = linkedMapOf<String, String>()
         val urlRewrites = mutableListOf<String>()
         val headerRewrites = mutableListOf<String>()
         val loonRewrites = mutableListOf<String>()
+        val bodyRewrites = mutableListOf<String>()
+        val wsRewrites = mutableListOf<String>()
         val arguments = linkedMapOf<String, String>()
         val argumentTypes = linkedMapOf<String, String>()
         val hostMappings = linkedMapOf<String, String>()
@@ -160,8 +175,20 @@ object ModuleParser {
                                 }
                         }
                         line.contains('=') -> {
-                            // 其他 MITM 选项（例如 skip）当前内核无对应语义，记录但不假装执行。
-                            ignore("unsupported_mitm_option")
+                            val key = line.substringBefore('=').trim().lowercase()
+                            val value = line.substringAfter('=').trim()
+                            if (key == "skip" || key == "skip-hostnames" || key == "skip_hostnames") {
+                                value.split(',').map { it.trim() }.filter { it.isNotEmpty() }.forEach { h ->
+                                    cleanMitmHost(h.replace(Regex("^\\s*%APPEND%\\s*", RegexOption.IGNORE_CASE), "").trim())?.let {
+                                        mitmSkips.add(it); acceptedHostLine = true
+                                    }
+                                }
+                            } else {
+                                // Loon MITM 细项：hostname/skip 执行，其余保留供审计与后续接入，
+                                // 不再以「不支持」丢弃整行。
+                                if (key.isNotEmpty()) mitmOptions[key] = value
+                                acceptedHostLine = true
+                            }
                         }
                         else -> {
                             val h = cleanMitmHost(line)
@@ -183,6 +210,46 @@ object ModuleParser {
                     headerRewrites.add(line)
                     acc(section).ok++
                 }
+                section == "body rewrite" -> {
+                    acc(section).lines++
+                    val normalized = normalizeBodyRewrite(line)
+                    if (normalized != null) {
+                        bodyRewrites.add(normalized)
+                        acc(section).ok++
+                    } else {
+                        ignore("body_rewrite_invalid")
+                    }
+                }
+                section == "map local" -> {
+                    acc(section).lines++
+                    val (translated, issue) = mapLocalToLoon(line)
+                    if (translated != null) {
+                        loonRewrites.add(translated)
+                        acc(section).ok++
+                    } else {
+                        ignore(issue ?: "invalid_map_local")
+                    }
+                }
+                section == "map remote" -> {
+                    acc(section).lines++
+                    val (translated, issue) = mapRemoteToLoon(line)
+                    if (translated != null) {
+                        loonRewrites.add(translated)
+                        acc(section).ok++
+                    } else {
+                        ignore(issue ?: "invalid_map_remote")
+                    }
+                }
+                section == "websocket rewrite" -> {
+                    acc(section).lines++
+                    val action = line.substringBefore(' ', "").trim().lowercase()
+                    if (action == "ws-block" || action == "ws-text-replace") {
+                        wsRewrites.add(line)
+                        acc(section).ok++
+                    } else {
+                        ignore("unsupported_websocket_action")
+                    }
+                }
                 section == "rewrite" -> {
                     acc(section).lines++
                     if (loonRewriteSupported(line)) {
@@ -198,19 +265,33 @@ object ModuleParser {
                     if (decl != null) {
                         arguments[decl.first] = decl.second.first
                         argumentTypes[decl.first] = decl.second.second
+                        acc(section).ok++
+                    } else {
+                        ignore("invalid_argument")
                     }
-                    ignore("runtime_argument")
                 }
                 section == "general" -> {
                     acc(section).lines++
-                    ignore("general_option")
+                    val key = line.substringBefore('=', "").trim().lowercase()
+                    val value = line.substringAfter('=', "").trim()
+                    if (key.isNotEmpty()) {
+                        generalOptions[key] = value
+                        // General 不是每条都能映射到本机 TUN/DNS；能识别的先完整保留，
+                        // 由 ConfigStore 选择 DNS 覆盖、跳过域名等可执行项接入。
+                        if (key in supportedGeneralOptions) acc(section).ok++ else ignore("general_option")
+                    } else ignore("general_option")
                 }
                 section == "host" -> {
                     acc(section).lines++
                     val key = line.substringBefore('=', "").trim().lowercase()
                     val value = line.substringAfter('=', "").trim()
-                    if (key.isNotBlank() && value.isNotBlank()) hostMappings[key] = value
-                    ignore("host_mapping")
+                    val issue = validateHostMapping(key, value)
+                    if (issue == null) {
+                        hostMappings[key] = value
+                        acc(section).ok++
+                    } else {
+                        ignore(issue)
+                    }
                 }
                 section == "script" -> {
                     acc(section).lines++
@@ -231,11 +312,8 @@ object ModuleParser {
                 }
             }
         }
-        // [Argument] 可能出现在 [Rewrite]/[Script] 之后：统一按默认值展开参数引用，
-        // 保留 ${url} 等运行时变量。声明无编辑入口，因此编译期展开与 Loon 默认值语义一致。
-        loonRewrites.replaceAll { expandArguments(it, arguments) }
-        urlRewrites.replaceAll { expandArguments(it, arguments) }
-        headerRewrites.replaceAll { expandArguments(it, arguments) }
+        // 参数不再做编译期字符串展开：Rewrite 行保留原样，脚本只通过 $argument 注入，
+        // 避免把用户输入拼进正则/URL/脚本源码。
         // [Argument] 可能出现在 [Script] 之后；统一把最终参数并入每条脚本。
         scripts.replaceAll { rule ->
             val merged = LinkedHashMap(rule.arguments)
@@ -250,6 +328,10 @@ object ModuleParser {
                 "rewrite" -> "Rewrite"
                 "url rewrite" -> "URL Rewrite"
                 "header rewrite" -> "Header Rewrite"
+                "body rewrite" -> "Body Rewrite"
+                "websocket rewrite" -> "WebSocket Rewrite"
+                "map local" -> "Map Local"
+                "map remote" -> "Map Remote"
                 "mitm" -> "MITM"
                 "argument" -> "Argument"
                 "general" -> "General"
@@ -261,17 +343,58 @@ object ModuleParser {
             }
             val (status, detail) = when (key) {
                 "rule", "filter", "adblock" -> "executed" to "DNS 阻断/分流规则已合并到当前配置"
-                "mitm" -> "stored" to "域名列表已写入 MITM 配置；需启用 MITM 并安装 CA"
+                "mitm" -> {
+                    val bits = buildList {
+                        if (mitmHosts.isNotEmpty()) add("${mitmHosts.size} 个 hostname")
+                        if (mitmSkips.isNotEmpty()) add("${mitmSkips.size} 个 skip")
+                        if (mitmOptions.isNotEmpty()) add("${mitmOptions.size} 个细项")
+                    }
+                    "executed" to "MITM 配置已下发${bits.joinToString("、")?.let { "（$it）" } ?: ""}；需启用 MITM 并安装 CA"
+                }
                 "url rewrite" -> "stored" to "Surge 旧式 [URL Rewrite] 交给内核的 Surge 解析器，不按 Loon 语法推断"
-                "header rewrite" -> "stored" to "Surge [Header Rewrite] 交给内核执行"
+                "header rewrite" -> "stored" to "Surge [Header Rewrite] 双向执行（请求头 + 响应头）"
+                "body rewrite" -> if (a.ok > 0) {
+                    "stored" to "已翻译 ${a.ok} 条 Body Rewrite；jq 支持路径/管道/数组对象构造/map/select/del/算术/排序/编码函数"
+                } else {
+                    "unsupported" to "Body Rewrite 需要 http-request/http-response + URL/regex/replacement 或 jq 子集"
+                }
+                "websocket rewrite" -> if (a.ok > 0) {
+                    "stored" to "已 ${a.ok} 条 WebSocket 规则；仅 h1 Upgrade 帧改写，未命中时零代价透传"
+                } else {
+                    "unsupported" to "WebSocket 规则无法解析（支持 ws-block / ws-text-replace）"
+                }
+                "map local" -> if (a.ok > 0) {
+                    "executed" to "已翻译 ${a.ok} 条 Map Local（data 内联 / data-path / file），按路径返回 mock 响应"
+                } else {
+                    "unsupported" to "Map Local 需要 data、data-path 或 file 之一"
+                }
+                "map remote" -> if (a.ok > 0) {
+                    "executed" to "已翻译 ${a.ok} 条 Map Remote 为 URL 前缀改写，跨域请求按新 host 直连/走代理"
+                } else {
+                    "unsupported" to "Map Remote 需要 <源URL> <目标URL> 两段"
+                }
                 "rewrite" -> if (a.ok > 0) {
-                    "stored" to "Loon [Rewrite] 已编译执行；jq、data-path、复杂条件等缺口见依赖说明"
+                    "stored" to "Loon [Rewrite] 已编译执行；完整 jq、data-path/file、复合条件均已接入"
                 } else {
                     "unsupported" to "全部动作暂不支持"
                 }
-                "argument" -> "partial" to "参数只记录，不做 \${region} 式运行时替换"
-                "general" -> "partial" to "General 全局项只记录，不改变内核 DNS/TUN 行为"
-                "host" -> "partial" to "Host 映射只记录，当前内核不做域名到 IP 的本地覆盖"
+                "argument" -> if (a.ok > 0) {
+                    "executed" to "参数已解析并按声明类型注入 \$argument；运行期修改不重编译脚本"
+                } else {
+                    "unsupported" to "Argument 需要 key=默认值（可选 select/input/switch 与 type）"
+                }
+                "general" -> if (a.ok > 0) {
+                    "stored" to "已解析 ${a.ok}/${a.lines} 项 General；DNS/跳过域名等可执行项由壳层接入，TUN 路由项保留审计"
+                } else {
+                    "stored" to "General 已保留原文；未识别的键不改变内核行为"
+                }
+                "host" -> if (a.ok > 0 && a.lines == a.ok) {
+                    "executed" to "Host 映射已下发 DNS；IP/别名在本地生效，server 仅复用现有上游客户端"
+                } else if (a.ok > 0) {
+                    "partial" to "已 ${a.ok}/${a.lines} 条 Host 映射生效；server:system / http:// 等写法已拒绝"
+                } else {
+                    "unsupported" to "Host 值无法解析（需 IP、CNAME 别名或 server:上游）"
+                }
                 "script" -> if (a.ok > 0) {
                     "partial" to "已解析 ${a.ok} 条脚本，由内核 QuickJS 执行；正文在导入时下载缓存，API 覆盖见 M6 能力矩阵"
                 } else {
@@ -282,11 +405,12 @@ object ModuleParser {
             ModuleSectionStatus(name, a.lines, a.ok, status, detail)
         }
         val dependencies = buildList {
-            if (scripts.isNotEmpty()) add("QuickJS 脚本运行时（内置，Promise/async 微任务已支持）；binary-body-mode/Uint8Array 已支持，require/本地文件读取不支持，setTimeout 按 Loon 语义只执行一次")
+            if (scripts.isNotEmpty()) add("QuickJS 脚本运行时（内置，Promise/async 微任务已支持）；binary-body-mode/Uint8Array 已支持，require(crypto/base64/util) 已支持，本地文件读取不开放")
             if (scriptLines.isNotEmpty() && scripts.isEmpty()) add("脚本规则（未解析，[Script] 不执行）")
-            if (arguments.isNotEmpty()) add("参数替换：\$argument 按声明类型注入；Rewrite/Script 条件与动作里的 \${参数} 按默认值展开")
-            if (hostMappings.isNotEmpty()) add("Host 映射（未实现）")
-            if (sectionAcc["general"]?.lines ?: 0 > 0) add("General 全局项（仅记录）")
+            if (arguments.isNotEmpty()) add("参数注入：只把当前值按声明类型塞进 \$argument，不做编译期字符串展开")
+            if (hostMappings.isNotEmpty()) add("Host 映射已接入 DNS；server: 只复用现有 UDP/DoT/DoH 客户端，server:system 不支持")
+            if (generalOptions.isNotEmpty()) add("General 已解析：skip-proxy/bypass 可映射跳过域名，TUN 路由项保留审计")
+            if (mitmSkips.isNotEmpty()) add("MITM skip 域名已合并进 skip_hostnames")
         }
         return ParsedModule(
             name = name.ifBlank { app },
@@ -296,17 +420,22 @@ object ModuleParser {
             ruleSets = ruleSets.distinctBy { "${it.kind}|${it.url}" },
             ignored = ignoredReasons.values.sum(),
             mitmHostnames = mitmHosts.toList(),
+            mitmSkipHostnames = mitmSkips.toList(),
+            mitmOptions = mitmOptions,
+            generalOptions = generalOptions,
             urlRewrites = urlRewrites.distinct(),
             headerRewrites = headerRewrites.distinct(),
             allowLines = allows.toList(),
             ignoredReasons = ignoredReasons,
             lostRouteTargets = lostTargets.toList(),
             loonRewrites = loonRewrites.distinct(),
+            bodyRewrites = bodyRewrites.distinct(),
+            wsRewrites = wsRewrites.distinct(),
             arguments = arguments,
             argumentTypes = argumentTypes,
             hostMappings = hostMappings,
             scriptLines = scriptLines.toList(),
-            scripts = scripts.distinctBy { "${it.phase}|${it.pattern}|${it.scriptPath}|${it.name}" },
+            scripts = scripts.distinctBy { "${it.phase}|${it.pattern}|${it.condition}|${it.scriptPath}|${it.name}" },
             scriptIssues = scriptIssues.toList(),
             sectionStatus = statuses,
             dependencies = dependencies,
@@ -345,6 +474,17 @@ object ModuleParser {
         }
         val routes = mutableListOf<RuleItem>()
         val lostTargets = LinkedHashSet<String>()
+        val hostMappings = linkedMapOf<String, String>()
+        for (field in listOf("hosts", "hostMappings")) {
+            o.optJSONObject(field)?.let { h ->
+                h.keys().forEach { rawKey ->
+                    val key = rawKey.trim().lowercase()
+                    val value = h.optString(rawKey, "").trim()
+                    if (validateHostMapping(key, value) == null) hostMappings[key] = value
+                    else ignore("host_mapping_invalid")
+                }
+            }
+        }
         o.optJSONArray("rules")?.let { arr ->
             for (i in 0 until arr.length()) {
                 when (val item = arr.opt(i)) {
@@ -378,6 +518,7 @@ object ModuleParser {
             allowLines = allows.toList(),
             ignoredReasons = ignoredReasons,
             lostRouteTargets = lostTargets.toList(),
+            hostMappings = hostMappings,
         )
     }
 
@@ -402,15 +543,23 @@ object ModuleParser {
         "request-header-add", "request-header-del", "request-header-replace", "request-header-replace-regex",
         "response-header-add", "response-header-del", "response-header-replace", "response-header-replace-regex",
         "request-body-replace-regex", "request-body-json-add", "request-body-json-replace",
-        "request-body-json-del", "request-body-json-delete",
+        "request-body-json-del", "request-body-json-delete", "request-body-json-jq", "request-body-jq",
         "response-body-replace-regex", "response-body-json-add", "response-body-json-replace",
-        "response-body-json-del", "response-body-json-delete",
+        "response-body-json-del", "response-body-json-delete", "response-body-json-jq", "response-body-jq",
         "mock-request-body", "mock-response-body",
+    )
+
+    /** Loon/小火箭 [General] 里可被本机识别并审计的键；未列出的键保留原文但不计成功。 */
+    private val supportedGeneralOptions = setOf(
+        "skip-proxy", "bypass", "bypass-tun", "tun-excluded-routes", "dns-server", "dns-fallback",
+        "always-real-ip", "hijack-dns", "ipv6", "prefer-ipv6", "force-close-connections",
+        "proxy-test-url", "internet-test-url", "test-timeout", "allow-wifi-access", "wifi-assist",
+        "dns-cache", "dns-cache-size", "geoip-maxmind", "skip-cert-verify",
     )
 
     /**
      * 模块预览用的 Loon [Rewrite] 支持判断。真正执行以内核解析器为准；
-     * 这里只把明确不支持的 jq、data-path、脚本和复杂条件标出来，避免界面虚假承诺。
+     * jq / data-path / 复合条件都已接入；这里只拒绝混入 script 动作或无法解析的行。
      */
     private fun loonRewriteSupported(line: String): Boolean {
         val lower = line.lowercase()
@@ -443,8 +592,9 @@ object ModuleParser {
             else -> second
         } ?: return false
         if (action !in loonSimpleActions) return false
-        if (action.contains("json-jq") || action.endsWith("-jq")) return false
-        if (action.startsWith("mock-") && lower.contains("data-path=")) return false
+        // jq 动作可以是 -jq 后缀，也可以是 `body-json-jq` 别名；内核统一走完整 jq 解析器。
+        if (action.contains("json-jq") || action.endsWith("-jq")) return true
+        if (action.startsWith("mock-") && (lower.contains("data-path=") || lower.contains("file="))) return true
         return true
     }
 
@@ -594,27 +744,171 @@ object ModuleParser {
      * 不认识的键只会被忽略，不会把整条脚本当成可执行。
      */
     /** 展开插件参数：`${region}` → 默认值；保留 `${url}` 与 `${request...}` 等运行时变量。 */
-    private fun expandArguments(text: String, args: Map<String, String>): String {
-        if (args.isEmpty()) return text
-        val re = Regex("""\$\{([A-Za-z_][A-Za-z0-9_.-]*)\}""")
-        return re.replace(text) { m ->
-            val name = m.groupValues[1]
-            if (name == "url" || name.startsWith("request") || name.startsWith("response")) {
-                m.value
-            } else {
-                args[name] ?: m.value
-            }
-        }
-    }
-
     private fun indexOfIgnoreCase(text: String, needle: String, start: Int = 0): Int =
         text.lowercase().indexOf(needle.lowercase(), start)
 
     /**
+     * [Map Local] 行 → Loon `mock-response-body` 行。
+     * 支持 data= 内联、data-path/file 本地文件；后者交给内核在 mock_base_dir 下读取。
+     * status-code / header 原样带进 mock，内核 parse_mock 已支持。
+     */
+    private fun mapLocalToLoon(raw: String): Pair<String?, String?> {
+        val line = raw.trim()
+        val firstSpace = line.indexOfFirst { it.isWhitespace() }
+        if (firstSpace <= 0) return null to "invalid_map_local"
+        val url = line.substring(0, firstSpace).trim()
+        if (url.isEmpty()) return null to "invalid_map_local"
+        val params = splitMapArgs(line.substring(firstSpace + 1))
+        var dataType = ""
+        var data: String? = null
+        var dataFile: String? = null
+        var statusCode: String? = null
+        val headers = mutableListOf<String>()
+        for (token in params) {
+            val eq = token.indexOf('=')
+            if (eq <= 0) continue
+            val key = token.substring(0, eq).trim().lowercase()
+            var value = token.substring(eq + 1).trim()
+            val quoted = value.length >= 2 &&
+                ((value.startsWith("\"") && value.endsWith("\"")) ||
+                    (value.startsWith("'") && value.endsWith("'"))
+                )
+            if (quoted) {
+                value = value.substring(1, value.length - 1)
+            }
+            when (key) {
+                "data-type" -> dataType = value
+                "data" -> data = value
+                "status-code" -> statusCode = value
+                "header" -> if (value.contains(':')) headers.add(value)
+                "data-path", "file" -> dataFile = value
+            }
+        }
+        val body = data
+        val file = dataFile
+        if (body == null && file == null) return null to "unsupported_map_local_no_data"
+        if (dataType.isBlank()) {
+            val probe = body?.trimStart().orEmpty()
+            dataType = if (probe.startsWith("{") || probe.startsWith("[") ||
+                file?.substringAfterLast('.', "")?.lowercase() in setOf("json", "geojson")
+            ) "json" else "text"
+        }
+        fun esc(v: String): String = v.replace("\\", "\\\\").replace("\"", "\\\"")
+        val sb = if (body != null) {
+            StringBuilder("$url mock-response-body data-type=$dataType data=\"${esc(body)}\"")
+        } else {
+            StringBuilder("$url mock-response-body data-type=$dataType data-path=\"${esc(file!!)}\"")
+        }
+        if (!statusCode.isNullOrBlank() && statusCode!!.toIntOrNull() != null) {
+            sb.append(" status-code=$statusCode")
+        }
+        headers.forEach { sb.append(" header=\"${esc(it)}\"") }
+        return sb.toString() to null
+    }
+
+    /**
+     * Surge [Map Remote]：`<源URL前缀> <目标URL>` → Loon URL 替换。
+     * 源按字面前缀转正则并捕获剩余路径；目标若已含 $1/${1} 则尊重用户模板，
+     * 否则自动拼接捕获段，保留查询串与尾部路径。
+     */
+    private fun mapRemoteToLoon(raw: String): Pair<String?, String?> {
+        val line = raw.trim()
+        val firstSpace = line.indexOfFirst { it.isWhitespace() }
+        if (firstSpace <= 0) return null to "invalid_map_remote"
+        val source = line.substring(0, firstSpace).trim()
+        val target = line.substring(firstSpace + 1).trim().trim('"', '\'')
+        if (source.isEmpty() || target.isEmpty()) return null to "invalid_map_remote"
+        if (!target.startsWith("http://") && !target.startsWith("https://") && !target.startsWith("/")) {
+            return null to "invalid_map_remote_target"
+        }
+        // 已是正则的源（以 ^ 开头或显式 /.../）直接沿用；否则按字面 URL 前缀转义。
+        val pattern: String
+        val replacement: String
+        if (source.startsWith("^") || (source.startsWith("/") && source.lastIndexOf('/') > 0)) {
+            pattern = source
+            replacement = if (target.contains("$1") || target.contains("${'$'}{1}")) target else target + "\$1"
+        } else {
+            val prefix = source.trimEnd('/')
+            val escaped = regexEscape(prefix)
+            pattern = if (source.endsWith("/")) {
+                "^$escaped/(.*)$"
+            } else {
+                "^$escaped(.*)$"
+            }
+            val base = if (target.contains("$1") || target.contains("${'$'}{1}")) {
+                target
+            } else if (source.endsWith("/")) {
+                target.trimEnd('/') + "/\$1"
+            } else {
+                target.trimEnd('/') + "\$1"
+            }
+            replacement = base
+        }
+        return "$pattern $replacement header" to null
+    }
+
+    /** Rust regex 不支持 \Q...\E，逐字符转义元字符。 */
+    private fun regexEscape(value: String): String {
+        val meta = "\\^$.|?*+()[]{}"
+        val sb = StringBuilder(value.length * 2)
+        for (c in value) {
+            if (c in meta) sb.append('\\')
+            sb.append(c)
+        }
+        return sb.toString()
+    }
+
+    /** Map Local 参数按空白切分，但保留引号内空格与 JSON {} / [] 内的空格。 */
+    private fun splitMapArgs(raw: String): List<String> {
+        val out = mutableListOf<String>()
+        val cur = StringBuilder()
+        var quote = false
+        var escape = false
+        var depth = 0
+        fun flush() {
+            if (cur.isNotEmpty()) { out.add(cur.toString()); cur.clear() }
+        }
+        for (ch in raw) {
+            if (escape) {
+                cur.append(ch)
+                escape = false
+                continue
+            }
+            when {
+                // 反斜杠转义在引号内外都成立：Surge Body Rewrite 的正文正则常把
+                // 双引号写成 \"，不能让它切换引号状态，否则整行会被切成 2 个 token。
+                ch == '\\' -> { cur.append(ch); escape = true }
+                ch == '"' -> { quote = !quote; cur.append(ch) }
+                !quote && (ch == '{' || ch == '[') -> { depth++; cur.append(ch) }
+                !quote && (ch == '}' || ch == ']') -> { depth--; cur.append(ch) }
+                !quote && depth == 0 && ch.isWhitespace() -> flush()
+                else -> cur.append(ch)
+            }
+        }
+        flush()
+        return out
+    }
+
+    /** 从 Script v2 条件里提取 URL 预筛正则；顶层 || 或无 ${'$'}{url} 分支时返回 .*。 */
+    private fun scriptConditionPrefilter(condition: String): String {
+        if (condition.contains("||")) return ".*"
+        val marker = "${'$'}{url}"
+        val idx = condition.indexOf(marker)
+        if (idx < 0) return ".*"
+        var rest = condition.substring(idx + marker.length).trim()
+        if (!rest.startsWith("~=")) return ".*"
+        rest = rest.removePrefix("~=").trim()
+        // 截到下一个 && 之前；正则字面量本身可能包含 &&，但 Loon 条件里极少见。
+        val literal = rest.substringBefore("&&").trim()
+        return regexLiteral(literal) ?: ".*"
+    }
+
+    /**
      * Loon 3.5.1 Script v2：
      * `request if ${url} ~= /re/ then script("a.js", {${x}}) with requires_body=true, timeout=5, tag="x"`
-     * 只接受单条 `${url} ~= /re/` 条件；`&&`/`||`/header 条件明确报不支持，
-     * 避免按旧语法误解析成「看起来生效、实际不执行」。cron 无调度器，明确拒绝。
+     * 条件表达式原样透传给内核 LoonCond 求值，支持 &&/||/header 条件；
+     * 内核不认的形式会显式报错，不再按旧语法误解析成「看起来生效、实际不执行」。
+     * cron 无调度器，明确拒绝。
      */
     private fun parseScriptV2(
         raw: String,
@@ -622,30 +916,45 @@ object ModuleParser {
         moduleTypes: Map<String, String>,
     ): Pair<ScriptConfig?, String?>? {
         val lower = raw.trim().lowercase()
-        if (!lower.startsWith("request if ") && !lower.startsWith("response if ") && !lower.startsWith("cron ")) {
+        if (!lower.startsWith("request if ") && !lower.startsWith("response if ") &&
+            !lower.startsWith("cron ") && !lower.startsWith("network-changed ") &&
+            !lower.startsWith("generic ")
+        ) {
             return null
         }
         if (lower.startsWith("cron ")) {
-            return null to "cron 定时脚本暂不支持（内核无调度器）: ${raw.take(60)}"
+            val m = Regex("""^cron\s+"([^"]+)"\s+(.+)$""", RegexOption.IGNORE_CASE).find(raw.trim())
+                ?: return null to "cron 需要 cron \"...\" script-path=...: ${raw.take(80)}"
+            val expr = m.groupValues[1].trim()
+            val cronIssue = validateCronExpr(expr)
+            if (cronIssue != null) return null to "cron 表达式$cronIssue: $expr"
+            val rest = m.groupValues[2].trim()
+            // 同时接受 cron "expr" script-path=... 与 cron "expr" script("url") 两种写法。
+            val call = Regex("""^script\s*\(\s*"([^"]+)"\s*(?:,\s*\{[^)]*\})?\s*\)""").find(rest)
+            val normalized = if (call != null) "type=cron script-path=${call.groupValues[1]}" else "type=cron $rest"
+            val parsed = parseScriptLine(normalized, moduleArgs, moduleTypes)
+            val rule = parsed.first ?: return parsed
+            return rule.copy(phase = "cron", pattern = ".*", cron = expr, trigger = "cron") to null
         }
-        val line = expandArguments(raw.trim(), moduleArgs)
+        if (lower.startsWith("network-changed ") || lower.startsWith("generic ")) {
+            val kind = if (lower.startsWith("network-changed ")) "network-changed" else "generic"
+            val rest = raw.trim().substring(kind.length).trim()
+            val parsed = parseScriptLine("type=cron " + rest, moduleArgs, moduleTypes)
+            val rule = parsed.first ?: return parsed
+            return rule.copy(phase = "cron", pattern = ".*", trigger = kind) to null
+        }
+        val line = raw.trim()
         val thenIdx = indexOfIgnoreCase(line, " then ")
         if (thenIdx <= 0) return null to "Script v2 缺少 then: ${line.take(80)}"
         val phase = if (line.lowercase().startsWith("request if ")) "request" else "response"
         val condRaw = line.substring(line.indexOf(" if ") + 4, thenIdx).trim()
-        if (condRaw.contains("&&") || condRaw.contains("||")) {
-            return null to "Script v2 复合条件暂不支持: ${condRaw.take(80)}"
-        }
-        val cond = condRaw.substringBefore(" as ").trim()
-        if (!cond.startsWith("\${url}")) {
-            return null to "Script v2 仅支持 \${url} 条件: ${cond.take(80)}"
-        }
-        val rest = cond.removePrefix("\${url}").trim()
-        if (!rest.startsWith("~=")) return null to "Script v2 条件运算符不支持: ${cond.take(80)}"
-        val literal = rest.removePrefix("~=").trim()
-        val pattern = regexLiteral(literal) ?: return null to "Script v2 URL 正则非法: ${literal.take(80)}"
+        val condition = condRaw.substringBefore(" as ").trim()
+        if (condition.isBlank()) return null to "Script v2 条件为空: ${line.take(80)}"
+        // pattern 只做预筛：有 URL 分支时沿用其正则，无 URL 分支或顶层 || 时放宽到 .*，
+        // 精确命中交给内核 LoonCond 条件树（按实际请求/响应头求值）。
+        val pattern = scriptConditionPrefilter(condition)
         val actionRaw = line.substring(thenIdx + 6).trim()
-        val call = Regex("""^script\s*\(\s*"([^"]+)"\s*(?:,\s*\{[^}]*\})?\s*\)""").find(actionRaw)
+        val call = Regex("""^script\s*\(\s*"([^"]+)"\s*(?:,\s*\{[^)]*\})?\s*\)""").find(actionRaw)
             ?: return null to "Script v2 动作只支持 script(\"http(s)://...\"): ${actionRaw.take(80)}"
         val scriptPath = call.groupValues[1].trim()
         val withRaw = actionRaw.substring(call.range.last + 1).trim().removePrefix("with").trim()
@@ -679,6 +988,7 @@ object ModuleParser {
             name = tag.ifBlank { scriptPath.substringAfterLast('/').ifBlank { pattern.take(48) } },
             phase = phase,
             pattern = pattern,
+            condition = condition,
             source = "",
             arguments = args,
             argumentTypes = moduleTypes.filterKeys { args.containsKey(it) },
@@ -688,6 +998,42 @@ object ModuleParser {
             binaryBodyMode = binaryBody,
             scriptPath = scriptPath,
         ) to null
+    }
+
+    private fun validateCronExpr(expr: String): String? {
+        val fields = expr.trim().split(Regex("""\s+""")).filter { it.isNotBlank() }
+        if (fields.size != 5) return "必须是 5 段"
+        if (fields.any { it.any { c -> !(c.isDigit() || c == '*' || c == '/' || c == ',' || c == '-') } }) {
+            return "含不支持的字符"
+        }
+        val ranges = listOf(0 to 59, 0 to 23, 1 to 31, 1 to 12, 0 to 7)
+        for ((idx, field) in fields.withIndex()) {
+            val issue = validateCronField(field, ranges[idx].first, ranges[idx].second)
+            if (issue != null) return "第 ${idx + 1} 段$issue"
+        }
+        return null
+    }
+
+    /** 与 Rust cron 解析保持一致：支持 *、星号斜杠步进、a-b、a-b 斜杠步进、逗号列表。 */
+    private fun validateCronField(field: String, min: Int, max: Int): String? {
+        for (part in field.split(',')) {
+            if (part.isBlank()) return "有空项"
+            val slash = part.split('/')
+            if (slash.size > 2) return "步进格式错误"
+            val base = slash[0]
+            if (slash.size == 2) {
+                val step = slash[1].toIntOrNull()
+                if (step == null || step <= 0) return "步进必须为正整数"
+            }
+            if (base == "*") continue
+            val dash = base.split('-')
+            if (dash.size > 2) return "范围格式错误"
+            val lo = dash[0].toIntOrNull() ?: return "不是数字"
+            val hi = if (dash.size == 2) (dash[1].toIntOrNull() ?: return "范围终点不是数字") else lo
+            if (lo < min || hi > max) return "超出 $min-$max"
+            if (lo > hi) return "范围起止颠倒"
+        }
+        return null
     }
 
     /** 提取 `/regex/` 字面量；内部允许转义斜杠，取最后一个未转义 `/` 收尾。 */
@@ -787,11 +1133,13 @@ object ModuleParser {
             }
         }
         phase = when {
+            phase.contains("cron") -> "cron"
             phase.contains("request") && !phase.contains("response") -> "request"
             phase.contains("response") -> "response"
             else -> ""
         }
         if (!enabled) return null to null
+        if (phase == "cron" && pattern.isBlank()) pattern = ".*"
         if (phase.isBlank()) return null to "缺少 request/response 阶段: ${line.take(80)}"
         if (pattern.isBlank()) return null to "缺少 URL 匹配正则: ${line.take(80)}"
         if (scriptPath.isBlank()) return null to "缺少 script-path: ${line.take(80)}"
@@ -886,6 +1234,118 @@ object ModuleParser {
         }
         if (cur.isNotBlank()) out.add(cur.toString().trim())
         return out
+    }
+
+    private fun normalizeBodyRewrite(line: String): String? {
+        val tokens = splitMapArgs(line)
+        if (tokens.size != 4) return null
+        val action = tokens[0].trim().lowercase()
+        if (action != "http-request" && action != "http-response") return null
+        val url = unquoteToken(tokens[1])
+        if (url.isBlank()) return null
+        if (tokens[2].trim().equals("jq", ignoreCase = true)) {
+            val expr = unquoteToken(tokens[3])
+            if (!miniJqSupported(expr)) return null
+            return "$action ${tokens[1]} jq ${tokens[3]}"
+        }
+        val pattern = unquoteToken(tokens[2])
+        return runCatching {
+            Regex(url)
+            Regex(pattern)
+            "$action ${tokens[1]} ${tokens[2]} ${tokens[3]}"
+        }.getOrNull()
+    }
+
+    /** mini jq 的解析期白名单：只允许三种表达式，其余在导入时就拒绝。 */
+    private fun miniJqSupported(expr: String): Boolean {
+        val e = expr.trim()
+        if (e.startsWith("del(") && e.endsWith(")")) {
+            return miniJqPath(e.substring(4, e.length - 1))
+        }
+        val eq = e.indexOf(" = ")
+        if (eq >= 0) {
+            val path = e.substring(0, eq).trim()
+            val value = e.substring(eq + 3).trim()
+            if (value.contains('=')) return false
+            if (!miniJqPath(path)) return false
+            return runCatching {
+                // 包进对象属性再解析，既校验完整 JSON 字面量，也避免 nextValue 的尾部宽容。
+                JSONObject("{\"v\":$value}").get("v")
+            }.isSuccess
+        }
+        return miniJqPath(e)
+    }
+
+    private fun miniJqPath(raw: String): Boolean {
+        val e = raw.trim()
+        if (!e.startsWith(".")) return false
+        val p = e.removePrefix(".")
+        if (p.isEmpty() || p.contains("..")) return false
+        var i = 0
+        while (i < p.length) {
+            val start = i
+            while (i < p.length && (p[i].isLetterOrDigit() || p[i] == '_' || p[i] == '-')) i++
+            if (i == start) return false
+            while (i < p.length && p[i] == '[') {
+                i++
+                val n0 = i
+                while (i < p.length && p[i].isDigit()) i++
+                if (i == n0 || i >= p.length || p[i] != ']') return false
+                i++
+            }
+            if (i == p.length) return true
+            if (p[i] != '.') return false
+            i++
+            if (i == p.length) return false
+        }
+        return true
+    }
+
+    private fun unquoteToken(raw: String): String {
+        val s = raw.trim()
+        return if (s.length >= 2 && (s.first() == '"' || s.first() == '\'') && s.last() == s.first()) {
+            s.substring(1, s.length - 1)
+                .replace("\\\"", "\"")
+                .replace("\\'", "'")
+        } else s
+    }
+
+    private fun validateHostMapping(key: String, value: String): String? {
+        if (key.isBlank()) return "host_mapping_invalid"
+        val base = if (key.startsWith("*.")) key.removePrefix("*.") else key
+        if (base.isBlank() || key.count { it == '*' } > 1 || !isValidAdsDomain(base)) {
+            return "host_mapping_invalid"
+        }
+        if (value.isBlank()) return "host_mapping_invalid"
+        if (value.startsWith("server:", ignoreCase = true)) {
+            val server = value.substringAfter(':').trim()
+            if (server.equals("system", ignoreCase = true)) return "host_server_system_unsupported"
+            if (server.startsWith("http://", ignoreCase = true)) return "host_server_http_unsupported"
+            if (server.startsWith("https://", ignoreCase = true) ||
+                server.startsWith("tls://", ignoreCase = true) ||
+                server.startsWith("dot://", ignoreCase = true) ||
+                server.startsWith("udp://", ignoreCase = true) ||
+                (!server.contains("://") && server.isNotBlank())
+            ) return null
+            return "host_server_scheme_unsupported"
+        }
+        val parts = value.split(',', ' ', '\t').map { it.trim() }.filter { it.isNotEmpty() }
+        if (parts.isNotEmpty() && parts.all { isIpLiteral(it) }) return null
+        if (parts.size == 1 && isValidAdsDomain(parts[0].trim('.'))) return null
+        return "host_mapping_invalid"
+    }
+
+    private fun isIpLiteral(raw: String): Boolean {
+        val s = raw.trim()
+        val v4 = Regex("^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})$").matchEntire(s)
+        if (v4 != null) {
+            return (1..4).all { i ->
+                val n = v4.groupValues[i].toIntOrNull()
+                n != null && n in 0..255
+            }
+        }
+        if (!s.contains(':')) return false
+        return runCatching { java.net.InetAddress.getByName(s); true }.getOrDefault(false)
     }
 
     private fun cleanMitmHost(raw: String): String? {

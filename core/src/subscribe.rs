@@ -11,11 +11,7 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
     if let Ok(v) = URL_SAFE_NO_PAD.decode(cleaned.as_bytes()) {
         return Some(v);
     }
-    let padded = format!(
-        "{}{}",
-        cleaned,
-        "=".repeat((4 - cleaned.len() % 4) % 4)
-    );
+    let padded = format!("{}{}", cleaned, "=".repeat((4 - cleaned.len() % 4) % 4));
     URL_SAFE
         .decode(padded.as_bytes())
         .or_else(|_| STANDARD.decode(padded.as_bytes()))
@@ -114,10 +110,26 @@ fn redact_uri(raw: &str) -> String {
     let scheme_lower = scheme.to_ascii_lowercase();
     let (main, fragment) = rest.split_once('#').unwrap_or((rest, ""));
     if scheme_lower == "vmess" {
-        return format!("{}://<redacted>{}", scheme, if fragment.is_empty() { "" } else { "#<redacted>" });
+        return format!(
+            "{}://<redacted>{}",
+            scheme,
+            if fragment.is_empty() {
+                ""
+            } else {
+                "#<redacted>"
+            }
+        );
     }
     if scheme_lower == "ss" && !main.contains('@') {
-        return format!("{}://<redacted>{}", scheme, if fragment.is_empty() { "" } else { "#<redacted>" });
+        return format!(
+            "{}://<redacted>{}",
+            scheme,
+            if fragment.is_empty() {
+                ""
+            } else {
+                "#<redacted>"
+            }
+        );
     }
     let (body, query) = main.split_once('?').unwrap_or((main, ""));
     let body = if let Some(at) = body.rfind('@') {
@@ -130,10 +142,23 @@ fn redact_uri(raw: &str) -> String {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         let sensitive = matches!(
             k.to_ascii_lowercase().as_str(),
-            "password" | "passwd" | "pwd" | "token" | "access_token" | "secret"
-                | "auth" | "authorization" | "uuid" | "key" | "private_key"
+            "password"
+                | "passwd"
+                | "pwd"
+                | "token"
+                | "access_token"
+                | "secret"
+                | "auth"
+                | "authorization"
+                | "uuid"
+                | "key"
+                | "private_key"
         );
-        q.push(if sensitive { format!("{}=<redacted>", k) } else { format!("{}={}", k, v) });
+        q.push(if sensitive {
+            format!("{}=<redacted>", k)
+        } else {
+            format!("{}={}", k, v)
+        });
     }
     let mut out = format!("{}://{}", scheme, body);
     if !q.is_empty() {
@@ -150,30 +175,67 @@ fn redact_uri(raw: &str) -> String {
 fn diagnose_uri(raw: &str, line: usize) -> NodeDiagnostic {
     let lower = raw.trim().to_ascii_lowercase();
     let scheme = lower.split("://").next().unwrap_or("").to_string();
-    let known_uri = matches!(scheme.as_str(), "ss" | "trojan" | "vless" | "socks5" | "socks" | "http" | "https");
+    let known_uri = matches!(
+        scheme.as_str(),
+        "ss" | "trojan" | "vless" | "vmess" | "socks5" | "socks" | "http" | "https"
+    );
     let known_unsupported = matches!(
         scheme.as_str(),
-        "vmess" | "hysteria" | "hysteria2" | "hy2" | "tuic" | "ssr" | "wireguard" | "wg"
-            | "anytls" | "snell" | "shadowtls" | "juicity" | "mieru" | "ssh" | "h2" | "http2"
+        "hysteria"
+            | "hysteria2"
+            | "hy2"
+            | "tuic"
+            | "ssr"
+            | "wireguard"
+            | "wg"
+            | "anytls"
+            | "snell"
+            | "shadowtls"
+            | "juicity"
+            | "mieru"
+            | "ssh"
+            | "h2"
+            | "http2"
     );
     let (category, reason) = if known_unsupported {
-        ("unsupported_protocol", format!("{} 协议暂不支持，已跳过", scheme))
+        (
+            "unsupported_protocol",
+            format!("{} 协议暂不支持，已跳过", scheme),
+        )
     } else if !known_uri {
-        ("unknown_scheme", format!("未知 URI scheme：{}", if scheme.is_empty() { "无" } else { &scheme }))
+        (
+            "unknown_scheme",
+            format!(
+                "未知 URI scheme：{}",
+                if scheme.is_empty() { "无" } else { &scheme }
+            ),
+        )
     } else {
         classify_uri_failure(raw, &scheme)
     };
-    NodeDiagnostic { line, scheme, category: category.into(), reason, raw: redact_uri(raw) }
+    NodeDiagnostic {
+        line,
+        scheme,
+        category: category.into(),
+        reason,
+        raw: redact_uri(raw),
+    }
 }
 
 fn classify_uri_failure(raw: &str, scheme: &str) -> (&'static str, String) {
+    if scheme == "vmess" {
+        return classify_vmess_failure(raw);
+    }
     let Ok(u) = Url::parse(raw.trim()) else {
         return ("invalid", "URI 格式无效".into());
     };
     let q: HashMap<String, String> = u.query_pairs().into_owned().collect();
     match scheme {
         "vless" => {
-            if q.get("security").map(|s| s.eq_ignore_ascii_case("reality")).unwrap_or(false) {
+            if q.get("security")
+                .map(|s| s.eq_ignore_ascii_case("reality"))
+                .unwrap_or(false)
+            {
                 return ("unsupported_param", "不支持 security=Reality".into());
             }
             if q.get("flow").map(|f| !f.is_empty()).unwrap_or(false) {
@@ -181,13 +243,19 @@ fn classify_uri_failure(raw: &str, scheme: &str) -> (&'static str, String) {
             }
             if let Some(net) = q.get("type").or_else(|| q.get("network")) {
                 if net != "tcp" && net != "ws" {
-                    return ("unsupported_param", format!("不支持传输类型 {}（仅 tcp/ws）", net));
+                    return (
+                        "unsupported_param",
+                        format!("不支持传输类型 {}（仅 tcp/ws）", net),
+                    );
                 }
             }
             ("invalid", "VLESS 缺少 UUID 或主机/端口无效".into())
         }
         "trojan" => {
-            if q.get("security").map(|s| s.eq_ignore_ascii_case("reality")).unwrap_or(false) {
+            if q.get("security")
+                .map(|s| s.eq_ignore_ascii_case("reality"))
+                .unwrap_or(false)
+            {
                 return ("unsupported_param", "不支持 security=Reality".into());
             }
             if q.get("flow").map(|f| !f.is_empty()).unwrap_or(false) {
@@ -195,7 +263,10 @@ fn classify_uri_failure(raw: &str, scheme: &str) -> (&'static str, String) {
             }
             if let Some(net) = q.get("type").or_else(|| q.get("network")) {
                 if net != "tcp" && net != "ws" {
-                    return ("unsupported_param", format!("不支持传输类型 {}（仅 tcp/ws）", net));
+                    return (
+                        "unsupported_param",
+                        format!("不支持传输类型 {}（仅 tcp/ws）", net),
+                    );
                 }
             }
             ("invalid", "Trojan 缺少密码或主机/端口无效".into())
@@ -286,11 +357,21 @@ fn yaml_bool(v: &serde_yaml::Value, key: &str) -> Option<bool> {
 
 fn diagnostic_summary(c: &DiagnosticCounts) -> String {
     let mut parts = Vec::new();
-    if c.unknown_scheme > 0 { parts.push(format!("未知 scheme {}", c.unknown_scheme)); }
-    if c.unsupported_protocol > 0 { parts.push(format!("已知不支持协议 {}", c.unsupported_protocol)); }
-    if c.unsupported_param > 0 { parts.push(format!("不支持参数 {}", c.unsupported_param)); }
-    if c.invalid > 0 { parts.push(format!("无效条目 {}", c.invalid)); }
-    if parts.is_empty() { return String::new(); }
+    if c.unknown_scheme > 0 {
+        parts.push(format!("未知 scheme {}", c.unknown_scheme));
+    }
+    if c.unsupported_protocol > 0 {
+        parts.push(format!("已知不支持协议 {}", c.unsupported_protocol));
+    }
+    if c.unsupported_param > 0 {
+        parts.push(format!("不支持参数 {}", c.unsupported_param));
+    }
+    if c.invalid > 0 {
+        parts.push(format!("无效条目 {}", c.invalid));
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
     format!(
         "跳过 {} 个节点：{}",
         c.unknown_scheme + c.unsupported_protocol + c.unsupported_param + c.invalid,
@@ -321,24 +402,80 @@ fn clash_diagnostic(v: &serde_yaml::Value, line: usize) -> NodeDiagnostic {
         let flow = yaml_str(v, "flow").map(|f| !f.is_empty()).unwrap_or(false);
         let net = yaml_str(v, "network").unwrap_or_else(|| "tcp".into());
         if reality || flow || (net != "tcp" && net != "ws") {
-            ("unsupported_param", format!("VLESS 参数不支持（reality={} flow={} network={}）", reality, flow, net))
+            (
+                "unsupported_param",
+                format!(
+                    "VLESS 参数不支持（reality={} flow={} network={}）",
+                    reality, flow, net
+                ),
+            )
         } else {
             ("invalid", "VLESS 节点字段无效".into())
+        }
+    } else if kind == "vmess" {
+        let aid = v.get("alterId").and_then(|x| x.as_u64()).unwrap_or(0);
+        let net = yaml_str(v, "network").unwrap_or_else(|| "tcp".into());
+        let cipher = yaml_str(v, "cipher").unwrap_or_else(|| "auto".into());
+        if aid > 0 {
+            (
+                "unsupported_param",
+                "VMess 不支持 alterId>0（旧 MD5 认证）".into(),
+            )
+        } else if net != "tcp" && net != "ws" {
+            (
+                "unsupported_param",
+                format!("VMess 不支持传输类型 {}（仅 tcp/ws）", net),
+            )
+        } else if !matches!(
+            cipher.as_str(),
+            "auto" | "aes-128-gcm" | "chacha20-poly1305"
+        ) {
+            (
+                "unsupported_param",
+                format!("VMess 不支持加密方式 {}", cipher),
+            )
+        } else {
+            ("invalid", "VMess 节点字段无效".into())
         }
     } else if kind == "trojan" {
         let reality = v.get("reality-opts").is_some();
         let flow = yaml_str(v, "flow").map(|f| !f.is_empty()).unwrap_or(false);
         let net = yaml_str(v, "network").unwrap_or_else(|| "tcp".into());
         if reality || flow || (net != "tcp" && net != "ws") {
-            ("unsupported_param", format!("Trojan 参数不支持（reality={} flow={} network={}）", reality, flow, net))
+            (
+                "unsupported_param",
+                format!(
+                    "Trojan 参数不支持（reality={} flow={} network={}）",
+                    reality, flow, net
+                ),
+            )
         } else {
             ("invalid", "Trojan 节点字段无效".into())
         }
     } else {
-        ("unsupported_protocol", format!("{} 协议暂不支持，已跳过", kind))
+        (
+            "unsupported_protocol",
+            format!("{} 协议暂不支持，已跳过", kind),
+        )
     };
-    let raw = format!("{}://{}:{}{}", kind, server, port, if name.is_empty() { String::new() } else { format!("（{}）", name) });
-    NodeDiagnostic { line, scheme: kind, category: category.into(), reason, raw }
+    let raw = format!(
+        "{}://{}:{}{}",
+        kind,
+        server,
+        port,
+        if name.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", name)
+        }
+    );
+    NodeDiagnostic {
+        line,
+        scheme: kind,
+        category: category.into(),
+        reason,
+        raw,
+    }
 }
 
 fn parse_clash(value: &serde_yaml::Value) -> ParseResult {
@@ -362,7 +499,9 @@ fn parse_clash(value: &serde_yaml::Value) -> ParseResult {
     let mut group_names = std::collections::HashSet::new();
     if let Some(list) = value.get("proxy-groups").and_then(|p| p.as_sequence()) {
         for g in list {
-            let Some(name) = yaml_str(g, "name") else { continue };
+            let Some(name) = yaml_str(g, "name") else {
+                continue;
+            };
             if name.trim().is_empty() {
                 continue;
             }
@@ -371,9 +510,14 @@ fn parse_clash(value: &serde_yaml::Value) -> ParseResult {
                 continue;
             }
             groups.push(name.clone());
-            let kind = match yaml_str(g, "type").unwrap_or_else(|| "select".into()).to_ascii_lowercase().as_str() {
+            let kind = match yaml_str(g, "type")
+                .unwrap_or_else(|| "select".into())
+                .to_ascii_lowercase()
+                .as_str()
+            {
                 "url-test" | "urltest" => "url-test",
                 "fallback" => "fallback",
+                "load-balance" | "loadbalance" | "balance" => "load-balance",
                 _ => "select",
             };
             let mut members = Vec::new();
@@ -402,7 +546,8 @@ fn parse_clash(value: &serde_yaml::Value) -> ParseResult {
                 warnings.push(format!("策略组 {} 没有有效成员，已跳过", name));
                 continue;
             }
-            let test_url = yaml_str(g, "url").unwrap_or_else(|| "http://www.gstatic.com/generate_204".into());
+            let test_url =
+                yaml_str(g, "url").unwrap_or_else(|| "http://www.gstatic.com/generate_204".into());
             let interval = yaml_u64(g, "interval").unwrap_or(600);
             let timeout = yaml_u64(g, "timeout").unwrap_or(5_000);
             let tolerance = yaml_u64(g, "tolerance").unwrap_or(50);
@@ -417,6 +562,10 @@ fn parse_clash(value: &serde_yaml::Value) -> ParseResult {
                 failure_threshold: 3,
                 recovery_threshold: 2,
                 no_node_action: "global".into(),
+                lb_mode: yaml_str(g, "strategy")
+                    .or_else(|| yaml_str(g, "lbmode"))
+                    .unwrap_or_default(),
+                switch_interval: yaml_u64(g, "switch-interval").unwrap_or(30),
             });
         }
     }
@@ -425,12 +574,13 @@ fn parse_clash(value: &serde_yaml::Value) -> ParseResult {
     if let Some(list) = value.get("rules").and_then(|p| p.as_sequence()) {
         for r in list {
             if let Some(s) = r.as_str() {
-                let Some((kind, rest)) = s.split_once(',') else { continue };
+                let Some((kind, rest)) = s.split_once(',') else {
+                    continue;
+                };
                 let kind_up = kind.trim().to_ascii_uppercase();
                 if kind_up == "MATCH" || kind_up == "FINAL" {
                     let target = rest.trim();
-                    let (action, warning) =
-                        map_clash_target(target, &node_names, &group_names);
+                    let (action, warning) = map_clash_target(target, &node_names, &group_names);
                     if let Some(w) = warning {
                         warnings.push(w);
                     }
@@ -449,8 +599,7 @@ fn parse_clash(value: &serde_yaml::Value) -> ParseResult {
                 let parts: Vec<&str> = rest.split(',').collect();
                 if parts.len() >= 2 {
                     let target = parts[parts.len() - 1].trim();
-                    let (action, warning) =
-                        map_clash_target(target, &node_names, &group_names);
+                    let (action, warning) = map_clash_target(target, &node_names, &group_names);
                     if let Some(w) = warning {
                         warnings.push(w);
                     }
@@ -547,6 +696,54 @@ fn clash_node(v: &serde_yaml::Value) -> Option<Node> {
             flow: None,
             udp: yaml_bool(v, "udp"),
         }),
+        "vmess" => {
+            if v.get("alterId").and_then(|x| x.as_u64()).unwrap_or(0) > 0 {
+                return None;
+            }
+            let net = yaml_str(v, "network").unwrap_or_else(|| "tcp".into());
+            if net != "tcp" && net != "ws" {
+                return None;
+            }
+            let cipher = yaml_str(v, "cipher").unwrap_or_else(|| "auto".into());
+            if !matches!(
+                cipher.as_str(),
+                "auto" | "aes-128-gcm" | "chacha20-poly1305"
+            ) {
+                return None;
+            }
+            let ws = net == "ws";
+            Some(Node {
+                name,
+                kind: "vmess".into(),
+                server,
+                port,
+                method: Some(cipher),
+                password: None,
+                uuid: yaml_str(v, "uuid"),
+                sni: yaml_str(v, "servername").or_else(|| yaml_str(v, "sni")),
+                insecure: yaml_bool(v, "skip-cert-verify"),
+                tls: Some(yaml_bool(v, "tls").unwrap_or(false)),
+                ws_path: if ws {
+                    Some(
+                        v.get("ws-opts")
+                            .and_then(|w| yaml_str(w, "path"))
+                            .unwrap_or_else(|| "/".into()),
+                    )
+                } else {
+                    None
+                },
+                ws_host: if ws {
+                    v.get("ws-opts")
+                        .and_then(|w| w.get("headers"))
+                        .and_then(|h| yaml_str(h, "Host"))
+                        .or_else(|| yaml_str(v, "host"))
+                } else {
+                    None
+                },
+                flow: None,
+                udp: Some(false),
+            })
+        }
         "trojan" => Some(Node {
             name,
             kind: "trojan".into(),
@@ -584,32 +781,32 @@ fn clash_node(v: &serde_yaml::Value) -> Option<Node> {
                 }
             }
             Some(Node {
-            name,
-            kind: "vless".into(),
-            server,
-            port,
-            method: None,
-            password: None,
-            uuid: yaml_str(v, "uuid"),
-            sni: yaml_str(v, "servername").or_else(|| yaml_str(v, "sni")),
-            insecure: yaml_bool(v, "skip-cert-verify"),
-            // Clash 的 tls 是布尔字段：先按布尔读，再兼容字符串写法；缺省按明文。
-            tls: Some(
-                yaml_bool(v, "tls")
-                    .or_else(|| yaml_str(v, "tls").map(|t| t == "tls"))
-                    .unwrap_or(false),
-            ),
-            ws_path: v
-                .get("ws-opts")
-                .and_then(|w| yaml_str(w, "path"))
-                .or_else(|| yaml_str(v, "path")),
-            ws_host: v
-                .get("ws-opts")
-                .and_then(|w| w.get("headers"))
-                .and_then(|h| yaml_str(h, "Host"))
-                .or_else(|| yaml_str(v, "host")),
-            flow: yaml_str(v, "flow"),
-            udp: yaml_bool(v, "udp"),
+                name,
+                kind: "vless".into(),
+                server,
+                port,
+                method: None,
+                password: None,
+                uuid: yaml_str(v, "uuid"),
+                sni: yaml_str(v, "servername").or_else(|| yaml_str(v, "sni")),
+                insecure: yaml_bool(v, "skip-cert-verify"),
+                // Clash 的 tls 是布尔字段：先按布尔读，再兼容字符串写法；缺省按明文。
+                tls: Some(
+                    yaml_bool(v, "tls")
+                        .or_else(|| yaml_str(v, "tls").map(|t| t == "tls"))
+                        .unwrap_or(false),
+                ),
+                ws_path: v
+                    .get("ws-opts")
+                    .and_then(|w| yaml_str(w, "path"))
+                    .or_else(|| yaml_str(v, "path")),
+                ws_host: v
+                    .get("ws-opts")
+                    .and_then(|w| w.get("headers"))
+                    .and_then(|h| yaml_str(h, "Host"))
+                    .or_else(|| yaml_str(v, "host")),
+                flow: yaml_str(v, "flow"),
+                udp: yaml_bool(v, "udp"),
             })
         }
         "socks5" | "socks" => Some(Node {
@@ -686,6 +883,7 @@ fn parse_uri(line: &str) -> Option<Node> {
         "ss" => parse_ss(line),
         "trojan" => parse_trojan(line),
         "vless" => parse_vless(line),
+        "vmess" => parse_vmess(line),
         "socks5" | "socks" => parse_socks(line),
         "http" | "https" => parse_http(line),
         _ => None,
@@ -694,11 +892,8 @@ fn parse_uri(line: &str) -> Option<Node> {
 
 /// Url 对非特殊 scheme 的 IPv6 主机会保留方括号，内核连接需要裸地址。
 fn host_of(u: &Url) -> Option<String> {
-    u.host_str().map(|h| {
-        h.trim_start_matches('[')
-            .trim_end_matches(']')
-            .to_string()
-    })
+    u.host_str()
+        .map(|h| h.trim_start_matches('[').trim_end_matches(']').to_string())
 }
 
 fn decode_name(u: &Url) -> String {
@@ -710,11 +905,12 @@ fn decode_name(u: &Url) -> String {
 
 /// 分享链接的 `udp=false` 开关：只认明确的布尔写法，未知值按缺省（跟随协议能力）。
 fn uri_udp(q: &HashMap<String, String>) -> Option<bool> {
-    q.get("udp").and_then(|v| match v.to_ascii_lowercase().as_str() {
-        "false" | "0" => Some(false),
-        "true" | "1" => Some(true),
-        _ => None,
-    })
+    q.get("udp")
+        .and_then(|v| match v.to_ascii_lowercase().as_str() {
+            "false" | "0" => Some(false),
+            "true" | "1" => Some(true),
+            _ => None,
+        })
 }
 
 fn parse_ss(line: &str) -> Option<Node> {
@@ -723,7 +919,11 @@ fn parse_ss(line: &str) -> Option<Node> {
     // 把带插件的节点当普通 SS 导入（否则用户会得到一个必然连不上的节点）。
     let before_fragment = body.split_once('#').map(|(a, _)| a).unwrap_or(body);
     if let Some((_, query)) = before_fragment.split_once('?') {
-        if query.split('&').any(|p| p.split_once('=').map(|(k, _)| k.eq_ignore_ascii_case("plugin")).unwrap_or(false)) {
+        if query.split('&').any(|p| {
+            p.split_once('=')
+                .map(|(k, _)| k.eq_ignore_ascii_case("plugin"))
+                .unwrap_or(false)
+        }) {
             return None;
         }
     }
@@ -733,7 +933,11 @@ fn parse_ss(line: &str) -> Option<Node> {
     };
     let main = main.split('?').next().unwrap_or(main);
     let name = fragment
-        .map(|f| percent_encoding::percent_decode_str(&f).decode_utf8_lossy().to_string())
+        .map(|f| {
+            percent_encoding::percent_decode_str(&f)
+                .decode_utf8_lossy()
+                .to_string()
+        })
         .unwrap_or_default();
 
     if let Some((userinfo, hostpart)) = main.rsplit_once('@') {
@@ -742,7 +946,11 @@ fn parse_ss(line: &str) -> Option<Node> {
         let (method, password) = cred.split_once(':')?;
         let (host, port) = split_host_port(hostpart)?;
         return Some(Node {
-            name: if name.is_empty() { format!("{}:{}", host, port) } else { name },
+            name: if name.is_empty() {
+                format!("{}:{}", host, port)
+            } else {
+                name
+            },
             kind: "ss".into(),
             server: host,
             port,
@@ -765,7 +973,11 @@ fn parse_ss(line: &str) -> Option<Node> {
     let (method, password) = cred.split_once(':')?;
     let (host, port) = split_host_port(hostpart)?;
     Some(Node {
-        name: if name.is_empty() { format!("{}:{}", host, port) } else { name },
+        name: if name.is_empty() {
+            format!("{}:{}", host, port)
+        } else {
+            name
+        },
         kind: "ss".into(),
         server: host,
         port,
@@ -808,12 +1020,18 @@ fn parse_trojan(line: &str) -> Option<Node> {
         .to_string();
     let q: HashMap<String, String> = u.query_pairs().into_owned().collect();
     // 只支持 TCP/WS；Reality/flow/grpc 等未实现参数必须拒绝并给出诊断。
-    if q.get("security").map(|s| s.eq_ignore_ascii_case("reality")).unwrap_or(false)
+    if q.get("security")
+        .map(|s| s.eq_ignore_ascii_case("reality"))
+        .unwrap_or(false)
         || q.get("flow").map(|f| !f.is_empty()).unwrap_or(false)
     {
         return None;
     }
-    let network = q.get("type").cloned().or_else(|| q.get("network").cloned()).unwrap_or_else(|| "tcp".into());
+    let network = q
+        .get("type")
+        .cloned()
+        .or_else(|| q.get("network").cloned())
+        .unwrap_or_else(|| "tcp".into());
     if network != "tcp" && network != "ws" {
         return None;
     }
@@ -821,7 +1039,11 @@ fn parse_trojan(line: &str) -> Option<Node> {
     Some(Node {
         name: {
             let n = decode_name(&u);
-            if n.is_empty() { format!("{}:{}", host, port) } else { n }
+            if n.is_empty() {
+                format!("{}:{}", host, port)
+            } else {
+                n
+            }
         },
         kind: "trojan".into(),
         server: host,
@@ -849,7 +1071,9 @@ fn parse_vless(line: &str) -> Option<Node> {
     }
     let q: HashMap<String, String> = u.query_pairs().into_owned().collect();
     // Reality / XTLS Vision 未实现：拒绝导入（调用方计入 unsupported 并给出警告）。
-    if q.get("security").map(|s| s.eq_ignore_ascii_case("reality")).unwrap_or(false)
+    if q.get("security")
+        .map(|s| s.eq_ignore_ascii_case("reality"))
+        .unwrap_or(false)
         || q.get("flow").map(|f| !f.is_empty()).unwrap_or(false)
     {
         return None;
@@ -860,11 +1084,18 @@ fn parse_vless(line: &str) -> Option<Node> {
         return None;
     }
     // VLESS 分享链接规范：security 缺省为 none（明文 TCP），不能默认按 TLS 处理。
-    let tls = q.get("security").map(|s| s.eq_ignore_ascii_case("tls")).unwrap_or(false);
+    let tls = q
+        .get("security")
+        .map(|s| s.eq_ignore_ascii_case("tls"))
+        .unwrap_or(false);
     Some(Node {
         name: {
             let n = decode_name(&u);
-            if n.is_empty() { format!("{}:{}", host, port) } else { n }
+            if n.is_empty() {
+                format!("{}:{}", host, port)
+            } else {
+                n
+            }
         },
         kind: "vless".into(),
         server: host,
@@ -882,6 +1113,179 @@ fn parse_vless(line: &str) -> Option<Node> {
     })
 }
 
+fn vmess_json(line: &str) -> Option<Value> {
+    let body = line.trim().strip_prefix("vmess://")?;
+    let payload = body.split('#').next().unwrap_or(body);
+    let decoded = b64_decode(payload)?;
+    serde_json::from_slice::<Value>(&decoded).ok()
+}
+
+fn vmess_aid(v: &Value) -> u64 {
+    v.get("aid")
+        .and_then(|x| {
+            x.as_u64()
+                .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+        })
+        .unwrap_or(0)
+}
+
+fn vmess_str<'a>(v: &'a Value, key: &str) -> &'a str {
+    v.get(key).and_then(|x| x.as_str()).unwrap_or("")
+}
+
+fn parse_vmess(line: &str) -> Option<Node> {
+    let v = vmess_json(line)?;
+    let add = vmess_str(&v, "add")
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let port = v.get("port").and_then(|x| {
+        x.as_u64()
+            .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+    })?;
+    let id = vmess_str(&v, "id").trim();
+    if add.is_empty() || !(1..=65535).contains(&port) || id.is_empty() {
+        return None;
+    }
+    // 旧 MD5 认证（alterId > 0）明确不做；AEAD 只接受 alterId=0。
+    if vmess_aid(&v) > 0 {
+        return None;
+    }
+    let net = {
+        let n = vmess_str(&v, "net").to_ascii_lowercase();
+        if n.is_empty() {
+            "tcp".to_string()
+        } else {
+            n
+        }
+    };
+    if net != "tcp" && net != "ws" {
+        return None;
+    }
+    let scy = {
+        let s = vmess_str(&v, "scy").to_ascii_lowercase();
+        if s.is_empty() {
+            "auto".to_string()
+        } else {
+            s
+        }
+    };
+    if !matches!(
+        scy.as_str(),
+        "auto" | "aes-128-gcm" | "aes128-gcm" | "chacha20-poly1305" | "chacha20"
+    ) {
+        return None;
+    }
+    crate::proto::vless::parse_uuid(id).ok()?;
+    let fragment = line
+        .split_once('#')
+        .map(|(_, f)| {
+            percent_encoding::percent_decode_str(f)
+                .decode_utf8_lossy()
+                .to_string()
+        })
+        .unwrap_or_default();
+    let name = if !fragment.is_empty() {
+        fragment
+    } else {
+        let ps = vmess_str(&v, "ps").trim();
+        if ps.is_empty() {
+            format!("{}:{}", add, port)
+        } else {
+            ps.to_string()
+        }
+    };
+    let tls = match v.get("tls") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(raw)) => {
+            let r = raw.to_ascii_lowercase();
+            r == "tls" || r == "true" || r == "1"
+        }
+        _ => false,
+    };
+    let ws = net == "ws";
+    let insecure = v
+        .get("allowInsecure")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(false)
+        || v.get("verify").and_then(|x| x.as_bool()) == Some(false);
+    Some(Node {
+        name,
+        kind: "vmess".into(),
+        server: add.to_string(),
+        port: port as u16,
+        method: Some(scy),
+        password: None,
+        uuid: Some(id.to_string()),
+        sni: {
+            let s = vmess_str(&v, "sni").trim();
+            if s.is_empty() {
+                let h = vmess_str(&v, "host").trim();
+                if h.is_empty() {
+                    None
+                } else {
+                    Some(h.to_string())
+                }
+            } else {
+                Some(s.to_string())
+            }
+        },
+        insecure: Some(insecure),
+        tls: Some(tls),
+        ws_path: if ws {
+            let p = vmess_str(&v, "path").trim();
+            Some(if p.is_empty() {
+                "/".into()
+            } else {
+                p.to_string()
+            })
+        } else {
+            None
+        },
+        ws_host: if ws {
+            let h = vmess_str(&v, "host").trim();
+            if h.is_empty() {
+                None
+            } else {
+                Some(h.to_string())
+            }
+        } else {
+            None
+        },
+        flow: None,
+        udp: Some(false),
+    })
+}
+
+fn classify_vmess_failure(raw: &str) -> (&'static str, String) {
+    let Some(v) = vmess_json(raw) else {
+        return ("invalid", "VMess 链接不是有效的 Base64 JSON".into());
+    };
+    if vmess_aid(&v) > 0 {
+        return (
+            "unsupported_param",
+            "不支持 alterId>0（旧 MD5 认证）".into(),
+        );
+    }
+    let net = vmess_str(&v, "net").to_ascii_lowercase();
+    if !net.is_empty() && net != "tcp" && net != "ws" {
+        return (
+            "unsupported_param",
+            format!("不支持传输类型 {}（仅 tcp/ws）", net),
+        );
+    }
+    let scy = vmess_str(&v, "scy").to_ascii_lowercase();
+    if !scy.is_empty()
+        && !matches!(
+            scy.as_str(),
+            "auto" | "aes-128-gcm" | "aes128-gcm" | "chacha20-poly1305" | "chacha20"
+        )
+    {
+        return ("unsupported_param", format!("不支持加密方式 {}", scy));
+    }
+    ("invalid", "VMess 缺少有效 add/port/id".into())
+}
+
 fn parse_socks(line: &str) -> Option<Node> {
     let u = Url::parse(line).ok()?;
     let host = host_of(&u)?;
@@ -889,18 +1293,26 @@ fn parse_socks(line: &str) -> Option<Node> {
     Some(Node {
         name: {
             let n = decode_name(&u);
-            if n.is_empty() { format!("{}:{}", host, port) } else { n }
+            if n.is_empty() {
+                format!("{}:{}", host, port)
+            } else {
+                n
+            }
         },
         kind: "socks5".into(),
         server: host,
         port,
         method: None,
-        password: Some(percent_encoding::percent_decode_str(u.password().unwrap_or(""))
-            .decode_utf8_lossy()
-            .to_string()),
-        uuid: Some(percent_encoding::percent_decode_str(u.username())
-            .decode_utf8_lossy()
-            .to_string()),
+        password: Some(
+            percent_encoding::percent_decode_str(u.password().unwrap_or(""))
+                .decode_utf8_lossy()
+                .to_string(),
+        ),
+        uuid: Some(
+            percent_encoding::percent_decode_str(u.username())
+                .decode_utf8_lossy()
+                .to_string(),
+        ),
         sni: None,
         insecure: None,
         tls: None,
@@ -914,7 +1326,9 @@ fn parse_socks(line: &str) -> Option<Node> {
 fn parse_http(line: &str) -> Option<Node> {
     let u = Url::parse(line).ok()?;
     let host = host_of(&u)?;
-    let port = u.port().unwrap_or(if u.scheme() == "https" { 443 } else { 80 });
+    let port = u
+        .port()
+        .unwrap_or(if u.scheme() == "https" { 443 } else { 80 });
     let user = percent_encoding::percent_decode_str(u.username())
         .decode_utf8_lossy()
         .to_string();
@@ -929,7 +1343,11 @@ fn parse_http(line: &str) -> Option<Node> {
     Some(Node {
         name: {
             let n = decode_name(&u);
-            if n.is_empty() { format!("{}:{}", host, port) } else { n }
+            if n.is_empty() {
+                format!("{}:{}", host, port)
+            } else {
+                n
+            }
         },
         kind: "http".into(),
         server: host,
@@ -970,7 +1388,9 @@ mod tests {
         // 分享链接：udp=false / udp=true
         let t = first("trojan://pw@example.com:443?udp=false#t");
         assert_eq!(t["udp"], false);
-        let v = first("vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&udp=true#v");
+        let v = first(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?security=tls&udp=true#v",
+        );
         assert_eq!(v["udp"], true);
 
         // Clash YAML：节点级 udp: false
@@ -1014,5 +1434,55 @@ mod tests {
         assert_eq!(n["uuid"], "user");
         assert_eq!(n["password"], Value::Null);
         assert_eq!(n["tls"], false);
+    }
+    #[test]
+    fn vmess_aead_uri_parses_tcp_and_ws() {
+        let tcp = r#"{"v":"2","ps":"HK","add":"example.com","port":"443","id":"11111111-1111-1111-1111-111111111111","aid":"0","scy":"auto","net":"tcp","tls":"tls","sni":"example.com"}"#;
+        let uri = format!(
+            "vmess://{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, tcp)
+        );
+        let n = first(&uri);
+        assert_eq!(n["type"], "vmess");
+        assert_eq!(n["server"], "example.com");
+        assert_eq!(n["port"], 443);
+        assert_eq!(n["uuid"], "11111111-1111-1111-1111-111111111111");
+        assert_eq!(n["tls"], true);
+        assert_eq!(n["method"], "auto");
+
+        let ws = r#"{"v":"2","ps":"WS","add":"example.com","port":8443,"id":"11111111-1111-1111-1111-111111111111","aid":0,"scy":"aes-128-gcm","net":"ws","path":"/ws","host":"cdn.example.com","tls":"tls","sni":"cdn.example.com"}"#;
+        let uri = format!(
+            "vmess://{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, ws)
+        );
+        let n = first(&uri);
+        assert_eq!(n["type"], "vmess");
+        assert_eq!(n["ws_path"], "/ws");
+        assert_eq!(n["ws_host"], "cdn.example.com");
+        assert_eq!(n["tls"], true);
+        assert_eq!(n["method"], "aes-128-gcm");
+    }
+
+    #[test]
+    fn vmess_clash_proxy_parses() {
+        let yaml = "proxies:\n  - {name: vm, type: vmess, server: example.com, port: 443, uuid: 11111111-1111-1111-1111-111111111111, alterId: 0, cipher: auto, tls: true, network: ws, ws-opts: {path: /ws, headers: {Host: cdn.example.com}}, servername: cdn.example.com}\n";
+        let n = first(yaml);
+        assert_eq!(n["type"], "vmess");
+        assert_eq!(n["method"], "auto");
+        assert_eq!(n["tls"], true);
+        assert_eq!(n["ws_path"], "/ws");
+        assert_eq!(n["ws_host"], "cdn.example.com");
+    }
+
+    #[test]
+    fn vmess_alter_id_is_rejected_with_diagnostic() {
+        let body = r#"{"v":"2","ps":"old","add":"example.com","port":443,"id":"11111111-1111-1111-1111-111111111111","aid":2,"net":"tcp"}"#;
+        let uri = format!(
+            "vmess://{}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, body)
+        );
+        let parsed: Value = serde_json::from_str(&parse_to_json(&uri)).unwrap();
+        assert_eq!(parsed["nodes"].as_array().unwrap().len(), 0);
+        assert_eq!(parsed["diagnostics"][0]["category"], "unsupported_param");
     }
 }

@@ -127,8 +127,8 @@ fun NodesScreen(onRestart: () -> Unit) {
                 scope.launch {
                     refreshing = true
                     try {
-                        Actions.refreshSubscription()
-                        messages.show("订阅已刷新")
+                        val result = Actions.refreshSubscription()
+                        messages.show(Actions.subscriptionRefreshMessage(result))
                     } catch (e: Exception) {
                         messages.show(e.message ?: "订阅刷新失败")
                     } finally {
@@ -362,6 +362,7 @@ private fun NodeRow(
         "ss" -> NamuColors.Teal
         "trojan" -> NamuColors.Blue
         "vless" -> NamuColors.Green
+        "vmess" -> NamuColors.Blue
         "socks5" -> NamuColors.Orange
         else -> NamuColors.TextSub
     }

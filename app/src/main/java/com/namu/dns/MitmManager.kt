@@ -72,18 +72,22 @@ object MitmManager {
         }
     }
 
-    /** 系统证书区是否已装好当前这张 CA；按 DER 比对，避免文件名存在但仍是旧证书。 */
+    /** 系统证书区是否已装好当前这张 CA；APEX 与 legacy 都查，按 DER 比对。 */
     fun systemCertInstalled(context: Context, systemName: String): Boolean {
         if (systemName.isBlank()) return false
         val expected = caDer(context) ?: return false
-        val apex = File("/apex/com.android.conscrypt/cacerts")
-        // Android 14+ Conscrypt 实际读 APEX 目录；APEX 存在时不能拿旧版目录的结果冒充成功。
-        val dir = if (apex.isDirectory) apex else File("/system/etc/security/cacerts")
-        val file = File(dir, systemName)
-        return file.isFile && systemCertDerMatches(file, expected)
+        val dirs = buildList {
+            File("/apex/com.android.conscrypt/cacerts").takeIf { it.isDirectory }?.let { add(it) }
+            File("/system/etc/security/cacerts").takeIf { it.isDirectory }?.let { add(it) }
+        }
+        if (dirs.isEmpty()) return false
+        return dirs.any { dir ->
+            val file = File(dir, systemName)
+            file.isFile && systemCertDerMatches(file, expected)
+        }
     }
 
-    private fun systemCertDerMatches(file: File, expected: ByteArray): Boolean {
+    internal fun systemCertDerMatches(file: File, expected: ByteArray): Boolean {
         val raw = runCatching { file.readBytes() }.getOrNull() ?: return false
         val text = String(raw, Charsets.UTF_8)
         if (!text.trimStart().startsWith("-----BEGIN CERTIFICATE-----")) {
@@ -96,6 +100,19 @@ object MitmManager {
             Base64.decode(body.filterNot { it.isWhitespace() }, Base64.DEFAULT)
         }.getOrNull() ?: return false
         return der.contentEquals(expected)
+    }
+
+    /**
+     * A3 榜单「加入/取消跳过」：同一入口可逆切换。
+     * 只改 skipHostnames，不碰模块 hostname；下次热重载只影响新连接。
+     */
+    fun toggleSkip(current: List<String>, host: String): List<String> {
+        val key = parseHostList(host).firstOrNull() ?: return current
+        return if (current.any { it.equals(key, ignoreCase = true) }) {
+            current.filterNot { it.equals(key, ignoreCase = true) }
+        } else {
+            (current + key).distinct()
+        }
     }
 
     /** 解析用户输入的域名列表：逗号/换行/空格分隔，去重、小写、校验。 */

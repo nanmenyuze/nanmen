@@ -443,6 +443,7 @@ private fun parseSectionConfig(
     val nodes = mutableListOf<NodeInfo>()
     val groupBuilders = linkedMapOf<String, ProxyGroupBuilder>()
     val rawRules = mutableListOf<Pair<Int, String>>()
+    val hostMappings = linkedMapOf<String, String>()
     var section = ""
     var lineNo = 0
     var dnsUpstream = ""
@@ -501,7 +502,7 @@ private fun parseSectionConfig(
             val parts = splitCsv(line.substring(i + 1))
             if (parts.isEmpty()) return@forEach
             val type = parts[0].trim().lowercase()
-            if (type !in setOf("select", "url-test", "fallback")) {
+            if (type !in setOf("select", "url-test", "fallback", "load-balance")) {
                 issues += ConfigIssue(ConfigIssueLevel.ERROR, "[Proxy Group] line $lineNo", "未知策略组类型：${parts[0]}")
                 return@forEach
             }
@@ -521,7 +522,18 @@ private fun parseSectionConfig(
                 failureThreshold = opt["failure-threshold"]?.toIntOrNull() ?: 3,
                 recoveryThreshold = opt["recovery-threshold"]?.toIntOrNull() ?: 2,
                 noNodeAction = opt["no-node-action"] ?: "global",
+                lbMode = opt["strategy"] ?: opt["lb-mode"] ?: opt["lbmode"] ?: "consistent-hash",
+                switchInterval = opt["switch-interval"]?.toIntOrNull() ?: 30,
             )
+            return@forEach
+        }
+        if (lower == "host") {
+            val i = line.indexOf('=')
+            if (i > 0) {
+                val key = line.substring(0, i).trim().lowercase().trim('.')
+                val value = line.substring(i + 1).trim()
+                if (key.isNotBlank() && value.isNotBlank()) hostMappings[key] = value
+            }
             return@forEach
         }
         if (lower == "rule") {
@@ -616,7 +628,8 @@ private fun parseSectionConfig(
             "General" -> if (dnsUpstream.isBlank() && dnsFallback.isBlank()) partial += "[General] 未找到 dns-server/doh-server"
             "MITM" -> partial += "[MITM] 配置已识别，MITM 需在 MITM 页面单独启用"
             "URL Rewrite", "Header Rewrite" -> partial += "[$it] 仅识别，未自动启用"
-            "Rewrite", "Host", "Script" -> skipped += "[$it]"
+            "Host" -> if (hostMappings.isNotEmpty()) supported += "Host(${hostMappings.size})" else partial += "[Host] 未找到映射"
+            "Rewrite", "Script" -> skipped += "[$it]"
         }
     }
     if (appRules > 0) supported += "按 App 规则($appRules 条)"
@@ -635,6 +648,7 @@ private fun parseSectionConfig(
             ),
             rules = nativeRules.distinctBy { "${it.type}|${it.value}|${it.action}" },
             proxyGroups = groupDefs,
+            mitm = MitmConfig(hostMappings = hostMappings),
             sourceFormat = if (loon) ConfigFile.SOURCE_LOON else ConfigFile.SOURCE_SHADOWROCKET,
             unknownRoot = buildJsonObject {
                 if (unknownSections.isNotEmpty()) put("sourceUnknownSections", JsonPrimitive(unknownSections.joinToString(",")))
@@ -678,6 +692,8 @@ private data class ProxyGroupBuilder(
     val failureThreshold: Int,
     val recoveryThreshold: Int,
     val noNodeAction: String,
+    val lbMode: String,
+    val switchInterval: Int,
 ) {
     fun toProxyGroup(): ProxyGroup = ProxyGroup(
         name = name,
@@ -690,6 +706,8 @@ private data class ProxyGroupBuilder(
         failureThreshold = failureThreshold,
         recoveryThreshold = recoveryThreshold,
         noNodeAction = noNodeAction,
+        lbMode = lbMode,
+        switchInterval = switchInterval,
     )
 }
 
@@ -751,13 +769,14 @@ private fun parseLoonNode(
         "ss", "shadowsocks" -> "ss"
         "trojan" -> "trojan"
         "vless" -> "vless"
+        "vmess" -> "vmess"
         "socks5", "socks" -> "socks5"
         "http", "https" -> "http"
         else -> {
             issues += ConfigIssue(
                 ConfigIssueLevel.WARNING,
                 "[Proxy] line $line",
-                "$typeRaw 协议未实现，已跳过（VMess/Reality/Hysteria2/TUIC 需单独排期）",
+                "$typeRaw 协议未实现，已跳过（Reality/Hysteria2/TUIC 需单独排期）",
             )
             return null
         }
@@ -784,6 +803,8 @@ private fun parseLoonNode(
     val tls = when (type) {
         "trojan" -> opts["tls"]?.let { it != "false" && it != "0" } ?: true
         "vless" -> opts["security"]?.let { it.equals("tls", true) || it.equals("xtls", true) }
+            ?: opts["tls"]?.let { it != "false" && it != "0" } ?: false
+        "vmess" -> opts["security"]?.let { it.equals("tls", true) }
             ?: opts["tls"]?.let { it != "false" && it != "0" } ?: false
         "http" -> typeRaw == "https" || opts["tls"]?.let { it != "false" } == true
         else -> false
@@ -813,6 +834,31 @@ private fun parseLoonNode(
                 sni = opts["sni"] ?: opts["servername"], insecure = opts["allowinsecure"] == "1" || opts["skip-cert-verify"] == "true",
                 tls = tls, wsPath = if (ws) opts["path"] ?: "/" else null,
                 wsHost = if (ws) opts["host"] else null,
+            )
+        }
+        "vmess" -> {
+            val uuid = parts.getOrNull(3)?.takeIf { it.isNotBlank() && !it.contains('=') } ?: opts["uuid"] ?: opts["username"]
+            if (uuid.isNullOrBlank()) {
+                issues += ConfigIssue(ConfigIssueLevel.WARNING, "[Proxy] line $line", "VMess 缺少 UUID，已跳过 $name")
+                return null
+            }
+            val aid = opts["alterid"]?.toIntOrNull() ?: 0
+            if (aid > 0) {
+                issues += ConfigIssue(ConfigIssueLevel.WARNING, "[Proxy] line $line", "VMess 不支持 alterId>0，已跳过 $name")
+                return null
+            }
+            val cipher = opts["cipher"] ?: "auto"
+            if (cipher !in setOf("auto", "aes-128-gcm", "chacha20-poly1305")) {
+                issues += ConfigIssue(ConfigIssueLevel.WARNING, "[Proxy] line $line", "VMess 不支持 cipher=$cipher，已跳过 $name")
+                return null
+            }
+            val useWs = ws || opts["ws"] == "true"
+            NodeInfo(
+                name = name, type = "vmess", server = server, port = port, uuid = uuid,
+                method = cipher, sni = opts["sni"] ?: opts["servername"],
+                insecure = opts["allowinsecure"] == "1" || opts["skip-cert-verify"] == "true",
+                tls = tls, wsPath = if (useWs) opts["ws-path"] ?: opts["path"] ?: "/" else null,
+                wsHost = if (useWs) opts["ws-host"] ?: opts["host"] else null,
             )
         }
         "socks5" -> NodeInfo(

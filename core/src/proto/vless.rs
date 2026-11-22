@@ -45,7 +45,12 @@ fn build_header(node: &Node, command: u8, target: &Target) -> io::Result<Vec<u8>
 /// 读取 VLESS 响应头。黑洞服务器不回数据时必须超时，不能永久挂起任务。
 pub(crate) async fn read_response_header(stream: &mut BoxStream) -> io::Result<()> {
     let mut hdr = [0u8; 2];
-    match tokio::time::timeout(std::time::Duration::from_secs(8), stream.read_exact(&mut hdr)).await {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(8),
+        stream.read_exact(&mut hdr),
+    )
+    .await
+    {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => return Err(e),
         Err(_) => return Err(io_err("VLESS 响应头超时")),
@@ -60,7 +65,9 @@ pub(crate) async fn read_response_header(stream: &mut BoxStream) -> io::Result<(
 
 pub async fn connect(node: &Node, target: Target) -> io::Result<BoxStream> {
     let mut stream = open_stream(node).await?;
-    stream.write_all(&build_header(node, CMD_TCP, &target)?).await?;
+    stream
+        .write_all(&build_header(node, CMD_TCP, &target)?)
+        .await?;
 
     let (pipe_a, pipe_b) = tokio::io::duplex(128 * 1024);
     tokio::spawn(async move {
@@ -70,7 +77,14 @@ pub async fn connect(node: &Node, target: Target) -> io::Result<BoxStream> {
         bridge_stream(stream, pipe_a).await;
     });
 
-    logging::info("vless", format!("已连接 {} -> {}", node.label(), crate::outbound::display_target(&target)));
+    logging::info(
+        "vless",
+        format!(
+            "已连接 {} -> {}",
+            node.label(),
+            crate::outbound::display_target(&target)
+        ),
+    );
     Ok(Box::new(pipe_b))
 }
 
@@ -78,10 +92,16 @@ pub async fn connect(node: &Node, target: Target) -> io::Result<BoxStream> {
 /// 响应头不在这里读：部分服务端要等第一个 UDP 包才回响应头，先读会死等。
 pub async fn udp_associate(node: &Node, target: &Target) -> io::Result<BoxStream> {
     let mut stream = open_stream(node).await?;
-    stream.write_all(&build_header(node, CMD_UDP, target)?).await?;
+    stream
+        .write_all(&build_header(node, CMD_UDP, target)?)
+        .await?;
     logging::info(
         "vless",
-        format!("UDP 会话 {} -> {}", node.label(), crate::outbound::display_target(target)),
+        format!(
+            "UDP 会话 {} -> {}",
+            node.label(),
+            crate::outbound::display_target(target)
+        ),
     );
     Ok(stream)
 }

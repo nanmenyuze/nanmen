@@ -7,8 +7,8 @@ use nanmen_core::config::Target;
 use nanmen_core::engine::Action;
 use nanmen_core::mitm::http1::{self, Buffered};
 use nanmen_core::mitm::{MitmConfig, MitmRuleConf, MitmState};
-use nanmen_core::script::ScriptRuleConf;
 use nanmen_core::netstack::Ctx;
+use nanmen_core::script::ScriptRuleConf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::io::AsyncWriteExt;
@@ -65,7 +65,9 @@ fn grpc_frame(payload: &[u8]) -> Vec<u8> {
 fn test_ctx(state: Arc<MitmState>, stats: Arc<nanmen_core::stats::Stats>) -> Arc<Ctx> {
     let cfg = nanmen_core::config::Config::default();
     let filter = Arc::new(nanmen_core::engine::build_filter(&cfg));
-    let rules = Arc::new(RwLock::new(Arc::new(nanmen_core::engine::RuleEngine::from_config(&cfg))));
+    let rules = Arc::new(RwLock::new(Arc::new(
+        nanmen_core::engine::RuleEngine::from_config(&cfg),
+    )));
     let dns = Arc::new(RwLock::new(Arc::new(nanmen_core::dns::DnsEngine::new(
         &cfg.dns,
         filter.clone(),
@@ -113,10 +115,14 @@ async fn spawn_origin() -> (u16, Arc<rcgen::KeyPair>) {
     let port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
         loop {
-            let Ok((sock, _)) = listener.accept().await else { break };
+            let Ok((sock, _)) = listener.accept().await else {
+                break;
+            };
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                let Ok(tls) = acceptor.accept(sock).await else { return };
+                let Ok(tls) = acceptor.accept(sock).await else {
+                    return;
+                };
                 let mut io = Buffered::new(tls);
                 while let Ok(Some(req)) = http1::read_request(&mut io).await {
                     let (status, ctype, body): (u16, &str, Vec<u8>) = match req.path.as_str() {
@@ -158,7 +164,9 @@ async fn spawn_origin() -> (u16, Arc<rcgen::KeyPair>) {
 
 fn client_config(ca_der: &[u8]) -> Arc<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
-    roots.add(rustls::pki_types::CertificateDer::from(ca_der.to_vec())).unwrap();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(ca_der.to_vec()))
+        .unwrap();
     Arc::new(
         rustls::ClientConfig::builder()
             .with_root_certificates(roots)
@@ -203,7 +211,9 @@ async fn spawn_h2_origin_with_fail(
     let tcp_accepts_task = tcp_accepts.clone();
     tokio::spawn(async move {
         loop {
-            let Ok((sock, _)) = listener.accept().await else { break };
+            let Ok((sock, _)) = listener.accept().await else {
+                break;
+            };
             let seen = tcp_accepts_task.fetch_add(1, Ordering::Relaxed) + 1;
             if seen <= fail_first {
                 drop(sock);
@@ -212,9 +222,13 @@ async fn spawn_h2_origin_with_fail(
             let acceptor = acceptor.clone();
             let accepts = accepts_task.clone();
             tokio::spawn(async move {
-                let Ok(tls) = acceptor.accept(sock).await else { return };
+                let Ok(tls) = acceptor.accept(sock).await else {
+                    return;
+                };
                 accepts.fetch_add(1, Ordering::Relaxed);
-                let Ok(mut conn) = h2::server::handshake(tls).await else { return };
+                let Ok(mut conn) = h2::server::handshake(tls).await else {
+                    return;
+                };
                 while let Some(Ok((req, mut respond))) = conn.accept().await {
                     let path = req.uri().path().to_string();
                     // /duplex：收到首段请求体后先回一段响应，再继续等剩余请求体，
@@ -235,7 +249,9 @@ async fn spawn_h2_origin_with_fail(
                                 .header("content-type", "text/plain")
                                 .body(())
                                 .unwrap();
-                            let Ok(mut send) = respond.send_response(response, false) else { return };
+                            let Ok(mut send) = respond.send_response(response, false) else {
+                                return;
+                            };
                             if send
                                 .send_data(bytes::Bytes::from_static(b"first"), false)
                                 .is_err()
@@ -254,10 +270,18 @@ async fn spawn_h2_origin_with_fail(
                     // Loon 请求 mock 改写后上游收到的头与正文一致。
                     if path == "/echo-headers" {
                         tokio::spawn(async move {
-                            let ctype = req.headers().get("content-type")
-                                .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-                            let clen = req.headers().get("content-length")
-                                .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                            let ctype = req
+                                .headers()
+                                .get("content-type")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
+                            let clen = req
+                                .headers()
+                                .get("content-length")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_string();
                             let mut req_body = req.into_body();
                             let mut got = Vec::new();
                             while let Some(Ok(chunk)) = req_body.data().await {
@@ -277,7 +301,9 @@ async fn spawn_h2_origin_with_fail(
                                 .header("content-length", body.len().to_string())
                                 .body(())
                                 .unwrap();
-                            let Ok(mut send) = respond.send_response(response, false) else { return };
+                            let Ok(mut send) = respond.send_response(response, false) else {
+                                return;
+                            };
                             let _ = send.send_data(bytes::Bytes::from(body), true);
                         });
                         continue;
@@ -298,7 +324,9 @@ async fn spawn_h2_origin_with_fail(
                                 .header("content-length", got.len().to_string())
                                 .body(())
                                 .unwrap();
-                            let Ok(mut send) = respond.send_response(response, false) else { return };
+                            let Ok(mut send) = respond.send_response(response, false) else {
+                                return;
+                            };
                             let _ = send.send_data(bytes::Bytes::from(got), true);
                         });
                         continue;
@@ -316,7 +344,9 @@ async fn spawn_h2_origin_with_fail(
                                 .header("content-type", "text/plain")
                                 .body(())
                                 .unwrap();
-                            let Ok(mut send) = respond.send_response(response, false) else { return };
+                            let Ok(mut send) = respond.send_response(response, false) else {
+                                return;
+                            };
                             let _ = send.send_data(bytes::Bytes::from_static(b"slow"), true);
                         });
                         continue;
@@ -350,7 +380,9 @@ async fn spawn_h2_origin_with_fail(
                         builder = builder.header("content-encoding", enc);
                     }
                     let response = builder.body(()).unwrap();
-                    let Ok(mut send) = respond.send_response(response, false) else { return };
+                    let Ok(mut send) = respond.send_response(response, false) else {
+                        return;
+                    };
                     let _ = send.send_data(bytes::Bytes::from(body), true);
                 }
             });
@@ -374,7 +406,10 @@ async fn client_request_headers(
     extra: &[(&str, &str)],
     body: Option<&[u8]>,
 ) -> (u16, Vec<u8>, Vec<(String, String)>) {
-    let mut req = format!("{} {} HTTP/1.1\r\nHost: api.test.local\r\nAccept-Encoding: gzip\r\n", method, path);
+    let mut req = format!(
+        "{} {} HTTP/1.1\r\nHost: api.test.local\r\nAccept-Encoding: gzip\r\n",
+        method, path
+    );
     for (k, v) in extra {
         req.push_str(&format!("{}: {}\r\n", k, v));
     }
@@ -408,7 +443,10 @@ async fn start_h2_mitm(
     ca_path: &str,
     origin_port: u16,
     cfg: MitmConfig,
-) -> (Arc<MitmState>, tokio_rustls::client::TlsStream<tokio::io::DuplexStream>) {
+) -> (
+    Arc<MitmState>,
+    tokio_rustls::client::TlsStream<tokio::io::DuplexStream>,
+) {
     let state = Arc::new(MitmState::build(&cfg));
     let stats = Arc::new(nanmen_core::stats::Stats::new());
     let ctx = test_ctx(state.clone(), stats);
@@ -532,7 +570,8 @@ async fn mitm_scripts_mutate_request_response_and_short_circuit() {
             name: "local response".into(),
             phase: "request".into(),
             pattern: r"^https://api\.test\.local/short$".into(),
-            source: "$done({response:{status:201,headers:{\"x-local\":\"1\"},body:\"local\"}});".into(),
+            source: "$done({response:{status:201,headers:{\"x-local\":\"1\"},body:\"local\"}});"
+                .into(),
             ..Default::default()
         });
         v.push(ScriptRuleConf {
@@ -589,7 +628,9 @@ async fn mitm_scripts_mutate_request_response_and_short_circuit() {
         client_request_headers(&mut tls, "POST", "/echo", &[], Some(b"client-body")).await;
     assert_eq!(status, 200);
     assert_eq!(body, b"resp:script-body");
-    assert!(headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-script") && v == "yes"));
+    assert!(headers
+        .iter()
+        .any(|(k, v)| k.eq_ignore_ascii_case("x-script") && v == "yes"));
 
     // 请求脚本本地短路：不上源站，直接返回 201。
     let (status, body) = client_request(&mut tls, "/short").await;
@@ -720,7 +761,11 @@ async fn mitm_h2_grpc_reject_uses_trailers() {
     while let Some(chunk) = body.data().await {
         chunk.unwrap();
     }
-    let trailers = body.trailers().await.unwrap().expect("gRPC 必须有 trailers");
+    let trailers = body
+        .trailers()
+        .await
+        .unwrap()
+        .expect("gRPC 必须有 trailers");
     assert_eq!(trailers.get("grpc-status").unwrap(), "7");
     assert_eq!(stats.mitm_conns.load(Ordering::Relaxed), 1);
     assert_eq!(stats.mitm_rejected.load(Ordering::Relaxed), 1);
@@ -1155,7 +1200,12 @@ async fn mitm_body_limit_passthrough() {
         enabled: true,
         ca_file: ca_path.clone(),
         hostnames: vec!["api.test.local".into()],
-        rules: vec![rule(r"^https://api\.test\.local/feed", "body", "items", "ITEMS")],
+        rules: vec![rule(
+            r"^https://api\.test\.local/feed",
+            "body",
+            "items",
+            "ITEMS",
+        )],
         upstream_insecure: true,
         body_limit: 4096, // 最小上限 also 足够 /feed；用 /plain 验证无规则透传不受影响
         ..Default::default()
@@ -1173,7 +1223,16 @@ async fn mitm_body_limit_passthrough() {
     let ctx2 = ctx.clone();
     let st2 = state.clone();
     tokio::spawn(async move {
-        nanmen_core::mitm::handle(server_side, "api.test.local".into(), target, Action::Direct, ctx2, st2, 3).await;
+        nanmen_core::mitm::handle(
+            server_side,
+            "api.test.local".into(),
+            target,
+            Action::Direct,
+            ctx2,
+            st2,
+            3,
+        )
+        .await;
     });
     let connector = tokio_rustls::TlsConnector::from(client_config(ca.ca_der()));
     let name = rustls::pki_types::ServerName::try_from("api.test.local").unwrap();
@@ -1184,7 +1243,6 @@ async fn mitm_body_limit_passthrough() {
     assert_eq!(body, br#"{"ITEMS":[1,2],"ad_ITEMS":[{"id":9}],"ok":1}"#);
     let _ = std::fs::remove_file(&ca_path);
 }
-
 
 #[tokio::test]
 async fn mitm_h2_duplex_response_before_request_end() {
@@ -1230,9 +1288,7 @@ async fn mitm_h2_duplex_response_before_request_end() {
     req_body
         .send_data(bytes::Bytes::from_static(b"part2"), false)
         .unwrap();
-    req_body
-        .send_data(bytes::Bytes::new(), true)
-        .unwrap();
+    req_body.send_data(bytes::Bytes::new(), true).unwrap();
     let last = tokio::time::timeout(std::time::Duration::from_secs(3), body.data())
         .await
         .expect("未收到源站尾段响应")
@@ -1259,7 +1315,8 @@ async fn mitm_h2_small_window_streams_without_stalling() {
     builder
         .initial_window_size(1024)
         .initial_connection_window_size(1024);
-    let (mut send, conn): (h2::client::SendRequest<bytes::Bytes>, _) = builder.handshake(tls).await.unwrap();
+    let (mut send, conn): (h2::client::SendRequest<bytes::Bytes>, _) =
+        builder.handshake(tls).await.unwrap();
     tokio::spawn(async move {
         let _ = conn.await;
     });
@@ -1383,7 +1440,6 @@ fn rewrite_budget_caps_and_releases() {
     drop(p3);
     assert!(budget.try_acquire(10).is_some());
 }
-
 
 #[tokio::test]
 async fn mitm_h2_grpc_body_rewrites_protobuf_fields() {
@@ -1513,22 +1569,28 @@ async fn mitm_loon_old_rewrite_http1_headers_body_redirect_mock_request_json() {
 
     // URL 替换：/plain -> /feed。不同 URL 正则只在原 URL 命中时收集响应动作，
     // 因此 /feed 的响应头规则不会因替换后的 URL 再匹配一次。
-    let (status, body, _headers) = client_request_headers(&mut tls, "GET", "/plain", &[], None).await;
+    let (status, body, _headers) =
+        client_request_headers(&mut tls, "GET", "/plain", &[], None).await;
     assert_eq!(status, 200);
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["ok"], 1);
 
     // 响应头删除 Content-Length 后，透传路径仍必须补回组帧头。
-    let (status, body, headers) = client_request_headers(&mut tls, "GET", "/noclen", &[], None).await;
+    let (status, body, headers) =
+        client_request_headers(&mut tls, "GET", "/noclen", &[], None).await;
     assert_eq!(status, 200);
     assert_eq!(body, b"hello");
     assert_eq!(http1::get_header(&headers, "content-length"), Some("5"));
 
     let (status, _body, headers) = client_request_headers(&mut tls, "GET", "/ad", &[], None).await;
     assert_eq!(status, 302);
-    assert_eq!(http1::get_header(&headers, "location"), Some("https://example.com/new"));
+    assert_eq!(
+        http1::get_header(&headers, "location"),
+        Some("https://example.com/new")
+    );
 
-    let (status, body, _headers) = client_request_headers(&mut tls, "GET", "/mock", &[], None).await;
+    let (status, body, _headers) =
+        client_request_headers(&mut tls, "GET", "/mock", &[], None).await;
     assert_eq!(status, 201);
     assert_eq!(body, br#"{"ok":1}"#);
 
@@ -1555,7 +1617,10 @@ async fn mitm_loon_old_rewrite_http1_headers_body_redirect_mock_request_json() {
         http1::read_response_head(&mut io),
     )
     .await;
-    assert!(closed.is_err() || closed.unwrap().is_err(), "reject 必须断开而不是返回 204");
+    assert!(
+        closed.is_err() || closed.unwrap().is_err(),
+        "reject 必须断开而不是返回 204"
+    );
     let _ = std::fs::remove_file(&ca_path);
 }
 
@@ -1607,7 +1672,9 @@ async fn mitm_loon_new_syntax_h2_response_json_headers_and_request_json() {
         .body(())
         .unwrap();
     let (resp_fut, mut req_body) = send.send_request(req, false).unwrap();
-    req_body.send_data(bytes::Bytes::from_static(br#"{"a":1}"#), true).unwrap();
+    req_body
+        .send_data(bytes::Bytes::from_static(br#"{"a":1}"#), true)
+        .unwrap();
     let resp = tokio::time::timeout(std::time::Duration::from_secs(5), resp_fut)
         .await
         .unwrap()
@@ -1655,7 +1722,8 @@ async fn mitm_loon_h2_request_mock_rewrites_content_type_and_length() {
         ca_file: ca_path.clone(),
         hostnames: vec!["grpc.test.local".into()],
         loon_rewrites: vec![
-            r#"^https://grpc\.test\.local/echo mock-request-body data-type=text data="mock-body""#.to_string(),
+            r#"^https://grpc\.test\.local/echo mock-request-body data-type=text data="mock-body""#
+                .to_string(),
         ],
         upstream_insecure: true,
         ..Default::default()
@@ -1673,7 +1741,9 @@ async fn mitm_loon_h2_request_mock_rewrites_content_type_and_length() {
         .body(())
         .unwrap();
     let (resp_fut, mut req_body) = send.send_request(req, false).unwrap();
-    req_body.send_data(bytes::Bytes::from_static(br#"{"a":1}"#), true).unwrap();
+    req_body
+        .send_data(bytes::Bytes::from_static(br#"{"a":1}"#), true)
+        .unwrap();
     let resp = tokio::time::timeout(std::time::Duration::from_secs(5), resp_fut)
         .await
         .unwrap()
@@ -1690,17 +1760,33 @@ async fn mitm_loon_h2_request_mock_rewrites_content_type_and_length() {
     let _ = std::fs::remove_file(&ca_path);
 }
 
-
 #[derive(Debug)]
 struct IdleNoVerify(Arc<rustls::crypto::CryptoProvider>);
 impl rustls::client::danger::ServerCertVerifier for IdleNoVerify {
-    fn verify_server_cert(&self, _e: &rustls::pki_types::CertificateDer<'_>, _i: &[rustls::pki_types::CertificateDer<'_>], _s: &rustls::pki_types::ServerName<'_>, _o: &[u8], _n: rustls::pki_types::UnixTime) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+    fn verify_server_cert(
+        &self,
+        _e: &rustls::pki_types::CertificateDer<'_>,
+        _i: &[rustls::pki_types::CertificateDer<'_>],
+        _s: &rustls::pki_types::ServerName<'_>,
+        _o: &[u8],
+        _n: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
-    fn verify_tls12_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    fn verify_tls12_signature(
+        &self,
+        m: &[u8],
+        c: &rustls::pki_types::CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
     }
-    fn verify_tls13_signature(&self, m: &[u8], c: &rustls::pki_types::CertificateDer<'_>, d: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    fn verify_tls13_signature(
+        &self,
+        m: &[u8],
+        c: &rustls::pki_types::CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
         rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -1716,8 +1802,10 @@ async fn h2_idle_client_preface_is_reclaimed_quietly() {
     let params = rcgen::CertificateParams::new(vec!["idle.test.local".to_string()]).unwrap();
     let cert = params.self_signed(&key).unwrap();
     let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der());
-    let mut scfg = rustls::ServerConfig::builder().with_no_client_auth()
-        .with_single_cert(vec![cert.der().clone()], key_der.into()).unwrap();
+    let mut scfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.der().clone()], key_der.into())
+        .unwrap();
     scfg.alpn_protocols = vec![b"h2".to_vec()];
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(scfg));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1729,12 +1817,15 @@ async fn h2_idle_client_preface_is_reclaimed_quietly() {
 
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let ccfg = rustls::ClientConfig::builder()
-        .dangerous().with_custom_certificate_verifier(Arc::new(IdleNoVerify(provider)))
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(IdleNoVerify(provider)))
         .with_no_client_auth();
     let mut ccfg = ccfg;
     ccfg.alpn_protocols = vec![b"h2".to_vec()];
     let connector = tokio_rustls::TlsConnector::from(Arc::new(ccfg));
-    let sock = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
     let name = rustls::pki_types::ServerName::try_from("idle.test.local").unwrap();
     let _client_tls = connector.connect(name, sock).await.unwrap();
     let server_tls = server.await.unwrap();
@@ -1743,11 +1834,22 @@ async fn h2_idle_client_preface_is_reclaimed_quietly() {
     let state = Arc::new(MitmState::build(&MitmConfig::default()));
     let stats = Arc::new(nanmen_core::stats::Stats::default());
     let ctx = test_ctx(state.clone(), stats);
-    let target = Target { ip: "127.0.0.1".parse().unwrap(), port: 443, domain: Some("idle.test.local".into()) };
+    let target = Target {
+        ip: "127.0.0.1".parse().unwrap(),
+        port: 443,
+        domain: Some("idle.test.local".into()),
+    };
     let res = nanmen_core::mitm::h2::serve_with_preface_timeout(
-        server_tls, "idle.test.local".into(), target, Action::Direct, ctx, state, 1,
+        server_tls,
+        "idle.test.local".into(),
+        target,
+        Action::Direct,
+        ctx,
+        state,
+        1,
         Arc::new(nanmen_core::mitm::ConnTrace::default()),
         std::time::Duration::from_millis(200),
-    ).await;
+    )
+    .await;
     assert!(res.is_ok(), "空闲连接应安静回收，实际: {:?}", res.err());
 }

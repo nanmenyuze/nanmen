@@ -4,13 +4,15 @@
 //! 不做字节计数——那需要改中继路径，代价远大于收益。连接关闭时整条移除，
 //! 表本身有上限，漏删的条目会被最旧淘汰兜住，不会无界增长。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 /// 与 TUN 连接上限一致：活跃连接最多 1024 条，快照表不需要比它大。
 const MAX_ENTRIES: usize = 1024;
+/// 关闭事件环形缓冲：UI 每秒拉一次，2048 条足够覆盖一次密集短连接关闭。
+const CLOSED_CAP: usize = 2048;
 
 /// 每连接流量计：主循环只做原子累加（无锁），快照时读一次交给壳层算速率。
 #[derive(Debug, Default)]
@@ -34,6 +36,11 @@ pub struct ConnInfo {
     /// 内核 10s 采样算出的速率（B/s），壳层直接显示，不再自己做差分。
     pub up_bps: u64,
     pub down_bps: u64,
+    /// 上一次增量快照已下发的值；只有变化过的活跃连接才需要重发。
+    last_emit_up: u64,
+    last_emit_down: u64,
+    last_emit_up_bps: u64,
+    last_emit_down_bps: u64,
 }
 
 /// 输出给 JNI 的扁平结构，`age_ms` 在取快照时计算，避免壳层处理 Instant。
@@ -58,11 +65,23 @@ pub struct ConnOut {
 pub struct ConnTable {
     next_id: u64,
     items: HashMap<u64, ConnInfo>,
+    closed: VecDeque<u64>,
 }
 
 impl ConnTable {
     pub fn new() -> Self {
-        Self { next_id: 1, items: HashMap::new() }
+        Self {
+            next_id: 1,
+            items: HashMap::new(),
+            closed: VecDeque::new(),
+        }
+    }
+
+    fn note_closed(&mut self, id: u64) {
+        if self.closed.len() >= CLOSED_CAP {
+            self.closed.pop_front();
+        }
+        self.closed.push_back(id);
     }
 
     /// 插入一条连接，返回快照 id；满时先淘汰开始时间最早的一条。
@@ -85,6 +104,7 @@ impl ConnTable {
                 .map(|(k, _)| *k)
             {
                 self.items.remove(&oldest);
+                self.note_closed(oldest);
             }
         }
         let id = self.next_id;
@@ -105,6 +125,10 @@ impl ConnTable {
                 meter: meter.clone(),
                 up_bps: 0,
                 down_bps: 0,
+                last_emit_up: 0,
+                last_emit_down: 0,
+                last_emit_up_bps: 0,
+                last_emit_down_bps: 0,
             },
         );
         (id, meter)
@@ -120,7 +144,9 @@ impl ConnTable {
 
     pub fn remove(&mut self, id: Option<u64>) {
         if let Some(id) = id {
-            self.items.remove(&id);
+            if self.items.remove(&id).is_some() {
+                self.note_closed(id);
+            }
         }
     }
 
@@ -160,15 +186,28 @@ impl ConnTable {
         rows
     }
 
-    /// 增量快照：只返回 id > `since` 的记录，按 id 升序，并给出总条数与游标。
-    /// 壳层第一次传 0 拿到全表，之后用返回的 last 续取，避免每秒重传整表。
-    pub fn json_since(&self, since: u64) -> String {
+    /// 增量快照：返回 id > `since` 的新连接、字节/速率有变化的活跃连接，
+    /// 以及关闭连接 id。壳层第一次传 0 拿到全表，之后按 id 更新/删除，
+    /// 不再靠 total 猜哪条被关闭。`last` 仍只推进到新 id，变化重发不会重复建条目。
+    pub fn json_since(&mut self, since: u64) -> String {
         let now = Instant::now();
-        let mut rows: Vec<ConnOut> = self
-            .items
-            .values()
-            .filter(|c| c.id > since)
-            .map(|c| ConnOut {
+        let mut rows: Vec<ConnOut> = Vec::new();
+        for c in self.items.values_mut() {
+            let up = c.meter.up.load(Ordering::Relaxed);
+            let down = c.meter.down.load(Ordering::Relaxed);
+            let changed = c.id > since
+                || up != c.last_emit_up
+                || down != c.last_emit_down
+                || c.up_bps != c.last_emit_up_bps
+                || c.down_bps != c.last_emit_down_bps;
+            if !changed {
+                continue;
+            }
+            c.last_emit_up = up;
+            c.last_emit_down = down;
+            c.last_emit_up_bps = c.up_bps;
+            c.last_emit_down_bps = c.down_bps;
+            rows.push(ConnOut {
                 id: c.id,
                 uid: c.uid,
                 domain: c.domain.clone(),
@@ -178,17 +217,26 @@ impl ConnTable {
                 rule: c.rule.clone(),
                 mitm: c.mitm,
                 age_ms: now.duration_since(c.started).as_millis() as u64,
-                up_bytes: c.meter.up.load(Ordering::Relaxed),
-                down_bytes: c.meter.down.load(Ordering::Relaxed),
+                up_bytes: up,
+                down_bytes: down,
                 up_bps: c.up_bps,
                 down_bps: c.down_bps,
-            })
-            .collect();
+            });
+        }
         rows.sort_by_key(|r| r.id);
         let last = rows.last().map(|r| r.id).unwrap_or(since);
+        // 关闭事件只回一次：UI 每秒拉取，若把整个环一直重复下发，2048 个 id
+        // 会每秒占满一次快照，还会让旧事件掩盖本轮新关闭。这里取走即清空。
+        let closed = self
+            .closed
+            .drain(..)
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         format!(
-            "{{\"items\":{},\"last\":{},\"total\":{}}}",
+            "{{\"items\":{},\"closed\":[{}],\"last\":{},\"total\":{}}}",
             to_json_array(&rows),
+            closed,
             last,
             self.items.len()
         )
@@ -196,6 +244,7 @@ impl ConnTable {
 
     pub fn clear(&mut self) {
         self.items.clear();
+        self.closed.clear();
     }
 }
 
@@ -293,7 +342,15 @@ mod tests {
     #[test]
     fn unknown_uid_and_domain_render_null() {
         let mut t = ConnTable::new();
-        t.insert(None, None, "10.0.0.1".into(), 80, "直连".into(), String::new(), false);
+        t.insert(
+            None,
+            None,
+            "10.0.0.1".into(),
+            80,
+            "直连".into(),
+            String::new(),
+            false,
+        );
         let json = to_json_array(&t.snapshot(10));
         assert!(json.contains("\"uid\":null"));
         assert!(json.contains("\"domain\":null"));
@@ -327,6 +384,43 @@ mod tests {
         assert!(!second.contains("a.example.com"));
         // 没有新记录时 last 保持游标
         assert!(t.json_since(b).contains("\"last\":2"));
+    }
+
+    #[test]
+    fn delta_reports_changed_active_and_closed_ids() {
+        let mut t = ConnTable::new();
+        let (a, meter_a) = t.insert(
+            Some(1),
+            Some("long.example.com".into()),
+            "1.1.1.1".into(),
+            443,
+            "直连".into(),
+            "规则 A".into(),
+            false,
+        );
+        let b = add(&mut t, 2, "short.example.com", "直连");
+        let first = t.json_since(0);
+        assert!(first.contains("\"last\":2"));
+        assert!(first.contains("long.example.com"));
+        assert!(first.contains("short.example.com"));
+
+        // 长连 A 仍在传输：不产生新 id，但字节变化必须重发。
+        meter_a.up.store(4096, Ordering::Relaxed);
+        let second = t.json_since(b);
+        assert!(second.contains("\"id\":1"));
+        assert!(second.contains("\"up\":4096"));
+        assert!(!second.contains("short.example.com"));
+        assert!(second.contains("\"closed\":[]"));
+
+        // B 先关闭：必须按 id 删除，不能用 total 猜最旧。
+        t.remove(Some(b));
+        let third = t.json_since(b);
+        assert!(third.contains("\"closed\":[2]"));
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.snapshot(10)[0].id, a);
+        // 关闭事件取走即清空，下一轮不能重复下发 2048 个旧 id。
+        let fourth = t.json_since(b);
+        assert!(fourth.contains("\"closed\":[]"));
     }
 
     #[test]

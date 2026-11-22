@@ -75,3 +75,35 @@ class NodeTestWorker(
         }
     }
 }
+
+/** 远端模块/插件拉取：只更新用户已添加且启用的源；失败保留 good 缓存。 */
+class ModuleUpdateWorker(
+    appContext: Context,
+    params: WorkerParameters,
+) : CoroutineWorker(appContext, params) {
+    override suspend fun doWork(): Result = try {
+        Actions.syncModules()
+        Result.success()
+    } catch (_: Exception) {
+        Result.retry()
+    }
+
+    companion object {
+        private const val NAME = "namu_module_update"
+
+        fun schedule(context: Context) {
+            val request = PeriodicWorkRequestBuilder<ModuleUpdateWorker>(6, TimeUnit.HOURS)
+                .setConstraints(
+                    Constraints.Builder()
+                        .setRequiredNetworkType(NetworkType.CONNECTED)
+                        .build(),
+                )
+                .build()
+            WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+                NAME,
+                ExistingPeriodicWorkPolicy.UPDATE,
+                request,
+            )
+        }
+    }
+}

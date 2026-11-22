@@ -17,6 +17,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -30,16 +31,20 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.namu.dns.App
 import com.namu.dns.AppConfig
 import com.namu.dns.CrashGuard
 import com.namu.dns.LiveConn
 import com.namu.dns.LiveConnStore
 import com.namu.dns.LogEntry
 import com.namu.dns.M7Backup
+import com.namu.dns.MitmManager
 import com.namu.dns.MigrationReportStore
 import com.namu.dns.NamuVpnService
+import com.namu.dns.RootCaManager
 import com.namu.dns.NetworkStatus
 import com.namu.dns.StatsData
+import com.namu.dns.UidTablePublisher
 import com.namu.dns.core.LocalAppContainer
 import com.namu.dns.core.runtime.RuntimeState
 import kotlinx.coroutines.Dispatchers
@@ -90,10 +95,14 @@ fun BackupRestoreDialog(onDismiss: () -> Unit) {
                 scope.launch {
                     loading = true
                     try {
+                        // A1：先记下恢复前的 CA 指纹。备份不带私钥；同一台机器且 CA 文件未丢时，
+                        // 下面的 export 会复用原证书，只有文件丢了/指纹变了才需要系统 CA 联动。
+                        val beforeFingerprint = MitmManager.caFingerprint(ctx)
                         val r = M7Backup.restore(ctx, text)
+                        val caNote = ensureCaAfterRestore(ctx, beforeFingerprint)
                         val warn = if (r.warnings.isEmpty()) "" else "；${r.warnings.joinToString("；")}"
                         container.messages.show(
-                            "已恢复 ${r.files} 个配置、${r.nodes} 个节点，当前配置 ${r.activeConfig}$warn",
+                            "已恢复 ${r.files} 个配置/资源、${r.nodes} 个节点、${r.modules} 个模块，当前配置 ${r.activeConfig}$warn$caNote",
                         )
                         if (container.runtime.current().connected) NamuVpnService.reload(ctx)
                         pendingText = null
@@ -247,7 +256,7 @@ fun PrivacyAndLimitsDialog(onDismiss: () -> Unit, onOpenMitm: (() -> Unit)? = nu
             Text("证书与 MITM", fontSize = 13.sp, color = NamuColors.TextMain, fontWeight = FontWeight.Medium)
             Text(
                 "只有启用 MITM 并安装本机 CA 后才会解密命中域名的 HTTPS。银行、支付、证券类应用请加入跳过列表，" +
-                    "或直接关闭 MITM；卸载应用前先在系统证书/模块里移除 CA。",
+                    "或直接关闭 MITM；卸载应用前先到「MITM 去广告 → 证书安装 → 移除系统 CA」卸载证书层，再卸载应用。",
                 fontSize = 12.sp, color = NamuColors.TextSub, lineHeight = 17.sp,
             )
             Spacer(Modifier.height(10.dp))
@@ -286,6 +295,12 @@ fun LiveConnectionsDialog(
     val store = remember { LiveConnStore() }
     var rows by remember { mutableStateOf<List<LiveConn>>(emptyList()) }
     var total by remember { mutableStateOf(0) }
+
+    // 连接页是 UID 表的临时消费者：打开才读配置侧未覆盖的归属，关闭立即释放。
+    DisposableEffect(Unit) {
+        UidTablePublisher.setUiDemand(true)
+        onDispose { UidTablePublisher.setUiDemand(false) }
+    }
 
     // 只在已连接时轮询；对话框关闭后 LaunchedEffect 随组合取消，不会留后台协程。
     LaunchedEffect(runtimeState.connected) {
@@ -337,7 +352,7 @@ fun LiveConnectionsDialog(
                 else -> {
                     Text(
                         "按建立时间倒序，显示前 ${rows.take(60).size} 条（内核共 $total 条）。" +
-                            "关闭的连接会随内核计数自动消失。",
+                            "关闭项按内核推送的连接 id 精确删除；仍在传输的长连会继续按字节和速率更新。",
                         fontSize = 11.sp, color = NamuColors.TextSub, lineHeight = 16.sp,
                     )
                     Spacer(Modifier.height(6.dp))
@@ -441,3 +456,25 @@ private fun liveUptime(ms: Long): String {
 
 private fun liveTime(ts: Long): String =
     java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date(ts))
+
+/**
+ * A1：恢复成功后只做 CA 复用/核对，不在 restore 内部碰 Root。
+ * - 未启用 MITM：完全不生成 CA。
+ * - 同机恢复且指纹未变、证书区/模块已匹配：静默返回，不打扰。
+ * - 指纹变了，或系统库和模块都没有这张证书：才调用一键安装/更新。
+ */
+private suspend fun ensureCaAfterRestore(ctx: android.content.Context, beforeFingerprint: String?): String {
+    if (!App.container.settings.current().mitm.enabled) return ""
+    val exported = MitmManager.export(ctx)
+    if (!exported.ok) return "；CA 检查失败：${exported.error}"
+    val afterFingerprint = MitmManager.caFingerprint(ctx)
+    val regenerated = beforeFingerprint == null || afterFingerprint == null || beforeFingerprint != afterFingerprint
+    val trust = RootCaManager.inspect(ctx, exported.systemName)
+    if (!RootCaManager.caNeedsRefresh(regenerated, trust)) return ""
+    val updated = RootCaManager.install(ctx, exported.pemPath, exported.systemName)
+    return if (updated.ok) {
+        "；CA 已联动更新并注入系统信任"
+    } else {
+        "；CA 需要更新：${updated.message}"
+    }
+}

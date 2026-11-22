@@ -48,8 +48,8 @@ pub const BUILTIN_HOSTS: &[&str] = &[
 /// 按 `.`、`-`、`/` 之外还以 `_` 切分后整词比较，避免 `author` 误中 `auth`、
 /// `payload` 误中 `pay` 这类子串误判。
 pub const FINANCE_KEYWORDS: &[&str] = &[
-    "pay", "payment", "cashier", "trade", "trading", "finance", "bank", "banking",
-    "passport", "login", "auth", "security", "wallet", "fund", "invest", "loan",
+    "pay", "payment", "cashier", "trade", "trading", "finance", "bank", "banking", "passport",
+    "login", "auth", "security", "wallet", "fund", "invest", "loan",
 ];
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -125,7 +125,9 @@ fn suffix_matches(patterns: &[String], host: &str) -> bool {
     if h.is_empty() {
         return false;
     }
-    patterns.iter().any(|p| h == *p || h.ends_with(&format!(".{}", p)))
+    patterns
+        .iter()
+        .any(|p| h == *p || h.ends_with(&format!(".{}", p)))
 }
 
 /// 域名分词：点、横线、下划线都视为分隔，整词命中关键字才算。
@@ -152,7 +154,11 @@ impl FinanceProtect {
             uids: cfg.uids.iter().copied().collect(),
             mixed_uids: cfg.mixed_uids.iter().copied().collect(),
             blocked,
-            allowed: cfg.allow_hosts.iter().filter_map(|s| normalize(s)).collect(),
+            allowed: cfg
+                .allow_hosts
+                .iter()
+                .filter_map(|s| normalize(s))
+                .collect(),
         }
     }
 
@@ -205,7 +211,10 @@ mod tests {
         );
         // 整包排除与域名无关，甚至没有域名也排除。
         assert_eq!(p.bypass_reason(Some(10123), None), Some("金融App整包排除"));
-        assert_eq!(p.bypass_reason(Some(10123), Some("mp.weixin.qq.com")), Some("金融App整包排除"));
+        assert_eq!(
+            p.bypass_reason(Some(10123), Some("mp.weixin.qq.com")),
+            Some("金融App整包排除")
+        );
     }
 
     #[test]
@@ -218,17 +227,28 @@ mod tests {
             "openapi.alipay.com",
             "cashier.alipay.com",
         ] {
-            assert_eq!(p.bypass_reason(Some(9999), Some(h)), Some("金融域名硬排除"), "{}", h);
+            assert_eq!(
+                p.bypass_reason(Some(9999), Some(h)),
+                Some("金融域名硬排除"),
+                "{}",
+                h
+            );
         }
         // 大小写与结尾点不影响判定。
-        assert_eq!(p.bypass_reason(None, Some("PAY.Weixin.QQ.com.")), Some("金融域名硬排除"));
+        assert_eq!(
+            p.bypass_reason(None, Some("PAY.Weixin.QQ.com.")),
+            Some("金融域名硬排除")
+        );
     }
 
     #[test]
     fn mini_program_domains_stay_mitmable() {
         let p = protect();
         // 小程序第三方业务域名：既不在硬排除，也无金融关键字。
-        assert_eq!(p.bypass_reason(Some(10234), Some("api.shop-example.com")), None);
+        assert_eq!(
+            p.bypass_reason(Some(10234), Some("api.shop-example.com")),
+            None
+        );
         // 公众号等内容域名不受影响。
         assert_eq!(p.bypass_reason(Some(10234), Some("mp.weixin.qq.com")), None);
     }
@@ -241,10 +261,19 @@ mod tests {
             Some("金融关键字排除")
         );
         // 同样域名在普通 App 上不做关键字排除，避免误伤正常改写。
-        assert_eq!(p.bypass_reason(Some(9999), Some("login.weixin.qq.com")), None);
+        assert_eq!(
+            p.bypass_reason(Some(9999), Some("login.weixin.qq.com")),
+            None
+        );
         // 子串不算命中：author 不是 auth，payload 不是 pay。
-        assert_eq!(p.bypass_reason(Some(10234), Some("author.example.com")), None);
-        assert_eq!(p.bypass_reason(Some(10234), Some("payload.example.com")), None);
+        assert_eq!(
+            p.bypass_reason(Some(10234), Some("author.example.com")),
+            None
+        );
+        assert_eq!(
+            p.bypass_reason(Some(10234), Some("payload.example.com")),
+            None
+        );
     }
 
     #[test]
@@ -255,10 +284,19 @@ mod tests {
             allow_hosts: vec!["login.weixin.qq.com".into()],
             ..Default::default()
         });
-        assert_eq!(p.bypass_reason(Some(10234), Some("login.weixin.qq.com")), None);
+        assert_eq!(
+            p.bypass_reason(Some(10234), Some("login.weixin.qq.com")),
+            None
+        );
         // 但不能放行硬排除域名，也不能放行整包 UID。
-        assert_eq!(p.bypass_reason(Some(10234), Some("pay.weixin.qq.com")), Some("金融域名硬排除"));
-        assert_eq!(p.bypass_reason(Some(10123), Some("login.weixin.qq.com")), Some("金融App整包排除"));
+        assert_eq!(
+            p.bypass_reason(Some(10234), Some("pay.weixin.qq.com")),
+            Some("金融域名硬排除")
+        );
+        assert_eq!(
+            p.bypass_reason(Some(10123), Some("login.weixin.qq.com")),
+            Some("金融App整包排除")
+        );
     }
 
     #[test]
@@ -268,6 +306,9 @@ mod tests {
             uids: vec![10123],
             ..Default::default()
         });
-        assert_eq!(p.bypass_reason(Some(10123), Some("pay.weixin.qq.com")), None);
+        assert_eq!(
+            p.bypass_reason(Some(10123), Some("pay.weixin.qq.com")),
+            None
+        );
     }
 }

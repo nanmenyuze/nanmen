@@ -353,6 +353,7 @@ fun ConfigDetailScreen(onRestart: () -> Unit, onOpenModules: () -> Unit, onOpenM
     var showRuleSources by remember { mutableStateOf(false) }
     var showRulesUpdate by remember { mutableStateOf(false) }
     var showGroups by remember { mutableStateOf(false) }
+    var showHostMap by remember { mutableStateOf(false) }
     var updatingIp by remember { mutableStateOf(false) }
     val groupIssues = remember(cfg.proxyGroups, cfg.nodes, cfg.groupSelections) {
         ProxyGroupValidation.validate(cfg.proxyGroups, cfg.nodes.map { it.name }, cfg.groupSelections)
@@ -477,6 +478,13 @@ fun ConfigDetailScreen(onRestart: () -> Unit, onOpenModules: () -> Unit, onOpenM
                 settings.update { current -> current.copy(blockAaaa = it) }
                 if (runtime.current().connected) onRestart()
             }
+            SettingsRow(
+                title = "Host 映射",
+                value = "${cfg.mitm.hostMappings.size} 条",
+                subtitle = "域名到 IP / CNAME / 指定上游；模块 [Host] 自动合并，保存后清 DNS 缓存生效",
+                chevron = true,
+                onClick = { showHostMap = true },
+            )
             SwitchRow(
                 title = "DNS-only 全量接管",
                 subtitle = "只对 DNS-only 生效：接管全部流量，硬编码 DNS 与 DoT 853 才进内核；" +
@@ -792,6 +800,18 @@ fun ConfigDetailScreen(onRestart: () -> Unit, onOpenModules: () -> Unit, onOpenM
             nodes = cfg.nodes.map { it.name },
             selections = cfg.groupSelections,
             onDismiss = { showGroups = false },
+        )
+    }
+    if (showHostMap) {
+        HostMapDialog(
+            initial = cfg.mitm.hostMappings,
+            onDismiss = { showHostMap = false },
+            onDone = { map ->
+                // Host 是配置态：写回后走一次热重载，新 DNS 引擎不继承旧缓存。
+                settings.update { current -> current.copy(mitm = current.mitm.copy(hostMappings = map)) }
+                showHostMap = false
+                if (runtime.current().connected) onRestart()
+            },
         )
     }
     if (showCustomAds) {

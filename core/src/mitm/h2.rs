@@ -2,18 +2,17 @@
 //! 命中拒绝规则时用 HTTP/2 trailers 的 `grpc-status` 拒绝 gRPC，
 //! 其余请求转发到真实服务器的 h2 连接。请求体与响应体按 stream 流式搬运。
 
+use super::http1::{BodyKind, RequestHead};
+use super::loon::{self, BodyOp, HeaderOp};
+use super::{ConnTrace, MitmState, RewriteAction, RewriteRule, ScriptMessage, ScriptPhase};
 use crate::config::Target;
 use crate::engine::Action;
 use crate::logging;
 use crate::netstack::Ctx;
 use crate::outbound;
-use super::{ConnTrace, MitmState, RewriteAction, RewriteRule, ScriptMessage, ScriptPhase};
-use super::loon::{self, BodyOp, HeaderOp};
-use super::http1::{BodyKind, RequestHead};
-use bytes::Bytes;
-use ::h2::client::SendRequest;
 use ::h2::server::SendResponse;
 use ::h2::{RecvStream, SendStream};
+use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Request, Response, Version};
 use std::io;
 use std::sync::atomic::Ordering;
@@ -33,7 +32,11 @@ pub fn is_grpc(headers: &HeaderMap) -> bool {
     headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim().to_ascii_lowercase().starts_with("application/grpc"))
+        .map(|v| {
+            v.trim()
+                .to_ascii_lowercase()
+                .starts_with("application/grpc")
+        })
         .unwrap_or(false)
 }
 
@@ -73,7 +76,10 @@ fn sanitize_te(headers: &mut HeaderMap) {
     let has_trailers = headers.get_all("te").iter().any(|v| {
         v.to_str()
             .ok()
-            .map(|s| s.split(',').any(|t| t.trim().eq_ignore_ascii_case("trailers")))
+            .map(|s| {
+                s.split(',')
+                    .any(|t| t.trim().eq_ignore_ascii_case("trailers"))
+            })
             .unwrap_or(false)
     });
     headers.remove("te");
@@ -124,7 +130,7 @@ async fn connect_upstream(
     ctx: &Arc<Ctx>,
     state: &Arc<MitmState>,
     conn_id: u64,
-) -> Result<SendRequest<Bytes>, io::Error> {
+) -> Result<Arc<super::pool::H2Entry>, io::Error> {
     let raw = outbound::connect(
         action,
         &ctx.nodes_snapshot(),
@@ -137,16 +143,24 @@ async fn connect_upstream(
     let (send, conn) = ::h2::client::handshake(tls)
         .await
         .map_err(|e| outbound::io_err(format!("h2 上游握手失败: {}", e)))?;
+    // 对端 SETTINGS_MAX_CONCURRENT_STREAMS：池化时严格按此发流；关闭池化时保持
+    // 原有 h2 客户端队列语义，不额外限制。
+    let max = if state.pool.enabled() {
+        conn.max_concurrent_send_streams().max(1)
+    } else {
+        usize::MAX
+    };
+    let entry = Arc::new(super::pool::H2Entry::new(send, max));
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             logging::warn("mitm", format!("#{} h2 上游连接结束: {}", conn_id, e));
         }
     });
-    Ok(send)
+    Ok(entry)
 }
 
 struct UpstreamSlot {
-    send: Option<(SendRequest<Bytes>, u64)>,
+    entry: Option<(Arc<super::pool::H2Entry>, u64)>,
     generation: u64,
 }
 
@@ -170,7 +184,7 @@ impl UpstreamHandle {
     fn new(target: Target, action: Action) -> Self {
         Self {
             slot: tokio::sync::Mutex::new(UpstreamSlot {
-                send: None,
+                entry: None,
                 generation: 0,
             }),
             target,
@@ -184,10 +198,33 @@ impl UpstreamHandle {
         ctx: &Arc<Ctx>,
         state: &Arc<MitmState>,
         conn_id: u64,
-    ) -> Result<(SendRequest<Bytes>, u64), String> {
+    ) -> Result<(super::pool::H2Lease, u64), String> {
+        let key = super::pool::h2_key(
+            host,
+            &self.target,
+            &self.action,
+            state.engine.upstream_insecure,
+        );
         let mut slot = self.slot.lock().await;
-        if let Some((send, generation)) = slot.send.as_ref() {
-            return Ok((send.clone(), *generation));
+        if let Some((entry, generation)) = slot.entry.as_ref() {
+            if let Some(lease) = entry.reserve() {
+                return Ok((lease, *generation));
+            }
+            // 当前连接流配额已满：池化模式允许再建一条，旧连接继续服务已有流。
+            if !state.pool.enabled() {
+                // 非池化保持既有行为：由 h2 客户端内部排队/报错，不主动拆连接。
+                if let Some(lease) = entry.reserve_unbounded() {
+                    return Ok((lease, *generation));
+                }
+            }
+        }
+        if state.pool.enabled() {
+            if let Some(lease) = state.pool.take_h2(&key) {
+                let generation = slot.generation.wrapping_add(1);
+                slot.generation = generation;
+                slot.entry = Some((lease.entry.clone(), generation));
+                return Ok((lease, generation));
+            }
         }
         let mut last_error = String::new();
         for attempt in 0..2 {
@@ -197,11 +234,17 @@ impl UpstreamHandle {
             )
             .await;
             match result {
-                Ok(Ok(send)) => {
+                Ok(Ok(entry)) => {
                     slot.generation = slot.generation.wrapping_add(1);
                     let generation = slot.generation;
-                    slot.send = Some((send.clone(), generation));
-                    return Ok((send, generation));
+                    let lease = entry
+                        .reserve()
+                        .ok_or_else(|| "h2 新连接无可用流配额".to_string())?;
+                    if state.pool.enabled() {
+                        state.pool.offer_h2(key.clone(), entry.clone());
+                    }
+                    slot.entry = Some((entry, generation));
+                    return Ok((lease, generation));
                 }
                 Ok(Err(e)) => last_error = e.to_string(),
                 Err(_) => last_error = "连接超时".to_string(),
@@ -215,8 +258,10 @@ impl UpstreamHandle {
 
     async fn invalidate(&self, generation: u64) {
         let mut slot = self.slot.lock().await;
-        if slot.send.as_ref().map(|(_, g)| *g) == Some(generation) {
-            slot.send = None;
+        if slot.entry.as_ref().map(|(_, g)| *g) == Some(generation) {
+            if let Some((entry, _)) = slot.entry.take() {
+                entry.mark_closed();
+            }
         }
     }
 }
@@ -231,7 +276,11 @@ impl Responder {
         Self { inner, sent: false }
     }
 
-    fn send(&mut self, response: Response<()>, end_of_stream: bool) -> Result<SendStream<Bytes>, String> {
+    fn send(
+        &mut self,
+        response: Response<()>,
+        end_of_stream: bool,
+    ) -> Result<SendStream<Bytes>, String> {
         self.sent = true;
         self.inner
             .send_response(response, end_of_stream)
@@ -295,7 +344,10 @@ where
             if msg.contains("close_notify") || msg.contains("unexpected eof") {
                 logging::info(
                     "mitm",
-                    format!("#{} {} h2 客户端提前断开（连接池弃连），按回收处理", conn_id, host),
+                    format!(
+                        "#{} {} h2 客户端提前断开（连接池弃连），按回收处理",
+                        conn_id, host
+                    ),
                 );
                 return Ok(());
             }
@@ -304,7 +356,10 @@ where
         Err(_) => {
             // 客户端完成 TLS 但迟迟未发 h2 preface：多为连接池预热/备用连接。
             // 按空闲连接安静回收，不当错误 warn（避免日志噪声与误报）。
-            logging::info("mitm", format!("#{} {} h2 空闲连接未启用，回收", conn_id, host));
+            logging::info(
+                "mitm",
+                format!("#{} {} h2 空闲连接未启用，回收", conn_id, host),
+            );
             return Ok(());
         }
     };
@@ -315,7 +370,10 @@ where
         let (req, respond) = match next {
             Ok(v) => v,
             Err(e) => {
-                logging::warn("mitm", format!("#{} {} h2 stream 接收失败: {}", conn_id, host, e));
+                logging::warn(
+                    "mitm",
+                    format!("#{} {} h2 stream 接收失败: {}", conn_id, host, e),
+                );
                 continue;
             }
         };
@@ -342,13 +400,21 @@ where
                     // 客户端在改写送达前就 RST/弃流（splash、feed 这类紧超时接口常见）。
                     // 不是我们协议出错，不计失败、不刷 warn，单独计数便于定位真实漏改。
                     ctx.stats.mitm_canceled.fetch_add(1, Ordering::Relaxed);
+                    super::host_stats::record(&host, super::host_stats::Metric::Canceled);
                     logging::info(
                         "mitm",
-                        format!("#{} {} 客户端在响应送达前取消（弃流），改写未送达", conn_id, host),
+                        format!(
+                            "#{} {} 客户端在响应送达前取消（弃流），改写未送达",
+                            conn_id, host
+                        ),
                     );
                     return;
                 }
-                logging::warn("mitm", format!("#{} {} h2 stream 失败: {}", conn_id, host, e));
+                super::host_stats::record(&host, super::host_stats::Metric::Failed);
+                logging::warn(
+                    "mitm",
+                    format!("#{} {} h2 stream 失败: {}", conn_id, host, e),
+                );
                 if !responder.sent {
                     let _ = send_status(&mut responder, 502);
                 } else {
@@ -388,7 +454,12 @@ async fn handle_stream(
     }) {
         let grpc = is_grpc(req.headers());
         let action = rule.action.clone();
-        let path = http1_redact(req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/"));
+        let path = http1_redact(
+            req.uri()
+                .path_and_query()
+                .map(|p| p.as_str())
+                .unwrap_or("/"),
+        );
         let body = req.into_body();
         if grpc {
             send_grpc_reject(responder)?;
@@ -421,11 +492,20 @@ async fn handle_stream(
 
     let mut rh = RequestHead {
         method: req.method().to_string(),
-        path: req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string(),
+        path: req
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or("/")
+            .to_string(),
         headers: req
             .headers()
             .iter()
-            .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().to_string(), v.to_string())))
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|v| (k.as_str().to_string(), v.to_string()))
+            })
             .collect(),
         keep_alive: true,
         body: BodyKind::None,
@@ -434,20 +514,30 @@ async fn handle_stream(
         super::http1::set_header(&mut rh.headers, &r.header_field, &r.replacement);
     }
     let loon_hits = state.engine.loon_rules_for(&url);
-    let plan = super::plan_loon_request(
-        &loon_hits,
-        host,
-        upstream_handle.target(),
-        &mut rh,
-    );
+    let mut plan = super::plan_loon_request(&loon_hits, host, upstream_handle.target(), &mut rh);
+    // Surge [Header Rewrite] 默认语义是响应头；请求侧 set_header 已执行，
+    // 这里再把同一条规则追加到响应侧，保持现有模块靠它改请求头的兼容行为。
+    for r in hits.iter().filter(|r| r.action == RewriteAction::Header) {
+        plan.response_headers.push(HeaderOp::Replace {
+            name: r.header_field.clone(),
+            value: r.replacement.clone(),
+        });
+    }
     let script_url = format!("https://{}{}", plan.host, rh.path);
-    let request_scripts = state.engine.scripts.has_phase(&script_url, ScriptPhase::Request);
+    let request_scripts = state
+        .engine
+        .scripts
+        .has_phase(&script_url, ScriptPhase::Request);
     let script_needs_body = request_scripts && state.engine.scripts.needs_request_body(&script_url);
     trace.reqs.fetch_add(1, Ordering::Relaxed);
     ctx.stats.mitm_reqs.fetch_add(1, Ordering::Relaxed);
+    super::host_stats::record(host, super::host_stats::Metric::Request);
     // 响应阶段的规则/脚本同样算命中：B 站首页这类改写全在响应体阶段，
     // 只看请求阶段会把「改写成功」误报成「无规则」，诊断口径必须两阶段一起算。
-    let response_scripts = state.engine.scripts.has_phase(&script_url, ScriptPhase::Response);
+    let response_scripts = state
+        .engine
+        .scripts
+        .has_phase(&script_url, ScriptPhase::Response);
     let matched = !hits.is_empty()
         || !loon_hits.is_empty()
         || request_scripts
@@ -459,6 +549,7 @@ async fn handle_stream(
     if !matched {
         trace.no_rule.fetch_add(1, Ordering::Relaxed);
         ctx.stats.mitm_no_rule.fetch_add(1, Ordering::Relaxed);
+        super::host_stats::record(host, super::host_stats::Metric::NoRule);
         if !trace.noted.swap(true, Ordering::Relaxed) {
             logging::info(
                 "mitm",
@@ -472,11 +563,21 @@ async fn handle_stream(
         }
     }
     if let Some(term) = &plan.terminal {
-        send_terminal(responder, term, &plan.response_headers)?;
+        send_terminal(
+            responder,
+            term,
+            &plan.response_headers,
+            &state.engine.mock_base_dir,
+        )?;
         ctx.stats.mitm_rejected.fetch_add(1, Ordering::Relaxed);
         logging::info(
             "mitm",
-            format!("#{} MITM {} {} -> h2 Loon 本地响应", conn_id, host, http1_redact(&path_for_log)),
+            format!(
+                "#{} MITM {} {} -> h2 Loon 本地响应",
+                conn_id,
+                host,
+                http1_redact(&path_for_log)
+            ),
         );
         let body = req.into_body();
         tokio::spawn(async move {
@@ -488,12 +589,23 @@ async fn handle_stream(
     // 复制请求头，剔除 HTTP/2 禁止的连接级头；Surge/Loon 头部规则已写入 rh.headers。
     let mut headers = HeaderMap::new();
     for (name, value) in &rh.headers {
-        let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else { continue };
-        let Ok(value) = HeaderValue::from_str(value) else { continue };
+        let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(value) = HeaderValue::from_str(value) else {
+            continue;
+        };
         headers.insert(name, value);
     }
     headers.remove(http::header::HOST);
-    for name in ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "expect"] {
+    for name in [
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "transfer-encoding",
+        "upgrade",
+        "expect",
+    ] {
         headers.remove(name);
     }
     sanitize_te(&mut headers);
@@ -507,9 +619,8 @@ async fn handle_stream(
         })
         .unwrap_or(false);
     // 压缩请求体不猜测语义：没有 mock 时保留原样，跳过正文改写。
-    let wants_body_work = plan.request_mock.is_some()
-        || !plan.request_body_ops.is_empty()
-        || script_needs_body;
+    let wants_body_work =
+        plan.request_mock.is_some() || !plan.request_body_ops.is_empty() || script_needs_body;
     let pre_body = if wants_body_work && !(encoded_request && plan.request_mock.is_none()) {
         let limit = state.engine.body_limit;
         let original = if end {
@@ -518,7 +629,10 @@ async fn handle_stream(
             match read_h2_body_limited(&mut request_body, limit).await {
                 Ok(v) => v,
                 Err(e) => {
-                    logging::warn("mitm", format!("#{} {} h2 请求体改写失败: {}", conn_id, host, e));
+                    logging::warn(
+                        "mitm",
+                        format!("#{} {} h2 请求体改写失败: {}", conn_id, host, e),
+                    );
                     send_status(responder, 413)?;
                     return Ok(());
                 }
@@ -532,8 +646,7 @@ async fn handle_stream(
             (mock.body.clone(), true)
         } else {
             let refs: Vec<&BodyOp> = plan.request_body_ops.iter().collect();
-            loon::apply_body_ops(&original, &refs, limit)
-                .unwrap_or((original, false))
+            loon::apply_body_ops(&original, &refs, limit).unwrap_or((original, false))
         };
         if changed {
             headers.remove(http::header::CONTENT_ENCODING);
@@ -546,7 +659,13 @@ async fn handle_stream(
         Some(body)
     } else {
         if encoded_request && !plan.request_body_ops.is_empty() {
-            logging::info("mitm", format!("#{} {} h2 请求体带压缩编码，跳过 Loon 请求体改写", conn_id, host));
+            logging::info(
+                "mitm",
+                format!(
+                    "#{} {} h2 请求体带压缩编码，跳过 Loon 请求体改写",
+                    conn_id, host
+                ),
+            );
         }
         None
     };
@@ -555,51 +674,87 @@ async fn handle_stream(
         if script_needs_body && pre_body.is_none() {
             logging::info(
                 "mitm",
-                format!("#{} {} h2 脚本需要正文但正文超限/带编码，跳过请求脚本", conn_id, host),
+                format!(
+                    "#{} {} h2 脚本需要正文但正文超限/带编码，跳过请求脚本",
+                    conn_id, host
+                ),
             );
         } else {
             let body_now = pre_body.as_deref().unwrap_or(&[]);
             let msg_in = super::request_script_message(&script_url, &rh, body_now);
-            let batch = state.run_scripts(ScriptPhase::Request, &script_url, &msg_in).await;
+            let batch = state
+                .run_scripts(ScriptPhase::Request, &script_url, &msg_in)
+                .await;
             if !batch.errors.is_empty() {
                 logging::warn(
                     "mitm",
-                    format!("#{} h2 请求脚本 {} 条，问题: {}", conn_id, batch.matched, batch.errors.join("; ")),
+                    format!(
+                        "#{} h2 请求脚本 {} 条，问题: {}",
+                        conn_id,
+                        batch.matched,
+                        batch.errors.join("; ")
+                    ),
                 );
             }
             if batch.short_circuit {
                 send_script_h2(responder, &batch.message, is_head).await?;
                 ctx.stats.mitm_rewritten.fetch_add(1, Ordering::Relaxed);
+                super::host_stats::record(host, super::host_stats::Metric::Rewritten);
                 logging::info(
                     "mitm",
-                    format!("#{} MITM {} {} -> h2 脚本本地响应 {}", conn_id, host, http1_redact(&path_for_log), batch.message.status),
+                    format!(
+                        "#{} MITM {} {} -> h2 脚本本地响应 {}",
+                        conn_id,
+                        host,
+                        http1_redact(&path_for_log),
+                        batch.message.status
+                    ),
                 );
                 tokio::spawn(async move {
-                    let _ = tokio::time::timeout(Duration::from_secs(10), drain(request_body)).await;
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(10), drain(request_body)).await;
                 });
                 return Ok(());
             }
             let mut rh_try = rh.clone();
-            match super::apply_request_script(&mut rh_try, &batch.message, &plan.host, &script_url) {
+            match super::apply_request_script(&mut rh_try, &batch.message, &plan.host, &script_url)
+            {
                 Ok(changed) => {
                     rh = rh_try;
                     if changed {
                         pre_body = Some(batch.message.body_bytes().to_vec());
                         headers.clear();
                         for (name, value) in &rh.headers {
-                            let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else { continue };
-                            let Ok(value) = HeaderValue::from_str(value) else { continue };
+                            let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+                                continue;
+                            };
+                            let Ok(value) = HeaderValue::from_str(value) else {
+                                continue;
+                            };
                             headers.insert(name, value);
                         }
                         headers.remove(http::header::HOST);
-                        for name in ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade", "expect"] {
+                        for name in [
+                            "connection",
+                            "keep-alive",
+                            "proxy-connection",
+                            "transfer-encoding",
+                            "upgrade",
+                            "expect",
+                        ] {
                             headers.remove(name);
                         }
                         sanitize_te(&mut headers);
                         ctx.stats.mitm_rewritten.fetch_add(1, Ordering::Relaxed);
+                        super::host_stats::record(host, super::host_stats::Metric::Rewritten);
                         logging::info(
                             "mitm",
-                            format!("#{} MITM {} {} -> 请求脚本已修改", conn_id, host, http1_redact(&path_for_log)),
+                            format!(
+                                "#{} MITM {} {} -> 请求脚本已修改",
+                                conn_id,
+                                host,
+                                http1_redact(&path_for_log)
+                            ),
                         );
                     }
                 }
@@ -634,12 +789,16 @@ async fn handle_stream(
         .body(())
         .map_err(|e| format!("h2 上游请求构造失败: {}", e))?;
 
-    let effective_handle = if plan.host != host || plan.target.port != upstream_handle.target().port {
-        Arc::new(UpstreamHandle::new(plan.target.clone(), upstream_handle.action().clone()))
+    let effective_handle = if plan.host != host || plan.target.port != upstream_handle.target().port
+    {
+        Arc::new(UpstreamHandle::new(
+            plan.target.clone(),
+            upstream_handle.action().clone(),
+        ))
     } else {
         upstream_handle.clone()
     };
-    let (mut upstream, mut upstream_generation) =
+    let (upstream_lease, mut upstream_generation) =
         match effective_handle.get(&plan.host, ctx, state, conn_id).await {
             Ok(v) => v,
             Err(e) => {
@@ -657,22 +816,29 @@ async fn handle_stream(
         };
 
     let retry_req = out_req.clone();
-    let (response_future, mut upstream_body) = match upstream.send_request(out_req, wire_end) {
-        Ok(v) => v,
-        Err(e) => {
-            logging::warn(
-                "mitm",
-                format!("#{} {} h2 上游请求失败，重连后重试: {}", conn_id, host, e),
-            );
-            effective_handle.invalidate(upstream_generation).await;
-            let (mut retry_upstream, retry_generation) =
-                effective_handle.get(&plan.host, ctx, state, conn_id).await?;
-            upstream_generation = retry_generation;
-            retry_upstream
-                .send_request(retry_req, wire_end)
-                .map_err(|e2| format!("h2 上游请求重试失败: {}", e2))?
-        }
-    };
+    let (response_future, mut upstream_body) =
+        match upstream_lease.send().send_request(out_req, wire_end) {
+            Ok(v) => v,
+            Err(e) => {
+                logging::warn(
+                    "mitm",
+                    format!("#{} {} h2 上游请求失败，重连后重试: {}", conn_id, host, e),
+                );
+                state.pool.evict_h2(&upstream_lease.entry);
+                effective_handle.invalidate(upstream_generation).await;
+                drop(upstream_lease);
+                let (retry_lease, retry_generation) = effective_handle
+                    .get(&plan.host, ctx, state, conn_id)
+                    .await?;
+                upstream_generation = retry_generation;
+                let result = retry_lease
+                    .send()
+                    .send_request(retry_req, wire_end)
+                    .map_err(|e2| format!("h2 上游请求重试失败: {}", e2))?;
+                let _retry_lease = retry_lease;
+                result
+            }
+        };
 
     // 请求上传与上游响应必须并发：半双工客户端/双向 gRPC 可能先发一条消息，
     // 等服务端回话后才继续发送；若先等上传结束再读响应，两边会互相等待。
@@ -688,7 +854,10 @@ async fn handle_stream(
     } else if end {
         None
     } else {
-        Some(tokio::spawn(forward_request_body(request_body, upstream_body)))
+        Some(tokio::spawn(forward_request_body(
+            request_body,
+            upstream_body,
+        )))
     };
     let mut upload_done = end || pre_body.is_some();
     let response = {
@@ -791,18 +960,12 @@ async fn forward_request_body(
             .release_capacity(len)
             .map_err(|e| ForwardBodyError::Fatal(format!("h2 请求体流控失败: {}", e)))?;
     }
-    if let Some(trailers) = body
-        .trailers()
-        .await
-        .map_err(forward_body_read_error)?
-    {
-        send.send_trailers(trailers).map_err(|e| {
-            ForwardBodyError::Fatal(format!("h2 请求 trailers 发送失败: {}", e))
-        })?;
+    if let Some(trailers) = body.trailers().await.map_err(forward_body_read_error)? {
+        send.send_trailers(trailers)
+            .map_err(|e| ForwardBodyError::Fatal(format!("h2 请求 trailers 发送失败: {}", e)))?;
     } else {
-        send.send_data(Bytes::new(), true).map_err(|e| {
-            ForwardBodyError::Fatal(format!("h2 请求体结束失败: {}", e))
-        })?;
+        send.send_data(Bytes::new(), true)
+            .map_err(|e| ForwardBodyError::Fatal(format!("h2 请求体结束失败: {}", e)))?;
     }
     Ok(())
 }
@@ -825,13 +988,21 @@ async fn copy_response(
         let mut hv: Vec<(String, String)> = parts
             .headers
             .iter()
-            .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().to_string(), v.to_string())))
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|v| (k.as_str().to_string(), v.to_string()))
+            })
             .collect();
         loon::apply_header_ops(&mut hv, &response_header_ops.iter().collect::<Vec<_>>());
         let mut hm = HeaderMap::new();
         for (k, v) in hv {
-            let Ok(n) = HeaderName::from_bytes(k.as_bytes()) else { continue };
-            let Ok(v) = HeaderValue::from_str(&v) else { continue };
+            let Ok(n) = HeaderName::from_bytes(k.as_bytes()) else {
+                continue;
+            };
+            let Ok(v) = HeaderValue::from_str(&v) else {
+                continue;
+            };
             hm.append(n, v);
         }
         parts.headers = hm;
@@ -845,12 +1016,12 @@ async fn copy_response(
         .unwrap_or("")
         .trim()
         .to_string();
-    let content_length = header_str(&parts.headers, "content-length")
-        .and_then(|v| v.trim().parse::<usize>().ok());
+    let content_length =
+        header_str(&parts.headers, "content-length").and_then(|v| v.trim().parse::<usize>().ok());
     // gRPC 正文是二进制帧，不能按文本 Content-Type 判断；gRPC-Web 是另一套
     // 分帧/编码，先排除，避免误把 base64 或 web 帧当 protobuf。
-    let grpc_body = ctype.starts_with("application/grpc")
-        && !ctype.starts_with("application/grpc-web");
+    let grpc_body =
+        ctype.starts_with("application/grpc") && !ctype.starts_with("application/grpc-web");
     let streaming = !grpc_body
         && (ctype.contains("text/event-stream")
             || ctype.starts_with("multipart/")
@@ -863,18 +1034,54 @@ async fn copy_response(
                 .any(|t| ctype.contains(t)));
     // gRPC 只接受 Surge 的 protobuf 字段改写；Loon 的文本/JSON 动作不碰二进制帧。
     let script_url = format!("https://{}{}", host, path);
-    let binary_response_scripts =
-        state.engine.scripts.has_binary_phase(&script_url, ScriptPhase::Response);
+    let binary_response_scripts = state
+        .engine
+        .scripts
+        .has_binary_phase(&script_url, ScriptPhase::Response);
     let response_scripts = (binary_response_scripts || !grpc_body)
-        && state.engine.scripts.has_phase(&script_url, ScriptPhase::Response);
-    let has_body_ops = !body_rules.is_empty()
-        || (!grpc_body && !response_body_ops.is_empty())
-        || response_scripts;
-    let can_rewrite = has_body_ops
+        && state
+            .engine
+            .scripts
+            .has_phase(&script_url, ScriptPhase::Response);
+    let has_body_ops =
+        !body_rules.is_empty() || (!grpc_body && !response_body_ops.is_empty()) || response_scripts;
+    let would_rewrite = has_body_ops
         && !is_head
         && (parts.status == http::StatusCode::OK || response_scripts)
-        && (grpc_body || text_like)
-        && content_length.map(|n| n <= limit).unwrap_or(true);
+        && (grpc_body || text_like);
+    // 大响应提前直通：非文本且没有二进制脚本、或 Content-Length 超过 2 MiB。
+    let early_bypass = if would_rewrite && !grpc_body {
+        super::body_bypass_reason(text_like, binary_response_scripts, content_length, limit)
+    } else {
+        None
+    };
+    if let Some(reason) = early_bypass {
+        ctx.stats.mitm_body_bypassed.fetch_add(1, Ordering::Relaxed);
+        logging::info(
+            "mitm",
+            format!(
+                "#{} {} {} h2 正文提前直通（{}，{} 字节）",
+                conn_id,
+                host,
+                http1_redact(path),
+                match reason {
+                    super::BodyBypass::NonText => "非文本",
+                    super::BodyBypass::TooLarge => "超过 2MiB",
+                },
+                content_length
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "chunked".into())
+            ),
+        );
+        let head = response_head(parts.status, &parts.headers)?;
+        let mut send = responder.send(head, false)?;
+        stream_response_body(body, &mut send).await?;
+        return Ok(());
+    }
+    let can_rewrite = would_rewrite
+        && content_length
+            .map(|n| n <= limit.min(super::BODY_PASSTHROUGH_LIMIT))
+            .unwrap_or(true);
     // 多流同时改写会叠加「原文 + 解压 + 改写」三份缓冲区；额度不足时直接流式透传。
     let rewrite_permit = if can_rewrite {
         // gRPC 需要帧重组 + protobuf 递归，按完整三份上限预留；
@@ -916,6 +1123,7 @@ async fn copy_response(
     if overflow {
         // 已决定回退流式透传，立即释放改写额度，别让长响应占着预算。
         drop(rewrite_permit);
+        ctx.stats.mitm_body_bypassed.fetch_add(1, Ordering::Relaxed);
         let head = response_head(parts.status, &parts.headers)?;
         let mut send = responder.send(head, false)?;
         send_chunked(&mut send, Bytes::from(raw)).await?;
@@ -957,9 +1165,18 @@ async fn copy_response(
             super::rewrite::apply_body_rules_limited(&plain, body_rules, limit)
         };
         let loon_out = if response_body_ops.is_empty() {
-            Some((surge_out.as_ref().map(|(b, _)| b.clone()).unwrap_or_default(), false))
+            Some((
+                surge_out
+                    .as_ref()
+                    .map(|(b, _)| b.clone())
+                    .unwrap_or_default(),
+                false,
+            ))
         } else {
-            let base = surge_out.as_ref().map(|(b, _)| b.as_slice()).unwrap_or(&plain);
+            let base = surge_out
+                .as_ref()
+                .map(|(b, _)| b.as_slice())
+                .unwrap_or(&plain);
             loon::apply_body_ops(base, &response_body_ops.iter().collect::<Vec<_>>(), limit)
         };
         let (new_body, loon_changed) = match loon_out {
@@ -983,15 +1200,26 @@ async fn copy_response(
             status_out.as_u16(),
             &script_headers
                 .iter()
-                .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str().to_string(), v.to_string())))
+                .filter_map(|(k, v)| {
+                    v.to_str()
+                        .ok()
+                        .map(|v| (k.as_str().to_string(), v.to_string()))
+                })
                 .collect::<Vec<_>>(),
             &new_body,
         );
-        let batch = state.run_scripts(ScriptPhase::Response, &script_url, &msg_in).await;
+        let batch = state
+            .run_scripts(ScriptPhase::Response, &script_url, &msg_in)
+            .await;
         if !batch.errors.is_empty() {
             logging::warn(
                 "mitm",
-                format!("#{} h2 响应脚本 {} 条，问题: {}", conn_id, batch.matched, batch.errors.join("; ")),
+                format!(
+                    "#{} h2 响应脚本 {} 条，问题: {}",
+                    conn_id,
+                    batch.matched,
+                    batch.errors.join("; ")
+                ),
             );
         }
         if batch.matched > 0 && batch.message.body_len() <= limit {
@@ -1010,8 +1238,12 @@ async fn copy_response(
             }
             let mut hm = HeaderMap::new();
             for (k, v) in &batch.message.headers {
-                let Ok(n) = HeaderName::from_bytes(k.as_bytes()) else { continue };
-                let Ok(v) = HeaderValue::from_str(v) else { continue };
+                let Ok(n) = HeaderName::from_bytes(k.as_bytes()) else {
+                    continue;
+                };
+                let Ok(v) = HeaderValue::from_str(v) else {
+                    continue;
+                };
                 hm.append(n, v);
             }
             if hm != script_headers {
@@ -1021,7 +1253,11 @@ async fn copy_response(
         } else if batch.matched > 0 {
             logging::warn(
                 "mitm",
-                format!("#{} 响应脚本输出 {} 字节超过上限，丢弃脚本结果", conn_id, batch.message.body_len()),
+                format!(
+                    "#{} 响应脚本输出 {} 字节超过上限，丢弃脚本结果",
+                    conn_id,
+                    batch.message.body_len()
+                ),
             );
         }
     }
@@ -1053,6 +1289,7 @@ async fn copy_response(
     let mut send = responder.send(head, false)?;
     send_buffered(&mut send, Bytes::from(new_body), trailers).await?;
     ctx.stats.mitm_rewritten.fetch_add(1, Ordering::Relaxed);
+    super::host_stats::record(host, super::host_stats::Metric::Rewritten);
     logging::info(
         "mitm",
         format!(
@@ -1074,15 +1311,11 @@ async fn copy_response(
 /// 压缩响应/未知长度按 `body_limit` 的三倍预留，避免解压膨胀突破预算。
 fn rewrite_reservation(content_length: Option<usize>, encoding: &str, limit: usize) -> usize {
     let full = limit.saturating_mul(super::REWRITE_BUFFER_COPIES);
-    let identity = encoding.trim().is_empty()
-        || encoding.trim().eq_ignore_ascii_case("identity");
+    let identity = encoding.trim().is_empty() || encoding.trim().eq_ignore_ascii_case("identity");
     if identity {
         content_length
             .filter(|n| *n > 0)
-            .map(|n| {
-                n.saturating_mul(super::REWRITE_BUFFER_COPIES)
-                    .min(full)
-            })
+            .map(|n| n.saturating_mul(super::REWRITE_BUFFER_COPIES).min(full))
             .unwrap_or(full)
     } else {
         full
@@ -1093,10 +1326,7 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
-fn response_head(
-    status: http::StatusCode,
-    headers: &HeaderMap,
-) -> Result<Response<()>, String> {
+fn response_head(status: http::StatusCode, headers: &HeaderMap) -> Result<Response<()>, String> {
     let mut builder = Response::builder().status(status).version(Version::HTTP_2);
     for (name, value) in headers.iter() {
         if is_hop_by_hop(name.as_str()) {
@@ -1155,6 +1385,7 @@ fn send_terminal(
     responder: &mut Responder,
     term: &super::Terminal,
     header_ops: &[HeaderOp],
+    mock_base_dir: &str,
 ) -> Result<(), String> {
     use super::Terminal;
     if matches!(term, Terminal::Reject(super::RejectKind::Drop)) {
@@ -1168,23 +1399,35 @@ fn send_terminal(
             super::RejectKind::Status200 => (200, "", HeaderMap::new(), Vec::new()),
             super::RejectKind::TinyGif => {
                 let mut h = HeaderMap::new();
-                h.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("image/gif"));
+                h.insert(
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("image/gif"),
+                );
                 (200, "", h, super::http1::TINY_GIF.to_vec())
             }
             super::RejectKind::JsonObject => {
                 let mut h = HeaderMap::new();
-                h.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                h.insert(
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
                 (200, "", h, b"{}".to_vec())
             }
             super::RejectKind::JsonArray => {
                 let mut h = HeaderMap::new();
-                h.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                h.insert(
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
                 (200, "", h, b"[]".to_vec())
             }
         },
         Terminal::Redirect { status, url } => {
             let mut h = HeaderMap::new();
-            h.insert(http::header::LOCATION, HeaderValue::from_str(url).map_err(|e| e.to_string())?);
+            h.insert(
+                http::header::LOCATION,
+                HeaderValue::from_str(url).map_err(|e| e.to_string())?,
+            );
             (*status, "", h, Vec::new())
         }
         Terminal::Mock(spec) => {
@@ -1193,10 +1436,33 @@ fn send_terminal(
                 http::header::CONTENT_TYPE,
                 HeaderValue::from_str(&spec.content_type).map_err(|e| e.to_string())?,
             );
-            (spec.status, "", h, spec.body.clone())
+            for (name, value) in &spec.headers {
+                let Ok(n) = http::header::HeaderName::from_bytes(name.as_bytes()) else {
+                    continue;
+                };
+                let Ok(v) = HeaderValue::from_str(value) else {
+                    continue;
+                };
+                h.insert(n, v);
+            }
+            match super::read_mock_file(spec, mock_base_dir) {
+                Ok(body) => (spec.status, "", h, body),
+                Err(e) => {
+                    super::logging::warn("mitm", format!("Map Local 文件读取失败: {e}"));
+                    (
+                        404,
+                        "",
+                        h,
+                        format!("Map Local 文件不可读: {e}").into_bytes(),
+                    )
+                }
+            }
         }
     };
-    headers.insert(http::header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
     if status != 204 {
         headers.insert(
             http::header::CONTENT_LENGTH,
@@ -1206,20 +1472,34 @@ fn send_terminal(
     for op in header_ops {
         match op {
             HeaderOp::Add { name, value } => {
-                let Ok(n) = HeaderName::from_bytes(name.as_bytes()) else { continue };
-                let Ok(v) = HeaderValue::from_str(value) else { continue };
+                let Ok(n) = HeaderName::from_bytes(name.as_bytes()) else {
+                    continue;
+                };
+                let Ok(v) = HeaderValue::from_str(value) else {
+                    continue;
+                };
                 headers.append(n, v);
             }
             HeaderOp::Del { name } => {
                 headers.remove(name.as_str());
             }
             HeaderOp::Replace { name, value } => {
-                let Ok(n) = HeaderName::from_bytes(name.as_bytes()) else { continue };
-                let Ok(v) = HeaderValue::from_str(value) else { continue };
+                let Ok(n) = HeaderName::from_bytes(name.as_bytes()) else {
+                    continue;
+                };
+                let Ok(v) = HeaderValue::from_str(value) else {
+                    continue;
+                };
                 headers.insert(n, v);
             }
-            HeaderOp::ReplaceRegex { name, re, replacement } => {
-                let Ok(n) = HeaderName::from_bytes(name.as_bytes()) else { continue };
+            HeaderOp::ReplaceRegex {
+                name,
+                re,
+                replacement,
+            } => {
+                let Ok(n) = HeaderName::from_bytes(name.as_bytes()) else {
+                    continue;
+                };
                 if let Some(v) = headers.get(&n).and_then(|v| v.to_str().ok()) {
                     let new = re.replace_all(v, replacement.as_str()).into_owned();
                     if let Ok(v) = HeaderValue::from_str(&new) {
@@ -1314,13 +1594,27 @@ async fn send_script_h2(
     msg: &ScriptMessage,
     is_head: bool,
 ) -> Result<(), String> {
-    let status = if (100..=599).contains(&msg.status) { msg.status } else { 200 };
-    let body = if is_head || status == 204 { Vec::new() } else { msg.body.as_bytes().to_vec() };
+    let status = if (100..=599).contains(&msg.status) {
+        msg.status
+    } else {
+        200
+    };
+    let body = if is_head || status == 204 {
+        Vec::new()
+    } else {
+        msg.body.as_bytes().to_vec()
+    };
     let mut builder = Response::builder().status(status).version(Version::HTTP_2);
     for (name, value) in &msg.headers {
-        let Ok(n) = HeaderName::from_bytes(name.as_bytes()) else { continue };
-        if is_hop_by_hop(n.as_str()) { continue; }
-        let Ok(v) = HeaderValue::from_str(value) else { continue };
+        let Ok(n) = HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        if is_hop_by_hop(n.as_str()) {
+            continue;
+        }
+        let Ok(v) = HeaderValue::from_str(value) else {
+            continue;
+        };
         builder = builder.header(n, v);
     }
     builder = builder.header("cache-control", "no-store");

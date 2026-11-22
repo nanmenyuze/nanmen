@@ -33,12 +33,8 @@ pub fn rewrite_grpc_body(
             return None;
         }
         let flags = body[pos];
-        let len = u32::from_be_bytes([
-            body[pos + 1],
-            body[pos + 2],
-            body[pos + 3],
-            body[pos + 4],
-        ]) as usize;
+        let len = u32::from_be_bytes([body[pos + 1], body[pos + 2], body[pos + 3], body[pos + 4]])
+            as usize;
         pos += 5;
         if len > body.len() - pos {
             return None;

@@ -10,6 +10,9 @@ fn system_cert_name_is_stable() {
     let ca_path = dir.join("ca.pem");
     let _ca = MitmCa::load_or_generate(ca_path.to_str().unwrap()).unwrap();
     let name = system_cert_name(ca_path.to_str().unwrap()).unwrap();
-    assert_eq!(name, "d756baa7.0", "CA subject_hash_old 变化，需同步更新系统信任模块");
+    assert_eq!(
+        name, "d756baa7.0",
+        "CA subject_hash_old 变化，需同步更新系统信任模块"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

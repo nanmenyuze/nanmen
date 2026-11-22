@@ -1,0 +1,11 @@
+#!name=南门DNS Remote 合成模块
+#!desc=远程模块拉取 compat fixture：合法文本模块、可被缓存并解析
+#!author=南门DNS
+#!category=测试
+#!date=2026-11-23
+
+[Rule]
+DOMAIN-SUFFIX,remote-ad.example,REJECT
+
+[MITM]
+hostname = remote-api.example.com

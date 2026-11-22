@@ -9,15 +9,19 @@
 pub mod ca;
 pub mod grpc;
 pub mod h2;
+pub mod host_stats;
 pub mod http1;
+pub mod jq;
 pub mod loon;
+pub mod pool;
 pub mod rewrite;
+pub mod ws;
 
-pub use rewrite::{MitmConfig, MitmEngine, MitmRuleConf, RewriteAction, RewriteRule};
 pub use crate::script::{
     ScriptBatchResult, ScriptMessage, ScriptPhase, ScriptPoolHealth, ScriptWorkerPool,
 };
 pub use loon::{LoonAction, LoonPhase, LoonRule};
+pub use rewrite::{MitmConfig, MitmEngine, MitmRuleConf, RewriteAction, RewriteRule};
 
 use crate::config::Target;
 use crate::engine::Action;
@@ -40,6 +44,34 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 /// 其余流在额度不足时直接原样流式转发，避免多流叠加把 PSS 推高。
 pub const REWRITE_BUFFER_COPIES: usize = 3;
 pub const MAX_CONCURRENT_REWRITE_STREAMS: usize = 2;
+/// 正文直通硬上限：超过 2 MiB 的响应绝不进改写缓冲，哪怕 body_limit 配得更大。
+pub const BODY_PASSTHROUGH_LIMIT: usize = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyBypass {
+    NonText,
+    TooLarge,
+}
+
+/// 大响应提前直通判定（纯函数，便于单测）。
+/// 只有本来会命中正文规则时才调用；`binary_response_scripts` 存在时允许二进制
+/// 正文进入脚本路径，否则 video/audio/octet-stream 等直接透传。
+pub fn body_bypass_reason(
+    text_like: bool,
+    binary_response_scripts: bool,
+    content_length: Option<usize>,
+    body_limit: usize,
+) -> Option<BodyBypass> {
+    if let Some(n) = content_length {
+        if n > BODY_PASSTHROUGH_LIMIT.min(body_limit) {
+            return Some(BodyBypass::TooLarge);
+        }
+    }
+    if !text_like && !binary_response_scripts {
+        return Some(BodyBypass::NonText);
+    }
+    None
+}
 
 /// 单条 MITM 连接的观测计数：请求数 / 无规则命中数 / 是否已记录过首条无规则请求。
 /// h2 与 h1 共用同一份，连接结束时汇总一条日志，避免逐请求刷屏。
@@ -73,12 +105,10 @@ impl RewriteBudget {
             if next > self.total {
                 return None;
             }
-            match self.used.compare_exchange_weak(
-                used,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .used
+                .compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => {
                     return Some(RewritePermit {
                         budget: self.clone(),
@@ -108,12 +138,20 @@ pub struct MitmState {
     pub rewrite_budget: Arc<RewriteBudget>,
     /// 限制并发脚本数：拿不到许可直接跳过脚本，不让隧道排队。
     pub script_slots: Arc<tokio::sync::Semaphore>,
+    /// WebSocket 帧改写独立并发闸，不与 h2 短正文改写共享预算。
+    pub ws_slots: Arc<tokio::sync::Semaphore>,
     /// 专用脚本工作线程池；每个线程独立持有 QuickJS Runtime。
     pub script_pool: Arc<ScriptWorkerPool>,
+    /// 上游连接池：灰度开关关闭时所有 acquire 都 miss，不改变原路径。
+    pub pool: Arc<pool::MitmPool>,
 }
 
 impl MitmState {
     pub fn build(cfg: &MitmConfig) -> Self {
+        Self::build_with_stats(cfg, None)
+    }
+
+    pub fn build_with_stats(cfg: &MitmConfig, stats: Option<Arc<crate::stats::Stats>>) -> Self {
         let engine = Arc::new(MitmEngine::from_config(cfg));
         let ca = if cfg.enabled && !cfg.ca_file.trim().is_empty() && !engine.hosts.is_empty() {
             match MitmCa::load_or_generate(&cfg.ca_file) {
@@ -121,15 +159,20 @@ impl MitmState {
                     logging::info(
                         "mitm",
                         format!(
-                            "MITM 就绪：{} 个域名模式，{} 条 Surge 改写规则，{} 条 Loon 重写（Loon 不支持 {} 条，跳过 {} 条非法规则）",
+                            "MITM 就绪：{} 个域名模式，{} 条 Surge 改写规则，{} 条 Loon 重写（Loon 不支持 {} 条，脚本不支持 {} 条，跳过 {} 条非法规则）",
                             cfg.hostnames.len(),
                             engine.rules.len(),
                             engine.loon_rules.len(),
                             engine.loon_unsupported.len(),
+                            engine.scripts.unsupported.len(),
                             engine.skipped_rules
                         ),
                     );
-                    Some(Arc::new(c))
+                    let c = Arc::new(c);
+                    if let Some(st) = stats.clone() {
+                        c.set_stats(st);
+                    }
+                    Some(c)
                 }
                 Err(e) => {
                     logging::warn("mitm", format!("CA 加载/生成失败，MITM 不生效: {}", e));
@@ -150,12 +193,48 @@ impl MitmState {
             ca,
             rewrite_budget,
             script_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            ws_slots: Arc::new(tokio::sync::Semaphore::new(8)),
             script_pool: Arc::new(ScriptWorkerPool::new(4)),
+            pool: Arc::new(pool::MitmPool::new(
+                cfg.pool_enabled,
+                cfg.pool_idle_secs,
+                stats,
+            )),
         }
     }
 
     pub fn active(&self) -> bool {
         self.engine.enabled && self.ca.is_some()
+    }
+
+    /// 定时/事件触发脚本：只执行指定规则，不走 URL `hits`，避免把其它
+    /// `.*` 脚本在同一时刻重复跑一遍。阻塞调用，调度器放在 spawn_blocking 中。
+    pub fn run_trigger_rule(&self, rule: &crate::script::CompiledScriptRule) -> Vec<String> {
+        let mut msg = crate::script::ScriptMessage::default();
+        msg.url = format!("cron://{}", rule.name);
+        msg.method = "CRON".to_string();
+        let opts = crate::script::ScriptOptions {
+            timeout_ms: rule.timeout_ms,
+            allow_private_network: false,
+            arguments: rule.arguments.clone(),
+            argument_types: rule.argument_types.clone(),
+            argument_values: self.engine.scripts.effective_argument_values(rule),
+            argument_text: rule.argument_text.clone(),
+            store: Some(self.engine.scripts.store.clone()),
+            script_name: rule.name.clone(),
+            binary_body_mode: rule.binary_body_mode,
+            environment: self.engine.environment.clone(),
+            notification_file: self.engine.notification_file.clone(),
+        };
+        let out = self.script_pool.run(&rule.source, rule.phase, &msg, &opts);
+        let mut errors = Vec::new();
+        if let Some(e) = out.error {
+            errors.push(format!("{}: {}", rule.name, e));
+        }
+        for n in out.notifications {
+            logging::info("cron", format!("{}: {}", rule.name, n));
+        }
+        errors
     }
 
     pub fn script_health(&self) -> ScriptPoolHealth {
@@ -183,9 +262,22 @@ impl MitmState {
         url: &str,
         message: &ScriptMessage,
     ) -> ScriptBatchResult {
-        let hits: Vec<_> = self.engine.scripts.hits(url, phase).into_iter().cloned().collect();
+        let hits: Vec<_> = self
+            .engine
+            .scripts
+            .hits_with_message(url, phase, message)
+            .into_iter()
+            .cloned()
+            .map(|mut r| {
+                r.argument_values = self.engine.scripts.effective_argument_values(&r);
+                r
+            })
+            .collect();
         if hits.is_empty() {
-            return ScriptBatchResult { message: message.clone(), ..Default::default() };
+            return ScriptBatchResult {
+                message: message.clone(),
+                ..Default::default()
+            };
         }
         let Ok(_permit) = self.script_slots.clone().try_acquire_owned() else {
             self.script_pool.note_skipped();
@@ -199,9 +291,14 @@ impl MitmState {
         let base = message.clone();
         let body_limit = self.engine.body_limit;
         let store = self.engine.scripts.store.clone();
+        let environment = self.engine.environment.clone();
+        let notification_file = self.engine.notification_file.clone();
         let pool = self.script_pool.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let mut out = ScriptBatchResult { message: base.clone(), ..Default::default() };
+            let mut out = ScriptBatchResult {
+                message: base.clone(),
+                ..Default::default()
+            };
             let mut current = base;
             for (idx, rule) in hits.iter().enumerate() {
                 out.matched += 1;
@@ -210,16 +307,21 @@ impl MitmState {
                     allow_private_network: false,
                     arguments: rule.arguments.clone(),
                     argument_types: rule.argument_types.clone(),
+                    argument_values: rule.argument_values.clone(),
                     argument_text: rule.argument_text.clone(),
                     store: Some(store.clone()),
                     script_name: rule.name.clone(),
                     binary_body_mode: rule.binary_body_mode,
+                    environment: environment.clone(),
+                    notification_file: notification_file.clone(),
                 };
                 let r = pool.run(&rule.source, phase, &current, &opts);
                 out.done_calls += r.done_calls;
                 out.http_calls += r.http_calls;
                 out.logs.extend(r.logs.iter().cloned());
                 out.notifications.extend(r.notifications.iter().cloned());
+                out.notification_items
+                    .extend(r.notification_items.iter().cloned());
                 out.timed_out |= r.timed_out;
                 if let Some(e) = &r.error {
                     out.errors.push(format!("{}: {}", rule.name, e));
@@ -229,7 +331,8 @@ impl MitmState {
                     continue;
                 }
                 if r.message.body_len() > rule.max_size.min(body_limit) {
-                    out.errors.push(format!("{}: 输出正文超过上限，已丢弃该脚本结果", rule.name));
+                    out.errors
+                        .push(format!("{}: 输出正文超过上限，已丢弃该脚本结果", rule.name));
                     continue;
                 }
                 current = r.message;
@@ -324,7 +427,9 @@ fn plan_loon_request(
         }
         match &rule.action {
             LoonAction::UrlReplace(template) => {
-                let Some(caps) = rule.url.captures(&url_now) else { continue };
+                let Some(caps) = rule.url.captures(&url_now) else {
+                    continue;
+                };
                 let new_url = loon::expand_url_template(template, &caps);
                 if let Some((new_host, new_path, new_port)) = parse_rewrite_url(&new_url) {
                     req.path = new_path;
@@ -344,7 +449,10 @@ fn plan_loon_request(
                 url_now = format!("https://{}{}", host_now, req.path);
             }
             LoonAction::Redirect { status, url } => {
-                plan.terminal = Some(Terminal::Redirect { status: *status, url: url.clone() });
+                plan.terminal = Some(Terminal::Redirect {
+                    status: *status,
+                    url: url.clone(),
+                });
                 break;
             }
             LoonAction::Reject(kind) => {
@@ -409,7 +517,10 @@ fn apply_request_script(
     let mut changed = false;
     if !msg.method.trim().is_empty() && msg.method != req.method {
         let m = msg.method.trim();
-        if !m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        if !m
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
             return Err(format!("脚本返回非法 method: {m}"));
         }
         req.method = m.to_string();
@@ -454,7 +565,11 @@ fn apply_request_script(
     if !is_no_body {
         http1::remove_header(&mut req.headers, "content-encoding");
         http1::remove_header(&mut req.headers, "transfer-encoding");
-        http1::set_header(&mut req.headers, "Content-Length", &desired.len().to_string());
+        http1::set_header(
+            &mut req.headers,
+            "Content-Length",
+            &desired.len().to_string(),
+        );
         req.body = if desired.is_empty() {
             http1::BodyKind::Length(0)
         } else {
@@ -504,7 +619,11 @@ where
     headers.push(("Content-Length".into(), msg.body_len().to_string()));
     headers.push((
         "Connection".into(),
-        if keep_alive { "keep-alive".into() } else { "close".into() },
+        if keep_alive {
+            "keep-alive".into()
+        } else {
+            "close".into()
+        },
     ));
     cio.stream
         .write_all(&http1::serialize_response(
@@ -516,10 +635,28 @@ where
         .await
 }
 
+fn read_mock_file(spec: &loon::MockSpec, base_dir: &str) -> Result<Vec<u8>, String> {
+    let Some(path) = spec.data_path.as_deref() else {
+        return Ok(spec.body.clone());
+    };
+    let p = std::path::Path::new(path);
+    let full = if p.is_absolute() || base_dir.trim().is_empty() {
+        p.to_path_buf()
+    } else {
+        std::path::Path::new(base_dir).join(p)
+    };
+    let meta = std::fs::metadata(&full).map_err(|e| format!("{}: {e}", full.display()))?;
+    if meta.len() > 4 * 1024 * 1024 {
+        return Err(format!("{}: 文件超过 4 MiB", full.display()));
+    }
+    std::fs::read(&full).map_err(|e| format!("{}: {e}", full.display()))
+}
+
 fn terminal_response(
     term: &Terminal,
     header_ops: &[HeaderOp],
     keep_alive: bool,
+    mock_base_dir: &str,
 ) -> (u16, String, Headers, Vec<u8>) {
     let conn = if keep_alive { "keep-alive" } else { "close" };
     let mut headers: Headers = vec![
@@ -536,17 +673,41 @@ fn terminal_response(
         },
         Terminal::Redirect { status, url } => {
             headers.push(("Location".into(), url.clone()));
-            (*status, if *status == 307 { "Temporary Redirect" } else { "Found" }, Vec::new())
+            (
+                *status,
+                if *status == 307 {
+                    "Temporary Redirect"
+                } else {
+                    "Found"
+                },
+                Vec::new(),
+            )
         }
         Terminal::Mock(spec) => {
             headers.push(("Content-Type".into(), spec.content_type.clone()));
-            (spec.status, "OK", spec.body.clone())
+            for (name, value) in &spec.headers {
+                http1::set_header(&mut headers, name, value);
+            }
+            match read_mock_file(spec, mock_base_dir) {
+                Ok(body) => (spec.status, "OK", body),
+                Err(e) => {
+                    logging::warn("mitm", format!("Map Local 文件读取失败: {e}"));
+                    (
+                        404,
+                        "Not Found",
+                        format!("Map Local 文件不可读: {e}").into_bytes(),
+                    )
+                }
+            }
         }
     };
     if matches!(term, Terminal::Reject(RejectKind::TinyGif)) {
         headers.push(("Content-Type".into(), "image/gif".into()));
     }
-    if matches!(term, Terminal::Reject(RejectKind::JsonObject | RejectKind::JsonArray)) {
+    if matches!(
+        term,
+        Terminal::Reject(RejectKind::JsonObject | RejectKind::JsonArray)
+    ) {
         headers.push(("Content-Type".into(), "application/json".into()));
     }
     loon::apply_header_ops(&mut headers, &header_ops.iter().collect::<Vec<_>>());
@@ -600,18 +761,26 @@ where
         .map(|v| v.eq_ignore_ascii_case("100-continue"))
         .unwrap_or(false);
     if expect {
-        cio.stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+        cio.stream
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await?;
         cio.stream.flush().await?;
         http1::remove_header(&mut req.headers, "expect");
     }
     // 压缩请求体不猜测语义：保留原样，跳过正文改写。
-    let enc = http1::get_header(&req.headers, "content-encoding").unwrap_or("").trim().to_ascii_lowercase();
+    let enc = http1::get_header(&req.headers, "content-encoding")
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     let encoded = !enc.is_empty() && enc != "identity";
     let original_kind = req.body;
     let original = match original_kind {
         http1::BodyKind::None => Vec::new(),
         http1::BodyKind::Length(n) if n > limit as u64 || encoded => {
-            logging::info("mitm", format!("请求体 {} 字节超过上限或带编码，跳过 Loon 请求体改写", n));
+            logging::info(
+                "mitm",
+                format!("请求体 {} 字节超过上限或带编码，跳过 Loon 请求体改写", n),
+            );
             return Ok(None);
         }
         _ => http1::read_body_limited(cio, original_kind, limit).await?,
@@ -699,7 +868,7 @@ pub async fn handle<S>(
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let Some(ca) = state.ca.clone() else { return };
-    let server_cfg = match ca.server_config(&host) {
+    let server_cfg = match ca.server_config_async(&host).await {
         Ok(c) => c,
         Err(e) => {
             logging::warn("mitm", format!("#{} {} 签证失败: {}", conn_id, host, e));
@@ -716,17 +885,25 @@ pub async fn handle<S>(
             let msg = e.to_string();
             if is_client_tls_abort(&msg) {
                 ctx.stats.mitm_tls_aborted.fetch_add(1, Ordering::Relaxed);
+                host_stats::record(&host, host_stats::Metric::Canceled);
                 logging::info(
                     "mitm",
-                    format!("#{} {} 客户端 TLS 握手中途断开（连接池弃连），按回收处理", conn_id, host),
+                    format!(
+                        "#{} {} 客户端 TLS 握手中途断开（连接池弃连），按回收处理",
+                        conn_id, host
+                    ),
                 );
                 return;
             }
             state.engine.mark_bypass(&host);
             ctx.stats.mitm_failed.fetch_add(1, Ordering::Relaxed);
+            host_stats::record(&host, host_stats::Metric::Failed);
             logging::warn(
                 "mitm",
-                format!("#{} {} 本地 TLS 握手失败（可能证书绑定），临时放行: {}", conn_id, host, e),
+                format!(
+                    "#{} {} 本地 TLS 握手失败（可能证书绑定），临时放行: {}",
+                    conn_id, host, e
+                ),
             );
             return;
         }
@@ -734,11 +911,16 @@ pub async fn handle<S>(
             // 完成 TCP 但迟迟不做 TLS：同样多为预热/备用连接。真正的证书绑定会
             // 明确回 alert，不会静默挂死，所以超时也不拉黑域名。
             ctx.stats.mitm_tls_aborted.fetch_add(1, Ordering::Relaxed);
-            logging::info("mitm", format!("#{} {} TLS 握手未开始，空闲连接回收", conn_id, host));
+            host_stats::record(&host, host_stats::Metric::Canceled);
+            logging::info(
+                "mitm",
+                format!("#{} {} TLS 握手未开始，空闲连接回收", conn_id, host),
+            );
             return;
         }
     };
     ctx.stats.mitm_conns.fetch_add(1, Ordering::Relaxed);
+    host_stats::record(&host, host_stats::Metric::Conn);
     let t0 = Instant::now();
     let trace = Arc::new(ConnTrace::default());
     // ALPN 协商到 h2 时走 HTTP/2 分流；HTTP/1.1 继续走原有解析/改写路径。
@@ -756,22 +938,28 @@ pub async fn handle<S>(
         .await;
         if let Err(e) = h2_res {
             ctx.stats.mitm_h2_failed.fetch_add(1, Ordering::Relaxed);
-            logging::warn("mitm", format!("#{} {} h2 连接处理失败: {}", conn_id, host, e));
+            logging::warn(
+                "mitm",
+                format!("#{} {} h2 连接处理失败: {}", conn_id, host, e),
+            );
         }
         log_conn_summary(conn_id, &host, &trace, t0);
         return;
     }
     let mut cio = Buffered::new(tls);
     loop {
-        let req = match tokio::time::timeout(Duration::from_secs(60), http1::read_request_head(&mut cio)).await {
-            Ok(Ok(Some(r))) => r,
-            Ok(Ok(None)) => break,
-            Ok(Err(e)) => {
-                logging::warn("mitm", format!("#{} {} 请求解析失败: {}", conn_id, host, e));
-                break;
-            }
-            Err(_) => break, // 空闲超时
-        };
+        let req =
+            match tokio::time::timeout(Duration::from_secs(60), http1::read_request_head(&mut cio))
+                .await
+            {
+                Ok(Ok(Some(r))) => r,
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => {
+                    logging::warn("mitm", format!("#{} {} 请求解析失败: {}", conn_id, host, e));
+                    break;
+                }
+                Err(_) => break, // 空闲超时
+            };
         let url = format!("https://{}{}", host, req.path);
         let hits = state.engine.rules_for(&url);
         if let Some(r) = hits.iter().find(|r| {
@@ -813,14 +1001,30 @@ pub async fn handle<S>(
             .copied()
             .collect();
         let loon_hits = state.engine.loon_rules_for(&url);
-        let plan = plan_loon_request(&loon_hits, &host, &target, &mut req);
+        let mut plan = plan_loon_request(&loon_hits, &host, &target, &mut req);
+        // Surge [Header Rewrite] 默认语义是响应头；请求侧 set_header 已执行，
+        // 这里再把同一条规则追加到响应侧，保持现有模块靠它改请求头的兼容行为。
+        for r in hits.iter().filter(|r| r.action == RewriteAction::Header) {
+            plan.response_headers.push(HeaderOp::Replace {
+                name: r.header_field.clone(),
+                value: r.replacement.clone(),
+            });
+        }
         let script_url = format!("https://{}{}", plan.host, req.path);
-        let request_scripts = state.engine.scripts.has_phase(&script_url, ScriptPhase::Request);
-        let script_needs_body = request_scripts && state.engine.scripts.needs_request_body(&script_url);
+        let request_scripts = state
+            .engine
+            .scripts
+            .has_phase(&script_url, ScriptPhase::Request);
+        let script_needs_body =
+            request_scripts && state.engine.scripts.needs_request_body(&script_url);
         trace.reqs.fetch_add(1, Ordering::Relaxed);
         ctx.stats.mitm_reqs.fetch_add(1, Ordering::Relaxed);
+        host_stats::record(&host, host_stats::Metric::Request);
         // 与 h2 路径一致：响应阶段规则/脚本也算命中，避免把响应体改写误报为无规则。
-        let response_scripts = state.engine.scripts.has_phase(&script_url, ScriptPhase::Response);
+        let response_scripts = state
+            .engine
+            .scripts
+            .has_phase(&script_url, ScriptPhase::Response);
         let matched = !hits.is_empty()
             || !loon_hits.is_empty()
             || request_scripts
@@ -832,10 +1036,16 @@ pub async fn handle<S>(
         if !matched {
             trace.no_rule.fetch_add(1, Ordering::Relaxed);
             ctx.stats.mitm_no_rule.fetch_add(1, Ordering::Relaxed);
+            host_stats::record(&host, host_stats::Metric::NoRule);
             if !trace.noted.swap(true, Ordering::Relaxed) {
                 logging::info(
                     "mitm",
-                    format!("#{} {} 请求与响应均未命中规则: {}", conn_id, host, http1::redact_path(&req.path)),
+                    format!(
+                        "#{} {} 请求与响应均未命中规则: {}",
+                        conn_id,
+                        host,
+                        http1::redact_path(&req.path)
+                    ),
                 );
             }
         }
@@ -845,28 +1055,57 @@ pub async fn handle<S>(
                 ctx.stats.mitm_rejected.fetch_add(1, Ordering::Relaxed);
                 logging::info(
                     "mitm",
-                    format!("#{} MITM {} {} -> Loon reject（断开）", conn_id, host, http1::redact_path(&req.path)),
+                    format!(
+                        "#{} MITM {} {} -> Loon reject（断开）",
+                        conn_id,
+                        host,
+                        http1::redact_path(&req.path)
+                    ),
                 );
                 break;
             }
             // 请求可能还在上传：终端响应后不复用连接，避免残留正文污染下一请求。
             let keep_alive = req.keep_alive && req.body == http1::BodyKind::None;
-            let (status, reason, headers, body) = terminal_response(term, &plan.response_headers, keep_alive);
-            if cio.stream.write_all(&http1::serialize_response(status, &reason, &headers, &body)).await.is_err() {
+            let (status, reason, headers, body) = terminal_response(
+                term,
+                &plan.response_headers,
+                keep_alive,
+                &state.engine.mock_base_dir,
+            );
+            if cio
+                .stream
+                .write_all(&http1::serialize_response(status, &reason, &headers, &body))
+                .await
+                .is_err()
+            {
                 break;
             }
             let _ = cio.stream.flush().await;
             ctx.stats.mitm_rejected.fetch_add(1, Ordering::Relaxed);
             logging::info(
                 "mitm",
-                format!("#{} MITM {} {} -> Loon 本地响应 {}", conn_id, host, http1::redact_path(&req.path), status),
+                format!(
+                    "#{} MITM {} {} -> Loon 本地响应 {}",
+                    conn_id,
+                    host,
+                    http1::redact_path(&req.path),
+                    status
+                ),
             );
             if !keep_alive {
                 break;
             }
             continue;
         }
-        let mut buffered_body = match prepare_request_body(&mut cio, &mut req, &plan, state.engine.body_limit, script_needs_body).await {
+        let mut buffered_body = match prepare_request_body(
+            &mut cio,
+            &mut req,
+            &plan,
+            state.engine.body_limit,
+            script_needs_body,
+        )
+        .await
+        {
             Ok(v) => v,
             Err(e) => {
                 logging::warn("mitm", format!("#{} 请求体改写失败: {}", conn_id, e));
@@ -875,7 +1114,15 @@ pub async fn handle<S>(
                     ("Content-Type".into(), "text/plain; charset=utf-8".into()),
                     ("Content-Length".into(), "22".into()),
                 ];
-                let _ = cio.stream.write_all(&http1::serialize_response(413, "Payload Too Large", &headers, b"request body too large")).await;
+                let _ = cio
+                    .stream
+                    .write_all(&http1::serialize_response(
+                        413,
+                        "Payload Too Large",
+                        &headers,
+                        b"request body too large",
+                    ))
+                    .await;
                 let _ = cio.stream.flush().await;
                 break;
             }
@@ -884,28 +1131,50 @@ pub async fn handle<S>(
             if script_needs_body && buffered_body.is_none() {
                 logging::info(
                     "mitm",
-                    format!("#{} MITM {} {} 脚本需要正文但正文超限/带编码，跳过请求脚本", conn_id, host, http1::redact_path(&req.path)),
+                    format!(
+                        "#{} MITM {} {} 脚本需要正文但正文超限/带编码，跳过请求脚本",
+                        conn_id,
+                        host,
+                        http1::redact_path(&req.path)
+                    ),
                 );
             } else {
                 let body_now = buffered_body.as_deref().unwrap_or(&[]);
                 let msg_in = request_script_message(&script_url, &req, body_now);
-                let batch = state.run_scripts(ScriptPhase::Request, &script_url, &msg_in).await;
+                let batch = state
+                    .run_scripts(ScriptPhase::Request, &script_url, &msg_in)
+                    .await;
                 if !batch.errors.is_empty() {
                     logging::warn(
                         "mitm",
-                        format!("#{} 请求脚本 {} 条，问题: {}", conn_id, batch.matched, batch.errors.join("; ")),
+                        format!(
+                            "#{} 请求脚本 {} 条，问题: {}",
+                            conn_id,
+                            batch.matched,
+                            batch.errors.join("; ")
+                        ),
                     );
                 }
                 if batch.short_circuit {
                     let keep_alive = req.keep_alive
                         && (req.body == http1::BodyKind::None || buffered_body.is_some());
-                    if send_script_response(&mut cio, &batch.message, keep_alive).await.is_ok() {
+                    if send_script_response(&mut cio, &batch.message, keep_alive)
+                        .await
+                        .is_ok()
+                    {
                         let _ = cio.stream.flush().await;
                     }
                     ctx.stats.mitm_rewritten.fetch_add(1, Ordering::Relaxed);
+                    host_stats::record(&host, host_stats::Metric::Rewritten);
                     logging::info(
                         "mitm",
-                        format!("#{} MITM {} {} -> 脚本本地响应 {}", conn_id, host, http1::redact_path(&req.path), batch.message.status),
+                        format!(
+                            "#{} MITM {} {} -> 脚本本地响应 {}",
+                            conn_id,
+                            host,
+                            http1::redact_path(&req.path),
+                            batch.message.status
+                        ),
                     );
                     if !keep_alive {
                         break;
@@ -919,9 +1188,15 @@ pub async fn handle<S>(
                         if changed {
                             buffered_body = Some(batch.message.body_bytes().to_vec());
                             ctx.stats.mitm_rewritten.fetch_add(1, Ordering::Relaxed);
+                            host_stats::record(&host, host_stats::Metric::Rewritten);
                             logging::info(
                                 "mitm",
-                                format!("#{} MITM {} {} -> 请求脚本已修改", conn_id, host, http1::redact_path(&req.path)),
+                                format!(
+                                    "#{} MITM {} {} -> 请求脚本已修改",
+                                    conn_id,
+                                    host,
+                                    http1::redact_path(&req.path)
+                                ),
                             );
                         }
                     }
@@ -945,7 +1220,8 @@ pub async fn handle<S>(
             &plan.response_body_ops,
             conn_id,
         )
-        .await {
+        .await
+        {
             Ok(k) => k,
             Err(e) => {
                 logging::warn(
@@ -964,7 +1240,12 @@ pub async fn handle<S>(
                 ];
                 let _ = cio
                     .stream
-                    .write_all(&http1::serialize_response(502, "Bad Gateway", &headers, &[]))
+                    .write_all(&http1::serialize_response(
+                        502,
+                        "Bad Gateway",
+                        &headers,
+                        &[],
+                    ))
                     .await;
                 let _ = cio.stream.flush().await;
                 break;
@@ -999,11 +1280,31 @@ where
     let nodes = ctx.nodes_snapshot();
     let selected = ctx.selected_snapshot();
     let dns = ctx.dns();
-    let raw = outbound::connect(action, &nodes, selected.as_deref(), target.clone(), Some(&dns)).await?;
-    let mut up = Buffered::new(
-        outbound::tls_wrap(raw, host, state.engine.upstream_insecure).await?,
-    );
     let websocket = http1::is_upgrade_request(&req.headers);
+    let pool_key = pool::h1_key(host, target, action, state.engine.upstream_insecure);
+    let pooled = state.pool.take_h1(&pool_key);
+    let conn = match pooled {
+        Some(conn) => conn,
+        None => {
+            let raw = outbound::connect(
+                action,
+                &nodes,
+                selected.as_deref(),
+                target.clone(),
+                Some(&dns),
+            )
+            .await?;
+            let tls = outbound::tls_wrap(raw, host, state.engine.upstream_insecure).await?;
+            pool::H1Conn::new(Buffered::new(Box::new(tls) as outbound::BoxStream))
+        }
+    };
+    let mut lease = pool::H1Lease::new(state.pool.clone(), pool_key, conn);
+    let up = lease.up();
+    let ws_plan = if websocket {
+        state.engine.ws_rules.plan(host, &req.path)
+    } else {
+        ws::WsPlan::default()
+    };
     let expect_continue = http1::get_header(&req.headers, "expect")
         .map(|v| v.eq_ignore_ascii_case("100-continue"))
         .unwrap_or(false);
@@ -1011,11 +1312,40 @@ where
     // 组装上游请求：普通请求每请求独立连接（connection: close）；WebSocket
     // 保留 Upgrade 语义，101 后切换成双向透传。
     let mut headers = req.headers.clone();
-    for h in ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "content-length", "expect"] {
+    for h in [
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "transfer-encoding",
+        "content-length",
+        "expect",
+    ] {
         http1::remove_header(&mut headers, h);
     }
     http1::set_header(&mut headers, "Host", host);
-    http1::set_header(&mut headers, "Connection", if websocket { "Upgrade" } else { "close" });
+    let upstream_pool = state.pool.enabled() && !websocket;
+    http1::set_header(
+        &mut headers,
+        "Connection",
+        if websocket {
+            "Upgrade"
+        } else if upstream_pool {
+            "keep-alive"
+        } else {
+            "close"
+        },
+    );
+    if ws_plan.active {
+        // 帧改写只实现未压缩文本；剥掉扩展，拒绝 permessage-deflate 等协商。
+        http1::remove_header(&mut headers, "sec-websocket-extensions");
+        logging::info(
+            "mitm",
+            format!(
+                "#{} WebSocket 帧改写启用，已剥离 Sec-WebSocket-Extensions（压缩/扩展降级）",
+                conn_id
+            ),
+        );
+    }
     let has_body_rewrite = !body_rules.is_empty() || !response_body_ops.is_empty();
     if has_body_rewrite && !websocket {
         // 改写路径只要可解码的编码，避免 br
@@ -1035,13 +1365,17 @@ where
         method: req.method.clone(),
         path: req.path.clone(),
         headers,
-        keep_alive: false,
+        keep_alive: upstream_pool,
         body: req.body,
     };
-    up.stream.write_all(&http1::serialize_request_head(&up_req)).await?;
+    up.stream
+        .write_all(&http1::serialize_request_head(&up_req))
+        .await?;
     if expect_continue {
         // 客户端在等 100；先本地应答，避免它一直不发送大请求体。
-        cio.stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+        cio.stream
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await?;
         cio.stream.flush().await?;
     }
     if let Some(body) = buffered_body {
@@ -1056,7 +1390,7 @@ where
     }
     up.stream.flush().await?;
 
-    let head = tokio::time::timeout(Duration::from_secs(30), http1::read_response_head(&mut up))
+    let head = tokio::time::timeout(Duration::from_secs(30), http1::read_response_head(up))
         .await
         .map_err(|_| outbound::io_err("上游响应头超时"))??;
 
@@ -1065,12 +1399,45 @@ where
         let mut h = head.headers.clone();
         http1::set_header(&mut h, "Connection", "Upgrade");
         cio.stream
-            .write_all(&http1::serialize_response(head.status, &head.reason, &h, &[]))
+            .write_all(&http1::serialize_response(
+                head.status,
+                &head.reason,
+                &h,
+                &[],
+            ))
             .await?;
         // read_request_head/read_response_head 可能已把早期帧读进残留缓冲，
         // 先按方向补写，再进入纯字节双向复制。
         let client_early = std::mem::take(&mut cio.buf);
         let upstream_early = std::mem::take(&mut up.buf);
+        if ws_plan.active {
+            // WebSocket 长连接有独立并发闸，不占 h2 短正文改写的 2 条预算。
+            let permit = state.ws_slots.clone().try_acquire_owned().ok();
+            if let Some(_permit) = permit {
+                logging::info(
+                    "mitm",
+                    format!(
+                        "#{} MITM {} {} -> WebSocket 帧改写",
+                        conn_id,
+                        host,
+                        http1::redact_path(&req.path)
+                    ),
+                );
+                ws::relay(
+                    &mut cio.stream,
+                    &mut up.stream,
+                    &client_early,
+                    &upstream_early,
+                    ws_plan,
+                )
+                .await?;
+                return Ok(false);
+            }
+            logging::warn(
+                "mitm",
+                format!("#{} WebSocket 帧改写并发已满，本次降级为纯透传", conn_id),
+            );
+        }
         if !upstream_early.is_empty() {
             cio.stream.write_all(&upstream_early).await?;
         }
@@ -1081,29 +1448,113 @@ where
         up.stream.flush().await?;
         logging::info(
             "mitm",
-            format!("#{} MITM {} {} -> WebSocket 隧道", conn_id, host, http1::redact_path(&req.path)),
+            format!(
+                "#{} MITM {} {} -> WebSocket 隧道",
+                conn_id,
+                host,
+                http1::redact_path(&req.path)
+            ),
         );
         let _ = tokio::io::copy_bidirectional(&mut cio.stream, &mut up.stream).await;
         return Ok(false);
     }
 
     let framing = http1::response_framing(&head, &req.method);
+    let upstream_keep = state.pool.enabled()
+        && framing != Framing::Eof
+        && !http1::get_header(&head.headers, "connection")
+            .map(|v| v.to_ascii_lowercase().contains("close"))
+            .unwrap_or(false);
     let mut resp_headers = head.headers.clone();
     {
         let refs: Vec<&HeaderOp> = response_headers.iter().collect();
         loon::apply_header_ops(&mut resp_headers, &refs);
     }
     let limit = state.engine.body_limit;
-    let ctype = http1::get_header(&resp_headers, "content-type").unwrap_or("").to_ascii_lowercase();
+    let ctype = http1::get_header(&resp_headers, "content-type")
+        .unwrap_or("")
+        .to_ascii_lowercase();
     let text_like = ctype.is_empty()
-        || ["json", "text", "html", "xml", "javascript"].iter().any(|t| ctype.contains(t));
+        || ["json", "text", "html", "xml", "javascript"]
+            .iter()
+            .any(|t| ctype.contains(t));
     let script_url = format!("https://{}{}", host, req.path);
-    let binary_response_scripts =
-        state.engine.scripts.has_binary_phase(&script_url, ScriptPhase::Response);
-    let response_scripts = state.engine.scripts.has_phase(&script_url, ScriptPhase::Response);
-    let can_rewrite = (!body_rules.is_empty() || !response_body_ops.is_empty() || response_scripts)
-        && framing != Framing::None
-        && (text_like || binary_response_scripts);
+    let binary_response_scripts = state
+        .engine
+        .scripts
+        .has_binary_phase(&script_url, ScriptPhase::Response);
+    let response_scripts = state
+        .engine
+        .scripts
+        .has_phase(&script_url, ScriptPhase::Response);
+    let has_body_work = !body_rules.is_empty() || !response_body_ops.is_empty() || response_scripts;
+    let content_length = match framing {
+        Framing::Length(n) => Some(n as usize),
+        _ => None,
+    };
+    // 响应头已经改写，正文不必进缓冲：非文本大响应/超过 2 MiB 的正文直接透传。
+    // 先 flush 已写出的头，再 pipe 剩余字节，保证 chunked 前缀不丢。
+    let early_bypass = if has_body_work && framing != Framing::None {
+        body_bypass_reason(text_like, binary_response_scripts, content_length, limit)
+    } else {
+        None
+    };
+    if let Some(reason) = early_bypass {
+        ctx.stats.mitm_body_bypassed.fetch_add(1, Ordering::Relaxed);
+        logging::info(
+            "mitm",
+            format!(
+                "#{} {} {} 正文提前直通（{}，{} 字节）",
+                conn_id,
+                host,
+                http1::redact_path(&req.path),
+                match reason {
+                    BodyBypass::NonText => "非文本",
+                    BodyBypass::TooLarge => "超过 2MiB",
+                },
+                content_length
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "chunked".into())
+            ),
+        );
+        let mut h = resp_headers.clone();
+        match framing {
+            Framing::Length(n) => http1::set_header(&mut h, "Content-Length", &n.to_string()),
+            Framing::Chunked => http1::set_header(&mut h, "Transfer-Encoding", "chunked"),
+            _ => {}
+        }
+        let keep = framing != Framing::Eof;
+        http1::set_header(
+            &mut h,
+            "Connection",
+            if keep && req.keep_alive {
+                "keep-alive"
+            } else {
+                "close"
+            },
+        );
+        cio.stream
+            .write_all(&http1::serialize_response(
+                head.status,
+                &head.reason,
+                &h,
+                &[],
+            ))
+            .await?;
+        cio.stream.flush().await?;
+        match framing {
+            Framing::Length(n) => up.pipe_n(&mut cio.stream, n).await?,
+            Framing::Chunked => up.pipe_chunked(&mut cio.stream).await?,
+            Framing::Eof => up.pipe_rest(&mut cio.stream).await?,
+            Framing::None => {}
+        }
+        if upstream_keep {
+            lease.mark_reusable();
+        }
+        return Ok(keep);
+    }
+    let can_rewrite =
+        has_body_work && framing != Framing::None && (text_like || binary_response_scripts);
 
     if can_rewrite {
         // 先按原始组帧收字节（不解码），超限可无缝转透传。
@@ -1114,6 +1565,15 @@ where
                     .map_err(|_| outbound::io_err("上游响应体超时"))??;
                 (b, false)
             }
+            Framing::Chunked => {
+                let (b, exceeded) = tokio::time::timeout(
+                    Duration::from_secs(120),
+                    up.read_chunked_raw_limit(limit),
+                )
+                .await
+                .map_err(|_| outbound::io_err("上游响应体超时"))??;
+                (b, exceeded)
+            }
             _ => tokio::time::timeout(Duration::from_secs(120), up.read_to_end_limit(limit))
                 .await
                 .map_err(|_| outbound::io_err("上游响应体超时"))??,
@@ -1122,8 +1582,17 @@ where
             // 超过改写上限：原样透传剩余字节，保持原始组帧
             let mut h = resp_headers.clone();
             http1::set_header(&mut h, "Connection", "close");
-            cio.stream.write_all(&http1::serialize_response(head.status, &head.reason, &h, &[])).await?;
+            ctx.stats.mitm_body_bypassed.fetch_add(1, Ordering::Relaxed);
+            cio.stream
+                .write_all(&http1::serialize_response(
+                    head.status,
+                    &head.reason,
+                    &h,
+                    &[],
+                ))
+                .await?;
             cio.stream.write_all(&raw_body).await?;
+            cio.stream.flush().await?;
             up.pipe_rest(&mut cio.stream).await?;
             return Ok(false);
         }
@@ -1132,9 +1601,17 @@ where
                 Some(d) => d,
                 None => {
                     // chunked 不完整：原样透传
+                    ctx.stats.mitm_body_bypassed.fetch_add(1, Ordering::Relaxed);
                     let mut h = resp_headers.clone();
                     http1::set_header(&mut h, "Connection", "close");
-                    cio.stream.write_all(&http1::serialize_response(head.status, &head.reason, &h, &raw_body)).await?;
+                    cio.stream
+                        .write_all(&http1::serialize_response(
+                            head.status,
+                            &head.reason,
+                            &h,
+                            &raw_body,
+                        ))
+                        .await?;
                     cio.stream.flush().await?;
                     return Ok(false);
                 }
@@ -1153,17 +1630,42 @@ where
                 };
                 let loon_ops: Vec<&BodyOp> = response_body_ops.iter().collect();
                 let loon_out = if loon_ops.is_empty() {
-                    Some((surge_out.as_ref().map(|(b, _)| b.clone()).unwrap_or_default(), false))
+                    Some((
+                        surge_out
+                            .as_ref()
+                            .map(|(b, _)| b.clone())
+                            .unwrap_or_default(),
+                        false,
+                    ))
                 } else {
-                    let base = surge_out.as_ref().map(|(b, _)| b.as_slice()).unwrap_or(&plain);
+                    let base = surge_out
+                        .as_ref()
+                        .map(|(b, _)| b.as_slice())
+                        .unwrap_or(&plain);
                     loon::apply_body_ops(base, &loon_ops, limit)
                 };
                 let Some((new_body, loon_changed)) = loon_out else {
                     // 改写后超过上限：不能把放大后的正文发给客户端，回退原始响应。
+                    ctx.stats.mitm_body_bypassed.fetch_add(1, Ordering::Relaxed);
                     let mut h = resp_headers.clone();
                     let keep = framing != Framing::Eof;
-                    http1::set_header(&mut h, "Connection", if keep && req.keep_alive { "keep-alive" } else { "close" });
-                    cio.stream.write_all(&http1::serialize_response(head.status, &head.reason, &h, &raw_body)).await?;
+                    http1::set_header(
+                        &mut h,
+                        "Connection",
+                        if keep && req.keep_alive {
+                            "keep-alive"
+                        } else {
+                            "close"
+                        },
+                    );
+                    cio.stream
+                        .write_all(&http1::serialize_response(
+                            head.status,
+                            &head.reason,
+                            &h,
+                            &raw_body,
+                        ))
+                        .await?;
                     cio.stream.flush().await?;
                     return Ok(keep);
                 };
@@ -1173,19 +1675,31 @@ where
                 let mut body_out = new_body;
                 let mut script_changed = false;
                 if response_scripts {
-                    let msg_in = response_script_message(&script_url, status_out, &headers_out, &body_out);
-                    let batch = state.run_scripts(ScriptPhase::Response, &script_url, &msg_in).await;
+                    let msg_in =
+                        response_script_message(&script_url, status_out, &headers_out, &body_out);
+                    let batch = state
+                        .run_scripts(ScriptPhase::Response, &script_url, &msg_in)
+                        .await;
                     if !batch.errors.is_empty() {
                         logging::warn(
                             "mitm",
-                            format!("#{} 响应脚本 {} 条，问题: {}", conn_id, batch.matched, batch.errors.join("; ")),
+                            format!(
+                                "#{} 响应脚本 {} 条，问题: {}",
+                                conn_id,
+                                batch.matched,
+                                batch.errors.join("; ")
+                            ),
                         );
                     }
                     if batch.matched > 0 {
                         if batch.message.body_len() > limit {
                             logging::warn(
                                 "mitm",
-                                format!("#{} 响应脚本输出 {} 字节超过上限，丢弃脚本结果", conn_id, batch.message.body_len()),
+                                format!(
+                                    "#{} 响应脚本输出 {} 字节超过上限，丢弃脚本结果",
+                                    conn_id,
+                                    batch.message.body_len()
+                                ),
                             );
                         } else {
                             let body_bytes = batch.message.body_bytes().to_vec();
@@ -1207,12 +1721,29 @@ where
                 }
                 http1::set_header(&mut h, "Content-Length", &body_out.len().to_string());
                 let keep = framing != Framing::Eof;
-                http1::set_header(&mut h, "Connection", if keep && req.keep_alive { "keep-alive" } else { "close" });
-                let reason = if status_out == head.status { head.reason.clone() } else { "OK".to_string() };
-                cio.stream.write_all(&http1::serialize_response(status_out, &reason, &h, &body_out)).await?;
+                http1::set_header(
+                    &mut h,
+                    "Connection",
+                    if keep && req.keep_alive {
+                        "keep-alive"
+                    } else {
+                        "close"
+                    },
+                );
+                let reason = if status_out == head.status {
+                    head.reason.clone()
+                } else {
+                    "OK".to_string()
+                };
+                cio.stream
+                    .write_all(&http1::serialize_response(
+                        status_out, &reason, &h, &body_out,
+                    ))
+                    .await?;
                 cio.stream.flush().await?;
                 if changed {
                     ctx.stats.mitm_rewritten.fetch_add(1, Ordering::Relaxed);
+                    host_stats::record(&host, host_stats::Metric::Rewritten);
                     logging::info(
                         "mitm",
                         format!(
@@ -1226,15 +1757,37 @@ where
                         ),
                     );
                 }
+                if upstream_keep {
+                    lease.mark_reusable();
+                }
                 return Ok(keep);
             }
             None => {
                 // br 等无法解码，或解压后超过上限：原样透传（完整收到的原始字节）
+                ctx.stats.mitm_body_bypassed.fetch_add(1, Ordering::Relaxed);
                 let mut h = resp_headers.clone();
                 let keep = framing != Framing::Eof;
-                http1::set_header(&mut h, "Connection", if keep && req.keep_alive { "keep-alive" } else { "close" });
-                cio.stream.write_all(&http1::serialize_response(head.status, &head.reason, &h, &raw_body)).await?;
+                http1::set_header(
+                    &mut h,
+                    "Connection",
+                    if keep && req.keep_alive {
+                        "keep-alive"
+                    } else {
+                        "close"
+                    },
+                );
+                cio.stream
+                    .write_all(&http1::serialize_response(
+                        head.status,
+                        &head.reason,
+                        &h,
+                        &raw_body,
+                    ))
+                    .await?;
                 cio.stream.flush().await?;
+                if upstream_keep {
+                    lease.mark_reusable();
+                }
                 return Ok(keep);
             }
         }
@@ -1250,14 +1803,33 @@ where
         _ => {}
     }
     let keep = framing != Framing::Eof;
-    http1::set_header(&mut h, "Connection", if keep && req.keep_alive { "keep-alive" } else { "close" });
-    cio.stream.write_all(&http1::serialize_response(head.status, &head.reason, &h, &[])).await?;
+    http1::set_header(
+        &mut h,
+        "Connection",
+        if keep && req.keep_alive {
+            "keep-alive"
+        } else {
+            "close"
+        },
+    );
+    cio.stream
+        .write_all(&http1::serialize_response(
+            head.status,
+            &head.reason,
+            &h,
+            &[],
+        ))
+        .await?;
     match framing {
         Framing::Length(n) => up.pipe_n(&mut cio.stream, n).await?,
-        Framing::Chunked | Framing::Eof => up.pipe_rest(&mut cio.stream).await?,
+        Framing::Chunked => up.pipe_chunked(&mut cio.stream).await?,
+        Framing::Eof => up.pipe_rest(&mut cio.stream).await?,
         Framing::None => {
             cio.stream.flush().await?;
         }
+    }
+    if upstream_keep {
+        lease.mark_reusable();
     }
     Ok(keep)
 }
@@ -1298,5 +1870,64 @@ mod tls_abort_tests {
     #[test]
     fn unknown_error_is_not_abort() {
         assert!(!is_client_tls_abort("some other failure"));
+    }
+}
+
+#[cfg(test)]
+mod body_bypass_tests {
+    use super::{body_bypass_reason, BodyBypass, BODY_PASSTHROUGH_LIMIT};
+
+    #[test]
+    fn small_text_is_buffered() {
+        assert_eq!(
+            body_bypass_reason(true, false, Some(64 * 1024), 8 * 1024 * 1024),
+            None
+        );
+        assert_eq!(body_bypass_reason(true, false, None, 8 * 1024 * 1024), None);
+    }
+
+    #[test]
+    fn video_is_passed_through() {
+        assert_eq!(
+            body_bypass_reason(false, false, Some(1024), 8 * 1024 * 1024),
+            Some(BodyBypass::NonText)
+        );
+        assert_eq!(
+            body_bypass_reason(false, false, None, 8 * 1024 * 1024),
+            Some(BodyBypass::NonText)
+        );
+    }
+
+    #[test]
+    fn binary_script_may_consume_small_binary() {
+        assert_eq!(
+            body_bypass_reason(false, true, Some(1024), 8 * 1024 * 1024),
+            None
+        );
+    }
+
+    #[test]
+    fn over_two_mib_is_passed_through_even_for_text() {
+        assert_eq!(
+            body_bypass_reason(
+                true,
+                false,
+                Some(BODY_PASSTHROUGH_LIMIT + 1),
+                8 * 1024 * 1024
+            ),
+            Some(BodyBypass::TooLarge)
+        );
+        assert_eq!(
+            body_bypass_reason(true, false, Some(BODY_PASSTHROUGH_LIMIT), 8 * 1024 * 1024),
+            None
+        );
+    }
+
+    #[test]
+    fn configured_smaller_limit_wins() {
+        assert_eq!(
+            body_bypass_reason(true, false, Some(512 * 1024 + 1), 512 * 1024),
+            Some(BodyBypass::TooLarge)
+        );
     }
 }

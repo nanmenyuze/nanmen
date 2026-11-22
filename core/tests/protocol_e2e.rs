@@ -10,8 +10,16 @@ fn node(kind: &str, port: u16) -> Node {
         kind: kind.into(),
         server: "127.0.0.1".into(),
         port,
-        method: if kind == "vless" { Some("tcp".into()) } else { None },
-        password: if kind == "trojan" { Some("pass".into()) } else { None },
+        method: if kind == "vless" {
+            Some("tcp".into())
+        } else {
+            None
+        },
+        password: if kind == "trojan" {
+            Some("pass".into())
+        } else {
+            None
+        },
         uuid: if kind == "vless" {
             Some("11111111-2222-3333-4444-555555555555".into())
         } else {
@@ -29,11 +37,19 @@ fn node(kind: &str, port: u16) -> Node {
 
 fn target() -> Target {
     // Trojan/VLESS 这里用 IPv4 目标，便于本地服务端精确读取握手头。
-    Target { ip: "203.0.113.9".parse().unwrap(), port: 443, domain: None }
+    Target {
+        ip: "203.0.113.9".parse().unwrap(),
+        port: 443,
+        domain: None,
+    }
 }
 
 fn domain_target() -> Target {
-    Target { ip: "203.0.113.9".parse().unwrap(), port: 443, domain: Some("example.com".into()) }
+    Target {
+        ip: "203.0.113.9".parse().unwrap(),
+        port: 443,
+        domain: Some("example.com".into()),
+    }
 }
 
 async fn echo_loop(mut sock: tokio::net::TcpStream) {
@@ -42,7 +58,9 @@ async fn echo_loop(mut sock: tokio::net::TcpStream) {
         match sock.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if sock.write_all(&buf[..n]).await.is_err() { break; }
+                if sock.write_all(&buf[..n]).await.is_err() {
+                    break;
+                }
             }
         }
     }
@@ -51,14 +69,24 @@ async fn echo_loop(mut sock: tokio::net::TcpStream) {
 async fn roundtrip(mut stream: nanmen_core::outbound::BoxStream, expect_hello: bool) {
     if expect_hello {
         let mut hello = [0u8; 5];
-        tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_exact(&mut hello))
-            .await.unwrap().unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_exact(&mut hello),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(&hello, b"hello");
     }
     stream.write_all(b"ping").await.unwrap();
     let mut pong = [0u8; 4];
-    tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_exact(&mut pong))
-        .await.unwrap().unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_exact(&mut pong),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(&pong, b"ping");
 }
 
@@ -79,13 +107,29 @@ async fn trojan_plain_connects_roundtrip_and_reconnects() {
         }
     });
     let client = node("trojan", addr.port());
-    roundtrip(nanmen_core::proto::trojan::connect(&client, target()).await.unwrap(), true).await;
-    roundtrip(nanmen_core::proto::trojan::connect(&client, target()).await.unwrap(), true).await;
+    roundtrip(
+        nanmen_core::proto::trojan::connect(&client, target())
+            .await
+            .unwrap(),
+        true,
+    )
+    .await;
+    roundtrip(
+        nanmen_core::proto::trojan::connect(&client, target())
+            .await
+            .unwrap(),
+        true,
+    )
+    .await;
     // 端口关闭后必须报错，而不是假装连接成功。
     let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dead_port = dead.local_addr().unwrap().port();
     drop(dead);
-    assert!(nanmen_core::proto::trojan::connect(&node("trojan", dead_port), target()).await.is_err());
+    assert!(
+        nanmen_core::proto::trojan::connect(&node("trojan", dead_port), target())
+            .await
+            .is_err()
+    );
     server.abort();
 }
 
@@ -107,11 +151,25 @@ async fn vless_plain_connects_roundtrip_and_reconnects() {
         }
     });
     let client = node("vless", addr.port());
-    roundtrip(nanmen_core::proto::vless::connect(&client, target()).await.unwrap(), false).await;
-    roundtrip(nanmen_core::proto::vless::connect(&client, target()).await.unwrap(), false).await;
+    roundtrip(
+        nanmen_core::proto::vless::connect(&client, target())
+            .await
+            .unwrap(),
+        false,
+    )
+    .await;
+    roundtrip(
+        nanmen_core::proto::vless::connect(&client, target())
+            .await
+            .unwrap(),
+        false,
+    )
+    .await;
     let mut bad = node("vless", addr.port());
     bad.uuid = Some("bad-uuid".into());
-    assert!(nanmen_core::proto::vless::connect(&bad, target()).await.is_err());
+    assert!(nanmen_core::proto::vless::connect(&bad, target())
+        .await
+        .is_err());
     server.abort();
 }
 
@@ -130,14 +188,28 @@ async fn socks5_connects_roundtrip_and_reconnects() {
                 let mut req = [0u8; 3 + 1 + 1 + 11 + 2];
                 sock.read_exact(&mut req).await.unwrap();
                 // 成功应答：IPv4 0.0.0.0:0
-                sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await.unwrap();
+                sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
                 echo_loop(sock).await;
             });
         }
     });
     let client = node("socks5", addr.port());
-    roundtrip(nanmen_core::proto::socks::connect_socks5(&client, domain_target()).await.unwrap(), false).await;
-    roundtrip(nanmen_core::proto::socks::connect_socks5(&client, domain_target()).await.unwrap(), false).await;
+    roundtrip(
+        nanmen_core::proto::socks::connect_socks5(&client, domain_target())
+            .await
+            .unwrap(),
+        false,
+    )
+    .await;
+    roundtrip(
+        nanmen_core::proto::socks::connect_socks5(&client, domain_target())
+            .await
+            .unwrap(),
+        false,
+    )
+    .await;
     server.abort();
 }
 
@@ -155,27 +227,40 @@ async fn socks5_udp_associate_is_separate_and_roundtrips() {
         let mut req = [0u8; 10];
         sock.read_exact(&mut req).await.unwrap();
         let mut reply = vec![0x05, 0x00, 0x00, 0x01];
-        reply.extend_from_slice(&relay_addr.ip().to_string().parse::<std::net::Ipv4Addr>().unwrap().octets());
+        reply.extend_from_slice(
+            &relay_addr
+                .ip()
+                .to_string()
+                .parse::<std::net::Ipv4Addr>()
+                .unwrap()
+                .octets(),
+        );
         reply.extend_from_slice(&relay_addr.port().to_be_bytes());
         sock.write_all(&reply).await.unwrap();
         // 控制连接必须保持，UDP relay 单独收发包。
         let mut buf = [0u8; 2048];
         loop {
             match relay.recv_from(&mut buf).await {
-                Ok((n, peer)) => { let _ = relay.send_to(&buf[..n], peer).await; }
+                Ok((n, peer)) => {
+                    let _ = relay.send_to(&buf[..n], peer).await;
+                }
                 Err(_) => break,
             }
         }
     });
     let client = node("socks5", addr.port());
-    let s = nanmen_core::proto::socks::udp_associate(&client).await.unwrap();
+    let s = nanmen_core::proto::socks::udp_associate(&client)
+        .await
+        .unwrap();
     // RSV 00 00 + FRAG 00 + IPv4 目标 + payload
     let mut packet = vec![0u8, 0u8, 0u8, 0x01, 127, 0, 0, 1, 9, 9];
     packet.extend_from_slice(b"udp-ping");
     s.socket.send(&packet).await.unwrap();
     let mut got = [0u8; 2048];
     let n = tokio::time::timeout(std::time::Duration::from_secs(5), s.socket.recv(&mut got))
-        .await.unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap();
     assert!(got[..n].ends_with(b"udp-ping"));
     server.abort();
 }

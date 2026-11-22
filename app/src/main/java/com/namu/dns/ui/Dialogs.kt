@@ -66,9 +66,11 @@ import com.namu.dns.NodeInfo
 import com.namu.dns.RuleItem
 import com.namu.dns.RuleSource
 import com.namu.dns.ProxyGroup
+import com.namu.dns.StatsData
 import com.namu.dns.core.config.ProxyGroupValidation
 import com.namu.dns.normalizeAdsDomain
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -433,6 +435,117 @@ fun CustomAdsDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
         }
     }
 }
+
+@Composable
+fun ScriptArgumentsDialog(
+    scripts: List<com.namu.dns.core.config.ScriptConfig>,
+    saved: Map<String, Map<String, String>>,
+    onSave: (com.namu.dns.core.config.ScriptConfig, Map<String, String>) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        Box(
+            Modifier.fillMaxWidth().padding(horizontal = 18.dp)
+                .clip(RoundedCornerShape(18.dp)).background(NamuColors.Card),
+        ) {
+            Column(Modifier.padding(18.dp).heightIn(max = 560.dp).verticalScroll(rememberScrollState())) {
+                Text("脚本参数", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = NamuColors.TextMain)
+                Text(
+                    "只改 \$argument 当前值：保存后立即生效，不重编译脚本；number/boolean 按声明类型注入。",
+                    fontSize = 11.sp, color = NamuColors.TextSub, modifier = Modifier.padding(top = 4.dp, bottom = 10.dp),
+                )
+                if (scripts.isEmpty()) {
+                    Text("当前没有可编辑参数的脚本。", fontSize = 12.sp, color = NamuColors.TextSub)
+                }
+                scripts.forEach { script ->
+                    val key = ConfigStore.scriptArgumentKey(script)
+                    var values by remember(script, saved) {
+                        mutableStateOf(
+                            script.arguments.mapValues { (k, v) -> saved[key]?.get(k) ?: v },
+                        )
+                    }
+                    Text(
+                        "${script.name.ifBlank { script.pattern }} · ${script.phase}",
+                        fontSize = 13.sp, fontWeight = FontWeight.Medium, color = NamuColors.TextMain,
+                        modifier = Modifier.padding(top = 12.dp, bottom = 4.dp),
+                    )
+                    if (script.arguments.isEmpty()) {
+                        Text("无声明参数（[Argument] 为空）", fontSize = 11.sp, color = NamuColors.TextSub)
+                    } else {
+                        script.arguments.keys.sorted().forEach { name ->
+                            val type = script.argumentTypes[name] ?: "string"
+                            Text("$name ($type)", fontSize = 11.sp, color = NamuColors.TextSub)
+                            NamuTextField(values[name] ?: "", { v -> values = values + (name to v) }, "值")
+                        }
+                        TextButton(onClick = { onSave(script, values) }) {
+                            Text("保存该脚本参数", fontSize = 12.sp, color = NamuColors.Accent)
+                        }
+                    }
+                }
+                Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.End) {
+                    TextButton(onClick = onDismiss) { Text("关闭", color = NamuColors.TextSub) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun HostMapDialog(
+    initial: Map<String, String>,
+    onDismiss: () -> Unit,
+    onDone: (Map<String, String>) -> Unit,
+) {
+    var text by remember {
+        mutableStateOf(initial.entries.joinToString("\n") { "${it.key} = ${it.value}" })
+    }
+    var error by remember { mutableStateOf<String?>(null) }
+    NamuDialog(
+        title = "Host 映射",
+        message = "每行一条：域名 = IP / 别名 / server:上游。支持 *.example.com；server:system 不支持。",
+        confirmText = "保存",
+        confirmEnabled = true,
+        onDismiss = onDismiss,
+        onConfirm = {
+            val map = linkedMapOf<String, String>()
+            var bad = false
+            text.lineSequence().forEach { raw ->
+                val line = raw.trim()
+                if (line.isEmpty() || line.startsWith("#")) return@forEach
+                val i = line.indexOf('=')
+                if (i <= 0) {
+                    bad = true
+                    return@forEach
+                }
+                val key = line.substring(0, i).trim().lowercase()
+                val value = line.substring(i + 1).trim()
+                if (key.isBlank() || value.isBlank()) {
+                    bad = true
+                } else {
+                    map[key] = value
+                }
+            }
+            if (bad) {
+                error = "存在缺少域名或值的行，请按“域名 = 值”填写"
+            } else {
+                onDone(map)
+            }
+        },
+    ) {
+        NamuTextField(
+            value = text,
+            onChange = { text = it; error = null },
+            placeholder = "example.com = 1.2.3.4\nold.example.com = new.example.com\napi.example.com = server:1.1.1.1",
+            singleLine = false,
+            maxLines = 8,
+        )
+        if (error != null) {
+            Spacer(Modifier.height(6.dp))
+            Text(error!!, fontSize = 12.sp, color = NamuColors.Red, modifier = Modifier.fillMaxWidth())
+        }
+    }
+}
+
 
 @Composable
 fun RulesUpdateDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
@@ -1050,6 +1163,17 @@ fun ProxyGroupsDialog(
 ) {
     var editing by remember { mutableStateOf<ProxyGroup?>(null) }
     var creating by remember { mutableStateOf(false) }
+    // 组页面可见时才轮询内核 stats；对话框销毁即停止，不建常驻通道。
+    var liveStats by remember { mutableStateOf<StatsData?>(null) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            if (NativeCore.available) {
+                val raw = withContext(Dispatchers.IO) { NativeCore.nativeStats() }
+                liveStats = StatsData.fromJson(raw)
+            }
+            delay(2_000)
+        }
+    }
     if (editing != null || creating) {
         ProxyGroupEditorDialog(
             initial = editing,
@@ -1084,6 +1208,8 @@ fun ProxyGroupsDialog(
             }
             groups.forEachIndexed { index, g ->
                 val selected = selections[g.name]
+                val health = liveStats?.groupHealth?.firstOrNull { it.name == g.name }
+                val current = health?.current ?: selected
                 val issues = ProxyGroupValidation.validate(groups, nodes, selections)
                     .count { it.level == ConfigIssueLevel.ERROR && it.path.contains(g.name) }
                 SettingsRow(
@@ -1093,11 +1219,12 @@ fun ProxyGroupsDialog(
                             when (g.type) {
                                 "url-test" -> "url-test · ${g.testUrl}"
                                 "fallback" -> "fallback · 故障切换"
+                                "load-balance" -> "load-balance · ${if (g.lbMode == "round-robin") "轮询" else "一致性哈希"}"
                                 else -> "select · 手动选择"
                             },
                         )
                         append(" · ${g.members.size} 个成员")
-                        if (!selected.isNullOrBlank()) append(" · 当前 $selected")
+                        if (!current.isNullOrBlank()) append(" · 当前 $current")
                         if (issues > 0) append(" · $issues 个错误")
                     },
                     value = if (g.type == "select") "选择" else "自动",
@@ -1106,6 +1233,25 @@ fun ProxyGroupsDialog(
                     showDivider = index < groups.lastIndex,
                     onClick = { editing = g },
                 )
+                val leafHealth = health?.members?.filter { it.node } ?: emptyList()
+                if (leafHealth.isNotEmpty()) {
+                    Text(
+                        leafHealth.joinToString("  ") { m ->
+                            val latency = m.tcpLatencyMs?.let { "${it}ms" } ?: "—"
+                            val mark = when (m.tcpStatus) {
+                                "healthy" -> "✓"
+                                "unhealthy" -> "✗"
+                                "failing" -> "!"
+                                else -> "?"
+                            }
+                            "${m.name} $latency$mark"
+                        },
+                        fontSize = 11.sp,
+                        color = NamuColors.TextSub,
+                        lineHeight = 15.sp,
+                        modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 8.dp),
+                    )
+                }
             }
             TextButton(onClick = { creating = true }, modifier = Modifier.fillMaxWidth()) {
                 Text("+ 新增策略组", fontSize = 14.sp, color = NamuColors.Blue)
@@ -1134,6 +1280,8 @@ private fun ProxyGroupEditorDialog(
     var failureThreshold by remember { mutableStateOf((initial?.failureThreshold ?: 3).toString()) }
     var recoveryThreshold by remember { mutableStateOf((initial?.recoveryThreshold ?: 2).toString()) }
     var noNodeAction by remember { mutableStateOf(initial?.noNodeAction ?: "global") }
+    var lbMode by remember { mutableStateOf(initial?.lbMode ?: "consistent-hash") }
+    var switchInterval by remember { mutableStateOf((initial?.switchInterval ?: 30).toString()) }
 
     val candidate = ProxyGroup(
         name = name.trim(),
@@ -1146,6 +1294,8 @@ private fun ProxyGroupEditorDialog(
         failureThreshold = failureThreshold.toIntOrNull() ?: 3,
         recoveryThreshold = recoveryThreshold.toIntOrNull() ?: 2,
         noNodeAction = noNodeAction,
+        lbMode = lbMode,
+        switchInterval = switchInterval.toIntOrNull() ?: 30,
     )
     val baseOthers = groups.filter { it.name != (initial?.name ?: "") }
     val candidateGroups = if (isNew) groups + candidate else baseOthers + candidate
@@ -1196,9 +1346,30 @@ private fun ProxyGroupEditorDialog(
             Spacer(Modifier.height(10.dp))
             Text("类型", fontSize = 12.sp, color = NamuColors.TextSub)
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                listOf("select" to "手动", "url-test" to "测速", "fallback" to "故障切换").forEach { (key, label) ->
+                listOf(
+                    "select" to "手动",
+                    "url-test" to "测速",
+                    "fallback" to "故障",
+                    "load-balance" to "负载",
+                ).forEach { (key, label) ->
                     ChoiceChip(label, type == key, Modifier.weight(1f)) { type = key }
                 }
+            }
+            if (type == "load-balance") {
+                Spacer(Modifier.height(8.dp))
+                Text("选路方式", fontSize = 12.sp, color = NamuColors.TextSub)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    ChoiceChip("一致性哈希", lbMode != "round-robin", Modifier.weight(1f)) {
+                        lbMode = "consistent-hash"
+                    }
+                    ChoiceChip("轮询", lbMode == "round-robin", Modifier.weight(1f)) {
+                        lbMode = "round-robin"
+                    }
+                }
+            }
+            if (type == "url-test" || type == "fallback" || type == "load-balance") {
+                Spacer(Modifier.height(6.dp))
+                NamuTextField(switchInterval, { switchInterval = it }, "切换间隔 秒（默认 30）", singleLine = true)
             }
             Spacer(Modifier.height(10.dp))
             Text("成员（节点 / 策略组）", fontSize = 12.sp, color = NamuColors.TextSub)

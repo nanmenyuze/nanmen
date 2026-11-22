@@ -27,6 +27,38 @@ class ProxyGroupTest {
     }
 
     @Test
+    fun `load balance group persists mode and switch interval`() {
+        val cfg = AppConfig(
+            proxyGroups = listOf(
+                ProxyGroup(
+                    "负载",
+                    "load-balance",
+                    listOf("a", "b"),
+                    lbMode = "round-robin",
+                    switchInterval = 45,
+                ),
+            ),
+        )
+        val decoded = AppConfig.fromJson(cfg.toJson().toString())
+        assertEquals("load-balance", decoded.proxyGroups.single().type)
+        assertEquals("round-robin", decoded.proxyGroups.single().lbMode)
+        assertEquals(45, decoded.proxyGroups.single().switchInterval)
+        val issues = ProxyGroupValidation.validate(decoded.proxyGroups, listOf("a", "b"))
+        assertTrue(issues.none { it.level == ConfigIssueLevel.ERROR })
+    }
+
+    @Test
+    fun `validation rejects unknown load balance mode`() {
+        val issues = ProxyGroupValidation.validate(
+            listOf(
+                ProxyGroup("负载", "load-balance", listOf("n1"), lbMode = "随机"),
+            ),
+            listOf("n1"),
+        )
+        assertTrue(issues.any { it.level == ConfigIssueLevel.ERROR && it.path == "proxyGroups[0].lbMode" })
+    }
+
+    @Test
     fun `validation rejects nested cycle`() {
         val issues = ProxyGroupValidation.validate(
             listOf(
@@ -86,7 +118,9 @@ class ProxyGroupTest {
                 .put("tolerance", 999999)
                 .put("failureThreshold", 0)
                 .put("recoveryThreshold", 99)
-                .put("noNodeAction", "乱写"),
+                .put("noNodeAction", "乱写")
+                .put("lbMode", "ROUND-ROBIN")
+                .put("switchInterval", 0),
         )
         assertEquals("G", parsed.name)
         assertEquals("url-test", parsed.type)
@@ -97,5 +131,7 @@ class ProxyGroupTest {
         assertEquals(1, parsed.failureThreshold)
         assertEquals(20, parsed.recoveryThreshold)
         assertEquals("global", parsed.noNodeAction)
+        assertEquals("round-robin", parsed.lbMode)
+        assertEquals(1, parsed.switchInterval)
     }
 }

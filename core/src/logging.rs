@@ -45,7 +45,16 @@ pub fn log(level: &str, tag: &str, msg: impl AsRef<str>) {
     // 单条日志限长：异常/上游报错可能带整段报文，不截断会让 600 条环形缓冲吃掉几十 MB。
     let text = msg.as_ref();
     let msg = if text.len() > 1024 {
-        format!("{}…[截断 {} 字节]", &text[..text.char_indices().take_while(|(i, _)| *i <= 1024).last().map(|(i, _)| i).unwrap_or(0)], text.len())
+        format!(
+            "{}…[截断 {} 字节]",
+            &text[..text
+                .char_indices()
+                .take_while(|(i, _)| *i <= 1024)
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0)],
+            text.len()
+        )
     } else {
         text.to_string()
     };

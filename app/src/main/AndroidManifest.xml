@@ -18,6 +18,8 @@
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent>
+        <!-- 支付宝深链「向我付款」；仅声明包可见性，不读取其他应用数据。 -->
+        <package android:name="com.eg.android.AlipayGphone" />
     </queries>
 
     <application

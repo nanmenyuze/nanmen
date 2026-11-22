@@ -16,6 +16,7 @@ class NamuApp : Application() {
         AutoConnect.install(this)
         SubscriptionUpdateWorker.schedule(this)
         RuleUpdateWorker.schedule(this)
+        ModuleUpdateWorker.schedule(this)
         NodeTestWorker.schedule(this)
         scope.launch { PrivateDnsController.restore(this@NamuApp) }
     }

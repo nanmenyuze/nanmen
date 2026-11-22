@@ -1,0 +1,12 @@
+#!name=南门DNS Host 合成模块
+#!desc=Host 四模式 compat fixture：直接 IP、CNAME 别名、server 上游、通配与显式拒绝。
+#!author=南门DNS
+#!category=测试
+#!date=2026-11-23
+
+[Host]
+ip.example = 1.2.3.4, 2001:db8::1
+*.wild.example = alias.example
+server.example = server:1.1.1.1
+system.example = server:system
+http.example = server:http://dns.example/dns-query

@@ -10,6 +10,10 @@ object NativeCore {
 
     @JvmStatic external fun nativeStart(tunFd: Int, configJson: String): Boolean
     @JvmStatic external fun nativeReloadRules(configJson: String): Boolean
+    /** 运行期修改脚本参数（只换 $argument 注入值，不重编译脚本）。 */
+    @JvmStatic external fun nativeSetScriptArguments(payloadJson: String): Boolean
+    /** 手动/网络事件触发：network-changed / generic；返回启动的脚本条数。 */
+    @JvmStatic external fun nativeTriggerScripts(kind: String): Int
     /** 下发「五元组 → 归属 UID」整表，返回接受的条数；-1 表示参数错误。 */
     @JvmStatic external fun nativeSetUidMap(tableJson: String): Int
     @JvmStatic external fun nativeStop()

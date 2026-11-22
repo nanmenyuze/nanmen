@@ -53,7 +53,14 @@ pub async fn connect(node: &Node, target: Target) -> io::Result<BoxStream> {
     stream.write_all(&addr).await?;
     stream.write_all(b"\r\n").await?;
 
-    logging::info("trojan", format!("已连接 {} -> {}", node.label(), crate::outbound::display_target(&target)));
+    logging::info(
+        "trojan",
+        format!(
+            "已连接 {} -> {}",
+            node.label(),
+            crate::outbound::display_target(&target)
+        ),
+    );
     Ok(stream)
 }
 
@@ -70,7 +77,11 @@ pub async fn udp_associate(node: &Node, target: &Target) -> io::Result<BoxStream
 
     logging::info(
         "trojan",
-        format!("UDP ASSOCIATE {} -> {}", node.label(), crate::outbound::display_target(target)),
+        format!(
+            "UDP ASSOCIATE {} -> {}",
+            node.label(),
+            crate::outbound::display_target(target)
+        ),
     );
     Ok(stream)
 }

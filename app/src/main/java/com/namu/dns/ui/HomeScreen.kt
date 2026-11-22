@@ -101,8 +101,8 @@ fun HomeScreen(onToggle: () -> Unit, onOpenNodes: () -> Unit, onRestart: () -> U
         scope.launch {
             refreshing = true
             try {
-                Actions.refreshSubscription()
-                vm.showMessage("订阅已刷新")
+                val result = Actions.refreshSubscription()
+                vm.showMessage(Actions.subscriptionRefreshMessage(result))
             } catch (e: Exception) {
                 vm.showMessage(e.message ?: "订阅刷新失败")
             } finally {
@@ -430,6 +430,7 @@ private val NodeInfo.badge: String
         "ss" -> "SS"
         "trojan" -> "TR"
         "vless" -> "VL"
+        "vmess" -> "VM"
         "socks5" -> "S5"
         else -> "H"
     }
@@ -446,6 +447,7 @@ private fun HomeNodeRow(
         "ss" -> NamuColors.Teal
         "trojan" -> NamuColors.Blue
         "vless" -> NamuColors.Green
+        "vmess" -> NamuColors.Blue
         "socks5" -> NamuColors.Orange
         else -> NamuColors.TextSub
     }

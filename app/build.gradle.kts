@@ -92,8 +92,8 @@ android {
         applicationId = "com.namu.dns"
         minSdk = 31
         targetSdk = 36
-        versionCode = 95
-        versionName = "2.7"
+        versionCode = 105
+        versionName = "2.9.1"
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }

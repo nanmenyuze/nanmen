@@ -1,0 +1,13 @@
+#!name=南门DNS Body Rewrite 合成模块
+#!desc=Surge Body Rewrite compat fixture：请求/响应独立段、quoted replacement、非法行显式拒绝。
+#!author=南门DNS
+#!category=测试
+#!date=2026-11-23
+
+[Body Rewrite]
+http-request ^https://api\.example\.com/upload (?s)old "new body"
+http-response ^https://api\.example\.com/feed \"ads\":\[.*?\]\s*,? ""
+http-response ^https://api\.example\.com/jq jq ".data.ads = []"
+http-response ^https://api\.example\.com/jq jq "del(.data.ads)"
+http-response ^https://api\.example\.com/jq jq "select(.data.ads)"
+http-response ^https://api\.example\.com/bad only-three-tokens

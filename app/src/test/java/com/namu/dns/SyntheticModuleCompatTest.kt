@@ -71,11 +71,49 @@ class SyntheticModuleCompatTest {
     }
 
     @Test
+    fun hostFourModesParseAndRejectUnsupportedServers() {
+        val p = ModuleParser.parse(fixture("host"))
+        assertEquals(3, p.hostMappings.size)
+        assertEquals("1.2.3.4, 2001:db8::1", p.hostMappings["ip.example"])
+        assertEquals("alias.example", p.hostMappings["*.wild.example"])
+        assertEquals("server:1.1.1.1", p.hostMappings["server.example"])
+        assertTrue(p.hostMappings.containsKey("*.wild.example"))
+        assertTrue(p.ignoredReasons.containsKey("host_server_system_unsupported"))
+        assertTrue(p.ignoredReasons.containsKey("host_server_http_unsupported"))
+        assertTrue(p.sectionStatus.any { it.section == "Host" && it.status == "partial" })
+    }
+
+    @Test
+    fun bodyRewriteSegmentKeepsRequestAndResponseRules() {
+        val p = ModuleParser.parse(fixture("body"))
+        assertEquals(4, p.bodyRewrites.size)
+        assertTrue(p.bodyRewrites[0].startsWith("http-request "))
+        assertTrue(p.bodyRewrites[1].startsWith("http-response "))
+        assertTrue(p.bodyRewrites[2].contains(" jq "))
+        assertTrue(p.bodyRewrites[3].contains(" jq "))
+        assertTrue(p.ignoredReasons.containsKey("body_rewrite_invalid"))
+        assertTrue(p.sectionStatus.any { it.section == "Body Rewrite" && it.status == "stored" })
+    }
+
+    @Test
+    fun triggerScriptsExposeCronNetworkAndGeneric() {
+        val p = ModuleParser.parse(fixture("trigger"))
+        assertEquals(p.scriptIssues.joinToString(";"), 3, p.scripts.size)
+        val cron = p.scripts.first { it.cron == "0 9 * * *" }
+        assertEquals("cron", cron.phase)
+        assertEquals("cron", cron.trigger)
+        assertEquals(".*", cron.pattern)
+        assertTrue(p.scripts.any { it.trigger == "network-changed" && it.phase == "cron" })
+        assertTrue(p.scripts.any { it.trigger == "generic" && it.phase == "cron" })
+        assertTrue(p.scriptIssues.any { it.contains("cron 表达式") })
+    }
+
+    @Test
     fun allModulesOnlyDropScriptLines() {
         val names = listOf(
             "video", "shortvideo", "locker", "shop", "market", "store", "local",
             "novel", "music", "maps", "community", "audio", "mail", "reading",
-            "groupbuy", "browser", "dns-filter",
+            "groupbuy", "browser", "dns-filter", "host", "body", "trigger",
         )
         val badKeys = setOf("invalid_mitm_host", "unsupported_rule_type", "invalid_rule")
         for (n in names) {

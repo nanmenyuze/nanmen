@@ -25,8 +25,15 @@ object ProxyGroupValidation {
                 issues += ConfigIssue(ConfigIssueLevel.ERROR, "proxyGroups[$i].name", "策略组名称为空")
                 return@forEachIndexed
             }
-            if (g.type !in setOf("select", "url-test", "fallback")) {
+            if (g.type !in setOf("select", "url-test", "fallback", "load-balance")) {
                 issues += ConfigIssue(ConfigIssueLevel.ERROR, "proxyGroups[$i].type", "未知类型：${g.type}")
+            }
+            if (g.type == "load-balance" && g.lbMode !in setOf("consistent-hash", "round-robin")) {
+                issues += ConfigIssue(
+                    ConfigIssueLevel.ERROR,
+                    "proxyGroups[$i].lbMode",
+                    "未知 load-balance 选路方式：${g.lbMode}",
+                )
             }
             if (g.members.isEmpty()) {
                 issues += ConfigIssue(ConfigIssueLevel.ERROR, "proxyGroups[$i].members", "策略组没有成员")

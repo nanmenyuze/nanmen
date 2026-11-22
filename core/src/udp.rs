@@ -36,7 +36,11 @@ struct BoundedMap<K: std::hash::Hash + Eq + Clone, V> {
 
 impl<K: std::hash::Hash + Eq + Clone, V> BoundedMap<K, V> {
     fn new(cap: usize) -> Self {
-        Self { map: HashMap::new(), order: std::collections::VecDeque::new(), cap }
+        Self {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            cap,
+        }
     }
 
     fn insert(&mut self, k: K, v: V) {
@@ -311,22 +315,33 @@ fn parse_trojan_udp(buf: &[u8]) -> io::Result<Option<(Target, Vec<u8>, usize)>> 
     let mut i = 1usize;
     let (domain, ip) = match atyp {
         0x01 => {
-            let Some(b) = buf.get(i..i + 4) else { return Ok(None) };
+            let Some(b) = buf.get(i..i + 4) else {
+                return Ok(None);
+            };
             i += 4;
-            (None, IpAddr::V4(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3])))
+            (
+                None,
+                IpAddr::V4(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3])),
+            )
         }
         0x04 => {
-            let Some(b) = buf.get(i..i + 16) else { return Ok(None) };
+            let Some(b) = buf.get(i..i + 16) else {
+                return Ok(None);
+            };
             i += 16;
             let mut octets = [0u8; 16];
             octets.copy_from_slice(b);
             (None, IpAddr::V6(std::net::Ipv6Addr::from(octets)))
         }
         0x03 => {
-            let Some(&len) = buf.get(i) else { return Ok(None) };
+            let Some(&len) = buf.get(i) else {
+                return Ok(None);
+            };
             i += 1;
             let len = len as usize;
-            let Some(b) = buf.get(i..i + len) else { return Ok(None) };
+            let Some(b) = buf.get(i..i + len) else {
+                return Ok(None);
+            };
             let d = String::from_utf8_lossy(b).to_string();
             if d.is_empty() {
                 return Err(io_err("Trojan UDP 空域名"));
@@ -336,14 +351,18 @@ fn parse_trojan_udp(buf: &[u8]) -> io::Result<Option<(Target, Vec<u8>, usize)>> 
         }
         other => return Err(io_err(format!("Trojan UDP 未知地址类型: {}", other))),
     };
-    let Some(rest) = buf.get(i..i + 4) else { return Ok(None) };
+    let Some(rest) = buf.get(i..i + 4) else {
+        return Ok(None);
+    };
     let port = u16::from_be_bytes([rest[0], rest[1]]);
     let len = u16::from_be_bytes([rest[2], rest[3]]) as usize;
     if len == 0 {
         return Err(io_err("Trojan UDP 空载荷"));
     }
     i += 4;
-    let Some(payload) = buf.get(i..i + len) else { return Ok(None) };
+    let Some(payload) = buf.get(i..i + len) else {
+        return Ok(None);
+    };
     Ok(Some((
         Target { ip, port, domain },
         payload.to_vec(),
@@ -571,7 +590,9 @@ mod udp_proto_tests {
         assert_eq!(parsed.2, frame.len());
 
         // 少一字节必须判「还要继续读」，不能当成坏包断开
-        assert!(parse_trojan_udp(&frame[..frame.len() - 1]).unwrap().is_none());
+        assert!(parse_trojan_udp(&frame[..frame.len() - 1])
+            .unwrap()
+            .is_none());
         assert!(parse_trojan_udp(&frame[..1]).unwrap().is_none());
     }
 

@@ -1,6 +1,7 @@
 package com.namu.dns
 
 import android.content.Context
+import android.os.Build
 import com.namu.dns.core.config.ScriptConfig
 import org.json.JSONArray
 import org.json.JSONObject
@@ -131,6 +132,10 @@ object ConfigStore {
         }
 
         val root = JSONObject()
+        // MITM/Host 分区：active 配置 + 启用模块合并。DNS 也要读同一份 Host 映射。
+        val moduleMitm = if (cfg.moduleSources.any { it.enabled }) {
+            runCatching { JSONObject(moduleMitmFile(context).readText()) }.getOrNull()
+        } else null
         root.put("mode", cfg.mode)
         root.put("selected", cfg.selected ?: "")
         root.put("final_policy", cfg.finalPolicy)
@@ -167,6 +172,21 @@ object ConfigStore {
                     if (cfg.dnsHeaderName.isNotBlank() && cfg.dnsHeaderValue.isNotBlank()) {
                         put(cfg.dnsHeaderName.trim(), cfg.dnsHeaderValue)
                     }
+                })
+                // [Host] 是 DNS 配置态：当前配置优先，模块只补未占用的 key。
+                put("hosts", JSONObject().apply {
+                    val merged = LinkedHashMap<String, String>()
+                    cfg.mitm.hostMappings.forEach { (k, v) ->
+                        if (k.isNotBlank() && v.isNotBlank()) merged[k.trim().lowercase()] = v.trim()
+                    }
+                    moduleMitm?.optJSONObject("hostMappings")?.let { h ->
+                        h.keys().forEach { k ->
+                            val v = h.optString(k, "").trim()
+                            val key = k.trim().lowercase()
+                            if (key.isNotBlank() && v.isNotBlank() && !merged.containsKey(key)) merged[key] = v
+                        }
+                    }
+                    merged.forEach { (k, v) -> put(k, v) }
                 })
                 put("cache_ttl", cfg.dnsCacheTtl)
                 put("cache_size", 2048)
@@ -217,22 +237,24 @@ object ConfigStore {
         })
         // MITM 分区：active 配置 + 启用模块合并。内核 1.11 消费；
         // url_rewrites/header_rewrites 下发原始模块规则行，由内核统一解析成结构化规则。
-        val moduleMitm = if (cfg.moduleSources.any { it.enabled }) {
-            runCatching { JSONObject(moduleMitmFile(context).readText()) }.getOrNull()
-        } else null
         root.put("mitm", JSONObject().apply {
             val hosts = LinkedHashSet(cfg.mitm.hostnames)
             val skips = LinkedHashSet(cfg.mitm.skipHostnames)
             val urls = LinkedHashSet(cfg.mitm.urlRewrites)
             val headers = LinkedHashSet(cfg.mitm.headerRewrites)
             val loon = LinkedHashSet(cfg.mitm.loonRewrites)
+            val body = LinkedHashSet(cfg.mitm.bodyRewrites)
+            val wsRules = LinkedHashSet(cfg.mitm.wsRewrites)
             val scripts = LinkedHashMap<String, ScriptConfig>()
             cfg.mitm.scripts.forEach { scripts[scriptKey(it)] = it }
             moduleMitm?.let { m ->
                 m.optJSONArray("hostnames")?.let { a -> for (i in 0 until a.length()) hosts.add(a.optString(i)) }
+                m.optJSONArray("skipHostnames")?.let { a -> for (i in 0 until a.length()) skips.add(a.optString(i)) }
                 m.optJSONArray("urlRewrites")?.let { a -> for (i in 0 until a.length()) urls.add(a.optString(i)) }
                 m.optJSONArray("headerRewrites")?.let { a -> for (i in 0 until a.length()) headers.add(a.optString(i)) }
                 m.optJSONArray("loonRewrites")?.let { a -> for (i in 0 until a.length()) loon.add(a.optString(i)) }
+                m.optJSONArray("bodyRewrites")?.let { a -> for (i in 0 until a.length()) body.add(a.optString(i)) }
+                m.optJSONArray("wsRewrites")?.let { a -> for (i in 0 until a.length()) wsRules.add(a.optString(i)) }
                 m.optJSONArray("scripts")?.let { a ->
                     for (i in 0 until a.length()) {
                         a.optJSONObject(i)?.let { o ->
@@ -249,9 +271,29 @@ object ConfigStore {
             put("header_rewrites", JSONArray(headers.toList()))
             // Loon [Rewrite] 与 Surge [URL Rewrite] 分开下发，内核不把一种语法推导成另一种。
             put("loon_rewrites", JSONArray(loon.toList()))
+            put("body_rewrites", JSONArray(body.toList()))
+            put("websocket_rewrites", JSONArray(wsRules.toList()))
             // ScriptConfig.toJsonObject 使用 camelCase，Rust serde 已按 camelCase 对齐。
-            put("scripts", JSONArray(scripts.values.map { it.toJsonObject() }))
+            // 参数当前值按脚本键覆盖模块默认值；只影响 $argument，不参与源码展开。
+            put("scripts", JSONArray(scripts.values.map { sc ->
+                cfg.mitm.scriptArguments[scriptArgumentKey(sc)]?.let { sc.copy(argumentValues = it) } ?: sc
+            }.map { it.toJsonObject() }))
             put("script_store_file", File(File(dir, "scripts"), "store.json").absolutePath)
+            // Map Local 相对 data-path 的基准目录；`$notification` 队列供服务轮询发系统通知。
+            put("mock_base_dir", context.filesDir.absolutePath)
+            put("notification_file", File(context.filesDir, "script_notifications.jsonl").absolutePath)
+            put("environment", JSONObject().apply {
+                put("app", "南门DNS")
+                put("appVersion", BuildConfig.VERSION_NAME)
+                put("buildVersion", BuildConfig.VERSION_CODE.toString())
+                put("version", BuildConfig.VERSION_NAME)
+                put("system", "Android")
+                put("systemVersion", Build.VERSION.RELEASE)
+                put("device", Build.MODEL)
+                put("language", java.util.Locale.getDefault().language)
+                put("timezone", java.util.TimeZone.getDefault().id)
+                put("packageName", context.packageName)
+            })
             // CA 必须与 MitmManager.caFile 保持一致；未导出前内核会自行生成。
             put("ca_file", File(File(dir, "mitm"), "ca.pem").absolutePath)
             put("body_limit", 2 * 1024 * 1024)
@@ -310,6 +352,10 @@ object ConfigStore {
     fun scriptKey(rule: ScriptConfig): String =
         "${rule.phase}|${rule.pattern}|${rule.name}|${rule.scriptPath}"
 
+    /** 与 Rust CompiledScriptRule.key 对齐；脚本路径变化不影响参数覆盖。 */
+    fun scriptArgumentKey(rule: ScriptConfig): String =
+        "${rule.phase.trim().lowercase()}|${rule.pattern.trim()}|${rule.name}"
+
     /**
      * 把所有启用模块的规则重新合并成一份 DNS 阻断文件 + 一份分流规则 JSON。
      * 模块被关闭/删除时，旧聚合文件会被清空，不会继续生效。
@@ -319,9 +365,15 @@ object ConfigStore {
         val allows = LinkedHashSet<String>()
         val routes = mutableListOf<RuleItem>()
         val mitmHosts = LinkedHashSet<String>()
+        val mitmSkips = LinkedHashSet<String>()
+        val generalOptions = LinkedHashMap<String, String>()
+        val mitmOptions = LinkedHashMap<String, String>()
         val urlRewrites = LinkedHashSet<String>()
         val headerRewrites = LinkedHashSet<String>()
         val loonRewrites = LinkedHashSet<String>()
+        val bodyRewrites = LinkedHashSet<String>()
+        val wsRewrites = LinkedHashSet<String>()
+        val hostMappings = LinkedHashMap<String, String>()
         val scripts = LinkedHashMap<String, ScriptConfig>()
         val scriptIssues = LinkedHashSet<String>()
         val ruleSetIssues = LinkedHashSet<String>()
@@ -362,9 +414,18 @@ object ConfigStore {
                 }
             }
             mitmHosts.addAll(parsed.mitmHostnames)
+            mitmSkips.addAll(parsed.mitmSkipHostnames)
+            parsed.generalOptions.forEach { (k, v) -> if (!generalOptions.containsKey(k)) generalOptions[k] = v }
+            parsed.mitmOptions.forEach { (k, v) -> if (!mitmOptions.containsKey(k)) mitmOptions[k] = v }
             urlRewrites.addAll(parsed.urlRewrites)
             headerRewrites.addAll(parsed.headerRewrites)
             loonRewrites.addAll(parsed.loonRewrites)
+            bodyRewrites.addAll(parsed.bodyRewrites)
+            wsRewrites.addAll(parsed.wsRewrites)
+            parsed.hostMappings.forEach { (k, v) ->
+                // 先加载的模块优先；重复 key 不让后加载模块静默覆盖。
+                if (!hostMappings.containsKey(k)) hostMappings[k] = v
+            }
             parsed.scripts.forEach { rule ->
                 var src = rule.source
                 if (src.isBlank() && rule.scriptPath.isNotBlank()) {
@@ -395,9 +456,15 @@ object ConfigStore {
             moduleMitmFile(context),
             JSONObject().apply {
                 put("hostnames", JSONArray(mitmHosts.toList()))
+                put("skipHostnames", JSONArray(mitmSkips.toList()))
+                put("generalOptions", JSONObject(generalOptions as Map<*, *>))
+                put("mitmOptions", JSONObject(mitmOptions as Map<*, *>))
                 put("urlRewrites", JSONArray(urlRewrites.toList()))
                 put("headerRewrites", JSONArray(headerRewrites.toList()))
                 put("loonRewrites", JSONArray(loonRewrites.toList()))
+                put("bodyRewrites", JSONArray(bodyRewrites.toList()))
+                put("wsRewrites", JSONArray(wsRewrites.toList()))
+                put("hostMappings", JSONObject(hostMappings as Map<*, *>))
                 put("scripts", JSONArray(scripts.values.map { it.toJsonObject() }))
                 put("scriptIssues", JSONArray(scriptIssues.toList()))
                 put("ruleSetIssues", JSONArray(ruleSetIssues.toList()))

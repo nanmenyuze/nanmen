@@ -38,7 +38,7 @@ class CompatFixtureTest {
         // 规则集增量后：RULE-SET 行解析为规则集引用，不再计入 ignored（5→4）。
         assertEquals(1, parsed.ruleSets.size)
         assertEquals("https://example.com/rules.txt", parsed.ruleSets[0].url)
-        assertEquals(4, parsed.ignored)
+        assertEquals(3, parsed.ignored)
     }
 
     @Test
@@ -52,8 +52,8 @@ class CompatFixtureTest {
         assertEquals(1, parsed.blockLines.size)
         assertEquals(3, parsed.routeRules.size)
         assertEquals(1, parsed.mitmHostnames.size)
-        // Argument/General/Host 和无法解析成 script-path 的 Script 行仍计为未执行。
-        assertEquals(4, parsed.ignored)
+        // General/Argument 已接入；只有无法解析成 script-path 的 Script 行仍计为未执行。
+        assertEquals(1, parsed.ignored)
         assertEquals(1, parsed.loonRewrites.size)
         assertTrue(parsed.sectionStatus.any { it.section == "Rewrite" && it.status == "stored" })
         assertTrue(parsed.sectionStatus.any { it.section == "Script" && it.status == "unsupported" })
@@ -72,11 +72,11 @@ class CompatFixtureTest {
             ^https://api\.example\.com/y mock-response-body data-type=json data-path=response.json
             """.trimIndent(),
         )
-        assertEquals(2, parsed.loonRewrites.size)
-        assertEquals(2, parsed.ignored)
+        assertEquals(4, parsed.loonRewrites.size)
+        assertEquals(0, parsed.ignored)
         val rewrite = parsed.sectionStatus.first { it.section == "Rewrite" }
         assertEquals(4, rewrite.lines)
-        assertEquals(2, rewrite.supported)
+        assertEquals(4, rewrite.supported)
         assertEquals("stored", rewrite.status)
     }
 
@@ -195,8 +195,8 @@ class CompatFixtureTest {
         assertEquals("string", parsed.argumentTypes["region"])
         // number 默认值非法时降为 string，避免内核注入 NaN。
         assertEquals("string", parsed.argumentTypes["broken"])
-        // Rewrite 里的 ${'$'}{enabled} 按默认值展开，交由内核条件树执行。
-        assertTrue(parsed.loonRewrites.single().contains("&& true == true"))
+        // Rewrite 里的参数引用不再编译期展开，避免拼进正则/URL。
+        assertTrue(parsed.loonRewrites.single().contains("${'$'}{enabled}"))
         val script = parsed.scripts.single()
         assertEquals("request", script.phase)
         assertEquals("""^https:\/\/api\.example\.com\/feed""", script.pattern)
@@ -207,7 +207,7 @@ class CompatFixtureTest {
     }
 
     @Test
-    fun `loon script v2 cron and compound conditions are reported not silently dropped`() {
+    fun `loon script v2 cron is scheduled and compound condition is passed to kernel`() {
         val parsed = ModuleParser.parse(
             """
             [Script]
@@ -215,9 +215,81 @@ class CompatFixtureTest {
             request if ${'$'}{url} ~= /^https:\/\/api\.example\.com\/x/ && ${'$'}{request.header['X']} == "1" then script("https://cdn.example.com/x.js")
             """.trimIndent(),
         )
-        assertEquals(0, parsed.scripts.size)
-        assertEquals(2, parsed.scriptIssues.size)
-        assertTrue(parsed.scriptIssues.any { it.contains("调度器") })
-        assertTrue(parsed.scriptIssues.any { it.contains("复合条件") })
+        assertEquals(2, parsed.scripts.size)
+        assertEquals(0, parsed.scriptIssues.size)
+        val cron = parsed.scripts.first { it.cron == "0 8 * * *" }
+        assertEquals("cron", cron.phase)
+        assertEquals(".*", cron.pattern)
+        val script = parsed.scripts.first { it.phase == "request" }
+        assertTrue(script.pattern.startsWith("^https"))
+        assertTrue(script.condition.contains("request.header['X']"))
+    }
+
+    @Test
+    fun `websocket rewrite section keeps own syntax and rejects unknown actions`() {
+        val parsed = ModuleParser.parse(
+            """
+            [WebSocket Rewrite]
+            ws-block ^https://api.example.com/blocked
+            ws-text-replace ^https://api.example.com/ws "foo" "bar"
+            ws-redirect ^https://api.example.com/ws
+            """.trimIndent(),
+        )
+        assertEquals(2, parsed.wsRewrites.size)
+        assertTrue(parsed.wsRewrites.any { it.startsWith("ws-block") })
+        assertTrue(parsed.wsRewrites.any { it.startsWith("ws-text-replace") })
+        assertTrue(parsed.ignoredReasons.containsKey("unsupported_websocket_action"))
+        assertTrue(parsed.sectionStatus.any { it.section == "WebSocket Rewrite" && it.status == "stored" })
+    }
+
+    @Test
+    fun `map local inline data becomes mock and file path is reported`() {
+        val parsed = ModuleParser.parse(
+            """
+            [Map Local]
+            ^https://api.example.com/ad data-type=json data={"code":0,"msg":"ok"} status-code=200 header=Content-Type:application/json
+            ^https://api.example.com/file data-path=/tmp/mock.json
+            [Map Remote]
+            ^https://old.example.com/ https://new.example.com/
+            """.trimIndent(),
+        )
+        assertEquals(3, parsed.loonRewrites.size)
+        assertTrue(parsed.loonRewrites.any { it.contains("mock-response-body") && it.contains("status-code=200") && it.contains("header=") })
+        assertTrue(parsed.loonRewrites.any { it.contains("data-path=") })
+        assertTrue(parsed.loonRewrites.any { it.contains("https://new.example.com/") })
+        assertTrue(!parsed.ignoredReasons.containsKey("unsupported_map_local_data_path"))
+        assertTrue(!parsed.ignoredReasons.containsKey("unsupported_map_remote"))
+        assertTrue(parsed.sectionStatus.any { it.section == "Map Local" && it.status == "executed" })
+        assertTrue(parsed.sectionStatus.any { it.section == "Map Remote" && it.status == "executed" })
+    }
+
+    @Test
+    fun `general mitm skip and arguments are parsed`() {
+        val parsed = ModuleParser.parse(
+            """
+            [General]
+            skip-proxy = 192.168.0.0/16, localhost
+            dns-server = 223.5.5.5
+            [Argument]
+            region = select,"CN","US",tag=Region
+            [Mitm]
+            hostname = %APPEND% api.example.com, *.example.net
+            skip = bank.example.com
+            tcp-connection = true
+            [Script]
+            response if ${'$'}{url} ~= /^https:\/\/api\.example\.com\// && ${'$'}{request.method} == GET then script("https://example.com/a.js")
+            """.trimIndent(),
+        )
+        assertEquals(2, parsed.generalOptions.size)
+        assertEquals("223.5.5.5", parsed.generalOptions["dns-server"])
+        assertEquals(setOf("api.example.com", "*.example.net"), parsed.mitmHostnames.toSet())
+        assertEquals(listOf("bank.example.com"), parsed.mitmSkipHostnames)
+        assertEquals("true", parsed.mitmOptions["tcp-connection"])
+        assertEquals("CN", parsed.arguments["region"])
+        assertEquals("string", parsed.argumentTypes["region"])
+        assertEquals(0, parsed.ignored)
+        assertTrue(parsed.sectionStatus.any { it.section == "General" && it.status == "stored" })
+        assertTrue(parsed.sectionStatus.any { it.section == "Argument" && it.status == "executed" })
+        assertTrue(parsed.sectionStatus.any { it.section == "MITM" && it.status == "executed" })
     }
 }

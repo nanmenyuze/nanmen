@@ -1,6 +1,7 @@
 package com.namu.dns
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Test
 
 /**
@@ -66,5 +67,18 @@ class NamuVpnServiceSwitchTest {
         // 窗口必须足够长以覆盖常见验证抖动（秒级），又不能长到真断网恢复不可感。
         assertEquals(5000L, NamuVpnService.NETWORK_SWITCH_CONFIRM_MS)
         assertEquals(3000L, NamuVpnService.REBUILD_RETRY_DELAY_MS)
+    }
+
+    @Test
+    fun tunnelSpecTracksMtuRouteAndMode() {
+        val base = AppConfig(mode = "dns_only", dnsOnlyFullRoute = false, mtu = 1500)
+        assertEquals(TunnelSpec("dns_only", 1500, fullRoute = false), tunnelSpec(base))
+        // 连接中只改 MTU 也必须重建：setMtu 只在 establish 时生效。
+        assertNotEquals(tunnelSpec(base), tunnelSpec(base.copy(mtu = 9000)))
+        // DNS-only 全量接管会加默认路由，同样不是热重载能改的。
+        assertNotEquals(tunnelSpec(base), tunnelSpec(base.copy(dnsOnlyFullRoute = true)))
+        assertNotEquals(tunnelSpec(base), tunnelSpec(base.copy(mode = "global")))
+        // establish 回退 1500 时，已应用状态必须记录实际值，不能记配置里的 9000。
+        assertEquals(1500, tunnelSpec(base.copy(mtu = 9000), appliedMtu = 1500).mtu)
     }
 }

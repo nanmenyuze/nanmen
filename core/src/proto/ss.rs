@@ -79,7 +79,8 @@ fn evp_bytes_to_key(password: &[u8], key_len: usize) -> Vec<u8> {
 fn hkdf_subkey(master: &[u8], salt: &[u8]) -> io::Result<Vec<u8>> {
     let hk = Hkdf::<Sha1>::new(Some(salt), master);
     let mut okm = vec![0u8; master.len()];
-    hk.expand(b"ss-subkey", &mut okm).map_err(|_| io_err("HKDF 派生失败"))?;
+    hk.expand(b"ss-subkey", &mut okm)
+        .map_err(|_| io_err("HKDF 派生失败"))?;
     Ok(okm)
 }
 
@@ -171,9 +172,12 @@ async fn pump(
         // 服务端 salt 与首个响应数据可能一直等到应用真正发出请求后才返回，
         // 所以读握手必须和写循环并发，不能阻塞 connect() 返回。
         let mut server_salt = vec![0u8; key_len];
-        tokio::time::timeout(std::time::Duration::from_secs(8), sr.read_exact(&mut server_salt))
-            .await
-            .map_err(|_| io_err("等待 SS 服务端 salt 超时"))??;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            sr.read_exact(&mut server_salt),
+        )
+        .await
+        .map_err(|_| io_err("等待 SS 服务端 salt 超时"))??;
         let read_key = hkdf_subkey(&master, &server_salt)?;
         let read_cipher = cipher_new(&method, &read_key)?;
         let mut read_nonce = [0u8; 12];
@@ -268,14 +272,7 @@ impl SsUdpCipher {
             .ok_or_else(|| io_err("SS UDP 解密失败"))?;
         let (domain, ip, port, offset) = crate::outbound::parse_socks_addr_bytes(&plain, 0)?;
         let payload = plain[offset..].to_vec();
-        Ok((
-            Target {
-                ip,
-                port,
-                domain,
-            },
-            payload,
-        ))
+        Ok((Target { ip, port, domain }, payload))
     }
 }
 
@@ -303,8 +300,16 @@ pub async fn connect(node: &Node, target: Target) -> io::Result<BoxStream> {
     let log_method = method.clone();
     let (pipe_a, pipe_b) = tokio::io::duplex(128 * 1024);
     // connect 立即返回；应用请求由 write_loop 转发，服务端 salt 在后台读取。
-    tokio::spawn(pump(sr, sw, master, method, key_len, write_cipher, write_nonce, pipe_a));
+    tokio::spawn(pump(
+        sr,
+        sw,
+        master,
+        method,
+        key_len,
+        write_cipher,
+        write_nonce,
+        pipe_a,
+    ));
     crate::logging::info("ss", format!("已连接 {} ({})", node.label(), log_method));
     Ok(Box::new(pipe_b))
 }
-

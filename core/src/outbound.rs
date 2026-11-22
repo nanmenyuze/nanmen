@@ -22,7 +22,10 @@ pub struct PrefixedStream {
 
 impl PrefixedStream {
     pub fn new(prefix: Vec<u8>, inner: BoxStream) -> Self {
-        Self { prefix: std::io::Cursor::new(prefix), inner }
+        Self {
+            prefix: std::io::Cursor::new(prefix),
+            inner,
+        }
     }
 }
 
@@ -69,10 +72,17 @@ impl AsyncWrite for PrefixedStream {
 
 /// 上游调优全局开关与统计入口：engine 启动/热更时下发，避免给每个 dial 路径传参。
 static TUNE_BBR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-static TUNE_STATS: std::sync::RwLock<Option<Arc<crate::stats::Stats>>> = std::sync::RwLock::new(None);
+static TUNE_STATS: std::sync::RwLock<Option<Arc<crate::stats::Stats>>> =
+    std::sync::RwLock::new(None);
+/// BBR 支持探测缓存：0=未探测，1=支持，2=不支持，3=正在探测。
+/// 只探测一次：首条 WAN socket 上试设并 getsockopt 复核，失败后后续连接不再逐条
+/// setsockopt，把「每条连接一次失败」收敛成「整机一次探测」。
+static BBR_SUPPORT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 pub fn set_tuning(bbr: bool, stats: Arc<crate::stats::Stats>) {
     TUNE_BBR.store(bbr, std::sync::atomic::Ordering::Relaxed);
+    // 手动关掉再打开时允许重新探测；不同设备/内核热更后也不沿用旧结论。
+    BBR_SUPPORT.store(0, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut g) = TUNE_STATS.write() {
         *g = Some(stats);
     }
@@ -82,7 +92,11 @@ fn tune_stats() -> Option<Arc<crate::stats::Stats>> {
     TUNE_STATS.read().ok().and_then(|g| g.clone())
 }
 
-fn get_sockopt_int(fd: std::os::fd::RawFd, level: libc::c_int, name: libc::c_int) -> Option<libc::c_int> {
+fn get_sockopt_int(
+    fd: std::os::fd::RawFd,
+    level: libc::c_int,
+    name: libc::c_int,
+) -> Option<libc::c_int> {
     let mut v: libc::c_int = 0;
     let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
     let rc = unsafe {
@@ -126,10 +140,12 @@ fn get_congestion(fd: std::os::fd::RawFd) -> Option<String> {
 fn sample_sock_bufs(fd: std::os::fd::RawFd, stats: &Option<Arc<crate::stats::Stats>>) {
     let Some(st) = stats else { return };
     if let Some(v) = get_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_RCVBUF) {
-        st.upstream_rcvbuf_max.fetch_max(v as i64, std::sync::atomic::Ordering::Relaxed);
+        st.upstream_rcvbuf_max
+            .fetch_max(v as i64, std::sync::atomic::Ordering::Relaxed);
     }
     if let Some(v) = get_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_SNDBUF) {
-        st.upstream_sndbuf_max.fetch_max(v as i64, std::sync::atomic::Ordering::Relaxed);
+        st.upstream_sndbuf_max
+            .fetch_max(v as i64, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -266,6 +282,7 @@ async fn proxy(node: &Node, target: Target) -> io::Result<BoxStream> {
             "ss" => crate::proto::ss::connect(node, target).await,
             "trojan" => crate::proto::trojan::connect(node, target).await,
             "vless" => crate::proto::vless::connect(node, target).await,
+            "vmess" => crate::proto::vmess::connect(node, target).await,
             "socks5" => crate::proto::socks::connect_socks5(node, target).await,
             "http" => crate::proto::socks::connect_http(node, target).await,
             other => Err(io_err(format!("不支持的节点类型: {}", other))),
@@ -302,8 +319,26 @@ async fn direct(target: &Target, dns: Option<&Arc<DnsEngine>>) -> io::Result<Box
 }
 
 pub async fn tcp_connect(host: &str, port: u16) -> io::Result<BoxStream> {
-    let addrs = resolve_all(host, port).await?;
-    Ok(Box::new(MeteredStream::new(connect_any(&addrs).await?)))
+    let started = std::time::Instant::now();
+    let result: io::Result<BoxStream> = async {
+        let addrs = resolve_all(host, port).await?;
+        Ok(Box::new(MeteredStream::new(connect_any(&addrs).await?)) as BoxStream)
+    }
+    .await;
+    if let Some(st) = tune_stats() {
+        let dt = started.elapsed().as_millis() as u64;
+        st.outbound_tcp_ms
+            .fetch_add(dt, std::sync::atomic::Ordering::Relaxed);
+        match &result {
+            Ok(_) => st
+                .outbound_tcp_ok
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            Err(_) => st
+                .outbound_tcp_fail
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        };
+    }
+    result
 }
 
 pub async fn resolve(host: &str, port: u16) -> io::Result<SocketAddr> {
@@ -313,7 +348,10 @@ pub async fn resolve(host: &str, port: u16) -> io::Result<SocketAddr> {
     let addrs = tokio::net::lookup_host(format!("{}:{}", host, port))
         .await
         .map_err(|e| io_err(format!("解析 {} 失败: {}", host, e)))?;
-    addrs.into_iter().next().ok_or_else(|| io_err("没有解析结果"))
+    addrs
+        .into_iter()
+        .next()
+        .ok_or_else(|| io_err("没有解析结果"))
 }
 
 /// 解析出多个地址（去重，最多 4 个），双栈下可依次尝试。
@@ -365,7 +403,12 @@ const UPSTREAM_KEEPALIVE_PROBES: libc::c_int = 4;
 /// 手机切网后中继任务会一直挂在这条死连接上，APP 侧只能干等到超时。
 const UPSTREAM_USER_TIMEOUT_MS: libc::c_int = 120_000;
 
-unsafe fn set_sockopt_int(fd: std::os::fd::RawFd, level: libc::c_int, name: libc::c_int, value: libc::c_int) {
+unsafe fn set_sockopt_int(
+    fd: std::os::fd::RawFd,
+    level: libc::c_int,
+    name: libc::c_int,
+    value: libc::c_int,
+) {
     // 必须取 value 的地址：直接把整数 as *const 会变成「地址 = 60」的野指针，
     // setsockopt 返回 EFAULT 但不会报错，选项静默不生效（编译期看不出来）。
     libc::setsockopt(
@@ -385,34 +428,98 @@ pub fn tune_tcp(stream: &TcpStream) {
     let fd = stream.as_raw_fd();
     unsafe {
         set_sockopt_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
-        set_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, UPSTREAM_KEEPALIVE_IDLE_SECS);
-        set_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, UPSTREAM_KEEPALIVE_INTVL_SECS);
-        set_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPCNT, UPSTREAM_KEEPALIVE_PROBES);
-        set_sockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_USER_TIMEOUT, UPSTREAM_USER_TIMEOUT_MS);
+        set_sockopt_int(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPIDLE,
+            UPSTREAM_KEEPALIVE_IDLE_SECS,
+        );
+        set_sockopt_int(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPINTVL,
+            UPSTREAM_KEEPALIVE_INTVL_SECS,
+        );
+        set_sockopt_int(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPCNT,
+            UPSTREAM_KEEPALIVE_PROBES,
+        );
+        set_sockopt_int(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_USER_TIMEOUT,
+            UPSTREAM_USER_TIMEOUT_MS,
+        );
     }
     // WAN 腿 per-socket BBR：丢包 Wi-Fi/WAN 上不等丢包信号就维持速率（gVisor 也给不了这条）。
-    // 内核无 bbr 时 setsockopt 失败静默回退 cubic；getsockopt 复核真实生效算法并计数。
-    if TUNE_BBR.load(std::sync::atomic::Ordering::Relaxed) {
-        let name = b"bbr\0";
-        let rc = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_TCP,
-                libc::TCP_CONGESTION,
-                name.as_ptr() as *const libc::c_void,
-                name.len() as libc::socklen_t,
-            )
-        };
-        let ok = rc == 0 && get_congestion(fd).map(|s| s == "bbr").unwrap_or(false);
-        if let Some(st) = tune_stats() {
-            if ok {
-                st.tcp_bbr_ok.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                st.tcp_bbr_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // 先探测一次本机内核是否支持，再决定后续每条 socket 是否值得 setsockopt；
+    // 内核无 bbr 时只留下一次探测失败，不再让每条连接都失败一次。
+    apply_bbr(fd);
+    sample_sock_bufs(fd, &tune_stats());
+}
+
+/// 设置并在本 socket 上复核 BBR。返回是否真正生效。
+fn set_bbr(fd: std::os::fd::RawFd) -> bool {
+    let name = b"bbr\0";
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            name.as_ptr() as *const libc::c_void,
+            name.len() as libc::socklen_t,
+        )
+    };
+    rc == 0 && get_congestion(fd).map(|s| s == "bbr").unwrap_or(false)
+}
+
+fn apply_bbr(fd: std::os::fd::RawFd) {
+    use std::sync::atomic::Ordering;
+    if !TUNE_BBR.load(Ordering::Relaxed) {
+        return;
+    }
+    let state = BBR_SUPPORT.load(Ordering::Relaxed);
+    match state {
+        // 已知不支持：后续连接直接跳过 setsockopt。
+        2 => return,
+        // 另一条连接正在探测：这条先不设，避免并发探测重复计数。
+        3 => return,
+        // 已知支持：每条 socket 仍必须单独设置，拥塞算法是 per-socket 的。
+        1 => {
+            let ok = set_bbr(fd);
+            if let Some(st) = tune_stats() {
+                if ok {
+                    st.tcp_bbr_ok.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // 缓存说支持但该 socket 设置失败：是真异常，保留计数。
+                    st.tcp_bbr_fail.fetch_add(1, Ordering::Relaxed);
+                }
             }
+            return;
+        }
+        _ => {}
+    }
+    // 首连探测：只允许一个连接进入，其余并发首连先跳过 BBR（不影响连通）。
+    if BBR_SUPPORT
+        .compare_exchange(0, 3, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let ok = set_bbr(fd);
+    BBR_SUPPORT.store(if ok { 1 } else { 2 }, Ordering::Relaxed);
+    if let Some(st) = tune_stats() {
+        st.tcp_bbr_support
+            .store(if ok { 1 } else { 2 }, Ordering::Relaxed);
+        if ok {
+            st.tcp_bbr_ok.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // 只记这一次探测失败；后续连接不会再尝试。
+            st.tcp_bbr_fail.fetch_add(1, Ordering::Relaxed);
         }
     }
-    sample_sock_bufs(fd, &tune_stats());
 }
 
 /// 双地址并发竞速（happy-eyeballs 的简化版）：两边同时发起，先成功者胜出。
@@ -465,7 +572,6 @@ pub fn io_err(msg: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::Other, msg.to_string())
 }
 
-
 /// 通过真实节点探测一个测速 URL。只测 TCP/HTTP 路径；调用方必须把结果写入 TCP 健康状态，
 /// 不能据此宣称同一节点的 UDP 可用。
 pub async fn probe_node(node: &Node, url: &str, timeout: Duration) -> io::Result<u16> {
@@ -474,7 +580,9 @@ pub async fn probe_node(node: &Node, url: &str, timeout: Duration) -> io::Result
         .host_str()
         .ok_or_else(|| io_err("测速 URL 缺少主机"))?
         .to_string();
-    let port = parsed.port_or_known_default().ok_or_else(|| io_err("测速 URL 缺少端口"))?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| io_err("测速 URL 缺少端口"))?;
     let https = parsed.scheme() == "https";
     let path = if parsed.query().is_some() {
         format!("{}?{}", parsed.path(), parsed.query().unwrap_or(""))
@@ -534,7 +642,11 @@ pub async fn probe_node(node: &Node, url: &str, timeout: Duration) -> io::Result
 }
 
 async fn wrap_tls(stream: BoxStream, sni: &str, insecure: bool) -> io::Result<BoxStream> {
-    let config = if insecure { TLS_INSECURE.clone() } else { TLS_SECURE.clone() };
+    let config = if insecure {
+        TLS_INSECURE.clone()
+    } else {
+        TLS_SECURE.clone()
+    };
     let connector = tokio_rustls::TlsConnector::from(config);
     let name = server_name(sni)?;
     let tls = tokio::time::timeout(Duration::from_secs(8), connector.connect(name, stream))
@@ -587,35 +699,70 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 }
 
 /// TLS 配置全局缓存：根证书库解析开销大，不能每条连接都重建。
-static TLS_SECURE: once_cell::sync::Lazy<Arc<rustls::ClientConfig>> = once_cell::sync::Lazy::new(|| {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth())
-});
+static TLS_SECURE: once_cell::sync::Lazy<Arc<rustls::ClientConfig>> =
+    once_cell::sync::Lazy::new(|| {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        )
+    });
 
-static TLS_INSECURE: once_cell::sync::Lazy<Arc<rustls::ClientConfig>> = once_cell::sync::Lazy::new(|| {
-    let provider = rustls::crypto::ring::default_provider();
-    let schemes = provider.signature_verification_algorithms.supported_schemes();
-    let verifier = Arc::new(NoVerifier { schemes });
-    Arc::new(
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth(),
-    )
-});
+static TLS_INSECURE: once_cell::sync::Lazy<Arc<rustls::ClientConfig>> =
+    once_cell::sync::Lazy::new(|| {
+        let provider = rustls::crypto::ring::default_provider();
+        let schemes = provider
+            .signature_verification_algorithms
+            .supported_schemes();
+        let verifier = Arc::new(NoVerifier { schemes });
+        Arc::new(
+            rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth(),
+        )
+    });
 
-pub async fn tls_connect(host: &str, port: u16, sni: &str, insecure: bool) -> io::Result<tokio_rustls::client::TlsStream<BoxStream>> {
-    let tcp = tcp_connect(host, port).await?;
-    let config = if insecure { TLS_INSECURE.clone() } else { TLS_SECURE.clone() };
-    let connector = tokio_rustls::TlsConnector::from(config);
-    let name = server_name(sni)?;
-    let tls = tokio::time::timeout(Duration::from_secs(8), connector.connect(name, tcp))
-        .await
-        .map_err(|_| io_err("TLS 握手超时"))?
-        .map_err(|e| io_err(format!("TLS 握手失败: {}", e)))?;
-    logging::info("tls", format!("已建立 TLS: {}:{} ({})", host, port, sni));
-    Ok(tls)
+pub async fn tls_connect(
+    host: &str,
+    port: u16,
+    sni: &str,
+    insecure: bool,
+) -> io::Result<tokio_rustls::client::TlsStream<BoxStream>> {
+    let started = std::time::Instant::now();
+    let result = async {
+        let tcp = tcp_connect(host, port).await?;
+        let config = if insecure {
+            TLS_INSECURE.clone()
+        } else {
+            TLS_SECURE.clone()
+        };
+        let connector = tokio_rustls::TlsConnector::from(config);
+        let name = server_name(sni)?;
+        let tls = tokio::time::timeout(Duration::from_secs(8), connector.connect(name, tcp))
+            .await
+            .map_err(|_| io_err("TLS 握手超时"))?
+            .map_err(|e| io_err(format!("TLS 握手失败: {}", e)))?;
+        logging::info("tls", format!("已建立 TLS: {}:{} ({})", host, port, sni));
+        Ok(tls)
+    }
+    .await;
+    if let Some(st) = tune_stats() {
+        let dt = started.elapsed().as_millis() as u64;
+        st.outbound_tls_ms
+            .fetch_add(dt, std::sync::atomic::Ordering::Relaxed);
+        match &result {
+            Ok(_) => st
+                .outbound_tls_ok
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            Err(_) => st
+                .outbound_tls_fail
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        };
+    }
+    result
 }
 
 /// MITM 上游 TLS：HTTP/1.1 路径只提 http/1.1；h2 路径单独提 h2，
@@ -654,14 +801,24 @@ pub async fn tls_wrap(
     sni: &str,
     insecure: bool,
 ) -> io::Result<tokio_rustls::client::TlsStream<BoxStream>> {
-    let config = if insecure { MITM_TLS_INSECURE.clone() } else { MITM_TLS_SECURE.clone() };
-    let connector = tokio_rustls::TlsConnector::from(config);
-    let name = server_name(sni)?;
-    let tls = tokio::time::timeout(Duration::from_secs(10), connector.connect(name, stream))
-        .await
-        .map_err(|_| io_err("MITM 上游 TLS 握手超时"))?
-        .map_err(|e| io_err(format!("MITM 上游 TLS 握手失败: {}", e)))?;
-    Ok(tls)
+    let started = std::time::Instant::now();
+    let result = async {
+        let config = if insecure {
+            MITM_TLS_INSECURE.clone()
+        } else {
+            MITM_TLS_SECURE.clone()
+        };
+        let connector = tokio_rustls::TlsConnector::from(config);
+        let name = server_name(sni)?;
+        let tls = tokio::time::timeout(Duration::from_secs(10), connector.connect(name, stream))
+            .await
+            .map_err(|_| io_err("MITM 上游 TLS 握手超时"))?
+            .map_err(|e| io_err(format!("MITM 上游 TLS 握手失败: {}", e)))?;
+        Ok(tls)
+    }
+    .await;
+    record_mitm_tls(&started, &result);
+    result
 }
 
 /// MITM h2 上游：必须协商到 h2，否则降级回 HTTP/1.1 的字节流不能交给 h2 解析。
@@ -670,17 +827,43 @@ pub async fn tls_wrap_h2(
     sni: &str,
     insecure: bool,
 ) -> io::Result<tokio_rustls::client::TlsStream<BoxStream>> {
-    let config = if insecure { MITM_TLS_H2_INSECURE.clone() } else { MITM_TLS_H2_SECURE.clone() };
-    let connector = tokio_rustls::TlsConnector::from(config);
-    let name = server_name(sni)?;
-    let tls = tokio::time::timeout(Duration::from_secs(10), connector.connect(name, stream))
-        .await
-        .map_err(|_| io_err("MITM h2 上游 TLS 握手超时"))?
-        .map_err(|e| io_err(format!("MITM h2 上游 TLS 握手失败: {}", e)))?;
-    if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
-        return Err(io_err("MITM h2 上游未协商到 h2"));
+    let started = std::time::Instant::now();
+    let result = async {
+        let config = if insecure {
+            MITM_TLS_H2_INSECURE.clone()
+        } else {
+            MITM_TLS_H2_SECURE.clone()
+        };
+        let connector = tokio_rustls::TlsConnector::from(config);
+        let name = server_name(sni)?;
+        let tls = tokio::time::timeout(Duration::from_secs(10), connector.connect(name, stream))
+            .await
+            .map_err(|_| io_err("MITM h2 上游 TLS 握手超时"))?
+            .map_err(|e| io_err(format!("MITM h2 上游 TLS 握手失败: {}", e)))?;
+        if tls.get_ref().1.alpn_protocol() != Some(b"h2".as_slice()) {
+            return Err(io_err("MITM h2 上游未协商到 h2"));
+        }
+        Ok(tls)
     }
-    Ok(tls)
+    .await;
+    record_mitm_tls(&started, &result);
+    result
+}
+
+fn record_mitm_tls<T>(started: &std::time::Instant, result: &io::Result<T>) {
+    if let Some(st) = tune_stats() {
+        let dt = started.elapsed().as_millis() as u64;
+        st.outbound_tls_ms
+            .fetch_add(dt, std::sync::atomic::Ordering::Relaxed);
+        match result {
+            Ok(_) => st
+                .outbound_tls_ok
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            Err(_) => st
+                .outbound_tls_fail
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        };
+    }
 }
 
 fn server_name(sni: &str) -> io::Result<rustls::pki_types::ServerName<'static>> {
@@ -755,7 +938,9 @@ pub fn parse_socks_addr_bytes(
     i += 1;
     let (domain, ip) = match atyp {
         0x01 => {
-            let b = buf.get(i..i + 4).ok_or_else(|| io_err("IPv4 地址长度不足"))?;
+            let b = buf
+                .get(i..i + 4)
+                .ok_or_else(|| io_err("IPv4 地址长度不足"))?;
             i += 4;
             (
                 None,
@@ -774,7 +959,9 @@ pub fn parse_socks_addr_bytes(
             (Some(d), IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
         }
         0x04 => {
-            let b = buf.get(i..i + 16).ok_or_else(|| io_err("IPv6 地址长度不足"))?;
+            let b = buf
+                .get(i..i + 16)
+                .ok_or_else(|| io_err("IPv6 地址长度不足"))?;
             i += 16;
             let mut octets = [0u8; 16];
             octets.copy_from_slice(b);
@@ -800,7 +987,11 @@ mod keepalive_tests {
     use super::*;
     use std::os::fd::AsRawFd;
 
-    unsafe fn get_sockopt_int(fd: std::os::fd::RawFd, level: libc::c_int, name: libc::c_int) -> libc::c_int {
+    unsafe fn get_sockopt_int(
+        fd: std::os::fd::RawFd,
+        level: libc::c_int,
+        name: libc::c_int,
+    ) -> libc::c_int {
         let mut v: libc::c_int = -1;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
         let rc = libc::getsockopt(

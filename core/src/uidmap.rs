@@ -41,8 +41,7 @@ impl UidMap {
         self.by_port.reserve(entries.len().min(MAX_FLOWS));
         for (key, uid) in entries.into_iter().take(MAX_FLOWS) {
             self.exact.insert(key, uid);
-            self.by_port
-                .insert((key.1, key.2, key.3), uid);
+            self.by_port.insert((key.1, key.2, key.3), uid);
         }
     }
 
@@ -66,7 +65,11 @@ impl UidMap {
         self.exact
             .get(&(client_ip, client_port, server_ip, server_port))
             .copied()
-            .or_else(|| self.by_port.get(&(client_port, server_ip, server_port)).copied())
+            .or_else(|| {
+                self.by_port
+                    .get(&(client_port, server_ip, server_port))
+                    .copied()
+            })
     }
 
     pub fn len(&self) -> usize {
@@ -142,7 +145,10 @@ mod tests {
         // 第二次只带一条：旧条目必须消失，否则关掉的连接会留下幽灵归属。
         m.replace(vec![(key("10.10.10.1", 5001, "1.1.1.1", 443), 10300)]);
         assert_eq!(m.len(), 1);
-        assert_eq!(m.lookup(&key("10.10.10.1", 5001, "1.1.1.1", 443)), Some(10300));
+        assert_eq!(
+            m.lookup(&key("10.10.10.1", 5001, "1.1.1.1", 443)),
+            Some(10300)
+        );
         assert_eq!(m.lookup(&key("10.10.10.1", 5002, "2.2.2.2", 443)), None);
     }
 
@@ -157,10 +163,7 @@ mod tests {
     fn lookup_flow_falls_back_to_port_when_source_ip_differs() {
         let mut m = UidMap::default();
         // socket 表里源地址是物理网卡，TUN 里看到的是 VPN 地址。
-        m.replace(vec![(
-            key("192.168.1.20", 54321, "1.2.3.4", 443),
-            10200,
-        )]);
+        m.replace(vec![(key("192.168.1.20", 54321, "1.2.3.4", 443), 10200)]);
         // 精确命中
         assert_eq!(
             m.lookup_flow(
@@ -242,7 +245,12 @@ mod tests {
     fn replace_caps_at_max_flows() {
         let mut m = UidMap::default();
         let entries: Vec<(FlowKey, u32)> = (0..(MAX_FLOWS + 100))
-            .map(|i| (key("10.10.10.1", (i % 60000) as u16, "1.1.1.1", 443), i as u32))
+            .map(|i| {
+                (
+                    key("10.10.10.1", (i % 60000) as u16, "1.1.1.1", 443),
+                    i as u32,
+                )
+            })
             .collect();
         m.replace(entries);
         assert!(m.len() <= MAX_FLOWS);

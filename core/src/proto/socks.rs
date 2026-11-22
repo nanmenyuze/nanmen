@@ -1,5 +1,5 @@
 use crate::config::{Node, Target};
-use crate::outbound::{encode_socks_addr, io_err, tls_connect, tcp_connect, BoxStream};
+use crate::outbound::{encode_socks_addr, io_err, tcp_connect, tls_connect, BoxStream};
 use base64::Engine;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -62,7 +62,14 @@ pub async fn connect_socks5(node: &Node, target: Target) -> io::Result<BoxStream
         }
         _ => return Err(io_err("SOCKS5 地址类型错误")),
     }
-    crate::logging::info("socks", format!("SOCKS5 已连接 {} -> {}", node.label(), crate::outbound::display_target(&target)));
+    crate::logging::info(
+        "socks",
+        format!(
+            "SOCKS5 已连接 {} -> {}",
+            node.label(),
+            crate::outbound::display_target(&target)
+        ),
+    );
     Ok(Box::new(sock))
 }
 
@@ -74,9 +81,12 @@ pub struct Socks5Udp {
 
 pub async fn udp_associate(node: &Node) -> io::Result<Socks5Udp> {
     // 整个握手包超时：黑洞服务器接受连接后不回数据时，会话任务不能永久挂起。
-    tokio::time::timeout(std::time::Duration::from_secs(12), udp_associate_inner(node))
-        .await
-        .map_err(|_| io_err("SOCKS5 UDP ASSOCIATE 握手超时"))?
+    tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        udp_associate_inner(node),
+    )
+    .await
+    .map_err(|_| io_err("SOCKS5 UDP ASSOCIATE 握手超时"))?
 }
 
 async fn udp_associate_inner(node: &Node) -> io::Result<Socks5Udp> {
@@ -116,7 +126,10 @@ async fn udp_associate_inner(node: &Node) -> io::Result<Socks5Udp> {
     let mut hdr = [0u8; 4];
     sock.read_exact(&mut hdr).await?;
     if hdr[0] != 0x05 || hdr[1] != 0x00 {
-        return Err(io_err(format!("SOCKS5 UDP ASSOCIATE 失败: code {}", hdr[1])));
+        return Err(io_err(format!(
+            "SOCKS5 UDP ASSOCIATE 失败: code {}",
+            hdr[1]
+        )));
     }
     let mut raw = vec![hdr[3]];
     match hdr[3] {
@@ -140,8 +153,7 @@ async fn udp_associate_inner(node: &Node) -> io::Result<Socks5Udp> {
         }
         _ => return Err(io_err("SOCKS5 UDP 地址类型错误")),
     }
-    let (domain, ip, port, _offset) =
-        crate::outbound::parse_socks_addr_bytes(&raw, 0)?;
+    let (domain, ip, port, _offset) = crate::outbound::parse_socks_addr_bytes(&raw, 0)?;
     let mut relay_ip = ip;
     if relay_ip.is_unspecified() {
         if let Ok(a) = crate::outbound::resolve(&node.server, node.port).await {
@@ -164,14 +176,28 @@ async fn udp_associate_inner(node: &Node) -> io::Result<Socks5Udp> {
     };
     let socket = UdpSocket::bind(bind).await?;
     socket.connect(relay).await?;
-    crate::logging::info("socks", format!("SOCKS5 UDP relay: {} (via {})", relay, node.label()));
-    Ok(Socks5Udp { control: sock, socket })
+    crate::logging::info(
+        "socks",
+        format!("SOCKS5 UDP relay: {} (via {})", relay, node.label()),
+    );
+    Ok(Socks5Udp {
+        control: sock,
+        socket,
+    })
 }
 
 pub async fn connect_http(node: &Node, target: Target) -> io::Result<BoxStream> {
     let use_tls = node.tls.unwrap_or(false);
     let mut sock: BoxStream = if use_tls {
-        Box::new(tls_connect(&node.server, node.port, &node.server, node.insecure.unwrap_or(false)).await?)
+        Box::new(
+            tls_connect(
+                &node.server,
+                node.port,
+                &node.server,
+                node.insecure.unwrap_or(false),
+            )
+            .await?,
+        )
     } else {
         Box::new(tcp_connect(&node.server, node.port).await?)
     };
@@ -217,12 +243,21 @@ pub async fn connect_http(node: &Node, target: Target) -> io::Result<BoxStream> 
     if !status_ok {
         return Err(io_err(format!("HTTP CONNECT 失败: {}", status_line)));
     }
-    crate::logging::info("http", format!("HTTP 代理已连接 {} -> {}", node.label(), crate::outbound::display_target(&target)));
+    crate::logging::info(
+        "http",
+        format!(
+            "HTTP 代理已连接 {} -> {}",
+            node.label(),
+            crate::outbound::display_target(&target)
+        ),
+    );
     // 与头部一起读到的早到数据必须保留，接在返回流前面，不能丢弃。
     let leftover = head[end..].to_vec();
     if leftover.is_empty() {
         Ok(sock)
     } else {
-        Ok(Box::new(crate::outbound::PrefixedStream::new(leftover, sock)))
+        Ok(Box::new(crate::outbound::PrefixedStream::new(
+            leftover, sock,
+        )))
     }
 }

@@ -1,6 +1,8 @@
 # 打赏码放置说明
 
-- 支付宝收款码：`app/src/main/res/drawable/donate_alipay.png`（已配置，来源为用户提供的收款码）。
-- 微信收款码：`app/src/main/res/drawable-nodpi/donate_wechat.png`（已配置，来源为用户提供的收款码）。
+- 支付宝收款码：`app/src/main/res/drawable-nodpi/donate_alipay.png`（已配置，来源为用户提供的收款码）。
+- 支付宝深链：`alipayqr://platformapi/startapp?saId=10000007&qrcode=<URL 编码后的收款码链接>`，点击直接进入「向你付款」页，金额由付款人自选。
+- 未安装支付宝时：先回退打开 `https://qr.alipay.com/...` 收款页；仍失败则弹窗内显示上面的收款码图片。
+- 微信收款码已移除，不再提供微信入口。
 - 仅用于自愿打赏，金额随意、无回报档位；不要设置「打赏解锁功能 / 进群 / 优先支持」等任何对价。
 - 若打赏形成经常性收入，注意个人收款与经营认定边界，必要时咨询专业人士。

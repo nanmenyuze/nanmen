@@ -1,6 +1,6 @@
+use once_cell::sync::Lazy;
 use serde_json::json;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use once_cell::sync::Lazy;
 
 /// UDP 截断转 TCP 次数（无引擎上下文的全局计数）
 pub static STATS_TCP: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -65,6 +65,8 @@ pub struct Stats {
     /// MITM 内解析到的请求总数 / 请求与响应两阶段都没有任何规则脚本命中的请求数。
     pub mitm_reqs: AtomicU64,
     pub mitm_no_rule: AtomicU64,
+    /// 命中正文规则但按 Content-Type/大小提前直通的响应数。
+    pub mitm_body_bypassed: AtomicU64,
     /// 客户端在本地 TLS 握手中途弃连（连接池预热），不计失败、不拉黑域名。
     pub mitm_tls_aborted: AtomicU64,
     /// 响应改写完成前客户端已取消该 h2 stream（RST/弃流），改写无法送达。
@@ -73,6 +75,28 @@ pub struct Stats {
     pub mitm_bypassed: AtomicU64,
     /// h2 连接级处理失败次数（服务端提前断开等，整条连接的请求都会失效）。
     pub mitm_h2_failed: AtomicU64,
+    /// 出站拨号/握手：成功、失败、累计耗时；以及连接池命中/复用/淘汰。
+    pub outbound_tcp_ok: AtomicU64,
+    pub outbound_tcp_fail: AtomicU64,
+    pub outbound_tcp_ms: AtomicU64,
+    pub outbound_tls_ok: AtomicU64,
+    pub outbound_tls_fail: AtomicU64,
+    pub outbound_tls_ms: AtomicU64,
+    pub mitm_pool_h1_hit: AtomicU64,
+    pub mitm_pool_h1_miss: AtomicU64,
+    pub mitm_pool_h1_reuse: AtomicU64,
+    pub mitm_pool_h1_evict: AtomicU64,
+    pub mitm_pool_h2_hit: AtomicU64,
+    pub mitm_pool_h2_miss: AtomicU64,
+    pub mitm_pool_h2_reuse: AtomicU64,
+    pub mitm_pool_h2_evict: AtomicU64,
+    /// 叶子证书缓存：命中/未命中、single-flight 等待、等待超时、等待打满、实际签发。
+    pub mitm_leaf_hit: AtomicU64,
+    pub mitm_leaf_miss: AtomicU64,
+    pub mitm_leaf_wait: AtomicU64,
+    pub mitm_leaf_wait_timeout: AtomicU64,
+    pub mitm_leaf_pending_full: AtomicU64,
+    pub mitm_leaf_sign: AtomicU64,
     /// TUN 出口诊断：TxToken 队列满静默丢包 / pending_out 硬上限丢弃 /
     /// 历史 backlog 峰值 / transmit() 因高水位返回 None 的背压次数 /
     /// write(2) 返回 WouldBlock 的次数 / 其他写错误。
@@ -115,11 +139,17 @@ pub struct Stats {
     /// 上游内核 socket 收/发缓冲观测最大值（getsockopt 采样，看自动调窗天花板）。
     pub upstream_rcvbuf_max: AtomicI64,
     pub upstream_sndbuf_max: AtomicI64,
-    /// per-socket BBR：设置成功 / 回退 cubic 的次数。
+    /// per-socket BBR：设置成功 / 回退 cubic 的次数；探测结果 0=未探测/1=支持/2=不支持。
     pub tcp_bbr_ok: AtomicU64,
     pub tcp_bbr_fail: AtomicU64,
+    pub tcp_bbr_support: AtomicU64,
     /// 本次运行 TUN 实际 MTU（壳 setMtu 与内核 iface 取同一配置值）。
     pub tun_mtu: AtomicI64,
+    /// 动态 UDP 目标表：普通+DNS 合计数、预分配缓冲容量（字节，物理页懒提交）。
+    pub udp_targets: AtomicU64,
+    pub udp_target_buf_bytes: AtomicU64,
+    /// 动态 DNS socket 被淘汰/复用后，旧异步回包按 generation 丢弃的次数。
+    pub dns_stale_reply: AtomicU64,
 }
 
 impl Stats {
@@ -153,7 +183,9 @@ impl Stats {
     pub fn record_fallback(&self, reason: FallbackReason) {
         self.dns_fallback.fetch_add(1, Ordering::Relaxed);
         match reason {
-            FallbackReason::PrimaryFailure => self.dns_fallback_fail.fetch_add(1, Ordering::Relaxed),
+            FallbackReason::PrimaryFailure => {
+                self.dns_fallback_fail.fetch_add(1, Ordering::Relaxed)
+            }
             FallbackReason::Breaker => self.dns_fallback_breaker.fetch_add(1, Ordering::Relaxed),
             FallbackReason::Race => self.dns_fallback_race.fetch_add(1, Ordering::Relaxed),
             FallbackReason::Review => self.dns_fallback_review.fetch_add(1, Ordering::Relaxed),
@@ -176,12 +208,24 @@ impl Stats {
     pub fn to_json_with(&self, bypass_hosts: &str) -> String {
         let start = self.started_at.load(Ordering::Relaxed);
         let stopped = self.stopped_at.load(Ordering::Relaxed);
-        let end = if stopped > 0 { stopped } else { now_ms() as i64 };
+        let end = if stopped > 0 {
+            stopped
+        } else {
+            now_ms() as i64
+        };
         let uptime = (end - start).max(0) as u64;
         let n = self.dns_ms_count.load(Ordering::Relaxed);
-        let avg = if n == 0 { 0 } else { self.dns_ms_sum.load(Ordering::Relaxed) / n };
+        let avg = if n == 0 {
+            0
+        } else {
+            self.dns_ms_sum.load(Ordering::Relaxed) / n
+        };
         let local_n = self.dns_local_ms_count.load(Ordering::Relaxed);
-        let local_avg = if local_n == 0 { 0 } else { self.dns_local_ms_sum.load(Ordering::Relaxed) / local_n };
+        let local_avg = if local_n == 0 {
+            0
+        } else {
+            self.dns_local_ms_sum.load(Ordering::Relaxed) / local_n
+        };
         let mut v = json!({
             "up": self.up_bytes.load(Ordering::Relaxed),
             "down": self.down_bytes.load(Ordering::Relaxed),
@@ -225,10 +269,31 @@ impl Stats {
             "mitmFinanceSkipped": self.mitm_finance_skipped.load(Ordering::Relaxed),
             "mitmReqs": self.mitm_reqs.load(Ordering::Relaxed),
             "mitmNoRule": self.mitm_no_rule.load(Ordering::Relaxed),
+            "mitmBodyBypassed": self.mitm_body_bypassed.load(Ordering::Relaxed),
             "mitmTlsAborted": self.mitm_tls_aborted.load(Ordering::Relaxed),
             "mitmCanceled": self.mitm_canceled.load(Ordering::Relaxed),
             "mitmBypassed": self.mitm_bypassed.load(Ordering::Relaxed),
             "mitmH2Failed": self.mitm_h2_failed.load(Ordering::Relaxed),
+            "mitmLeafCacheHit": self.mitm_leaf_hit.load(Ordering::Relaxed),
+            "mitmLeafCacheMiss": self.mitm_leaf_miss.load(Ordering::Relaxed),
+            "mitmLeafWait": self.mitm_leaf_wait.load(Ordering::Relaxed),
+            "mitmLeafWaitTimeout": self.mitm_leaf_wait_timeout.load(Ordering::Relaxed),
+            "mitmLeafPendingFull": self.mitm_leaf_pending_full.load(Ordering::Relaxed),
+            "mitmLeafSign": self.mitm_leaf_sign.load(Ordering::Relaxed),
+            "outboundTcpOk": self.outbound_tcp_ok.load(Ordering::Relaxed),
+            "outboundTcpFail": self.outbound_tcp_fail.load(Ordering::Relaxed),
+            "outboundTcpMs": self.outbound_tcp_ms.load(Ordering::Relaxed),
+            "outboundTlsOk": self.outbound_tls_ok.load(Ordering::Relaxed),
+            "outboundTlsFail": self.outbound_tls_fail.load(Ordering::Relaxed),
+            "outboundTlsMs": self.outbound_tls_ms.load(Ordering::Relaxed),
+            "mitmPoolH1Hit": self.mitm_pool_h1_hit.load(Ordering::Relaxed),
+            "mitmPoolH1Miss": self.mitm_pool_h1_miss.load(Ordering::Relaxed),
+            "mitmPoolH1Reuse": self.mitm_pool_h1_reuse.load(Ordering::Relaxed),
+            "mitmPoolH1Evict": self.mitm_pool_h1_evict.load(Ordering::Relaxed),
+            "mitmPoolH2Hit": self.mitm_pool_h2_hit.load(Ordering::Relaxed),
+            "mitmPoolH2Miss": self.mitm_pool_h2_miss.load(Ordering::Relaxed),
+            "mitmPoolH2Reuse": self.mitm_pool_h2_reuse.load(Ordering::Relaxed),
+            "mitmPoolH2Evict": self.mitm_pool_h2_evict.load(Ordering::Relaxed),
             "tunTxDrop": self.tun_tx_drop.load(Ordering::Relaxed),
             "tunPendingDrop": self.tun_pending_drop.load(Ordering::Relaxed),
             "tunPendingPeak": self.tun_pending_peak.load(Ordering::Relaxed),
@@ -252,13 +317,20 @@ impl Stats {
             "upstreamSndbufMax": self.upstream_sndbuf_max.load(Ordering::Relaxed),
             "tcpBbrOk": self.tcp_bbr_ok.load(Ordering::Relaxed),
             "tcpBbrFail": self.tcp_bbr_fail.load(Ordering::Relaxed),
+            "tcpBbrSupport": self.tcp_bbr_support.load(Ordering::Relaxed),
             "tunMtu": self.tun_mtu.load(Ordering::Relaxed),
-            "tunPoolMiss": crate::netstack::pool_misses(),
+            "udpTargets": self.udp_targets.load(Ordering::Relaxed),
+            "udpTargetBufKb": self.udp_target_buf_bytes.load(Ordering::Relaxed) / 1024,
+            "dnsStaleReply": self.dns_stale_reply.load(Ordering::Relaxed),
+            "tunPoolMiss": crate::netstack::pool_misses().0,
+            "tunPoolMissRx": crate::netstack::pool_misses().1,
+            "tunPoolMissTx": crate::netstack::pool_misses().2,
             "loopRoundMsLast": self.loop_round_ms_last.load(Ordering::Relaxed),
             "loopRoundMsMax": self.loop_round_ms_max.load(Ordering::Relaxed),
             "uptime": uptime,
         });
         v["mitmBypassHosts"] = json!(bypass_hosts);
+        v["mitmHosts"] = crate::mitm::host_stats::HOST_STATS.snapshot_json();
         v.to_string()
     }
 }

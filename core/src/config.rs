@@ -138,6 +138,12 @@ pub struct ProxyGroup {
     /// 组内无可用成员：global 沿全局 block_when_no_node，block 拦截，direct 直连。
     #[serde(default = "default_no_node_action")]
     pub no_node_action: String,
+    /// load-balance 选路方式：consistent-hash（默认）/ round-robin。
+    #[serde(default, alias = "lbMode", alias = "strategy")]
+    pub lb_mode: String,
+    /// 自动切换最短间隔，秒；当前节点不可用时立即切换，不受此限。
+    #[serde(default = "default_switch_interval")]
+    pub switch_interval: u64,
 }
 
 impl Default for ProxyGroup {
@@ -153,19 +159,39 @@ impl Default for ProxyGroup {
             failure_threshold: default_failure_threshold(),
             recovery_threshold: default_recovery_threshold(),
             no_node_action: default_no_node_action(),
+            lb_mode: String::new(),
+            switch_interval: default_switch_interval(),
         }
     }
 }
 
-fn default_group_type() -> String { "select".into() }
-fn default_test_url() -> String { "http://www.gstatic.com/generate_204".into() }
-fn default_interval() -> u64 { 600 }
-fn default_timeout() -> u64 { 5_000 }
-fn default_tolerance() -> u64 { 50 }
-fn default_failure_threshold() -> u32 { 3 }
-fn default_recovery_threshold() -> u32 { 2 }
-fn default_no_node_action() -> String { "global".into() }
-
+fn default_group_type() -> String {
+    "select".into()
+}
+fn default_test_url() -> String {
+    "http://www.gstatic.com/generate_204".into()
+}
+fn default_interval() -> u64 {
+    600
+}
+fn default_timeout() -> u64 {
+    5_000
+}
+fn default_tolerance() -> u64 {
+    50
+}
+fn default_failure_threshold() -> u32 {
+    3
+}
+fn default_recovery_threshold() -> u32 {
+    2
+}
+fn default_no_node_action() -> String {
+    "global".into()
+}
+fn default_switch_interval() -> u64 {
+    30
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DnsConfig {
@@ -177,6 +203,10 @@ pub struct DnsConfig {
     pub bootstrap: String,
     #[serde(default)]
     pub headers: std::collections::BTreeMap<String, String>,
+    /// Surge/Loon `[Host]` 域名映射：直接 IP、CNAME 别名或 server 指定上游。
+    /// 外壳合并模块与当前配置后下发；空 = 不覆盖任何域名。
+    #[serde(default)]
+    pub hosts: std::collections::BTreeMap<String, String>,
     #[serde(default = "default_cache_ttl")]
     pub cache_ttl: u32,
     #[serde(default = "default_cache_size")]
@@ -245,6 +275,7 @@ impl Default for DnsConfig {
             fallback: default_fallback(),
             bootstrap: String::new(),
             headers: Default::default(),
+            hosts: Default::default(),
             cache_ttl: default_cache_ttl(),
             cache_size: default_cache_size(),
             query_log: true,

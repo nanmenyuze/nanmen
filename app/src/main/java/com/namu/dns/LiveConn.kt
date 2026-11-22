@@ -38,9 +38,9 @@ data class LiveConn(
 /**
  * 活跃连接快照的增量缓存。
  *
- * 内核每次只回 id 大于游标的记录，壳层按内核给的 total 裁掉最旧的条目：
- * 连接关闭时内核不会推删除事件，`total` 就是唯一可信的「现在还有几条」。
- * 这样每秒只传新增部分，不会因为 1024 条上限把整表重传一遍。
+ * 内核增量返回三类数据：新连接、字节/速率变化的活跃连接、关闭连接 id。
+ * 壳层按 id 删除关闭项，不能再用 total 猜最旧——那会把仍在下载的长连删掉、
+ * 留下后建的短连。首次传 0 拿全表，之后只更新变化项。
  */
 internal class LiveConnStore {
     private val items = LinkedHashMap<Long, LiveConn>()
@@ -58,14 +58,31 @@ internal class LiveConnStore {
         items.clear()
         cursor = 0
         total = 0
+        prevBytes.clear()
+        lastSampleMs = 0
     }
 
     fun refresh(): List<LiveConn> {
         if (!NativeCore.available) return rows()
         val text = runCatching { NativeCore.nativeConnections(cursor) }.getOrNull() ?: return rows()
         val o = runCatching { JSONObject(text) }.getOrNull() ?: return rows()
+        applySnapshot(o)
+        return rows()
+    }
+
+    /** 独立出来便于单测：不依赖 JNI，验证按 id 删除和活跃项更新。 */
+    internal fun applySnapshot(o: JSONObject) {
         total = o.optInt("total", items.size)
         cursor = o.optLong("last", cursor)
+        val closed = o.optJSONArray("closed")
+        if (closed != null) {
+            for (i in 0 until closed.length()) {
+                val id = closed.optLong(i)
+                if (id <= 0) continue
+                items.remove(id)
+                prevBytes.remove(id)
+            }
+        }
         val arr = o.optJSONArray("items")
         if (arr != null) {
             for (i in 0 until arr.length()) {
@@ -91,11 +108,13 @@ internal class LiveConnStore {
                 }
             }
         }
-        // id 单调递增，keys 的插入顺序就是建立顺序；超出总数就从头删最旧的。
-        while (items.size > total) {
-            val oldest = items.keys.firstOrNull() ?: break
-            items.remove(oldest)
-            prevBytes.remove(oldest)
+        // 兼容旧内核：没有 closed 字段时才退回按 total 裁最旧。
+        if (closed == null) {
+            while (items.size > total) {
+                val oldest = items.keys.firstOrNull() ?: break
+                items.remove(oldest)
+                prevBytes.remove(oldest)
+            }
         }
         // 速率差分：间隔太短会放大抖动，0.2s 以下直接沿用上次结果。
         val nowMs = System.currentTimeMillis()
@@ -117,7 +136,6 @@ internal class LiveConnStore {
             for (c in items.values) prevBytes[c.id] = c.upBytes to c.downBytes
             lastSampleMs = nowMs
         }
-        return rows()
     }
 }
 

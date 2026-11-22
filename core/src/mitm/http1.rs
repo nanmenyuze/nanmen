@@ -61,7 +61,10 @@ pub struct Buffered<S> {
 
 impl<S: AsyncRead + Unpin> Buffered<S> {
     pub fn new(stream: S) -> Self {
-        Self { stream, buf: Vec::new() }
+        Self {
+            stream,
+            buf: Vec::new(),
+        }
     }
 
     async fn fill(&mut self) -> io::Result<usize> {
@@ -130,6 +133,79 @@ impl<S: AsyncRead + Unpin> Buffered<S> {
             tokio::io::copy(&mut (&mut self.stream).take(rest), out).await?;
         }
         out.flush().await
+    }
+
+    async fn read_line_raw(&mut self) -> io::Result<Vec<u8>> {
+        let mut from = 0usize;
+        loop {
+            if let Some(pos) = self.buf[from..]
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .map(|i| from + i)
+            {
+                let line = self.buf[..pos + 2].to_vec();
+                self.buf.drain(..pos + 2);
+                return Ok(line);
+            }
+            from = self.buf.len().saturating_sub(1);
+            if self.buf.len() > MAX_HEAD {
+                return Err(io_err("HTTP chunk 行超过 64KB"));
+            }
+            if self.fill().await? == 0 {
+                return Err(io_err("chunked 正文在 chunk 行中途关闭"));
+            }
+        }
+    }
+
+    /// 透传 chunked 正文到终止 chunk（含 trailer），消费完即可复用连接。
+    pub async fn pipe_chunked<W: AsyncWrite + Unpin>(&mut self, out: &mut W) -> io::Result<()> {
+        loop {
+            let line = self.read_line_raw().await?;
+            let size = parse_chunk_size(&line)?;
+            out.write_all(&line).await?;
+            if size == 0 {
+                loop {
+                    let trailer = self.read_line_raw().await?;
+                    out.write_all(&trailer).await?;
+                    if trailer == b"\r\n" {
+                        break;
+                    }
+                }
+                out.flush().await?;
+                return Ok(());
+            }
+            self.pipe_n(out, size).await?;
+            self.pipe_n(out, 2).await?; // chunk 末尾 CRLF
+        }
+    }
+
+    /// 读取完整 chunked 原始字节（保留组帧），最多 limit+1；供改写路径不依赖 EOF。
+    pub async fn read_chunked_raw_limit(&mut self, limit: usize) -> io::Result<(Vec<u8>, bool)> {
+        let mut out = Vec::new();
+        loop {
+            let line = self.read_line_raw().await?;
+            let size = parse_chunk_size(&line)?;
+            out.extend_from_slice(&line);
+            if size == 0 {
+                loop {
+                    let trailer = self.read_line_raw().await?;
+                    out.extend_from_slice(&trailer);
+                    if trailer == b"\r\n" {
+                        return Ok((out, false));
+                    }
+                }
+            }
+            if out.len() > limit {
+                return Ok((out, true));
+            }
+            let mut data = self.read_n(size as usize).await?;
+            out.append(&mut data);
+            let crlf = self.read_n(2).await?;
+            out.extend_from_slice(&crlf);
+            if out.len() > limit {
+                return Ok((out, true));
+            }
+        }
     }
 
     /// 把残留缓冲 + 剩余流原样写给对端（透传路径）。
@@ -247,7 +323,13 @@ pub async fn read_request_head<S: AsyncRead + Unpin>(
         _ => true, // HTTP/1.1 默认长连接
     };
     let body = request_body_kind(&headers)?;
-    Ok(Some(RequestHead { method, path, headers, keep_alive, body }))
+    Ok(Some(RequestHead {
+        method,
+        path,
+        headers,
+        keep_alive,
+        body,
+    }))
 }
 
 /// 按组帧读取完整请求体并解码 chunked；超过 limit 返回错误，由调用方决定回退。
@@ -275,7 +357,13 @@ pub async fn read_request<S: AsyncRead + Unpin>(
     let Some(head) = read_request_head(io).await? else {
         return Ok(None);
     };
-    let RequestHead { method, path, headers, keep_alive, body: kind } = head;
+    let RequestHead {
+        method,
+        path,
+        headers,
+        keep_alive,
+        body: kind,
+    } = head;
     let body = match kind {
         BodyKind::None => Vec::new(),
         BodyKind::Chunked => read_chunked_body(io, MAX_REQ_BODY).await?,
@@ -286,7 +374,13 @@ pub async fn read_request<S: AsyncRead + Unpin>(
             io.read_n(len as usize).await?
         }
     };
-    Ok(Some(Request { method, path, headers, body, keep_alive }))
+    Ok(Some(Request {
+        method,
+        path,
+        headers,
+        body,
+        keep_alive,
+    }))
 }
 
 /// 从流里读 chunked 正文并解码（请求体用；响应体透传时不解码）。
@@ -493,13 +587,26 @@ pub async fn read_response_head<S: AsyncRead + Unpin>(
     })
 }
 
+fn parse_chunk_size(line: &[u8]) -> io::Result<u64> {
+    let text = std::str::from_utf8(line)
+        .map_err(|_| io_err("chunk 长度不是 UTF-8"))?
+        .trim_end_matches("\r\n");
+    let size_text = text.split(';').next().unwrap_or("").trim();
+    u64::from_str_radix(size_text, 16)
+        .map_err(|_| io_err(format!("非法 chunk 长度: {}", size_text)))
+}
+
 /// 解码完整接收的 chunked 原始字节（改写路径用；不完整返回 None）。
 pub fn decode_chunked(raw: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let mut p = 0usize;
     loop {
         let eol = raw[p..].windows(2).position(|w| w == b"\r\n")? + p;
-        let size_str = std::str::from_utf8(&raw[p..eol]).ok()?.split(';').next()?.trim();
+        let size_str = std::str::from_utf8(&raw[p..eol])
+            .ok()?
+            .split(';')
+            .next()?
+            .trim();
         let size = usize::from_str_radix(size_str, 16).ok()?;
         p = eol + 2;
         if size == 0 {
@@ -569,9 +676,9 @@ pub fn serialize_response(status: u16, reason: &str, headers: &Headers, body: &[
 
 /// 1x1 透明 GIF（reject-tinygif 用，43 字节标准像素）。
 pub const TINY_GIF: &[u8] = &[
-    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0xff, 0xff, 0xff, 0x21, 0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00,
-    0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b,
+    0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0xff, 0x21, 0xf9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b,
 ];
 
 #[cfg(test)]
@@ -632,7 +739,11 @@ mod tests {
 
     #[test]
     fn framing_rules() {
-        let mk = |status: u16, hs: Headers| ResponseHead { status, reason: "OK".into(), headers: hs };
+        let mk = |status: u16, hs: Headers| ResponseHead {
+            status,
+            reason: "OK".into(),
+            headers: hs,
+        };
         assert_eq!(response_framing(&mk(204, vec![]), "GET"), Framing::None);
         assert_eq!(response_framing(&mk(200, vec![]), "HEAD"), Framing::None);
         assert_eq!(
@@ -640,7 +751,10 @@ mod tests {
             Framing::Length(5)
         );
         assert_eq!(
-            response_framing(&mk(200, vec![("Transfer-Encoding".into(), "chunked".into())]), "GET"),
+            response_framing(
+                &mk(200, vec![("Transfer-Encoding".into(), "chunked".into())]),
+                "GET"
+            ),
             Framing::Chunked
         );
         assert_eq!(response_framing(&mk(200, vec![]), "GET"), Framing::Eof);
@@ -688,14 +802,18 @@ mod tests {
         let mut io = Buffered::new(std::io::Cursor::new(data.to_vec()));
         let head = read_request_head(&mut io).await.unwrap().unwrap();
         let mut out = Vec::new();
-        forward_request_body(&mut io, &mut out, head.body).await.unwrap();
+        forward_request_body(&mut io, &mut out, head.body)
+            .await
+            .unwrap();
         assert_eq!(out, b"abc");
 
         let data = b"POST /u HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3;e=1\r\nabc\r\n0\r\nX-T: v\r\n\r\n";
         let mut io = Buffered::new(std::io::Cursor::new(data.to_vec()));
         let head = read_request_head(&mut io).await.unwrap().unwrap();
         let mut out = Vec::new();
-        forward_request_body(&mut io, &mut out, head.body).await.unwrap();
+        forward_request_body(&mut io, &mut out, head.body)
+            .await
+            .unwrap();
         assert_eq!(out, b"3;e=1\r\nabc\r\n0\r\nX-T: v\r\n\r\n");
     }
 
@@ -704,7 +822,12 @@ mod tests {
         let body = vec![b'a'; 1024 * 1024];
         let enc = gzip_encode(&body).unwrap();
         assert!(decode_content_limited(&enc, "gzip", 4096).is_none());
-        assert_eq!(decode_content_limited(&enc, "gzip", 2 * 1024 * 1024).unwrap().len(), body.len());
+        assert_eq!(
+            decode_content_limited(&enc, "gzip", 2 * 1024 * 1024)
+                .unwrap()
+                .len(),
+            body.len()
+        );
     }
 
     #[test]

@@ -50,25 +50,77 @@ fn domain_regex_and_port_rules_execute() {
                 action: "block".into(),
                 source: None,
             },
-            RuleConf { kind: "PORT".into(), value: "8443".into(), action: "block".into(), source: None },
+            RuleConf {
+                kind: "PORT".into(),
+                value: "8443".into(),
+                action: "block".into(),
+                source: None,
+            },
         ],
         final_policy: "direct".into(),
         ..Default::default()
     };
     let engine = RuleEngine::from_config(&cfg);
-    assert_eq!(engine.decide(Some("ad12.example.com"), "1.2.3.4".parse().unwrap(), 443, ConnKind::Tcp), Action::Block);
-    assert_eq!(engine.decide(Some("good.example.com"), "1.2.3.4".parse().unwrap(), 443, ConnKind::Tcp), Action::Direct);
-    assert_eq!(engine.decide(Some("good.example.com"), "1.2.3.4".parse().unwrap(), 8443, ConnKind::Tcp), Action::Block);
-    assert_eq!(engine.decide(Some("good.example.com"), "1.2.3.4".parse().unwrap(), 443, ConnKind::Udp), Action::Direct);
+    assert_eq!(
+        engine.decide(
+            Some("ad12.example.com"),
+            "1.2.3.4".parse().unwrap(),
+            443,
+            ConnKind::Tcp
+        ),
+        Action::Block
+    );
+    assert_eq!(
+        engine.decide(
+            Some("good.example.com"),
+            "1.2.3.4".parse().unwrap(),
+            443,
+            ConnKind::Tcp
+        ),
+        Action::Direct
+    );
+    assert_eq!(
+        engine.decide(
+            Some("good.example.com"),
+            "1.2.3.4".parse().unwrap(),
+            8443,
+            ConnKind::Tcp
+        ),
+        Action::Block
+    );
+    assert_eq!(
+        engine.decide(
+            Some("good.example.com"),
+            "1.2.3.4".parse().unwrap(),
+            443,
+            ConnKind::Udp
+        ),
+        Action::Direct
+    );
 }
 
 #[test]
 fn rules_split() {
     let cfg = Config {
         rules: vec![
-            RuleConf { kind: "DOMAIN-SUFFIX".into(), value: "google.com".into(), action: "proxy".into(), source: None },
-            RuleConf { kind: "DOMAIN".into(), value: "direct.example".into(), action: "direct".into(), source: None },
-            RuleConf { kind: "IP-CIDR".into(), value: "10.0.0.0/8".into(), action: "block".into(), source: None },
+            RuleConf {
+                kind: "DOMAIN-SUFFIX".into(),
+                value: "google.com".into(),
+                action: "proxy".into(),
+                source: None,
+            },
+            RuleConf {
+                kind: "DOMAIN".into(),
+                value: "direct.example".into(),
+                action: "direct".into(),
+                source: None,
+            },
+            RuleConf {
+                kind: "IP-CIDR".into(),
+                value: "10.0.0.0/8".into(),
+                action: "block".into(),
+                source: None,
+            },
         ],
         final_policy: "direct".into(),
         cn_direct: false,
@@ -76,11 +128,21 @@ fn rules_split() {
     };
     let engine = RuleEngine::from_config(&cfg);
     assert_eq!(
-        engine.decide(Some("www.google.com"), "1.2.3.4".parse().unwrap(), 443, ConnKind::Tcp),
+        engine.decide(
+            Some("www.google.com"),
+            "1.2.3.4".parse().unwrap(),
+            443,
+            ConnKind::Tcp
+        ),
         Action::Proxy
     );
     assert_eq!(
-        engine.decide(Some("direct.example"), "9.9.9.9".parse().unwrap(), 443, ConnKind::Tcp),
+        engine.decide(
+            Some("direct.example"),
+            "9.9.9.9".parse().unwrap(),
+            443,
+            ConnKind::Tcp
+        ),
         Action::Direct
     );
     assert_eq!(
@@ -88,7 +150,12 @@ fn rules_split() {
         Action::Block
     );
     assert_eq!(
-        engine.decide(Some("other.site"), "8.8.8.8".parse().unwrap(), 443, ConnKind::Tcp),
+        engine.decide(
+            Some("other.site"),
+            "8.8.8.8".parse().unwrap(),
+            443,
+            ConnKind::Tcp
+        ),
         Action::Direct
     );
 }
@@ -112,15 +179,30 @@ fn cn_direct_before_final() {
     let engine = RuleEngine::from_config(&cfg);
     let _ = std::fs::remove_file(&cn);
     assert_eq!(
-        engine.decide(Some("www.video.example.com"), "1.2.3.4".parse().unwrap(), 443, ConnKind::Tcp),
+        engine.decide(
+            Some("www.video.example.com"),
+            "1.2.3.4".parse().unwrap(),
+            443,
+            ConnKind::Tcp
+        ),
         Action::Direct
     );
     assert_eq!(
-        engine.decide(Some("www.google.com"), "1.2.3.4".parse().unwrap(), 443, ConnKind::Tcp),
+        engine.decide(
+            Some("www.google.com"),
+            "1.2.3.4".parse().unwrap(),
+            443,
+            ConnKind::Tcp
+        ),
         Action::Proxy
     );
     assert_eq!(
-        engine.decide(Some("other.example"), "1.2.3.4".parse().unwrap(), 443, ConnKind::Tcp),
+        engine.decide(
+            Some("other.example"),
+            "1.2.3.4".parse().unwrap(),
+            443,
+            ConnKind::Tcp
+        ),
         Action::Proxy
     );
 }
@@ -169,8 +251,8 @@ rules:
   - MATCH,Proxy
 "#;
     let r = parse_subscription(yaml);
-    assert_eq!(r.nodes.len(), 3);
-    assert_eq!(r.unsupported, 1);
+    assert_eq!(r.nodes.len(), 4);
+    assert_eq!(r.unsupported, 0);
     assert_eq!(r.nodes[0].kind, "ss");
     assert_eq!(r.nodes[0].method.as_deref(), Some("aes-256-gcm"));
     assert_eq!(r.nodes[1].insecure, Some(true));
@@ -198,7 +280,10 @@ fn base64_uri_parse() {
     let r = parse_subscription(&encoded);
     assert_eq!(r.nodes.len(), 3);
     assert_eq!(r.nodes[0].name, "HK Node");
-    assert_eq!(r.nodes[1].uuid.as_deref(), Some("11111111-2222-3333-4444-555555555555"));
+    assert_eq!(
+        r.nodes[1].uuid.as_deref(),
+        Some("11111111-2222-3333-4444-555555555555")
+    );
     assert_eq!(r.nodes[2].method.as_deref(), Some("aes-256-gcm"));
 }
 
@@ -208,7 +293,10 @@ fn dns_block_response() {
     filter.load_text("||ads.test^");
     let stats = Arc::new(Stats::new());
     let dns = Arc::new(DnsEngine::new(
-        &DnsConfig { upstream: "udp://127.0.0.1:9".into(), ..Default::default() },
+        &DnsConfig {
+            upstream: "udp://127.0.0.1:9".into(),
+            ..Default::default()
+        },
         Arc::new(filter),
         stats.clone(),
         "nxdomain",
@@ -216,15 +304,24 @@ fn dns_block_response() {
         false,
         true,
     ));
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let mut msg = Message::new();
     msg.set_id(42).set_message_type(MessageType::Query);
-    msg.add_query(Query::query(Name::from_ascii("sub.ads.test").unwrap(), RecordType::A));
+    msg.add_query(Query::query(
+        Name::from_ascii("sub.ads.test").unwrap(),
+        RecordType::A,
+    ));
     let req = msg.to_vec().unwrap();
     let resp = rt.block_on(dns.resolve(&req)).unwrap();
     let parsed = Message::from_vec(&resp).unwrap();
     assert_eq!(parsed.response_code(), ResponseCode::NXDomain);
-    assert_eq!(stats.dns_blocked.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(
+        stats.dns_blocked.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
 }
 
 #[test]
@@ -236,7 +333,9 @@ fn socks_addr_parse_ipv6_and_domain() {
     assert_eq!(port, 443);
     assert_eq!(off, 7);
 
-    let domain = [0x03u8, 11, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm', 0x00, 0x50];
+    let domain = [
+        0x03u8, 11, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c', b'o', b'm', 0x00, 0x50,
+    ];
     let (d, _, port, off) = nanmen_core::outbound::parse_socks_addr_bytes(&domain, 0).unwrap();
     assert_eq!(d.as_deref(), Some("example.com"));
     assert_eq!(port, 80);
@@ -292,12 +391,14 @@ fn ss_udp_roundtrip() {
     assert_eq!(payload, b"payload");
 }
 
-
 #[test]
 fn fake_ip_response_has_stable_reverse_mapping() {
     let stats = Arc::new(Stats::new());
     let dns = Arc::new(DnsEngine::new(
-        &DnsConfig { upstream: "udp://127.0.0.1:9".into(), ..Default::default() },
+        &DnsConfig {
+            upstream: "udp://127.0.0.1:9".into(),
+            ..Default::default()
+        },
         Arc::new(FilterEngine::new()),
         stats,
         "nxdomain",
@@ -305,10 +406,16 @@ fn fake_ip_response_has_stable_reverse_mapping() {
         true,
         true,
     ));
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let mut msg = Message::new();
     msg.set_id(7).set_message_type(MessageType::Query);
-    msg.add_query(Query::query(Name::from_ascii("www.example.com").unwrap(), RecordType::A));
+    msg.add_query(Query::query(
+        Name::from_ascii("www.example.com").unwrap(),
+        RecordType::A,
+    ));
     let req = msg.to_vec().unwrap();
     let first = rt.block_on(dns.resolve(&req)).unwrap();
     let second = rt.block_on(dns.resolve(&req)).unwrap();
@@ -321,15 +428,23 @@ fn fake_ip_response_has_stable_reverse_mapping() {
     assert!(nanmen_core::outbound::is_fake_ip(ip));
     assert_eq!(first[2..], second[2..]);
     assert_eq!(b.answers()[0].data(), a.answers()[0].data());
-    assert_eq!(dns.reverse.lock().unwrap().lookup(ip).as_deref(), Some("www.example.com"));
+    assert_eq!(
+        dns.reverse.lock().unwrap().lookup(ip).as_deref(),
+        Some("www.example.com")
+    );
 
     let mut msg6 = Message::new();
     msg6.set_id(8).set_message_type(MessageType::Query);
-    msg6.add_query(Query::query(Name::from_ascii("www.example.com").unwrap(), RecordType::AAAA));
+    msg6.add_query(Query::query(
+        Name::from_ascii("www.example.com").unwrap(),
+        RecordType::AAAA,
+    ));
     let resp6 = rt.block_on(dns.resolve(&msg6.to_vec().unwrap())).unwrap();
     let parsed6 = Message::from_vec(&resp6).unwrap();
     match parsed6.answers()[0].data() {
-        Some(RData::AAAA(v6)) => assert!(nanmen_core::outbound::is_fake_ip(std::net::IpAddr::V6(v6.0))),
+        Some(RData::AAAA(v6)) => assert!(nanmen_core::outbound::is_fake_ip(std::net::IpAddr::V6(
+            v6.0
+        ))),
         other => panic!("expected fake AAAA answer: {:?}", other),
     }
 }
@@ -337,7 +452,10 @@ fn fake_ip_response_has_stable_reverse_mapping() {
 #[test]
 fn sniff_http_host_and_tls_sni() {
     let http = b"GET / HTTP/1.1\r\nHost: Example.COM:443\r\nUser-Agent: test\r\n\r\n";
-    assert_eq!(nanmen_core::sniff::sniff_domain(http).as_deref(), Some("example.com"));
+    assert_eq!(
+        nanmen_core::sniff::sniff_domain(http).as_deref(),
+        Some("example.com")
+    );
 
     let name = b"www.example.com";
     let mut sni_ext = Vec::new();
@@ -365,7 +483,10 @@ fn sniff_http_host_and_tls_sni() {
     let mut record = vec![0x16, 0x03, 0x01];
     record.extend_from_slice(&(hello.len() as u16).to_be_bytes());
     record.extend_from_slice(&hello);
-    assert_eq!(nanmen_core::sniff::sniff_domain(&record).as_deref(), Some("www.example.com"));
+    assert_eq!(
+        nanmen_core::sniff::sniff_domain(&record).as_deref(),
+        Some("www.example.com")
+    );
 }
 
 #[test]
@@ -384,7 +505,10 @@ fn remote_dns_config_supports_bootstrap_headers_and_query_log() {
     )
     .unwrap();
     assert_eq!(cfg.dns.bootstrap, "203.0.113.10");
-    assert_eq!(cfg.dns.headers.get("X-Namu-Token").map(String::as_str), Some("secret"));
+    assert_eq!(
+        cfg.dns.headers.get("X-Namu-Token").map(String::as_str),
+        Some("secret")
+    );
     assert_eq!(cfg.dns.fallback, "");
     assert!(cfg.dns.query_log);
 }
@@ -399,7 +523,10 @@ fn dns_query_log_aggregates_same_domain() {
     let json = nanmen_core::dns_log::json_since(0);
     let items: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
     // 其他并行用例也会写全局日志，这里只断言目标域名自身的聚合结果。
-    let item = items.iter().find(|it| it["domain"] == "sdk.e.qq.com").expect("目标域名日志缺失");
+    let item = items
+        .iter()
+        .find(|it| it["domain"] == "sdk.e.qq.com")
+        .expect("目标域名日志缺失");
     assert_eq!(item["count"], 12);
 }
 
@@ -438,8 +565,12 @@ fn coalesced_queries_keep_own_ids() {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
             loop {
-                let Ok((n, peer)) = sock.recv_from(&mut buf).await else { return };
-                let Ok(req) = Message::from_vec(&buf[..n]) else { continue };
+                let Ok((n, peer)) = sock.recv_from(&mut buf).await else {
+                    return;
+                };
+                let Ok(req) = Message::from_vec(&buf[..n]) else {
+                    continue;
+                };
                 let mut resp = Message::new();
                 resp.set_id(req.id())
                     .set_message_type(MessageType::Response)
@@ -451,7 +582,9 @@ fn coalesced_queries_keep_own_ids() {
                     resp.add_answer(hickory_proto::rr::Record::from_rdata(
                         q.name().clone(),
                         300,
-                        RData::A(hickory_proto::rr::rdata::A(std::net::Ipv4Addr::new(1, 2, 3, 4))),
+                        RData::A(hickory_proto::rr::rdata::A(std::net::Ipv4Addr::new(
+                            1, 2, 3, 4,
+                        ))),
                     ));
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -460,7 +593,10 @@ fn coalesced_queries_keep_own_ids() {
         });
 
         let stats = Arc::new(Stats::new());
-        let cfg = DnsConfig { upstream: format!("udp://{}", addr), ..Default::default() };
+        let cfg = DnsConfig {
+            upstream: format!("udp://{}", addr),
+            ..Default::default()
+        };
         let dns = Arc::new(DnsEngine::new(
             &cfg,
             Arc::new(FilterEngine::new()),
@@ -563,14 +699,24 @@ fn encode_addr_rejects_oversized_domain() {
 #[test]
 fn route_keyword_rule_case_insensitive() {
     let cfg = Config {
-        rules: vec![RuleConf { kind: "DOMAIN-KEYWORD".into(), value: "Google".into(), action: "proxy".into(), source: None }],
+        rules: vec![RuleConf {
+            kind: "DOMAIN-KEYWORD".into(),
+            value: "Google".into(),
+            action: "proxy".into(),
+            source: None,
+        }],
         final_policy: "direct".into(),
         cn_direct: false,
         ..Default::default()
     };
     let engine = RuleEngine::from_config(&cfg);
     assert_eq!(
-        engine.decide(Some("www.google.com"), "1.2.3.4".parse().unwrap(), 443, ConnKind::Tcp),
+        engine.decide(
+            Some("www.google.com"),
+            "1.2.3.4".parse().unwrap(),
+            443,
+            ConnKind::Tcp
+        ),
         Action::Proxy
     );
 }
@@ -605,8 +751,14 @@ fn ss_udp_replay_rejected() {
         port: 8388,
         method: Some("aes-256-gcm".into()),
         password: Some("secret".into()),
-        uuid: None, sni: None, insecure: None, tls: None,
-        ws_path: None, ws_host: None, flow: None, udp: None,
+        uuid: None,
+        sni: None,
+        insecure: None,
+        tls: None,
+        ws_path: None,
+        ws_host: None,
+        flow: None,
+        udp: None,
     };
     let cipher = nanmen_core::proto::ss::SsUdpCipher::new(&node).unwrap();
     let target = nanmen_core::config::Target {
@@ -624,7 +776,10 @@ fn ss_udp_replay_rejected() {
 fn stats_uptime_frozen_after_stop() {
     let s = Stats::new();
     std::thread::sleep(std::time::Duration::from_millis(30));
-    s.stopped_at.store(nanmen_core::stats::now_ms() as i64, std::sync::atomic::Ordering::Relaxed);
+    s.stopped_at.store(
+        nanmen_core::stats::now_ms() as i64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let j1: serde_json::Value = serde_json::from_str(&s.to_json()).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(50));
     let j2: serde_json::Value = serde_json::from_str(&s.to_json()).unwrap();
@@ -654,8 +809,18 @@ fn stats_exposes_tun_egress_diagnostics() {
 fn decide_detail_matches_decide() {
     let cfg = Config {
         rules: vec![
-            RuleConf { kind: "DOMAIN-SUFFIX".into(), value: ".Google.com".into(), action: "proxy".into(), source: None },
-            RuleConf { kind: "FINAL".into(), value: String::new(), action: "direct".into(), source: None },
+            RuleConf {
+                kind: "DOMAIN-SUFFIX".into(),
+                value: ".Google.com".into(),
+                action: "proxy".into(),
+                source: None,
+            },
+            RuleConf {
+                kind: "FINAL".into(),
+                value: String::new(),
+                action: "direct".into(),
+                source: None,
+            },
         ],
         cn_direct: false,
         ..Default::default()
@@ -663,7 +828,10 @@ fn decide_detail_matches_decide() {
     let engine = RuleEngine::from_config(&cfg);
     let ip = "1.2.3.4".parse().unwrap();
     let (action, detail) = engine.decide_detail(Some("www.google.com"), ip, 443, ConnKind::Tcp);
-    assert_eq!(action, engine.decide(Some("www.google.com"), ip, 443, ConnKind::Tcp));
+    assert_eq!(
+        action,
+        engine.decide(Some("www.google.com"), ip, 443, ConnKind::Tcp)
+    );
     assert!(detail.contains("第 1 条"));
     let (action2, detail2) = engine.decide_detail(Some("other.example"), ip, 443, ConnKind::Tcp);
     assert_eq!(action2, Action::Direct);
@@ -675,7 +843,10 @@ fn ws_handshake_keeps_early_data_and_validates_accept() {
     use base64::Engine;
     use sha1::{Digest, Sha1};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async {
         let (client, mut server) = tokio::io::duplex(64 * 1024);
         let server_task = tokio::spawn(async move {
@@ -719,10 +890,14 @@ fn ws_handshake_keeps_early_data_and_validates_accept() {
 #[test]
 fn https_proxy_connects_with_tls_before_connect() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async {
         let key = rcgen::KeyPair::generate().unwrap();
-        let mut params = rcgen::CertificateParams::new(vec!["proxy.test.local".to_string()]).unwrap();
+        let mut params =
+            rcgen::CertificateParams::new(vec!["proxy.test.local".to_string()]).unwrap();
         params.not_before = rcgen::date_time_ymd(2024, 1, 1);
         params.not_after = rcgen::date_time_ymd(2040, 1, 1);
         let cert = params.self_signed(&key).unwrap();
@@ -743,10 +918,14 @@ fn https_proxy_connects_with_tls_before_connect() {
             loop {
                 let n = tls.read(&mut buf).await.unwrap();
                 acc.extend_from_slice(&buf[..n]);
-                if acc.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
             }
             assert!(acc.starts_with(b"CONNECT example.com:443 HTTP/1.1"));
-            tls.write_all(b"HTTP/1.1 200 Connection established\r\n\r\nTLS-EARLY").await.unwrap();
+            tls.write_all(b"HTTP/1.1 200 Connection established\r\n\r\nTLS-EARLY")
+                .await
+                .unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         });
         let node = nanmen_core::config::Node {
@@ -754,18 +933,33 @@ fn https_proxy_connects_with_tls_before_connect() {
             kind: "http".into(),
             server: "127.0.0.1".into(),
             port: addr.port(),
-            method: None, password: None, uuid: None, sni: None,
-            insecure: Some(true), tls: Some(true), ws_path: None, ws_host: None, flow: None, udp: None,
+            method: None,
+            password: None,
+            uuid: None,
+            sni: None,
+            insecure: Some(true),
+            tls: Some(true),
+            ws_path: None,
+            ws_host: None,
+            flow: None,
+            udp: None,
         };
         let target = nanmen_core::config::Target {
             ip: "93.184.216.34".parse().unwrap(),
             port: 443,
             domain: Some("example.com".into()),
         };
-        let mut stream = nanmen_core::proto::socks::connect_http(&node, target).await.unwrap();
+        let mut stream = nanmen_core::proto::socks::connect_http(&node, target)
+            .await
+            .unwrap();
         let mut got = [0u8; 9];
-        tokio::time::timeout(std::time::Duration::from_secs(2), stream.read_exact(&mut got))
-            .await.unwrap().unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_exact(&mut got),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(&got, b"TLS-EARLY");
         server_task.abort();
     });
@@ -774,7 +968,10 @@ fn https_proxy_connects_with_tls_before_connect() {
 #[test]
 fn http_connect_keeps_early_data() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     rt.block_on(async {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -785,10 +982,14 @@ fn http_connect_keeps_early_data() {
             loop {
                 let n = sock.read(&mut buf).await.unwrap();
                 acc.extend_from_slice(&buf[..n]);
-                if acc.windows(4).any(|w| w == b"\r\n\r\n") { break; }
+                if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
             }
             // 200 响应后紧跟早到数据
-            sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\nEARLY").await.unwrap();
+            sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\nEARLY")
+                .await
+                .unwrap();
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         });
         let node = nanmen_core::config::Node {
@@ -796,18 +997,33 @@ fn http_connect_keeps_early_data() {
             kind: "http".into(),
             server: "127.0.0.1".into(),
             port: addr.port(),
-            method: None, password: None, uuid: None, sni: None,
-            insecure: None, tls: Some(false), ws_path: None, ws_host: None, flow: None, udp: None,
+            method: None,
+            password: None,
+            uuid: None,
+            sni: None,
+            insecure: None,
+            tls: Some(false),
+            ws_path: None,
+            ws_host: None,
+            flow: None,
+            udp: None,
         };
         let target = nanmen_core::config::Target {
             ip: "93.184.216.34".parse().unwrap(),
             port: 443,
             domain: Some("example.com".into()),
         };
-        let mut stream = nanmen_core::proto::socks::connect_http(&node, target).await.unwrap();
+        let mut stream = nanmen_core::proto::socks::connect_http(&node, target)
+            .await
+            .unwrap();
         let mut got = [0u8; 5];
-        tokio::time::timeout(std::time::Duration::from_secs(2), stream.read_exact(&mut got))
-            .await.unwrap().unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream.read_exact(&mut got),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert_eq!(&got, b"EARLY");
         server_task.abort();
     });
@@ -840,15 +1056,30 @@ fn wildcard_and_geoip_rules_match_common_clash_syntax() {
     let engine = RuleEngine::from_config(&cfg);
     let _ = std::fs::remove_file(&cn);
     assert_eq!(
-        engine.decide(Some("a.ads.example.com"), "198.51.100.1".parse().unwrap(), 443, ConnKind::Tcp),
+        engine.decide(
+            Some("a.ads.example.com"),
+            "198.51.100.1".parse().unwrap(),
+            443,
+            ConnKind::Tcp
+        ),
         Action::Block
     );
     assert_eq!(
-        engine.decide(Some("good.example.com"), "198.51.100.1".parse().unwrap(), 443, ConnKind::Tcp),
+        engine.decide(
+            Some("good.example.com"),
+            "198.51.100.1".parse().unwrap(),
+            443,
+            ConnKind::Tcp
+        ),
         Action::Proxy
     );
     assert_eq!(
-        engine.decide(Some("good.example.com"), "203.0.113.9".parse().unwrap(), 443, ConnKind::Tcp),
+        engine.decide(
+            Some("good.example.com"),
+            "203.0.113.9".parse().unwrap(),
+            443,
+            ConnKind::Tcp
+        ),
         Action::Direct
     );
 }
@@ -858,7 +1089,10 @@ fn wildcard_and_geoip_rules_match_common_clash_syntax() {
 #[test]
 fn host_matcher_mid_wildcard_globs() {
     use nanmen_core::mitm::rewrite::HostMatcher;
-    let m = HostMatcher::new(&["m*.maps.example.com".to_string(), "img*.shop.example.com".to_string()]);
+    let m = HostMatcher::new(&[
+        "m*.maps.example.com".to_string(),
+        "img*.shop.example.com".to_string(),
+    ]);
     assert!(m.matches("m1.maps.example.com"));
     assert!(m.matches("mxy.maps.example.com"));
     assert!(m.matches("img10.shop.example.com"));
@@ -868,28 +1102,59 @@ fn host_matcher_mid_wildcard_globs() {
     assert!(!m.is_empty());
 }
 
-
 /// PROTOCOL 规则按连接类型（TCP/UDP）匹配；无效值加载期拒绝，不当成不匹配静默。
 #[test]
 fn protocol_rule_matches_conn_kind() {
     let cfg = Config {
-        rules: vec![RuleConf { kind: "PROTOCOL".into(), value: "UDP".into(), action: "block".into(), source: None }],
+        rules: vec![RuleConf {
+            kind: "PROTOCOL".into(),
+            value: "UDP".into(),
+            action: "block".into(),
+            source: None,
+        }],
         final_policy: "direct".into(),
         ..Default::default()
     };
     let engine = RuleEngine::from_config(&cfg);
-    assert_eq!(engine.decide(Some("x.example.com"), "1.2.3.4".parse().unwrap(), 443, ConnKind::Udp), Action::Block);
-    assert_eq!(engine.decide(Some("x.example.com"), "1.2.3.4".parse().unwrap(), 443, ConnKind::Tcp), Action::Direct);
+    assert_eq!(
+        engine.decide(
+            Some("x.example.com"),
+            "1.2.3.4".parse().unwrap(),
+            443,
+            ConnKind::Udp
+        ),
+        Action::Block
+    );
+    assert_eq!(
+        engine.decide(
+            Some("x.example.com"),
+            "1.2.3.4".parse().unwrap(),
+            443,
+            ConnKind::Tcp
+        ),
+        Action::Direct
+    );
 }
 
 #[test]
 fn protocol_rule_invalid_value_is_rejected() {
     let cfg = Config {
-        rules: vec![RuleConf { kind: "PROTOCOL".into(), value: "ICMP".into(), action: "block".into(), source: None }],
+        rules: vec![RuleConf {
+            kind: "PROTOCOL".into(),
+            value: "ICMP".into(),
+            action: "block".into(),
+            source: None,
+        }],
         final_policy: "direct".into(),
         ..Default::default()
     };
     let engine = RuleEngine::from_config(&cfg);
-    assert_eq!(engine.decide(None, "1.2.3.4".parse().unwrap(), 443, ConnKind::Udp), Action::Direct);
-    assert_eq!(engine.decide(None, "1.2.3.4".parse().unwrap(), 443, ConnKind::Tcp), Action::Direct);
+    assert_eq!(
+        engine.decide(None, "1.2.3.4".parse().unwrap(), 443, ConnKind::Udp),
+        Action::Direct
+    );
+    assert_eq!(
+        engine.decide(None, "1.2.3.4".parse().unwrap(), 443, ConnKind::Tcp),
+        Action::Direct
+    );
 }

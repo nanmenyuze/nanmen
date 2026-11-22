@@ -35,7 +35,11 @@ fn diagnostics(v: &Value) -> &Vec<Value> {
 fn warnings(v: &Value) -> Vec<String> {
     v["warnings"]
         .as_array()
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -55,11 +59,14 @@ fn ss_legacy_imports() {
 }
 
 #[test]
-fn vmess_and_hysteria_are_counted_unsupported() {
-    assert_eq!(nodes(&parse("nodes/vmess.txt")), 0);
-    assert_eq!(unsupported(&parse("nodes/vmess.txt")), 1);
-    assert_eq!(nodes(&parse("nodes/hysteria2.txt")), 0);
-    assert_eq!(unsupported(&parse("nodes/hysteria2.txt")), 1);
+fn vmess_imports_while_hysteria_is_diagnosed() {
+    let vmess = parse("nodes/vmess.txt");
+    assert_eq!(nodes(&vmess), 1);
+    assert_eq!(unsupported(&vmess), 0);
+    assert_eq!(vmess["nodes"][0]["type"], "vmess");
+    let hy2 = parse("nodes/hysteria2.txt");
+    assert_eq!(nodes(&hy2), 0);
+    assert_eq!(unsupported(&hy2), 1);
 }
 
 #[test]
@@ -82,7 +89,10 @@ fn vless_reality_and_grpc_are_rejected_with_diagnosis() {
     assert_eq!(nodes(&v), 0);
     assert_eq!(unsupported(&v), 1);
     assert_eq!(diag_count(&v, "unsupported_param"), 1);
-    assert!(diagnostics(&v)[0]["reason"].as_str().unwrap().contains("Reality"));
+    assert!(diagnostics(&v)[0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("Reality"));
 
     let v = parse("nodes/vless-grpc.txt");
     assert_eq!(nodes(&v), 0);
@@ -101,7 +111,6 @@ fn tuic_and_anytls_are_diagnosed() {
     assert_eq!(unsupported(&anytls), 1);
     assert_eq!(diag_count(&anytls, "unsupported_protocol"), 1);
 }
-
 
 #[test]
 fn mixed_valid_and_unknown_nodes_are_all_counted() {
@@ -132,7 +141,13 @@ fn diagnostic_raw_is_redacted() {
 
 #[test]
 fn vless_tcp_ws_trojan_and_socks_import() {
-    for path in ["nodes/vless-tcp.txt", "nodes/vless-ws.txt", "nodes/trojan-tcp.txt", "nodes/trojan-ws.txt", "nodes/socks5.txt"] {
+    for path in [
+        "nodes/vless-tcp.txt",
+        "nodes/vless-ws.txt",
+        "nodes/trojan-tcp.txt",
+        "nodes/trojan-ws.txt",
+        "nodes/socks5.txt",
+    ] {
         let v = parse(path);
         assert_eq!(nodes(&v), 1, "{path}");
     }
@@ -152,8 +167,16 @@ fn http_and_https_proxy_import() {
 fn base64_subscription_decodes_uris() {
     let v = parse("subscriptions/base64-list.txt");
     assert_eq!(nodes(&v), 2);
-    assert!(v["nodes"].as_array().unwrap().iter().any(|n| n["type"] == "ss"));
-    assert!(v["nodes"].as_array().unwrap().iter().any(|n| n["type"] == "trojan"));
+    assert!(v["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n["type"] == "ss"));
+    assert!(v["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n["type"] == "trojan"));
 }
 
 #[test]
@@ -169,7 +192,10 @@ fn clash_subscription_imports_nodes_rules_groups() {
 
 #[test]
 fn loon_and_shadowrocket_conf_are_not_subscription_formats() {
-    for path in ["subscriptions/loon-main.conf", "subscriptions/shadowrocket.conf"] {
+    for path in [
+        "subscriptions/loon-main.conf",
+        "subscriptions/shadowrocket.conf",
+    ] {
         let v = parse(path);
         assert_eq!(nodes(&v), 0, "{path}");
         assert_eq!(v["routing"], false, "{path}");

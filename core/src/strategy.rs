@@ -1,7 +1,8 @@
 use crate::config::{Config, Node};
 use crate::outbound;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -48,6 +49,7 @@ enum GroupType {
     Select,
     UrlTest,
     Fallback,
+    LoadBalance,
 }
 
 impl GroupType {
@@ -56,7 +58,43 @@ impl GroupType {
             "select" => Some(Self::Select),
             "url-test" | "urltest" => Some(Self::UrlTest),
             "fallback" => Some(Self::Fallback),
+            "load-balance" | "loadbalance" | "balance" => Some(Self::LoadBalance),
             _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Select => "select",
+            Self::UrlTest => "url-test",
+            Self::Fallback => "fallback",
+            Self::LoadBalance => "load-balance",
+        }
+    }
+}
+
+/// load-balance 的选路方式。默认一致性哈希，只有显式配置 round-robin 才轮询。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LbMode {
+    ConsistentHash,
+    RoundRobin,
+}
+
+impl LbMode {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "" | "consistent" | "consistent-hash" | "consistent-hashing" | "hash" => {
+                Some(Self::ConsistentHash)
+            }
+            "round-robin" | "roundrobin" | "rr" | "polling" => Some(Self::RoundRobin),
+            _ => None,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ConsistentHash => "consistent-hash",
+            Self::RoundRobin => "round-robin",
         }
     }
 }
@@ -73,6 +111,9 @@ struct GroupDef {
     failure_threshold: u32,
     recovery_threshold: u32,
     no_node_action: NoNodePolicy,
+    lb_mode: LbMode,
+    /// 自动切换最短间隔；当前节点不可用时不受此限。
+    switch_interval: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,8 +134,69 @@ impl GroupIssue {
     }
 }
 
+type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+fn default_clock() -> Clock {
+    Arc::new(Instant::now)
+}
+
+/// 策略组的可变运行时状态。快照本身保持不可变，这里只放会随解析变化的小状态：
+/// 上次切换时间、当前自动命中、load-balance 轮询计数。
+struct GroupState {
+    clock: Clock,
+    last_switch: RwLock<Instant>,
+    current: RwLock<Option<String>>,
+    rr: AtomicUsize,
+}
+
+impl GroupState {
+    fn new(clock: Clock) -> Self {
+        let now = clock();
+        let last_switch = now.checked_sub(Duration::from_secs(3_600)).unwrap_or(now);
+        Self {
+            clock,
+            last_switch: RwLock::new(last_switch),
+            current: RwLock::new(None),
+            rr: AtomicUsize::new(0),
+        }
+    }
+
+    fn now(&self) -> Instant {
+        (self.clock)()
+    }
+
+    fn current(&self) -> Option<String> {
+        self.current
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    fn switch_allowed(&self, interval: Duration) -> bool {
+        let last = *self.last_switch.read().unwrap_or_else(|p| p.into_inner());
+        self.now().duration_since(last) >= interval
+    }
+
+    fn set_current(&self, member: &str) {
+        *self.current.write().unwrap_or_else(|p| p.into_inner()) = Some(member.to_string());
+    }
+
+    fn mark_switch(&self, member: &str) {
+        *self.last_switch.write().unwrap_or_else(|p| p.into_inner()) = self.now();
+        *self.current.write().unwrap_or_else(|p| p.into_inner()) = Some(member.to_string());
+    }
+
+    fn next_rr(&self, len: usize) -> usize {
+        if len == 0 {
+            0
+        } else {
+            self.rr.fetch_add(1, Ordering::Relaxed) % len
+        }
+    }
+}
+
 /// 不可变策略快照。热重载时整体替换；已有连接持有旧的解析结果，不受新快照影响。
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct StrategySet {
     groups: Vec<GroupDef>,
     by_name: HashMap<String, usize>,
@@ -106,10 +208,44 @@ pub struct StrategySet {
     issues: Vec<GroupIssue>,
     disabled: HashSet<String>,
     duplicate_nodes: Vec<String>,
+    states: HashMap<String, Arc<GroupState>>,
+}
+
+impl Default for StrategySet {
+    fn default() -> Self {
+        Self {
+            groups: Vec::new(),
+            by_name: HashMap::new(),
+            node_types: HashMap::new(),
+            node_udp: HashMap::new(),
+            selections: BTreeMap::new(),
+            issues: Vec::new(),
+            disabled: HashSet::new(),
+            duplicate_nodes: Vec::new(),
+            states: HashMap::new(),
+        }
+    }
+}
+
+impl std::fmt::Debug for StrategySet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StrategySet")
+            .field("groups", &self.groups)
+            .field("selections", &self.selections)
+            .field("issues", &self.issues)
+            .field("disabled", &self.disabled)
+            .field("duplicate_nodes", &self.duplicate_nodes)
+            .finish()
+    }
 }
 
 impl StrategySet {
     pub fn from_config(cfg: &Config) -> Self {
+        Self::from_config_with_clock(cfg, default_clock())
+    }
+
+    /// 测试可注入时钟；生产走 [`from_config`]。
+    pub fn from_config_with_clock(cfg: &Config, clock: Clock) -> Self {
         let mut issues = Vec::new();
         let mut node_types = HashMap::new();
         let mut node_udp = HashMap::new();
@@ -163,11 +299,33 @@ impl StrategySet {
                     issues.push(GroupIssue::new(
                         &name,
                         "unknown_type",
-                        format!("未知策略组类型：{}（仅支持 select / url-test / fallback）", raw.kind),
+                        format!(
+                            "未知策略组类型：{}（支持 select / url-test / fallback / load-balance）",
+                            raw.kind
+                        ),
                     ));
                     disabled.insert(name.clone());
                     GroupType::Select
                 }
+            };
+            let lb_mode = if kind == GroupType::LoadBalance {
+                match LbMode::parse(&raw.lb_mode) {
+                    Some(m) => m,
+                    None => {
+                        issues.push(GroupIssue::new(
+                            &name,
+                            "bad_lb_mode",
+                            format!(
+                                "未知 load-balance 选路方式：{}（consistent-hash / round-robin）",
+                                raw.lb_mode
+                            ),
+                        ));
+                        disabled.insert(name.clone());
+                        LbMode::ConsistentHash
+                    }
+                }
+            } else {
+                LbMode::ConsistentHash
             };
             let no_node_action = match NoNodePolicy::parse(&raw.no_node_action) {
                 Some(p) => p,
@@ -175,7 +333,10 @@ impl StrategySet {
                     issues.push(GroupIssue::new(
                         &name,
                         "bad_no_node_action",
-                        format!("未知无可用节点策略：{}（global / block / direct）", raw.no_node_action),
+                        format!(
+                            "未知无可用节点策略：{}（global / block / direct）",
+                            raw.no_node_action
+                        ),
                     ));
                     disabled.insert(name.clone());
                     NoNodePolicy::Global
@@ -188,7 +349,11 @@ impl StrategySet {
                 .filter(|m| !m.is_empty())
                 .collect();
             if members.is_empty() {
-                issues.push(GroupIssue::new(&name, "empty_group", "策略组没有成员，已禁用".to_string()));
+                issues.push(GroupIssue::new(
+                    &name,
+                    "empty_group",
+                    "策略组没有成员，已禁用".to_string(),
+                ));
                 disabled.insert(name.clone());
             }
             if members.iter().any(|m| m == &name) {
@@ -214,7 +379,10 @@ impl StrategySet {
             let idx = groups.len();
             if group_counts.get(&name).copied().unwrap_or(0) > 1 {
                 disabled.insert(name.clone());
-                if !issues.iter().any(|i| i.group == name && i.code == "duplicate_group") {
+                if !issues
+                    .iter()
+                    .any(|i| i.group == name && i.code == "duplicate_group")
+                {
                     issues.push(GroupIssue::new(
                         &name,
                         "duplicate_group",
@@ -238,6 +406,8 @@ impl StrategySet {
                 failure_threshold: raw.failure_threshold.max(1),
                 recovery_threshold: raw.recovery_threshold.max(1),
                 no_node_action,
+                lb_mode,
+                switch_interval: Duration::from_secs(raw.switch_interval.clamp(1, 86_400)),
             });
         }
 
@@ -303,7 +473,16 @@ impl StrategySet {
         let mut reported: HashSet<String> = HashSet::new();
         for i in 0..groups.len() {
             if color[i] == 0 {
-                dfs_cycle(i, &groups, &by_name, &mut color, &mut stack, &mut reported, &mut issues, &mut disabled);
+                dfs_cycle(
+                    i,
+                    &groups,
+                    &by_name,
+                    &mut color,
+                    &mut stack,
+                    &mut reported,
+                    &mut issues,
+                    &mut disabled,
+                );
             }
         }
 
@@ -315,7 +494,10 @@ impl StrategySet {
                 if disabled.contains(&g.name) {
                     continue;
                 }
-                if g.members.iter().any(|m| by_name.contains_key(m) && disabled.contains(m)) {
+                if g.members
+                    .iter()
+                    .any(|m| by_name.contains_key(m) && disabled.contains(m))
+                {
                     disabled.insert(g.name.clone());
                     issues.push(GroupIssue::new(
                         &g.name,
@@ -327,6 +509,13 @@ impl StrategySet {
             }
         }
 
+        let mut states: HashMap<String, Arc<GroupState>> = HashMap::new();
+        for g in &groups {
+            states
+                .entry(g.name.clone())
+                .or_insert_with(|| Arc::new(GroupState::new(clock.clone())));
+        }
+
         Self {
             groups,
             by_name,
@@ -336,6 +525,7 @@ impl StrategySet {
             issues,
             disabled,
             duplicate_nodes,
+            states,
         }
     }
 
@@ -368,7 +558,8 @@ impl StrategySet {
     }
 
     pub fn set_selection(&mut self, group: &str, member: &str) {
-        self.selections.insert(group.to_string(), member.to_string());
+        self.selections
+            .insert(group.to_string(), member.to_string());
     }
 
     /// 解析一个组到最终节点。chain 从顶层组到叶子节点，供规则测试和日志展示。
@@ -378,8 +569,27 @@ impl StrategySet {
         transport: Transport,
         health: &HealthRegistry,
     ) -> Result<Resolved, ResolveFailure> {
+        self.resolve_group_with_target(name, transport, health, None)
+    }
+
+    /// 带目标键的解析。load-balance 的一致性哈希需要「域名(无则 IP):目的端口」；
+    /// 其他组类型忽略该参数。
+    pub fn resolve_group_with_target(
+        &self,
+        name: &str,
+        transport: Transport,
+        health: &HealthRegistry,
+        target: Option<&str>,
+    ) -> Result<Resolved, ResolveFailure> {
         let mut visiting = HashSet::new();
-        self.resolve_group_inner(name, transport, health, &mut Vec::new(), &mut visiting)
+        self.resolve_group_inner(
+            name,
+            transport,
+            health,
+            target,
+            &mut Vec::new(),
+            &mut visiting,
+        )
     }
 
     fn resolve_group_inner(
@@ -387,6 +597,7 @@ impl StrategySet {
         name: &str,
         transport: Transport,
         health: &HealthRegistry,
+        target: Option<&str>,
         chain: &mut Vec<String>,
         visiting: &mut HashSet<String>,
     ) -> Result<Resolved, ResolveFailure> {
@@ -425,9 +636,18 @@ impl StrategySet {
         chain.push(group.name.clone());
 
         let result = match group.kind {
-            GroupType::Select => self.resolve_select(group, transport, health, chain, visiting),
-            GroupType::Fallback => self.resolve_fallback(group, transport, health, chain, visiting),
-            GroupType::UrlTest => self.resolve_url_test(group, transport, health, chain, visiting),
+            GroupType::Select => {
+                self.resolve_select(group, transport, health, target, chain, visiting)
+            }
+            GroupType::Fallback => {
+                self.resolve_fallback(group, transport, health, target, chain, visiting)
+            }
+            GroupType::UrlTest => {
+                self.resolve_url_test(group, transport, health, target, chain, visiting)
+            }
+            GroupType::LoadBalance => {
+                self.resolve_load_balance(group, transport, health, target, chain, visiting)
+            }
         };
         visiting.remove(&group.name);
         if result.is_err() {
@@ -441,6 +661,7 @@ impl StrategySet {
         group: &GroupDef,
         transport: Transport,
         health: &HealthRegistry,
+        target: Option<&str>,
         chain: &mut Vec<String>,
         visiting: &mut HashSet<String>,
     ) -> Result<Resolved, ResolveFailure> {
@@ -458,6 +679,7 @@ impl StrategySet {
             &member,
             transport,
             health,
+            target,
             chain,
             visiting,
             group.failure_threshold,
@@ -470,6 +692,7 @@ impl StrategySet {
         group: &GroupDef,
         transport: Transport,
         health: &HealthRegistry,
+        target: Option<&str>,
         chain: &mut Vec<String>,
         visiting: &mut HashSet<String>,
     ) -> Result<Resolved, ResolveFailure> {
@@ -481,6 +704,7 @@ impl StrategySet {
                 member,
                 transport,
                 health,
+                target,
                 chain,
                 visiting,
                 group.failure_threshold,
@@ -488,6 +712,9 @@ impl StrategySet {
             ) {
                 Ok(resolved) => {
                     if resolved.leaf_available {
+                        if let Some(st) = self.states.get(&group.name) {
+                            st.mark_switch(member);
+                        }
                         return Ok(resolved);
                     }
                     chain.truncate(base);
@@ -509,6 +736,7 @@ impl StrategySet {
         group: &GroupDef,
         transport: Transport,
         health: &HealthRegistry,
+        target: Option<&str>,
         chain: &mut Vec<String>,
         visiting: &mut HashSet<String>,
     ) -> Result<Resolved, ResolveFailure> {
@@ -521,6 +749,7 @@ impl StrategySet {
                 member,
                 transport,
                 health,
+                target,
                 chain,
                 visiting,
                 group.failure_threshold,
@@ -544,25 +773,105 @@ impl StrategySet {
                 .unwrap_or_else(|| "没有可测速成员".to_string());
             return Err(self.no_member(group, &reason, chain));
         }
-        let best_latency = candidates
+        let best = candidates
             .iter()
-            .map(|c| c.latency_ms.unwrap_or(u64::MAX))
-            .min()
-            .unwrap_or(u64::MAX);
-        // 容差内保持当前选择，避免每次探测都在两个相近节点之间来回切。
-        if let Some(current) = self.selections.get(&group.name) {
-            if let Some(c) = candidates.iter().find(|c| {
-                c.node == *current
-                    && c.latency_ms.unwrap_or(u64::MAX)
-                        <= best_latency.saturating_add(group.tolerance_ms)
+            .min_by_key(|c| c.latency_ms.unwrap_or(u64::MAX))
+            .cloned()
+            .unwrap_or_else(|| Resolved::new(chain.clone(), "", None, transport));
+        let best_latency = best.latency_ms.unwrap_or(u64::MAX);
+        let state = self.states.get(&group.name);
+        // 首次解析可以沿用旧的 groupSelections 作为起点；之后以运行时 current 为准。
+        let current = state
+            .and_then(|s| s.current())
+            .or_else(|| self.selections.get(&group.name).cloned());
+        if let Some(current) = current {
+            if let Some(cur) = candidates.iter().find(|c| {
+                c.node == current || c.chain.get(1).map(|m| m == &current).unwrap_or(false)
             }) {
-                return Ok(c.clone());
+                let cur_latency = cur.latency_ms.unwrap_or(u64::MAX);
+                // 容差内保持当前，避免来回切。
+                if cur_latency <= best_latency.saturating_add(group.tolerance_ms) {
+                    return Ok(cur.clone());
+                }
+                // 更优且超过容差：只有距上次切换满 switch_interval 才允许自动切。
+                let allowed = state
+                    .map(|s| s.switch_allowed(group.switch_interval))
+                    .unwrap_or(true);
+                if allowed {
+                    if let Some(st) = state {
+                        st.mark_switch(&best.node);
+                    }
+                    return Ok(best);
+                }
+                return Ok(cur.clone());
+            }
+            // 当前节点已不可用：立即切换，不受切换闸限制。
+        }
+        if let Some(st) = state {
+            st.mark_switch(&best.node);
+        }
+        Ok(best)
+    }
+
+    fn resolve_load_balance(
+        &self,
+        group: &GroupDef,
+        transport: Transport,
+        health: &HealthRegistry,
+        target: Option<&str>,
+        chain: &mut Vec<String>,
+        visiting: &mut HashSet<String>,
+    ) -> Result<Resolved, ResolveFailure> {
+        let mut candidates: Vec<Resolved> = Vec::new();
+        let mut last_error: Option<ResolveFailure> = None;
+        for member in &group.members {
+            let base = chain.len();
+            match self.resolve_member(
+                &group.name,
+                member,
+                transport,
+                health,
+                target,
+                chain,
+                visiting,
+                group.failure_threshold,
+                group.recovery_threshold,
+            ) {
+                Ok(resolved) => {
+                    if resolved.leaf_available {
+                        candidates.push(resolved);
+                    }
+                    chain.truncate(base);
+                }
+                Err(e) => {
+                    chain.truncate(base);
+                    last_error = Some(e);
+                }
             }
         }
-        Ok(candidates
-            .into_iter()
-            .min_by_key(|c| c.latency_ms.unwrap_or(u64::MAX))
-            .unwrap_or_else(|| Resolved::new(chain.clone(), "", None, transport)))
+        if candidates.is_empty() {
+            let reason = last_error
+                .map(|e| e.message)
+                .unwrap_or_else(|| "没有健康成员".to_string());
+            return Err(self.no_member(group, &reason, chain));
+        }
+        let state = self.states.get(&group.name);
+        let index = match group.lb_mode {
+            LbMode::RoundRobin => state.map(|s| s.next_rr(candidates.len())).unwrap_or(0),
+            LbMode::ConsistentHash => {
+                let key = target.unwrap_or(group.name.as_str());
+                let mut hasher = DefaultHasher::new();
+                key.hash(&mut hasher);
+                group.name.hash(&mut hasher);
+                (hasher.finish() as usize) % candidates.len()
+            }
+        };
+        let chosen = candidates[index].clone();
+        // 只记录「最近命中」，不刷新 last_switch：load-balance 每条连接都可能换节点。
+        if let Some(st) = state {
+            st.set_current(&chosen.node);
+        }
+        Ok(chosen)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -572,6 +881,7 @@ impl StrategySet {
         member: &str,
         transport: Transport,
         health: &HealthRegistry,
+        target: Option<&str>,
         chain: &mut Vec<String>,
         visiting: &mut HashSet<String>,
         failure_threshold: u32,
@@ -582,6 +892,7 @@ impl StrategySet {
                 &self.groups[idx].name,
                 transport,
                 health,
+                target,
                 chain,
                 visiting,
             );
@@ -597,13 +908,17 @@ impl StrategySet {
         if transport == Transport::Udp && !self.node_udp.get(member).copied().unwrap_or(false) {
             return Err(ResolveFailure::new(
                 "udp_unsupported",
-                format!("节点 {}（{}）不支持 UDP，不能作为 UDP 策略成员", member, kind),
+                format!(
+                    "节点 {}（{}）不支持 UDP，不能作为 UDP 策略成员",
+                    member, kind
+                ),
                 chain.clone(),
                 NoNodePolicy::Global,
             ));
         }
         // 阈值来自当前组配置；TCP 与 UDP 各自维护健康状态，互不背书。
-        let availability = health.availability(member, transport, failure_threshold, recovery_threshold);
+        let availability =
+            health.availability(member, transport, failure_threshold, recovery_threshold);
         chain.push(member.to_string());
         let latency_ms = health.latency(member, transport);
         Ok(Resolved {
@@ -624,12 +939,66 @@ impl StrategySet {
         )
     }
 
-    /// 健康检查目标：仅 url-test / fallback 需要主动探测；select 不做自动切换。
+    /// 策略组健康快照，供统计接口的 groups 字段导出。只读，不建立常驻通道。
+    pub fn health_json(&self, health: &HealthRegistry) -> serde_json::Value {
+        let snapshot = health.snapshot();
+        let groups: Vec<serde_json::Value> = self
+            .groups
+            .iter()
+            .filter(|g| !self.disabled.contains(&g.name))
+            .map(|g| {
+                let current = self
+                    .states
+                    .get(&g.name)
+                    .and_then(|s| s.current())
+                    .or_else(|| self.selections.get(&g.name).cloned());
+                let members: Vec<serde_json::Value> = g
+                    .members
+                    .iter()
+                    .map(|m| {
+                        let node = self.node_types.contains_key(m);
+                        let health_json = if node {
+                            snapshot.get(m).map(|h| {
+                                serde_json::json!({
+                                    "tcp": transport_health_json(&h.tcp),
+                                    "udp": transport_health_json(&h.udp),
+                                })
+                            })
+                        } else {
+                            None
+                        };
+                        serde_json::json!({
+                            "name": m,
+                            "node": node,
+                            "health": health_json,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "name": g.name,
+                    "type": g.kind.as_str(),
+                    "lbMode": g.lb_mode.as_str(),
+                    "switchInterval": g.switch_interval.as_secs(),
+                    "current": current,
+                    "members": members,
+                })
+            })
+            .collect();
+        serde_json::Value::Array(groups)
+    }
+
+    /// 健康检查目标：url-test / fallback / load-balance 需要主动探测；
+    /// select 不做自动切换，也不因健康状态剔除成员。
     pub fn health_targets(&self) -> Vec<HealthTarget> {
         self.groups
             .iter()
             .filter(|g| !self.disabled.contains(&g.name))
-            .filter(|g| matches!(g.kind, GroupType::UrlTest | GroupType::Fallback))
+            .filter(|g| {
+                matches!(
+                    g.kind,
+                    GroupType::UrlTest | GroupType::Fallback | GroupType::LoadBalance
+                )
+            })
             .map(|g| HealthTarget {
                 group: g.name.clone(),
                 test_url: g.test_url.clone(),
@@ -650,7 +1019,9 @@ impl StrategySet {
     }
 
     fn collect_leaves(&self, name: &str, out: &mut Vec<String>, seen: &mut HashSet<String>) {
-        let Some(idx) = self.by_name.get(name).copied() else { return };
+        let Some(idx) = self.by_name.get(name).copied() else {
+            return;
+        };
         if !seen.insert(name.to_string()) {
             return;
         }
@@ -678,7 +1049,9 @@ fn dfs_cycle(
     color[idx] = 1;
     stack.push(idx);
     for member in &groups[idx].members {
-        let Some(next) = by_name.get(member).copied() else { continue };
+        let Some(next) = by_name.get(member).copied() else {
+            continue;
+        };
         if color[next] == 1 {
             if let Some(pos) = stack.iter().position(|i| *i == next) {
                 let path: Vec<String> = stack[pos..]
@@ -700,7 +1073,9 @@ fn dfs_cycle(
                 }
             }
         } else if color[next] == 0 {
-            dfs_cycle(next, groups, by_name, color, stack, reported, issues, disabled);
+            dfs_cycle(
+                next, groups, by_name, color, stack, reported, issues, disabled,
+            );
         }
     }
     stack.pop();
@@ -874,6 +1249,25 @@ impl HealthRegistry {
     }
 }
 
+fn transport_health_json(h: &TransportHealth) -> serde_json::Value {
+    let status = match h.healthy {
+        Some(true) => "healthy",
+        Some(false) => "unhealthy",
+        None => {
+            if h.consecutive_failures > 0 {
+                "failing"
+            } else {
+                "unknown"
+            }
+        }
+    };
+    serde_json::json!({
+        "status": status,
+        "latencyMs": h.latency_ms,
+        "lastCheckMs": h.last_check_ms,
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct HealthTarget {
     pub group: String,
@@ -918,12 +1312,23 @@ pub async fn run_health_loop(
             let target_for_group = target.clone();
             tokio::spawn(async move {
                 for name in leaves {
-                    let Some(node) = nodes_for_group.iter().find(|n| n.name == name).cloned() else {
+                    let Some(node) = nodes_for_group.iter().find(|n| n.name == name).cloned()
+                    else {
                         continue;
                     };
                     let started = Instant::now();
-                    let ok = outbound::probe_node(&node, &target_for_group.test_url, target_for_group.timeout).await.is_ok();
-                    let latency = if ok { Some(started.elapsed().as_millis() as u64) } else { None };
+                    let ok = outbound::probe_node(
+                        &node,
+                        &target_for_group.test_url,
+                        target_for_group.timeout,
+                    )
+                    .await
+                    .is_ok();
+                    let latency = if ok {
+                        Some(started.elapsed().as_millis() as u64)
+                    } else {
+                        None
+                    };
                     health_for_group.record(
                         &name,
                         Transport::Tcp,
@@ -1019,7 +1424,9 @@ mod tests {
             &[],
         );
         let set = StrategySet::from_config(&cfg);
-        let r = set.resolve_group("G", Transport::Tcp, &HealthRegistry::new()).unwrap();
+        let r = set
+            .resolve_group("G", Transport::Tcp, &HealthRegistry::new())
+            .unwrap();
         assert_eq!(r.node, "n1");
     }
 
@@ -1032,16 +1439,31 @@ mod tests {
         let set = StrategySet::from_config(&cfg);
         let h = HealthRegistry::new();
 
-        assert_eq!(set.resolve_group("F", Transport::Tcp, &h).unwrap().node, "n1");
+        assert_eq!(
+            set.resolve_group("F", Transport::Tcp, &h).unwrap().node,
+            "n1"
+        );
         health_fail(&h, "n1", 1, 2, 2);
-        assert_eq!(set.resolve_group("F", Transport::Tcp, &h).unwrap().node, "n1");
+        assert_eq!(
+            set.resolve_group("F", Transport::Tcp, &h).unwrap().node,
+            "n1"
+        );
         health_fail(&h, "n1", 1, 2, 2);
-        assert_eq!(set.resolve_group("F", Transport::Tcp, &h).unwrap().node, "n2");
+        assert_eq!(
+            set.resolve_group("F", Transport::Tcp, &h).unwrap().node,
+            "n2"
+        );
 
         health_ok(&h, "n1", 1, 2, 2);
-        assert_eq!(set.resolve_group("F", Transport::Tcp, &h).unwrap().node, "n2");
+        assert_eq!(
+            set.resolve_group("F", Transport::Tcp, &h).unwrap().node,
+            "n2"
+        );
         health_ok(&h, "n1", 1, 2, 2);
-        assert_eq!(set.resolve_group("F", Transport::Tcp, &h).unwrap().node, "n1");
+        assert_eq!(
+            set.resolve_group("F", Transport::Tcp, &h).unwrap().node,
+            "n1"
+        );
     }
 
     #[test]
@@ -1058,9 +1480,106 @@ mod tests {
         health_ok(&h, "n1", 100, 1, 1);
         health_ok(&h, "n2", 80, 1, 1);
         // U 保留当前选择：100 <= 80 + 50。
-        assert_eq!(set.resolve_group("U", Transport::Tcp, &h).unwrap().node, "n1");
+        assert_eq!(
+            set.resolve_group("U", Transport::Tcp, &h).unwrap().node,
+            "n1"
+        );
         // V 没有当前选择，选最低延迟。
-        assert_eq!(set.resolve_group("V", Transport::Tcp, &h).unwrap().node, "n2");
+        assert_eq!(
+            set.resolve_group("V", Transport::Tcp, &h).unwrap().node,
+            "n2"
+        );
+    }
+
+    #[test]
+    fn load_balance_hashes_target_and_round_robin_alternates() {
+        let mut lb = group("LB", "load-balance", &["n1", "n2"]);
+        lb.lb_mode = "consistent-hash".into();
+        let cfg = config(vec![node("n1", "ss"), node("n2", "ss")], vec![lb], &[]);
+        let set = StrategySet::from_config(&cfg);
+        let h = HealthRegistry::new();
+        health_ok(&h, "n1", 10, 1, 1);
+        health_ok(&h, "n2", 20, 1, 1);
+        let a = set
+            .resolve_group_with_target("LB", Transport::Tcp, &h, Some("example.com:443"))
+            .unwrap()
+            .node;
+        let b = set
+            .resolve_group_with_target("LB", Transport::Tcp, &h, Some("example.com:443"))
+            .unwrap()
+            .node;
+        assert_eq!(a, b, "同一目标键必须落同一节点");
+        // 至少验证不同目标键不会因为轮询计数而漂移：连续同一 key 仍是同一节点。
+        let _ = set
+            .resolve_group_with_target("LB", Transport::Tcp, &h, Some("other.com:443"))
+            .unwrap();
+
+        let mut rr = group("RR", "load-balance", &["n1", "n2"]);
+        rr.lb_mode = "round-robin".into();
+        let cfg = config(vec![node("n1", "ss"), node("n2", "ss")], vec![rr], &[]);
+        let set = StrategySet::from_config(&cfg);
+        let h = HealthRegistry::new();
+        let first = set.resolve_group("RR", Transport::Tcp, &h).unwrap().node;
+        let second = set.resolve_group("RR", Transport::Tcp, &h).unwrap().node;
+        assert_ne!(first, second, "round-robin 必须轮询");
+    }
+
+    #[test]
+    fn url_test_switch_gate_waits_30s_but_unhealthy_switches_immediately() {
+        let now = Arc::new(std::sync::Mutex::new(Instant::now()));
+        let clock_now = now.clone();
+        let clock: Clock = Arc::new(move || *clock_now.lock().unwrap());
+        let mut g = group("U", "url-test", &["n1", "n2"]);
+        g.tolerance = 0;
+        g.switch_interval = 30;
+        let cfg = config(vec![node("n1", "ss"), node("n2", "ss")], vec![g], &[]);
+        let set = StrategySet::from_config_with_clock(&cfg, clock);
+        let h = HealthRegistry::new();
+        health_ok(&h, "n1", 100, 1, 1);
+        health_ok(&h, "n2", 50, 1, 1);
+        // 首次解析没有 current，直接命中最低延迟 n2，并记录切换时刻。
+        assert_eq!(
+            set.resolve_group("U", Transport::Tcp, &h).unwrap().node,
+            "n2"
+        );
+        // n1 变快，但 30s 闸未到，保持 n2。
+        health_ok(&h, "n1", 5, 1, 1);
+        assert_eq!(
+            set.resolve_group("U", Transport::Tcp, &h).unwrap().node,
+            "n2"
+        );
+        // 时钟前进 31s，允许切到更优 n1。
+        *now.lock().unwrap() += Duration::from_secs(31);
+        assert_eq!(
+            set.resolve_group("U", Transport::Tcp, &h).unwrap().node,
+            "n1"
+        );
+        // n1 被判定不可用：即使闸未到也立即切回 n2。
+        health_fail(&h, "n1", 1, 1, 1);
+        assert_eq!(
+            set.resolve_group("U", Transport::Tcp, &h).unwrap().node,
+            "n2"
+        );
+    }
+
+    #[test]
+    fn health_json_exports_groups_and_members() {
+        let cfg = config(
+            vec![node("n1", "ss"), node("n2", "ss")],
+            vec![group("LB", "load-balance", &["n1", "n2"])],
+            &[],
+        );
+        let set = StrategySet::from_config(&cfg);
+        let h = HealthRegistry::new();
+        health_ok(&h, "n1", 42, 1, 1);
+        let v = set.health_json(&h);
+        let groups = v.as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["name"], "LB");
+        assert_eq!(groups[0]["type"], "load-balance");
+        assert_eq!(groups[0]["lbMode"], "consistent-hash");
+        assert_eq!(groups[0]["members"][0]["health"]["tcp"]["latencyMs"], 42);
+        assert_eq!(groups[0]["members"][1]["health"], serde_json::Value::Null);
     }
 
     #[test]
@@ -1077,9 +1596,15 @@ mod tests {
         let h = HealthRegistry::new();
         health_ok(&h, "tj", 1, 1, 1);
         // TCP 仍可以走 trojan 的首选。
-        assert_eq!(set.resolve_group("F", Transport::Tcp, &h).unwrap().node, "tj");
+        assert_eq!(
+            set.resolve_group("F", Transport::Tcp, &h).unwrap().node,
+            "tj"
+        );
         // UDP 必须跳过不支持 UDP 的 trojan，不能拿 TCP 健康当 UDP 可用。
-        assert_eq!(set.resolve_group("F", Transport::Udp, &h).unwrap().node, "ss");
+        assert_eq!(
+            set.resolve_group("F", Transport::Udp, &h).unwrap().node,
+            "ss"
+        );
 
         let mut only_tj_node = node("tj", "trojan");
         only_tj_node.udp = Some(false);
@@ -1089,7 +1614,9 @@ mod tests {
             &[],
         );
         let set = StrategySet::from_config(&only_tj);
-        let err = set.resolve_group("F", Transport::Udp, &HealthRegistry::new()).unwrap_err();
+        let err = set
+            .resolve_group("F", Transport::Udp, &HealthRegistry::new())
+            .unwrap_err();
         assert_eq!(err.code, "no_available_member");
         assert!(err.message.contains("不支持 UDP"));
     }
@@ -1103,7 +1630,9 @@ mod tests {
                 &[],
             );
             let set = StrategySet::from_config(&cfg);
-            let r = set.resolve_group("F", Transport::Udp, &HealthRegistry::new()).unwrap();
+            let r = set
+                .resolve_group("F", Transport::Udp, &HealthRegistry::new())
+                .unwrap();
             assert_eq!(r.node, "n", "{} 默认应可用于 UDP", kind);
         }
     }
@@ -1119,7 +1648,9 @@ mod tests {
             &[],
         );
         let set = StrategySet::from_config(&cfg);
-        let r = set.resolve_group("outer", Transport::Tcp, &HealthRegistry::new()).unwrap();
+        let r = set
+            .resolve_group("outer", Transport::Tcp, &HealthRegistry::new())
+            .unwrap();
         assert_eq!(r.chain, vec!["outer", "inner", "n1"]);
     }
 
@@ -1127,10 +1658,7 @@ mod tests {
     fn cycle_is_reported_and_cannot_be_enabled() {
         let cfg = config(
             vec![node("n1", "ss")],
-            vec![
-                group("A", "select", &["B"]),
-                group("B", "select", &["A"]),
-            ],
+            vec![group("A", "select", &["B"]), group("B", "select", &["A"])],
             &[],
         );
         let set = StrategySet::from_config(&cfg);
@@ -1160,7 +1688,10 @@ mod tests {
         assert!(set.issues().iter().any(|i| i.code == "empty_group"));
         assert!(set.issues().iter().any(|i| i.code == "missing_reference"));
         assert!(set.issues().iter().any(|i| i.code == "duplicate_node"));
-        assert!(set.issues().iter().any(|i| i.code == "duplicate_node_reference"));
+        assert!(set
+            .issues()
+            .iter()
+            .any(|i| i.code == "duplicate_node_reference"));
         assert!(!set.is_usable("dup"));
     }
 
@@ -1203,11 +1734,27 @@ mod tests {
         let engine = RuleEngine::from_config(&cfg);
         let set = StrategySet::from_config(&cfg);
         let h = HealthRegistry::new();
-        let (a, _) = engine.decide_detail(Some("a.example"), std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 443, ConnKind::Tcp);
-        let (b, _) = engine.decide_detail(Some("b.example"), std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 443, ConnKind::Tcp);
+        let (a, _) = engine.decide_detail(
+            Some("a.example"),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            443,
+            ConnKind::Tcp,
+        );
+        let (b, _) = engine.decide_detail(
+            Some("b.example"),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            443,
+            ConnKind::Tcp,
+        );
         assert_eq!(a, Action::Group("组A".into()));
         assert_eq!(b, Action::Group("组B".into()));
-        assert_eq!(set.resolve_group("组A", Transport::Tcp, &h).unwrap().node, "n1");
-        assert_eq!(set.resolve_group("组B", Transport::Tcp, &h).unwrap().node, "n2");
+        assert_eq!(
+            set.resolve_group("组A", Transport::Tcp, &h).unwrap().node,
+            "n1"
+        );
+        assert_eq!(
+            set.resolve_group("组B", Transport::Tcp, &h).unwrap().node,
+            "n2"
+        );
     }
 }

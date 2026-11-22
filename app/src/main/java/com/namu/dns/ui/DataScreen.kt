@@ -209,6 +209,7 @@ fun DataScreen(
                 }
                 Text(
                     "握手失败放行 ${stats.mitmFailed} · QUIC 拦截回落 TCP ${stats.mitmQuicBlocked} · " +
+                        "正文提前直通 ${stats.mitmBodyBypassed} · " +
                         if (cfg.mitm.enabled) "MITM 已启用" else "MITM 未启用",
                     fontSize = 11.sp,
                     color = NamuColors.TextSub,

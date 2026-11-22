@@ -7,6 +7,7 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.namu.dns.Actions
 import com.namu.dns.MitmManager
+import com.namu.dns.RootCaManager
 import com.namu.dns.TrustModuleGenerator
 import com.namu.dns.core.AppContainer
 import com.namu.dns.core.runtime.MessageRepository
@@ -32,9 +33,17 @@ class MitmViewModel(
     private val applyHostnames: suspend (List<String>) -> Unit,
     private val applySkip: suspend (List<String>) -> Unit,
     private val applyApps: suspend (String, List<String>) -> Unit,
+    private val applyScriptArgs: suspend (com.namu.dns.core.config.ScriptConfig, Map<String, String>) -> Unit = { _, _ -> },
+    private val applyPool: suspend (Boolean) -> Unit = {},
     private val exportDirFallback: () -> String = { "" },
     private val caFingerprintCheck: () -> String? = { null },
     private val systemCertCheck: (systemName: String) -> Boolean = { _ -> false },
+    private val installCaAction: suspend (pemPath: String, systemName: String) -> RootCaManager.Result =
+        { _, _ -> RootCaManager.Result(false, "一键安装未接入") },
+    private val removeCaAction: suspend () -> RootCaManager.Result =
+        { RootCaManager.Result(false, "移除系统 CA 未接入") },
+    private val trustSnapshotCheck: suspend (systemName: String) -> RootCaManager.TrustSnapshot =
+        { RootCaManager.TrustSnapshot() },
 ) : ViewModel() {
 
     private val _busy = MutableStateFlow(false)
@@ -49,6 +58,9 @@ class MitmViewModel(
     private val _systemCertInstalled = MutableStateFlow(false)
     val systemCertInstalled: StateFlow<Boolean> = _systemCertInstalled.asStateFlow()
 
+    private val _trust = MutableStateFlow(RootCaManager.TrustSnapshot())
+    val trust: StateFlow<RootCaManager.TrustSnapshot> = _trust.asStateFlow()
+
     private var lastSystemName = ""
 
     /** 页面回到前台时重新核对 CA、指纹与系统证书区，避免状态仍旧。 */
@@ -62,12 +74,20 @@ class MitmViewModel(
                 ""
             }
             lastSystemName = systemName
-            val systemInstalled = withContext(Dispatchers.IO) {
-                systemName.takeIf { it.isNotBlank() }?.let(systemCertCheck) ?: false
+            val snapshot = withContext(Dispatchers.IO) {
+                if (systemName.isBlank()) {
+                    RootCaManager.TrustSnapshot(
+                        systemCertInstalled = systemCertCheck(systemName),
+                    )
+                } else {
+                    runCatching { trustSnapshotCheck(systemName) }
+                        .getOrElse { RootCaManager.TrustSnapshot(detail = it.message.orEmpty()) }
+                }
             }
             _caExists.value = exists
             _caFingerprint.value = fingerprint
-            _systemCertInstalled.value = systemInstalled
+            _trust.value = snapshot
+            _systemCertInstalled.value = snapshot.systemCertInstalled
         }
     }
 
@@ -107,15 +127,72 @@ class MitmViewModel(
         viewModelScope.launch { applyApps(mode, apps) }
     }
 
+    /** 只更新 $argument 注入值；不重建内核、不重编译脚本。 */
+    fun setScriptArguments(script: com.namu.dns.core.config.ScriptConfig, values: Map<String, String>) {
+        viewModelScope.launch { applyScriptArgs(script, values) }
+    }
+
+    /** 灰度开关：MITM 上游连接复用；默认关，切换后热重载只影响新连接。 */
+    fun setPoolEnabled(on: Boolean) {
+        viewModelScope.launch { applyPool(on) }
+    }
+
+    /** generic 仅手动触发；返回启动条数，0 表示没有匹配脚本或 VPN 未运行。 */
+    fun triggerGeneric() {
+        val n = runCatching { com.namu.dns.NativeCore.nativeTriggerScripts("generic") }.getOrDefault(-1)
+        messages.show(
+            when {
+                n > 0 -> "已触发 $n 条 generic 脚本（后台串行执行）"
+                n == 0 -> "没有匹配的 generic 脚本"
+                else -> "内核未运行，无法触发脚本"
+            },
+        )
+    }
+
     /** 生成 KernelSU/Magisk 系统信任模块（开机早期挂载、重启不丢）。 */
     fun generateTrustModule() = withExport { r ->
         val result = generateModule(r.pemPath, r.systemName)
         if (result.ok) {
             _systemCertInstalled.value = systemCertCheck(r.systemName)
-            messages.show("系统信任模块已生成：${result.path}。用 KernelSU/Magisk「从存储安装」该模块后重启，所有 App 即信任此 CA（重启不丢）。")
+            messages.show(
+                "系统信任模块已导出：${result.path}。用 KernelSU/Magisk「从存储安装」该模块后重启，" +
+                    "所有 App 即信任此 CA（重启不丢）。",
+            )
         } else {
             messages.show("模块生成失败：${result.error}")
         }
+    }
+
+    /** 有 Root 时直接写模块并立即注入 Zygote；无 Root 自动退回导出 zip。 */
+    fun installSystemCa() = withExport { r ->
+        val result = installCaAction(r.pemPath, r.systemName)
+        refreshTrust(r.systemName)
+        messages.show(result.message.ifBlank { if (result.ok) "系统 CA 已安装" else "安装失败" })
+    }
+
+    /** 精确 umount 我们自己的 staging 层，再删模块与状态。 */
+    fun removeSystemCa() {
+        if (_busy.value) return
+        viewModelScope.launch {
+            _busy.value = true
+            try {
+                val result = removeCaAction()
+                refreshTrust(lastSystemName)
+                messages.show(result.message.ifBlank { if (result.ok) "已移除系统 CA" else "移除失败" })
+            } finally {
+                _busy.value = false
+            }
+        }
+    }
+
+    private suspend fun refreshTrust(systemName: String) {
+        if (systemName.isBlank()) return
+        val snapshot = withContext(Dispatchers.IO) {
+            runCatching { trustSnapshotCheck(systemName) }
+                .getOrElse { RootCaManager.TrustSnapshot(detail = it.message.orEmpty()) }
+        }
+        _trust.value = snapshot
+        _systemCertInstalled.value = snapshot.systemCertInstalled
     }
 
     fun exportOnly() = withExport { r ->
@@ -152,9 +229,14 @@ class MitmViewModel(
                     applyHostnames = { Actions.setMitmHostnames(it) },
                     applySkip = { Actions.setMitmSkip(it) },
                     applyApps = { mode, apps -> Actions.setMitmApps(mode, apps) },
+                    applyScriptArgs = { script, values -> Actions.setMitmScriptArguments(script, values) },
+                    applyPool = { Actions.setMitmPoolEnabled(it) },
                     exportDirFallback = { MitmManager.exportDir(app).absolutePath },
                     caFingerprintCheck = { MitmManager.caFingerprint(app) },
                     systemCertCheck = { name -> MitmManager.systemCertInstalled(app, name) },
+                    installCaAction = { pem, name -> RootCaManager.install(app, pem, name) },
+                    removeCaAction = { RootCaManager.remove(app) },
+                    trustSnapshotCheck = { name -> RootCaManager.inspect(app, name) },
                 )
             }
         }

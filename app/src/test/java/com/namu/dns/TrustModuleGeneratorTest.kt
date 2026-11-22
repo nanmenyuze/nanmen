@@ -37,6 +37,10 @@ class TrustModuleGeneratorTest {
         assertTrue(m.containsKey("post-fs-data.sh"))
         assertTrue(m.containsKey("service.sh"))
         assertTrue(m.containsKey("uninstall.sh"))
+        assertTrue(m.containsKey("inject.sh"))
+        assertTrue(m.containsKey("bind.sh"))
+        assertTrue(m.containsKey("unmount.sh"))
+        assertTrue(m.containsKey("remove.sh"))
         assertTrue(m.containsKey("certs/d756baa7.0"))
         assertTrue(m.containsKey("README.md"))
     }
@@ -61,15 +65,56 @@ class TrustModuleGeneratorTest {
     }
 
     @Test
-    fun `scripts use certificate name and apex path`() {
+    fun `scripts use certificate name and staging bind`() {
         val m = build(name = "abcdef01.0")
         val post = String(m["post-fs-data.sh"]!!)
-        assertTrue(post.contains("NAME=abcdef01.0"))
-        assertTrue(post.contains("/apex/com.android.conscrypt/cacerts"))
-        assertTrue(post.contains("mount -t tmpfs"))
-        assertFalse(post.contains("umount"))
-        assertTrue(String(m["service.sh"]!!).contains("nsenter"))
+        assertTrue(post.contains("inject.sh"))
+        assertTrue(post.contains("--boot"))
+
+        val inject = String(m["inject.sh"]!!)
+        assertTrue(inject.contains("NAME=abcdef01.0"))
+        assertTrue(inject.contains("/apex/com.android.conscrypt/cacerts"))
+        assertTrue(inject.contains("cacerts_staging"))
+        assertTrue(String(m["bind.sh"]!!).contains("mount --bind"))
+        assertTrue(inject.contains("cmp -s"))
+        assertTrue(inject.contains("nsenter"))
+        assertTrue(inject.contains("STATUS.tmp"))
+        assertFalse(inject.contains("mount -t tmpfs"))
+
+        val remove = String(m["remove.sh"]!!)
+        assertTrue(remove.contains("/data/local/tmp/namu_ca_unmount.sh"))
+        assertTrue(String(m["unmount.sh"]!!).contains("umount"))
         assertTrue(String(m["module.prop"]!!).contains("id=namu_mitm_ca"))
+    }
+
+    @Test
+    fun `all shell scripts pass sh syntax check`() {
+        val m = build()
+        val tmp = kotlin.io.path.createTempDirectory("namu-sh").toFile()
+        try {
+            for ((name, bytes) in m) {
+                if (!name.endsWith(".sh")) continue
+                val f = java.io.File(tmp, name)
+                f.writeBytes(bytes)
+                val p = ProcessBuilder("sh", "-n", f.absolutePath)
+                    .redirectErrorStream(true)
+                    .start()
+                val out = p.inputStream.bufferedReader().readText()
+                assertTrue("$name syntax: $out", p.waitFor() == 0)
+            }
+        } finally {
+            tmp.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `module zip name carries first eight of fingerprint`() {
+        assertTrue(
+            TrustModuleGenerator.moduleZipFileName("ABCDEF01.0") == "namu_mitm_ca_abcdef01.zip",
+        )
+        assertTrue(
+            TrustModuleGenerator.moduleZipFileName("12345678.0") == "namu_mitm_ca_12345678.zip",
+        )
     }
 
     @Test

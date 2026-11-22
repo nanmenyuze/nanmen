@@ -230,7 +230,7 @@ fun SettingsScreen(onRestart: () -> Unit, onOpenLogs: () -> Unit, onOpenMitm: ()
         SectionHeader("关于")
         GroupCard {
             SettingsRow("版本", value = BuildConfig.VERSION_NAME)
-            SettingsRow("内核", value = "nanmen_core · 1.13.13")
+            SettingsRow("内核", value = "nanmen_core · 1.13.19")
             SettingsRow("代理协议", value = "SS · Trojan · VLESS")
             SettingsRow("DNS", value = "DoH · DoT · UDP")
             SettingsRow(

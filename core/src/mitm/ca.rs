@@ -2,6 +2,8 @@
 //!
 //! CA 以「证书 PEM + PKCS8 私钥 PEM」拼接落盘（ca_file），重启/热重载复用同一 CA，
 //! 用户只需安装一次证书。叶子证书带 128 条上限的 FIFO ServerConfig 缓存。
+//! 同 host 并发首连走 single-flight：只签一次，其余等待复用；签发放到阻塞线程池，
+//! 不把 rcgen 的同步 CPU 工作压回 async worker。等待有界、超时/打满时再直签兜底。
 //! 链里始终携带磁盘上的原始 CA DER，保证与用户已安装的证书完全一致。
 
 use rcgen::{
@@ -11,8 +13,14 @@ use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
+use tokio::sync::Notify;
 
+const LEAF_CACHE_CAP: usize = 128;
+const MAX_LEAF_WAITERS: usize = 128;
+const LEAF_WAIT_TIMEOUT: Duration = Duration::from_secs(4);
 const CERT_MARK: &str = "-----BEGIN CERTIFICATE-----";
 const CERT_END: &str = "-----END CERTIFICATE-----";
 const KEY_MARK: &str = "-----BEGIN PRIVATE KEY-----";
@@ -61,6 +69,16 @@ pub struct MitmCa {
     /// 磁盘上的原始 CA DER：进证书链、导出安装都用它。
     ca_der: CertificateDer<'static>,
     cache: Mutex<LeafCache>,
+    /// host -> 正在签发的通知；等待者不持锁、不阻塞 runtime worker。
+    inflight: Mutex<HashMap<String, Arc<Flight>>>,
+    pending_waiters: AtomicUsize,
+    stats: RwLock<Option<Arc<crate::stats::Stats>>>,
+}
+
+#[derive(Default)]
+struct Flight {
+    notify: Notify,
+    waiters: AtomicUsize,
 }
 
 /// 叶子证书缓存：HashMap + FIFO 淘汰队列。满 128 条只淘汰最老的一条，
@@ -72,7 +90,10 @@ struct LeafCache {
 
 impl LeafCache {
     fn new() -> Self {
-        Self { map: HashMap::new(), order: VecDeque::new() }
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
     }
 
     fn get(&self, host: &str) -> Option<Arc<rustls::ServerConfig>> {
@@ -84,7 +105,7 @@ impl LeafCache {
             self.map.insert(host, cfg);
             return;
         }
-        while self.order.len() >= 128 {
+        while self.order.len() >= LEAF_CACHE_CAP {
             if let Some(old) = self.order.pop_front() {
                 self.map.remove(&old);
             } else {
@@ -105,8 +126,8 @@ impl MitmCa {
             let pem = std::fs::read_to_string(path)?;
             let cert_pem = pem_section(&pem, CERT_MARK, CERT_END)
                 .ok_or_else(|| io_err("CA 文件缺少证书段"))?;
-            let key_pem = pem_section(&pem, KEY_MARK, KEY_END)
-                .ok_or_else(|| io_err("CA 文件缺少私钥段"))?;
+            let key_pem =
+                pem_section(&pem, KEY_MARK, KEY_END).ok_or_else(|| io_err("CA 文件缺少私钥段"))?;
             let key = KeyPair::from_pem(&key_pem)
                 .map_err(|e| io_err(format!("CA 私钥解析失败: {}", e)))?;
             let params = CertificateParams::from_ca_cert_pem(&cert_pem)
@@ -115,7 +136,15 @@ impl MitmCa {
                 .self_signed(&key)
                 .map_err(|e| io_err(format!("CA 重建失败: {}", e)))?;
             let ca_der = CertificateDer::from(pem_to_der(&cert_pem)?);
-            return Ok(Self { key, issuer, ca_der, cache: Mutex::new(LeafCache::new()) });
+            return Ok(Self {
+                key,
+                issuer,
+                ca_der,
+                cache: Mutex::new(LeafCache::new()),
+                inflight: Mutex::new(HashMap::new()),
+                pending_waiters: AtomicUsize::new(0),
+                stats: RwLock::new(None),
+            });
         }
         let key = KeyPair::generate().map_err(|e| io_err(format!("生成 CA 私钥失败: {}", e)))?;
         let mut params = CertificateParams::default();
@@ -125,8 +154,12 @@ impl MitmCa {
             KeyUsagePurpose::CrlSign,
             KeyUsagePurpose::DigitalSignature,
         ];
-        params.distinguished_name.push(DnType::CommonName, "Namu DNS MITM CA");
-        params.distinguished_name.push(DnType::OrganizationName, "Namu DNS");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "Namu DNS MITM CA");
+        params
+            .distinguished_name
+            .push(DnType::OrganizationName, "Namu DNS");
         params.not_before = date_time_ymd(2024, 1, 1);
         params.not_after = date_time_ymd(2044, 1, 1);
         let cert = params
@@ -145,7 +178,15 @@ impl MitmCa {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         }
-        Ok(Self { key, issuer: cert, ca_der, cache: Mutex::new(LeafCache::new()) })
+        Ok(Self {
+            key,
+            issuer: cert,
+            ca_der,
+            cache: Mutex::new(LeafCache::new()),
+            inflight: Mutex::new(HashMap::new()),
+            pending_waiters: AtomicUsize::new(0),
+            stats: RwLock::new(None),
+        })
     }
 
     pub fn ca_der(&self) -> &[u8] {
@@ -154,6 +195,127 @@ impl MitmCa {
 
     pub fn ca_pem(&self) -> String {
         der_to_pem(&self.ca_der)
+    }
+
+    pub fn set_stats(&self, stats: Arc<crate::stats::Stats>) {
+        if let Ok(mut g) = self.stats.write() {
+            *g = Some(stats);
+        }
+    }
+
+    fn stat(&self, f: impl FnOnce(&crate::stats::Stats)) {
+        if let Some(s) = self.stats.read().ok().and_then(|g| g.clone()) {
+            f(&s);
+        }
+    }
+
+    fn cached(&self, host: &str) -> Option<Arc<rustls::ServerConfig>> {
+        self.cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(host)
+    }
+
+    /// 同 host 并发首连只签一次。缓存命中直接返回；未命中的首个调用成为 leader，
+    /// 其余等待 Notify；等待超时或全局等待数打满时直接走阻塞线程池签发兜底。
+    pub async fn server_config_async(
+        self: &Arc<Self>,
+        host: &str,
+    ) -> io::Result<Arc<rustls::ServerConfig>> {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        if let Some(c) = self.cached(&host) {
+            self.stat(|s| {
+                s.mitm_leaf_hit.fetch_add(1, Ordering::Relaxed);
+            });
+            return Ok(c);
+        }
+        self.stat(|s| {
+            s.mitm_leaf_miss.fetch_add(1, Ordering::Relaxed);
+        });
+
+        enum Slot {
+            Leader(Arc<Flight>),
+            Follower(Arc<Flight>),
+            Full,
+        }
+        let slot = {
+            let mut g = self.inflight.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(f) = g.get(&host).cloned() {
+                if self.pending_waiters.load(Ordering::Relaxed) >= MAX_LEAF_WAITERS {
+                    self.stat(|s| {
+                        s.mitm_leaf_pending_full.fetch_add(1, Ordering::Relaxed);
+                    });
+                    Slot::Full
+                } else {
+                    self.pending_waiters.fetch_add(1, Ordering::Relaxed);
+                    f.waiters.fetch_add(1, Ordering::Relaxed);
+                    Slot::Follower(f)
+                }
+            } else {
+                let f = Arc::new(Flight::default());
+                g.insert(host.clone(), f.clone());
+                Slot::Leader(f)
+            }
+        };
+
+        let flight = match slot {
+            Slot::Full => return self.sign_blocking(host).await,
+            Slot::Leader(f) => {
+                let guard = FlightGuard {
+                    ca: self.clone(),
+                    host: host.clone(),
+                    flight: f,
+                };
+                let r = self.sign_blocking(host).await;
+                drop(guard);
+                return r;
+            }
+            Slot::Follower(f) => f,
+        };
+        self.stat(|s| {
+            s.mitm_leaf_wait.fetch_add(1, Ordering::Relaxed);
+        });
+        let wait_guard = WaiterGuard {
+            ca: self.clone(),
+            flight: flight.clone(),
+        };
+        // 先注册 notified，再复查缓存：避免 leader 在「查缓存」和「await」之间完成导致丢唤醒。
+        let notified = flight.notify.notified();
+        tokio::pin!(notified);
+        if let Some(c) = self.cached(&host) {
+            drop(wait_guard);
+            self.stat(|s| {
+                s.mitm_leaf_hit.fetch_add(1, Ordering::Relaxed);
+            });
+            return Ok(c);
+        }
+        let timed_out = tokio::time::timeout(LEAF_WAIT_TIMEOUT, notified)
+            .await
+            .is_err();
+        drop(wait_guard);
+        if let Some(c) = self.cached(&host) {
+            self.stat(|s| {
+                s.mitm_leaf_hit.fetch_add(1, Ordering::Relaxed);
+            });
+            return Ok(c);
+        }
+        if timed_out {
+            self.stat(|s| {
+                s.mitm_leaf_wait_timeout.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        // 超时/leader 失败：不继续排队，直接走阻塞线程池补签。
+        self.sign_blocking(host).await
+    }
+
+    async fn sign_blocking(
+        self: &Arc<Self>,
+        host: String,
+    ) -> io::Result<Arc<rustls::ServerConfig>> {
+        let ca = self.clone();
+        tokio::task::spawn_blocking(move || ca.server_config(&host))
+            .await
+            .map_err(|e| io_err(format!("证书签发任务失败: {}", e)))?
     }
 
     /// 为指定域名构建服务端 TLS 配置（叶子证书 + 原始 CA 链，ALPN 仅 http/1.1）。
@@ -186,6 +348,9 @@ impl MitmCa {
         // 不再被降级成 HTTP/1.1；不支持 h2 的客户端仍回落到 HTTP/1.1。
         cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let cfg = Arc::new(cfg);
+        self.stat(|s| {
+            s.mitm_leaf_sign.fetch_add(1, Ordering::Relaxed);
+        });
         let mut g = self.cache.lock().unwrap_or_else(|p| p.into_inner());
         g.insert(host, cfg.clone());
         Ok(cfg)
@@ -220,6 +385,39 @@ pub fn export_ca(ca_file: &str, out_dir: &str) -> Result<(String, String, String
         der_path.to_string_lossy().to_string(),
         name,
     ))
+}
+
+struct FlightGuard {
+    ca: Arc<MitmCa>,
+    host: String,
+    flight: Arc<Flight>,
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        let mut g = self.ca.inflight.lock().unwrap_or_else(|p| p.into_inner());
+        // 只有当前 leader 自己的 entry 才删；若 map 已被别的 leader 替换则不动。
+        if let Some(cur) = g.get(&self.host) {
+            if Arc::ptr_eq(cur, &self.flight) {
+                g.remove(&self.host);
+            }
+        }
+        drop(g);
+        // 唤醒所有等待者，让它们复查缓存（成功则复用，失败则兜底补签）。
+        self.flight.notify.notify_waiters();
+    }
+}
+
+struct WaiterGuard {
+    ca: Arc<MitmCa>,
+    flight: Arc<Flight>,
+}
+
+impl Drop for WaiterGuard {
+    fn drop(&mut self) {
+        self.ca.pending_waiters.fetch_sub(1, Ordering::Relaxed);
+        self.flight.waiters.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]
@@ -265,6 +463,38 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_connections_sign_leaf_once() {
+        let path = tmp_path("ca_singleflight.pem");
+        let _ = std::fs::remove_file(&path);
+        let ca = Arc::new(MitmCa::load_or_generate(&path).unwrap());
+        let stats = Arc::new(crate::stats::Stats::new());
+        ca.set_stats(stats.clone());
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let ca = ca.clone();
+            tasks.push(tokio::spawn(async move {
+                ca.server_config_async("burst.example.com").await.unwrap()
+            }));
+        }
+        let mut configs = Vec::new();
+        for t in tasks {
+            configs.push(t.await.unwrap());
+        }
+        for c in &configs[1..] {
+            assert!(
+                Arc::ptr_eq(&configs[0], c),
+                "同 host 并发首连必须复用同一 ServerConfig"
+            );
+        }
+        assert_eq!(
+            stats.mitm_leaf_sign.load(Ordering::Relaxed),
+            1,
+            "并发首连只允许签发一次"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn leaf_cert_verifies_against_ca() {
         use rustls::client::danger::ServerCertVerifier;
@@ -287,14 +517,12 @@ mod tests {
             .unwrap();
         let now = rustls::pki_types::UnixTime::now();
         let name = rustls::pki_types::ServerName::try_from("test.example.com").unwrap();
-        let result = verifier.verify_server_cert(
-            leaf.der(),
-            &[ca.ca_der.clone()],
-            &name,
-            &[],
-            now,
+        let result = verifier.verify_server_cert(leaf.der(), &[ca.ca_der.clone()], &name, &[], now);
+        assert!(
+            result.is_ok(),
+            "叶子证书必须能通过 CA 验证: {:?}",
+            result.err()
         );
-        assert!(result.is_ok(), "叶子证书必须能通过 CA 验证: {:?}", result.err());
         let _ = std::fs::remove_file(&path);
         // cfg 构建成功即 ALPN/链装配无误
         assert_eq!(

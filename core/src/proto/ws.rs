@@ -14,7 +14,11 @@ pub async fn wrap(mut stream: BoxStream, path: &str, host: &str) -> io::Result<B
     let mut key = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut key);
     let ws_key = base64::engine::general_purpose::STANDARD.encode(key);
-    let path = if path.starts_with('/') { path.to_string() } else { format!("/{}", path) };
+    let path = if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{}", path)
+    };
     let req = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: Mozilla/5.0 (Linux; Android 14)\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n\r\n",
         path, host, ws_key
@@ -69,7 +73,10 @@ pub async fn wrap(mut stream: BoxStream, path: &str, host: &str) -> io::Result<B
     });
     logging::info(
         "ws",
-        format!("WebSocket 已建立 {}", path.split('?').next().unwrap_or(&path)),
+        format!(
+            "WebSocket 已建立 {}",
+            path.split('?').next().unwrap_or(&path)
+        ),
     );
     Ok(Box::new(pipe_b))
 }
