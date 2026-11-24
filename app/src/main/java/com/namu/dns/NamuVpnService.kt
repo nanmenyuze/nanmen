@@ -38,8 +38,8 @@ internal fun tunnelSpec(cfg: AppConfig, appliedMtu: Int = cfg.mtu.coerceIn(1280,
     TunnelSpec(
         mode = cfg.mode,
         mtu = appliedMtu,
-        // 代理/DNS-only 全量接管都是默认路由；普通 DNS-only 只路由两个本地 DNS 地址。
-        fullRoute = cfg.mode != "dns_only" || cfg.dnsOnlyFullRoute,
+        // MITM 需要 HTTPS 连接进 TUN；仅扩展隧道路由，仍按当前模式决定如何转发。
+        fullRoute = cfg.mode != "dns_only" || cfg.dnsOnlyFullRoute || cfg.mitm.enabled,
     )
 
 private data class EstablishedTun(
@@ -408,7 +408,7 @@ class NamuVpnService : VpnService() {
         val cfg = settings.current()
         UidTablePublisher.setServiceDemand(needsUidMap(cfg))
         if (activeTunnel == null || activeTunnel != tunnelSpec(cfg)) {
-            // MTU、DNS-only 全量接管、mode 任一变化都会改系统隧道参数；
+            // MTU、实际接管范围、mode 任一变化都会改系统隧道参数；
             // 热重载只换内核配置，改不了已建立的 TUN，必须重建。
             rebuildTunnel()
             return
@@ -483,21 +483,21 @@ class NamuVpnService : VpnService() {
     }
 
     private fun establishTun(cfg: AppConfig): EstablishedTun? {
-        val mtu = cfg.mtu.coerceIn(1280, 9000)
-        val pfd = buildTun(cfg, mtu)
-        if (pfd != null) return EstablishedTun(pfd, tunnelSpec(cfg, mtu))
-        if (mtu == 1500) return null
-        // 个别 TUN 驱动不支持巨帧：回退 1500 并写回配置，
-        // 保证壳 setMtu 与内核 iface 永远取同一值（否则写侧超 MTU 静默丢包）。
+        val spec = tunnelSpec(cfg)
+        val pfd = buildTun(spec)
+        if (pfd != null) return EstablishedTun(pfd, spec)
+        if (spec.mtu == 1500) return null
+        // 个别 TUN 驱动不支持巨帧：回退 1500 并写回配置。
         settings.update { it.copy(mtu = 1500) }
-        val fallback = buildTun(cfg, 1500) ?: return null
-        return EstablishedTun(fallback, tunnelSpec(cfg, 1500))
+        val fallbackSpec = spec.copy(mtu = 1500)
+        val fallback = buildTun(fallbackSpec) ?: return null
+        return EstablishedTun(fallback, fallbackSpec)
     }
 
-    private fun buildTun(cfg: AppConfig, mtu: Int): ParcelFileDescriptor? {
+    private fun buildTun(spec: TunnelSpec): ParcelFileDescriptor? {
         val builder = Builder()
             .setSession("NamuDNS")
-            .setMtu(mtu)
+            .setMtu(spec.mtu)
             .addAddress("10.10.10.1", 24)
             .addRoute("10.10.10.53", 32)
             .addDnsServer("10.10.10.53")
@@ -506,14 +506,7 @@ class NamuVpnService : VpnService() {
             .addDnsServer("fd00:1::53")
             .setBlocking(false)
 
-        if (cfg.mode != "dns_only") {
-            builder.addRoute("0.0.0.0", 0)
-            builder.addRoute("::", 0)
-        } else if (cfg.dnsOnlyFullRoute) {
-            // DNS-only 也要全量接管：只加 VPN 的 DNS 地址时，App 硬编码 8.8.8.8、
-            // 系统 DoT 853、App 自己的 DoH 都不进 TUN，等于 DNS 泄漏。
-            // 全量接管后非 DNS 连接仍直连（内核在 dns_only 下判 Direct），
-            // 但所有 DNS 查询都会被劫持到本地引擎，DoT 才会被 block_dot 看到。
+        if (spec.fullRoute) {
             builder.addRoute("0.0.0.0", 0)
             builder.addRoute("::", 0)
         }

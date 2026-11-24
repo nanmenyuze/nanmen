@@ -61,7 +61,6 @@ import kotlinx.coroutines.launch
 
 @Composable
 fun DataScreen(
-    onOpenLogs: () -> Unit,
     onOpenDnsLogs: () -> Unit,
     onRestart: () -> Unit,
     onStartVpn: () -> Unit = {},
@@ -73,7 +72,6 @@ fun DataScreen(
     val cfg = state.config
     val runtime = state.runtime
     var showLive by remember { mutableStateOf(false) }
-    var showRuleTest by remember { mutableStateOf(false) }
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -264,12 +262,6 @@ fun DataScreen(
         SectionHeader("诊断")
         GroupCard {
             SettingsRow(
-                title = "命中诊断",
-                subtitle = "输入域名或 IPv4，按当前配置和模块规则展示命中结果",
-                chevron = true,
-                onClick = { showRuleTest = true },
-            )
-            SettingsRow(
                 title = "同步规则源",
                 subtitle = if (cfg.rulesUrl.isBlank()) {
                     "当前配置没有设置 rulesUrl"
@@ -367,15 +359,8 @@ fun DataScreen(
                 subtitle = "域名、拦截/放行、缓存或上游、耗时",
                 value = "${state.logs.dns.size} 条",
                 chevron = true,
-                onClick = onOpenDnsLogs,
-            )
-            SettingsRow(
-                title = "运行日志",
-                subtitle = "DNS、规则匹配与连接记录",
-                value = "${state.logs.runtime.size} 条",
-                chevron = true,
                 showDivider = false,
-                onClick = onOpenLogs,
+                onClick = onOpenDnsLogs,
             )
         }
 
@@ -391,9 +376,6 @@ fun DataScreen(
             logs = state.logs.runtime,
             onDismiss = { showLive = false },
         )
-    }
-    if (showRuleTest) {
-        RuleTestDialog(onDismiss = { showRuleTest = false })
     }
 }
 

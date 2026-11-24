@@ -440,6 +440,7 @@ async fn handle_stream(
     let url = url_for(host, &req);
     let hits = state.engine.rules_for(&url);
     let is_head = req.method() == http::Method::HEAD;
+    let client_accepts_gzip = accepts_gzip(req.headers());
     let path_for_log = req
         .uri()
         .path_and_query()
@@ -934,6 +935,7 @@ async fn handle_stream(
         &plan.response_headers,
         &plan.response_body_ops,
         is_head,
+        client_accepts_gzip,
         host,
         &path_for_log,
         conn_id,
@@ -994,6 +996,7 @@ async fn copy_response(
     response_header_ops: &[HeaderOp],
     response_body_ops: &[BodyOp],
     is_head: bool,
+    client_accepts_gzip: bool,
     host: &str,
     path: &str,
     conn_id: u64,
@@ -1296,20 +1299,9 @@ async fn copy_response(
     }
 
     let mut headers = script_headers;
-    // gRPC 的压缩在每帧 flag 里，不能删 grpc-encoding/content-encoding；
-    // 普通响应改写后正文已解压，必须移除 content-encoding。
-    if grpc_rewrite {
-        headers.remove(http::header::CONTENT_LENGTH);
-    } else {
-        for name in ["content-encoding", "content-length"] {
-            headers.remove(name);
-        }
-    }
-    headers.insert(
-        http::header::CONTENT_LENGTH,
-        HeaderValue::from_str(&new_body.len().to_string())
-            .map_err(|e| format!("h2 改写后 Content-Length 非法: {}", e))?,
-    );
+    let (new_body, gzip) =
+        encode_rewritten_response(&mut headers, new_body, &encoding, client_accepts_gzip, grpc_rewrite)
+            .await?;
     let rewritten_len = new_body.len();
     let head = response_head(status_out, &headers)?;
     let mut send = responder.send(head, false)?;
@@ -1324,12 +1316,77 @@ async fn copy_response(
             host,
             http1_redact(path),
             status_out.as_u16(),
-            if grpc_rewrite { "gRPC body" } else { "h2" },
+            if grpc_rewrite { "gRPC body" } else if gzip { "h2/gzip" } else { "h2" },
             raw.len(),
             rewritten_len
         ),
     );
     Ok(())
+}
+
+fn accepts_gzip(headers: &HeaderMap) -> bool {
+    let mut gzip = None;
+    let mut wildcard = false;
+    for value in headers.get_all(http::header::ACCEPT_ENCODING) {
+        let Ok(value) = value.to_str() else { continue };
+        for coding in value.split(',') {
+            let mut fields = coding.split(';');
+            let name = fields.next().unwrap_or("").trim();
+            let allowed = fields
+                .filter_map(|field| field.split_once('='))
+                .find(|(key, _)| key.trim().eq_ignore_ascii_case("q"))
+                .map(|(_, quality)| {
+                    quality
+                        .trim()
+                        .parse::<f32>()
+                        .is_ok_and(|q| q > 0.0 && q <= 1.0)
+                })
+                .unwrap_or(true);
+            if name.eq_ignore_ascii_case("gzip") {
+                gzip = Some(gzip.unwrap_or(true) && allowed);
+            } else if name == "*" {
+                wildcard |= allowed;
+            }
+        }
+    }
+    gzip.unwrap_or(wildcard)
+}
+
+async fn encode_rewritten_response(
+    headers: &mut HeaderMap,
+    mut body: Vec<u8>,
+    upstream_encoding: &str,
+    client_accepts_gzip: bool,
+    grpc: bool,
+) -> Result<(Vec<u8>, bool), String> {
+    let mut gzip = false;
+    // gRPC 封包压缩已由 protobuf 路径处理，此处只更新整个 HTTP/2 正文长度。
+    if !grpc {
+        headers.remove(http::header::CONTENT_ENCODING);
+        let upstream_compressed =
+            upstream_encoding.eq_ignore_ascii_case("gzip") || upstream_encoding.eq_ignore_ascii_case("deflate");
+        if client_accepts_gzip && upstream_compressed && !body.is_empty() {
+            let (encoded, compressed) = tokio::task::spawn_blocking(move || {
+                match super::http1::gzip_encode(&body) {
+                    Ok(compressed) => (compressed, true),
+                    Err(_) => (body, false),
+                }
+            })
+            .await
+            .map_err(|e| format!("h2 响应压缩任务失败: {e}"))?;
+            body = encoded;
+            gzip = compressed;
+        }
+        if gzip {
+            headers.insert(http::header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        }
+    }
+    headers.insert(
+        http::header::CONTENT_LENGTH,
+        HeaderValue::from_str(&body.len().to_string())
+            .map_err(|e| format!("h2 改写后 Content-Length 非法: {e}"))?,
+    );
+    Ok((body, gzip))
 }
 
 /// 一条流改写期间最坏占用三份正文缓冲（原文、解压结果、改写结果）。
@@ -1679,6 +1736,53 @@ mod tests {
     use super::*;
 
     /// 客户端 RST 后再发响应头会得到 unexpected frame type，属弃流不是协议错。
+    #[test]
+    fn gzip_accept_encoding_respects_explicit_refusal() {
+        let mut headers = HeaderMap::new();
+        assert!(!accepts_gzip(&headers));
+        headers.append(http::header::ACCEPT_ENCODING, HeaderValue::from_static("br, *;q=0.4"));
+        assert!(accepts_gzip(&headers));
+        headers.append(http::header::ACCEPT_ENCODING, HeaderValue::from_static("GZip; q=0"));
+        assert!(!accepts_gzip(&headers));
+        headers.insert(http::header::ACCEPT_ENCODING, HeaderValue::from_static("gzip;q=0.5"));
+        assert!(accepts_gzip(&headers));
+    }
+
+    #[tokio::test]
+    async fn rewritten_compressed_http_body_matches_its_headers() {
+        let original = b"rewritten JSON test".repeat(12000);
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONTENT_ENCODING, HeaderValue::from_static("deflate"));
+        let (wire, gzip) =
+            encode_rewritten_response(&mut headers, original.clone(), "deflate", true, false).await.unwrap();
+        assert!(gzip);
+        assert_eq!(headers[http::header::CONTENT_ENCODING], "gzip");
+        assert_eq!(headers[http::header::CONTENT_LENGTH], wire.len().to_string());
+        assert!(wire.len() < original.len());
+        assert_eq!(super::super::http1::decode_content(&wire, "gzip").unwrap(), original);
+
+        let (plain, gzip) =
+            encode_rewritten_response(&mut headers, original.clone(), "gzip", false, false).await.unwrap();
+        assert!(!gzip);
+        assert!(!headers.contains_key(http::header::CONTENT_ENCODING));
+        assert_eq!(headers[http::header::CONTENT_LENGTH], plain.len().to_string());
+        assert_eq!(plain, original);
+    }
+
+    #[tokio::test]
+    async fn rewritten_grpc_keeps_its_existing_encoding() {
+        let mut headers = HeaderMap::new();
+        headers.insert("grpc-encoding", HeaderValue::from_static("gzip"));
+        let frame = vec![1, 0, 0, 0, 1, 5];
+        let (body, gzip) =
+            encode_rewritten_response(&mut headers, frame.clone(), "", true, true).await.unwrap();
+        assert_eq!(body, frame);
+        assert!(!gzip);
+        assert_eq!(headers["grpc-encoding"], "gzip");
+        assert!(!headers.contains_key(http::header::CONTENT_ENCODING));
+        assert_eq!(headers[http::header::CONTENT_LENGTH], "6");
+    }
+
     #[test]
     fn client_cancel_classification() {
         for m in [

@@ -7,10 +7,6 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.saveable.rememberSaveableStateHolder
-import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -19,7 +15,6 @@ import androidx.compose.foundation.layout.calculateStartPadding
 import androidx.compose.foundation.layout.calculateEndPadding
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -65,8 +60,10 @@ import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.toRoute
 import com.namu.dns.UiPrefs
 import com.namu.dns.ui.OnboardingScreen
+import com.namu.dns.ui.AdvancedSettingsScreen
 import com.namu.dns.ui.ConfigDetailScreen
 import com.namu.dns.ui.ConfigScreen
+import com.namu.dns.ui.ConfigSectionScreen
 import com.namu.dns.ui.DataScreen
 import com.namu.dns.ui.DnsLogsScreen
 import com.namu.dns.ui.FirstRunVpnGuide
@@ -184,13 +181,7 @@ fun NamuAppShell(
                         selected = currentTab,
                         pageLayer = pageLayer,
                         pageOrigin = { pageOrigin },
-                        onSelect = { tab ->
-                            navController.navigate(tab.route) {
-                                popUpTo(navController.graph.findStartDestination().id) { saveState = true }
-                                launchSingleTop = true
-                                restoreState = true
-                            }
-                        },
+                        onSelect = navController::openMainTab,
                     )
                 }
             },
@@ -253,30 +244,16 @@ fun NamuNavHost(
                 onOpenNodes = { navController.navigate(NodesRoute) },
                 onRestart = onRestart,
                 onOpenData = { navController.navigate(DataRoute) },
-                onOpenConfig = { navController.navigate(ConfigDetailRoute) },
-                onOpenModules = {
-                    navController.navigate(ModulesRoute) {
-                        popUpTo(navController.graph.findStartDestination().id) { saveState = true }
-                        launchSingleTop = true
-                        restoreState = true
-                    }
-                },
-                onOpenMitm = { navController.navigate(MitmRoute) },
+                onOpenDnsLogs = { navController.navigate(LogsRoute(LogKind.Dns)) },
             )
         }
         composable<ConfigRoute> {
-            StrategyScreen(
-                onOpenDetail = {
-                    if (!navController.popBackStack<ConfigDetailRoute>(inclusive = false)) {
-                        navController.navigate(ConfigDetailRoute)
-                    }
-                },
-                onRestart = onRestart,
+            ConfigScreen(
+                onOpenDetail = { navController.navigate(ConfigDetailRoute) },
             )
         }
         composable<DataRoute> {
             DataScreen(
-                onOpenLogs = { navController.navigate(LogsRoute(LogKind.Runtime)) },
                 onOpenDnsLogs = { navController.navigate(LogsRoute(LogKind.Dns)) },
                 onRestart = onRestart,
                 onStartVpn = onToggle,
@@ -284,9 +261,15 @@ fun NamuNavHost(
         }
         composable<SettingsRoute> {
             SettingsScreen(
-                onRestart = onRestart,
-                onOpenLogs = { navController.navigate(LogsRoute(LogKind.Runtime)) },
+                onOpenConfig = { navController.navigate(ConfigRoute) },
                 onOpenMitm = { navController.navigate(MitmRoute) },
+                onOpenAdvanced = { navController.navigate(AdvancedSettingsRoute) },
+            )
+        }
+        composable<AdvancedSettingsRoute> {
+            AdvancedSettingsScreen(
+                onOpenLogs = { navController.navigate(LogsRoute(LogKind.Runtime)) },
+                onRestart = onRestart,
             )
         }
         composable<NodesRoute> {
@@ -302,19 +285,12 @@ fun NamuNavHost(
             }
         }
         composable<ConfigDetailRoute> {
-            ConfigDetailScreen(
-                onRestart = onRestart,
-                onOpenModules = { navController.navigate(ModulesRoute) },
-                onManageProfiles = { navController.navigate(ConfigRoute) },
-                onOpenMitm = { navController.navigate(MitmRoute) },
-            )
+            ConfigDetailScreen(onOpenSection = { navController.navigate(ConfigSectionRoute(it)) })
         }
-        composable<ModulesRoute> {
-            ModulesScreen(
-                onRestart = onRestart,
-                onOpenMitm = { navController.navigate(MitmRoute) },
-            )
+        composable<ConfigSectionRoute> { sectionEntry ->
+            ConfigSectionScreen(sectionEntry.toRoute<ConfigSectionRoute>().section, onRestart)
         }
+        composable<ModulesRoute> { ModulesScreen(onRestart = onRestart) }
         composable<MitmRoute> { MitmScreen() }
         composable<ScanRoute> {
             ScanScreen(onDone = {
@@ -324,46 +300,29 @@ fun NamuNavHost(
     }
 }
 
+private fun NavHostController.openMainTab(tab: MainTab) {
+    navigate(tab.route) {
+        popUpTo(graph.findStartDestination().id) { saveState = true }
+        launchSingleTop = true
+        restoreState = true
+    }
+}
+
 private fun titleFor(destination: NavDestination?, entry: androidx.navigation.NavBackStackEntry?): String = when {
     destination.matches(HomeRoute::class) -> "南门 DNS"
-    destination.matches(ConfigRoute::class) -> "规则"
-    destination.matches(DataRoute::class) -> "维护"
+    destination.matches(ConfigRoute::class) -> "配置文件"
+    destination.matches(DataRoute::class) -> "数据"
     destination.matches(ModulesRoute::class) -> "模块"
-    destination.matches(SettingsRoute::class) -> "我的"
-    destination.matches(NodesRoute::class) -> "代理节点"
+    destination.matches(SettingsRoute::class) -> "设置"
+    destination.matches(AdvancedSettingsRoute::class) -> "高级设置"
+    destination.matches(NodesRoute::class) -> "节点与订阅"
     destination.matches(LogsRoute::class) ->
         if (entry?.toRoute<LogsRoute>()?.kind == LogKind.Dns) "DNS 查询" else "运行日志"
-    destination.matches(ConfigDetailRoute::class) -> "当前配置"
+    destination.matches(ConfigDetailRoute::class) -> "编辑当前配置"
+    destination.matches(ConfigSectionRoute::class) -> entry?.toRoute<ConfigSectionRoute>()?.section?.title ?: "配置"
     destination.matches(MitmRoute::class) -> "MITM 管理"
     destination.matches(ScanRoute::class) -> "扫码导入"
     else -> "南门 DNS"
-}
-
-@Composable
-private fun StrategyScreen(onOpenDetail: () -> Unit, onRestart: () -> Unit) {
-    var section by rememberSaveable { mutableStateOf(0) }
-    val pages = rememberSaveableStateHolder()
-    Column(Modifier.fillMaxSize()) {
-        TabRow(
-            selectedTabIndex = section,
-            containerColor = NamuColors.Bg,
-            contentColor = NamuColors.Accent,
-        ) {
-            listOf("规则", "模块").forEachIndexed { index, label ->
-                Tab(
-                    selected = index == section,
-                    onClick = { section = index },
-                    selectedContentColor = NamuColors.Accent,
-                    unselectedContentColor = NamuColors.TextSub,
-                    text = { Text(label) },
-                )
-            }
-        }
-        pages.SaveableStateProvider(section) {
-            if (section == 0) ConfigScreen(onOpenDetail, onRestart)
-            else ModulesScreen(onRestart)
-        }
-    }
 }
 
 @Composable

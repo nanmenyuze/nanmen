@@ -33,7 +33,6 @@ import androidx.compose.material.icons.outlined.ArrowDownward
 import androidx.compose.material.icons.outlined.ArrowUpward
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Description
-import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -69,6 +68,8 @@ import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -83,6 +84,7 @@ import com.namu.dns.ModuleSource
 import com.namu.dns.core.LocalAppContainer
 import com.namu.dns.core.LocalDockClearance
 import com.namu.dns.core.config.ModuleOrder
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -91,10 +93,7 @@ import org.json.JSONObject
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ModulesScreen(
-    onRestart: () -> Unit,
-    onOpenMitm: (() -> Unit)? = null,
-) {
+fun ModulesScreen(onRestart: () -> Unit) {
     var showAdd by remember { mutableStateOf(false) }
     var showLibrary by remember { mutableStateOf(false) }
     var syncing by remember { mutableStateOf(false) }
@@ -211,7 +210,7 @@ fun ModulesScreen(
             .verticalScroll(scrollState),
     ) {
         SectionHeader(
-            "模块库 · ${container.config.activeName()}",
+            container.config.activeName(),
             trailing = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Box {
@@ -257,14 +256,12 @@ fun ModulesScreen(
         val appBound = modules.count { it.app.isNotBlank() }
         GroupCard {
             SettingsRow(
-                title = "按 App 分流",
-                subtitle = if (appBound > 0) "已绑定 $appBound 个应用" else "尚未绑定应用",
-                value = "${modules.size} 个模块",
+                title = "应用归属",
+                value = "$appBound 个模块",
                 showDivider = true,
             )
             SettingsRow(
                 title = "自定义规则",
-                subtitle = "模块之外的手写规则，优先级高于模块",
                 value = "${cfg.rules.size} 条",
                 showDivider = false,
             )
@@ -272,7 +269,7 @@ fun ModulesScreen(
         if (ruleSetIssues.isNotEmpty() || ignoredRules > 0) {
             GroupCard {
                 Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)) {
-                    Text("模块规则提示", fontSize = 13.sp, color = NamuColors.Orange)
+                    Text("规则异常", fontSize = 13.sp, color = NamuColors.Orange)
                     Spacer(Modifier.height(4.dp))
                     ruleSetIssues.take(5).forEach { issue ->
                         Text("· $issue", fontSize = 11.sp, color = NamuColors.TextSub, lineHeight = 16.sp)
@@ -282,7 +279,7 @@ fun ModulesScreen(
                     }
                     if (ignoredRules > 0) {
                         Text(
-                            "· 另有 $ignoredRules 行规则类型端上未实现，已按能力边界跳过",
+                            "已跳过 $ignoredRules 条规则",
                             fontSize = 11.sp,
                             color = NamuColors.TextSub,
                             lineHeight = 16.sp,
@@ -298,14 +295,6 @@ fun ModulesScreen(
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     Text("暂无模块", fontSize = 15.sp, color = NamuColors.TextMain)
-                    Spacer(Modifier.height(5.dp))
-                    Text(
-                        "模块主要用来按 App 维护规则，例如酷安、B站、闲鱼各自一份。",
-                        fontSize = 12.sp,
-                        color = NamuColors.TextSub,
-                        lineHeight = 17.sp,
-                        textAlign = TextAlign.Center,
-                    )
                     Spacer(Modifier.height(12.dp))
                     Row(
                         Modifier
@@ -316,7 +305,7 @@ fun ModulesScreen(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Icon(Icons.Outlined.Add, null, tint = androidx.compose.ui.graphics.Color.White, modifier = Modifier.height(16.dp))
-                        Text(" 导入模块 URL", fontSize = 13.sp, color = androidx.compose.ui.graphics.Color.White)
+                        Text(" 导入模块", fontSize = 13.sp, color = androidx.compose.ui.graphics.Color.White)
                     }
                 }
             }
@@ -384,60 +373,8 @@ fun ModulesScreen(
                     )
                 }
             }
-            FooterText("单击模块打开功能面板；长按卡片约 0.4 秒后拖动排序，松手保存。")
         }
 
-        if (onOpenMitm != null) {
-            SectionHeader("证书与 HTTPS 过滤")
-            GroupCard {
-                SettingsRow(
-                    title = "MITM 管理",
-                    subtitle = "HTTPS 内容级过滤 · 域名与应用例外 · CA 模块",
-                    value = "${cfg.mitm.hostnames.size + cfg.mitm.skipHostnames.size} 条名单",
-                    icon = Icons.Outlined.Security,
-                    chevron = true,
-                    showDivider = false,
-                    onClick = onOpenMitm,
-                )
-            }
-        }
-
-        SectionHeader("全局判定")
-        GroupCard {
-            SettingsRow(
-                title = "未命中时",
-                subtitle = "所有模块都没命中时，按下面的归属规则处理",
-                value = if (cfg.finalPolicy == "direct") "直连" else "走代理",
-                chevron = true,
-                onClick = {
-                    settings.update {
-                        it.copy(finalPolicy = if (it.finalPolicy == "direct") "proxy" else "direct")
-                    }
-                },
-            )
-            SettingsRow(
-                title = "国内域名直连",
-                subtitle = "未命中时按域名归属判断，国内域名不经过代理",
-                rightContent = {
-                    IosSwitch(
-                        checked = cfg.cnDirect,
-                        onCheckedChange = { on -> settings.update { it.copy(cnDirect = on) } },
-                    )
-                },
-                showDivider = false,
-            )
-        }
-
-        FooterText(
-            "模块按小火箭 .sgmodule 解析：[Rule] 支持 DOMAIN / DOMAIN-SUFFIX / DOMAIN-REGEX / " +
-                "IP-CIDR / IP-CIDR6 / PORT；AdBlock 支持 ||domain^ 后缀、|domain| 精确和 @@ 例外。" +
-                "带 $ 选项、通配路径与 PROCESS-NAME 的规则会跳过，并在导入预览按原因列出。" +
-                "[MITM] 域名与 [URL Rewrite] / [Header Rewrite] / Loon [Rewrite] / [Script] 会在「MITM 管理」启用并安装 CA 证书后生效；" +
-                "脚本运行在 QuickJS 沙箱内，支持 \$request/\$response/\$done/\$httpClient/\$persistentStore/\$argument/\$environment/\$utils；" +
-                "\$notification 已接系统通知（需通知权限），require 提供 crypto/base64/util 内置模块；" +
-                "setTimeout/setInterval 按 Loon 语义只执行一次，Promise/async 已驱动微任务，binary-body-mode/Uint8Array 已支持，本地文件读取仍不开放，导入预览会逐条标出；" +
-                "当前 DNS 过滤按域名生效，模块按 App 分组管理，不是系统级按 UID 隔离。",
-        )
         Spacer(Modifier.height(LocalDockClearance.current + 34.dp))
     }
 
@@ -654,25 +591,18 @@ private fun ModuleActionSheet(
                     fontWeight = FontWeight.SemiBold,
                     color = NamuColors.TextMain,
                 )
-                Text(
-                    if (module.enabled) "模块已启用 · 选择要执行的操作" else "模块已停用 · 仍可同步和编辑归属",
-                    fontSize = 12.sp,
-                    color = NamuColors.TextSub,
-                    modifier = Modifier.padding(top = 3.dp, bottom = 12.dp),
-                )
+                Spacer(Modifier.height(8.dp))
             }
             GroupCard {
                 ModuleActionRow(
                     icon = Icons.Outlined.Description,
                     title = "查看规则与详情",
-                    subtitle = "查看本地缓存正文、规则数量和更新状态",
                     chevron = true,
                     onClick = onDetail,
                 )
                 ModuleActionRow(
                     icon = Icons.Outlined.Apps,
                     title = "应用归属管理",
-                    subtitle = "编辑 #!app 分组元数据，不是 UID 隔离",
                     value = module.app.ifBlank { "未设置" },
                     chevron = true,
                     onClick = onEditApp,
@@ -680,7 +610,6 @@ private fun ModuleActionSheet(
                 ModuleActionRow(
                     icon = Icons.Outlined.Sync,
                     title = if (syncing) "正在同步当前模块" else "立即同步当前模块",
-                    subtitle = if (module.url.startsWith("https://")) "从远程更新，保留现有启用状态" else "仅远程 HTTPS 模块可同步",
                     loading = syncing,
                     enabled = !syncing && module.url.startsWith("https://"),
                     onClick = onSync,
@@ -688,14 +617,12 @@ private fun ModuleActionSheet(
                 ModuleActionRow(
                     icon = Icons.Outlined.ArrowUpward,
                     title = "上移",
-                    subtitle = if (index > 0) "无需拖拽的排序方式" else "已经是第一个模块",
                     enabled = index > 0,
                     onClick = { onMove(index - 1) },
                 )
                 ModuleActionRow(
                     icon = Icons.Outlined.ArrowDownward,
                     title = "下移",
-                    subtitle = if (index in 0 until lastIndex) "无需拖拽的排序方式" else "已经是最后一个模块",
                     enabled = index in 0 until lastIndex,
                     showDivider = false,
                     onClick = { onMove(index + 1) },
@@ -706,7 +633,6 @@ private fun ModuleActionSheet(
                 ModuleActionRow(
                     icon = Icons.Outlined.Delete,
                     title = "删除模块",
-                    subtitle = "删除前仍会再次确认",
                     destructive = true,
                     showDivider = false,
                     onClick = onDelete,
@@ -720,7 +646,6 @@ private fun ModuleActionSheet(
 private fun ModuleActionRow(
     icon: ImageVector,
     title: String,
-    subtitle: String? = null,
     value: String? = null,
     enabled: Boolean = true,
     loading: Boolean = false,
@@ -745,18 +670,7 @@ private fun ModuleActionRow(
         ) {
             NamuIcon(icon, null, tint = if (destructive) NamuColors.Red else NamuColors.Brand)
             Spacer(Modifier.width(13.dp))
-            Column(Modifier.weight(1f)) {
-                Text(title, fontSize = 16.sp, color = contentColor)
-                if (subtitle != null) {
-                    Text(
-                        subtitle,
-                        fontSize = 11.sp,
-                        color = NamuColors.TextSub,
-                        lineHeight = 15.sp,
-                        modifier = Modifier.padding(top = 2.dp),
-                    )
-                }
-            }
+            Text(title, fontSize = 16.sp, color = contentColor, modifier = Modifier.weight(1f))
             if (loading) {
                 CircularProgressIndicator(Modifier.size(19.dp), strokeWidth = 2.dp, color = NamuColors.Brand)
             } else if (value != null) {
@@ -876,16 +790,17 @@ private fun AddModuleDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
     var loading by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var preview by remember { mutableStateOf<Actions.ModulePreview?>(null) }
-    var acknowledged by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val clipboard = LocalClipboardManager.current
     val messages = LocalAppContainer.current.messages
     val context = LocalContext.current
+    val focus = LocalFocusManager.current
+    val keyboard = LocalSoftwareKeyboardController.current
     val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri == null) return@rememberLauncherForActivityResult
+        if (uri == null || loading || preview != null) return@rememberLauncherForActivityResult
+        loading = true
+        error = null
         scope.launch {
-            loading = true
-            error = null
             try {
                 val picked = withContext(Dispatchers.IO) {
                     val name = context.contentResolver.query(uri, null, null, null, null)?.use { c ->
@@ -897,10 +812,10 @@ private fun AddModuleDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
                     (name ?: "本地模块.plugin") to text
                 }
                 val (fileName, text) = picked
-                url = "local://$fileName"
-                if (name.isBlank()) name = fileName.substringBeforeLast('.')
-                preview = Actions.previewModuleText(url, text, name)
-                error = null
+                val displayName = name.ifBlank { fileName.substringBeforeLast('.') }
+                preview = Actions.previewModuleText("local://$fileName", text, displayName)
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 error = e.message ?: "读取本地模块失败"
             } finally {
@@ -910,27 +825,33 @@ private fun AddModuleDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
     }
 
     NamuDialog(
-        title = "导入模块",
-        message = if (preview == null) {
-            "填写模块 URL。支持小火箭 .sgmodule / 纯文本规则，也支持 {\"name\",\"rules\"} 形式的 JSON。"
-        } else {
-            "先预览再确认：确认后才会写入本地并合并规则。"
-        },
+        title = if (preview == null) "导入模块" else "模块预览",
+        message = if (preview == null) "选择本地文件或填写 HTTPS 链接。" else null,
         confirmText = if (preview == null) "预览" else "确认导入",
+        dismissText = if (preview == null) "取消" else "返回编辑",
         loading = loading,
-        confirmEnabled = url.isNotBlank() &&
-            (preview == null || preview!!.parsed.lostRouteTargets.isEmpty() || acknowledged),
-        onDismiss = onDismiss,
-        onConfirm = {
-            scope.launch {
-                loading = true
+        scrollContent = true,
+        confirmEnabled = preview != null || url.isNotBlank(),
+        onDismiss = {
+            if (preview == null) {
+                onDismiss()
+            } else {
+                preview = null
                 error = null
+            }
+        },
+        onConfirm = confirm@{
+            if (loading) return@confirm
+            focus.clearFocus()
+            keyboard?.hide()
+            loading = true
+            error = null
+            scope.launch {
                 try {
                     val p = preview
                     if (p == null) {
                         preview = Actions.previewModule(url, name)
-                        acknowledged = false
-                    } else {
+                            } else {
                         val result = Actions.importPreview(p)
                         messages.show(buildString {
                             append("已导入「${result.name}」：${result.blockRules} 条阻断")
@@ -941,6 +862,8 @@ private fun AddModuleDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
                         })
                         onDone()
                     }
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     error = e.message ?: "导入失败"
                 } finally {
@@ -949,34 +872,36 @@ private fun AddModuleDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
             }
         },
     ) {
-        NamuTextField(url, { url = it; error = null }, "https://example.com/app.sgmodule", singleLine = true)
-        Spacer(Modifier.height(8.dp))
-        NamuTextField(name, { name = it }, "模块名称（可留空，自动读取）", singleLine = true)
-        Row(
-            Modifier.fillMaxWidth().padding(top = 2.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                "从本地文件导入",
-                fontSize = 12.sp,
-                color = NamuColors.Blue,
-                modifier = Modifier
-                    .clickable {
-                        error = null
-                        preview = null
-                        filePicker.launch(arrayOf("*/*"))
-                    }
-                    .padding(vertical = 8.dp, horizontal = 4.dp),
-            )
-            Text(
-                "从剪贴板粘贴 URL",
-                fontSize = 12.sp,
-                color = NamuColors.Blue,
-                modifier = Modifier
-                    .clickable { clipboard.getText()?.text?.let { url = it; error = null } }
-                    .padding(vertical = 8.dp, horizontal = 4.dp),
-            )
+        if (preview == null) {
+            NamuTextField(url, { if (!loading) { url = it; error = null } }, "https://example.com/app.sgmodule", singleLine = true)
+            Spacer(Modifier.height(8.dp))
+            NamuTextField(name, { if (!loading) name = it }, "模块名称（可留空，自动读取）", singleLine = true)
+            Row(
+                Modifier.fillMaxWidth().padding(top = 2.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "从本地文件导入",
+                    fontSize = 12.sp,
+                    color = NamuColors.Blue,
+                    modifier = Modifier
+                        .clickable(enabled = !loading) {
+                            focus.clearFocus()
+                            keyboard?.hide()
+                            filePicker.launch(arrayOf("*/*"))
+                        }
+                        .padding(vertical = 8.dp, horizontal = 4.dp),
+                )
+                Text(
+                    "从剪贴板粘贴 URL",
+                    fontSize = 12.sp,
+                    color = NamuColors.Blue,
+                    modifier = Modifier
+                        .clickable(enabled = !loading) { clipboard.getText()?.text?.let { url = it; error = null } }
+                        .padding(vertical = 8.dp, horizontal = 4.dp),
+                )
+            }
         }
         if (error != null) {
             Text(
@@ -988,176 +913,30 @@ private fun AddModuleDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
             )
         }
         preview?.let { p ->
+            val unusable = moduleUnusableCount(p.parsed)
             Column(
                 Modifier
                     .fillMaxWidth()
-                    .padding(top = 10.dp)
                     .background(NamuColors.Fill, RoundedCornerShape(10.dp))
                     .padding(12.dp),
             ) {
-                Text("模块：${p.name}", fontSize = 14.sp, color = NamuColors.TextMain)
-                Spacer(Modifier.height(4.dp))
                 Text(
-                    buildString {
-                        val mitmCount = p.parsed.mitmHostnames.size +
-                            p.parsed.urlRewrites.size + p.parsed.headerRewrites.size +
-                            p.parsed.loonRewrites.size + p.parsed.bodyRewrites.size + p.parsed.hostMappings.size + p.parsed.scripts.size
-                        val lost = p.parsed.lostRouteTargets.size
-                        val supported = p.parsed.blockLines.size + p.parsed.routeRules.size + mitmCount
-                        append("完整支持 $supported 条 · 部分支持 $lost 条 · 跳过 ${p.parsed.ignored} 条")
-                        append("\n阻断 ${p.parsed.blockLines.size} · 分流 ${p.parsed.routeRules.size} · 例外 ${p.parsed.allowLines.size}")
-                        if (mitmCount > 0) append(" · MITM/重写 $mitmCount")
-                        if (p.parsed.ignoredReasons.isNotEmpty()) {
-                            append("\n跳过明细：")
-                            append(p.parsed.ignoredReasons.entries.sortedByDescending { it.value }
-                                .take(4)
-                                .joinToString("，") { "${moduleSkipLabel(it.key)} ${it.value}" })
-                        }
-                        if (p.duplicateBlock + p.duplicateRoute > 0) {
-                            append("\n与现有模块重复 ${p.duplicateBlock + p.duplicateRoute} 条（导入后自动去重）")
-                        }
-                        if (p.parsed.blockLines.isEmpty() && p.parsed.routeRules.isEmpty() && mitmCount == 0) {
-                            append("\n警告：没有任何可用规则")
-                        }
-                    },
-                    fontSize = 12.sp,
-                    color = NamuColors.TextSub,
-                    lineHeight = 17.sp,
+                    if (unusable == 0) "全部可用" else "有 $unusable 个不可用",
+                    fontSize = 13.sp,
+                    color = if (unusable == 0) NamuColors.Green else NamuColors.Orange,
                 )
-                if (p.parsed.sectionStatus.isNotEmpty()) {
-                    Spacer(Modifier.height(10.dp))
-                    Text(
-                        "分段能力：",
-                        fontSize = 12.sp,
-                        color = NamuColors.TextMain,
-                    )
-                    p.parsed.sectionStatus.forEach { st ->
-                        Text(
-                            "${st.section}：${st.lines} 行，${st.supported} 行可用 · ${sectionStatusLabel(st.status)}",
-                            fontSize = 11.sp,
-                            color = when (st.status) {
-                                "executed", "stored" -> NamuColors.Green
-                                "partial" -> NamuColors.Orange
-                                "unsupported" -> NamuColors.Red
-                                else -> NamuColors.TextSub
-                            },
-                            lineHeight = 16.sp,
-                        )
-                        Text(
-                            "  ${st.detail}",
-                            fontSize = 11.sp,
-                            color = NamuColors.TextSub,
-                            lineHeight = 16.sp,
-                        )
-                    }
-                }
-                if (p.parsed.scripts.isNotEmpty() || p.parsed.scriptLines.isNotEmpty()) {
-                    Spacer(Modifier.height(10.dp))
-                    Column(
-                        Modifier
-                            .fillMaxWidth()
-                            .background(NamuColors.Orange.copy(alpha = 0.12f), RoundedCornerShape(8.dp))
-                            .padding(10.dp),
-                    ) {
-                        Text(
-                            "脚本导入警示：脚本会进入 QuickJS 沙箱，仅在 MITM 启用并安装 CA 后执行；缺失正文或未实现 API 会逐条标注。",
-                            fontSize = 11.sp,
-                            color = NamuColors.Orange,
-                            lineHeight = 16.sp,
-                        )
-                        val remote = p.parsed.scripts
-                            .map { it.scriptPath.trim() }
-                            .filter { it.startsWith("http://", true) || it.startsWith("https://", true) }
-                            .distinct()
-                        if (remote.isNotEmpty()) {
-                            Spacer(Modifier.height(5.dp))
-                            Text(
-                                "远程 script-path（确认导入时将下载正文）：\n" +
-                                    remote.take(4).joinToString("\n") { "· $it" } +
-                                    if (remote.size > 4) "\n… 共 ${remote.size} 个远程脚本" else "",
-                                fontSize = 11.sp,
-                                color = NamuColors.TextSub,
-                                lineHeight = 15.sp,
-                            )
-                        }
-                    }
-                    Spacer(Modifier.height(10.dp))
-                    Text("脚本能力：", fontSize = 12.sp, color = NamuColors.TextMain)
-                    val req = p.parsed.scripts.count { it.phase == "request" }
-                    val resp = p.parsed.scripts.count { it.phase == "response" }
-                    val cached = p.parsed.scripts.count { it.source.isNotBlank() }
-                    Text(
-                        "已解析 ${p.parsed.scripts.size} 条（请求 $req / 响应 $resp），正文已缓存 $cached 条" +
-                            if (p.parsed.scriptLines.size > p.parsed.scripts.size) {
-                                "，${p.parsed.scriptLines.size - p.parsed.scripts.size} 条规则无法解析"
-                            } else "",
-                        fontSize = 11.sp,
-                        color = NamuColors.TextSub,
-                        lineHeight = 16.sp,
-                    )
-                    p.parsed.scripts.take(6).forEach { rule ->
-                        val (status, gap) = scriptCapability(rule)
-                        Text(
-                            "· ${rule.name}（${rule.phase}）: $status" +
-                                if (gap.isNotBlank()) " — $gap" else "",
-                            fontSize = 11.sp,
-                            color = when (status) {
-                                "可用" -> NamuColors.Green
-                                "部分可用" -> NamuColors.Orange
-                                else -> NamuColors.Red
-                            },
-                            lineHeight = 16.sp,
-                        )
-                    }
-                    if (p.parsed.scripts.size > 6) {
-                        Text("… 其余 ${p.parsed.scripts.size - 6} 条见模块详情", fontSize = 11.sp, color = NamuColors.TextSub)
-                    }
-                    if (p.parsed.scriptIssues.isNotEmpty()) {
-                        Text(
-                            "脚本缺口：" + p.parsed.scriptIssues.take(4).joinToString("；"),
-                            fontSize = 11.sp,
-                            color = NamuColors.Orange,
-                            lineHeight = 16.sp,
-                        )
-                    }
-                }
-                if (p.parsed.dependencies.isNotEmpty()) {
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "能力边界：" + p.parsed.dependencies.joinToString("、") +
-                            "。缺失或超限的脚本不会执行，也不会伪装修复。",
-                        fontSize = 11.sp,
-                        color = NamuColors.Orange,
-                        lineHeight = 16.sp,
-                    )
-                }
-                val lost = p.parsed.lostRouteTargets
-                if (lost.isNotEmpty()) {
-                    Spacer(Modifier.height(10.dp))
-                    Text(
-                        "重要分流目标丢失：" + lost.take(3).joinToString("、") +
-                            (if (lost.size > 3) " 等 ${lost.size} 个" else "") +
-                            "\n这些规则不会被导入；请确认后再继续。",
-                        fontSize = 12.sp,
-                        color = NamuColors.Red,
-                        lineHeight = 17.sp,
-                    )
-                    Row(
-                        Modifier.fillMaxWidth().padding(top = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            "我已确认丢失的分流目标",
-                            fontSize = 12.sp,
-                            color = NamuColors.TextMain,
-                            modifier = Modifier.weight(1f),
-                        )
-                        IosSwitch(checked = acknowledged, onCheckedChange = { acknowledged = it })
-                    }
-                }
             }
         }
     }
+}
+
+/** 导入预览只保留结论：不可用条目数；空模块按 1 个不可用处理。 */
+private fun moduleUnusableCount(parsed: com.namu.dns.ParsedModule): Int {
+    val supported = parsed.blockLines.size + parsed.routeRules.size + parsed.allowLines.size +
+        parsed.mitmHostnames.size + parsed.urlRewrites.size + parsed.headerRewrites.size +
+        parsed.loonRewrites.size + parsed.bodyRewrites.size + parsed.hostMappings.size + parsed.scripts.size
+    val unavailable = parsed.ignored + parsed.lostRouteTargets.size + parsed.scriptIssues.size
+    return if (supported == 0 && unavailable == 0) 1 else unavailable
 }
 
 /** 单条脚本的可用性判断：正文缺失=不可用；用了未提供的宿主 API=部分可用。 */

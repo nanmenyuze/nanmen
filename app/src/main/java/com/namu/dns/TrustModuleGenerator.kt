@@ -153,6 +153,7 @@ object TrustModuleGenerator {
         listOf(
             "module.prop" to moduleProp().toByteArray(),
             "customize.sh" to renderScript(customizeScript()).toByteArray(),
+            "post-fs-data.sh" to renderScript(postFsDataScript()).toByteArray(),
             "service.sh" to renderScript(serviceScript()).toByteArray(),
             "inject.sh" to renderScript(injectScript(systemName)).toByteArray(),
             "bind.sh" to renderScript(bindScript()).toByteArray(),
@@ -164,10 +165,10 @@ object TrustModuleGenerator {
 
     private fun moduleProp() = """id=namu_mitm_ca
 name=Namu MITM CA (System Trust)
-version=v2.11
-versionCode=211
+version=v2.14
+versionCode=214
 author=NamuDNS
-description=由 Magisk 管理的南门 DNS 系统 CA。安装、停用或移除后完整重启。
+description=由模块管理器管理的南门 DNS 系统 CA。安装或更新后重启系统界面并核验。
 """
 
     private fun customizeScript() = """
@@ -182,6 +183,14 @@ description=由 Magisk 管理的南门 DNS 系统 CA。安装、停用或移除�
           [ -f "${'$'}F" ] && chmod 0755 "${'$'}F"
         done
     """.trimIndent()
+
+    private fun postFsDataScript() = """
+        #!/system/bin/sh
+        MODDIR=§{0%/*}
+        [ ! -e "§MODDIR/disable" ] && [ ! -e "§MODDIR/remove" ] || exit 0
+        sh "§MODDIR/inject.sh" --early
+        exit 0
+    """.trimIndent().replace('§', '$')
 
     private fun serviceScript() = """
         #!/system/bin/sh
@@ -202,6 +211,8 @@ description=由 Magisk 管理的南门 DNS 系统 CA。安装、停用或移除�
             #!/system/bin/sh
             MODDIR=§{0%/*}
             STATE=__STATE__
+            MODE=§1
+            case "§MODE" in --early|--late) ;; *) exit 2 ;; esac
             BOOT_ID=§(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || exit 1
             case "§BOOT_ID" in ""|*[!0-9a-f-]*) exit 1 ;; esac
             STAGING=§STATE/cacerts_staging.§BOOT_ID
@@ -218,14 +229,15 @@ description=由 Magisk 管理的南门 DNS 系统 CA。安装、停用或移除�
             exec >>"§LOG" 2>&1
             LOCK=§STATE/inject_lock.§BOOT_ID
             mkdir "§LOCK" 2>/dev/null || exit 1
-            NEW=""
-            trap '[ -z "§NEW" ] || rm -rf "§NEW"; rmdir "§LOCK"' EXIT
+            trap 'rmdir "§LOCK"' EXIT
             echo "=== §(date) inject start (§1) ==="
             write_status() {
               ST="§1"; shift
               {
                 echo "state=§ST"
                 echo "boot_id=§BOOT_ID"
+                echo "phase=§MODE"
+                echo "staging=§{STAGING##*/}"
                 for L in "§@"; do echo "§L"; done
                 echo "done=1"
               } > "§STATUS.tmp.§§"
@@ -233,77 +245,116 @@ description=由 Magisk 管理的南门 DNS 系统 CA。安装、停用或移除�
             }
             fail() {
               echo "ERROR: §1"
-              write_status error "cert=§NAME" "error=§1"
+              write_status error "cert=§NAME" "target=§TARGET" "error=§1"
               exit 1
             }
             [ -f "§SRC" ] || fail "模块内证书缺失: §SRC"
             SDK=§(getprop ro.build.version.sdk)
             case "§SDK" in ""|*[!0-9]*) fail "无法识别 Android 版本" ;; esac
-            if [ "§SDK" -ge 34 ]; then
-              TARGET="§APEX"
-            else
-              TARGET="§LEGACY"
-            fi
-            [ -n "§(ls -A "§TARGET" 2>/dev/null)" ] || fail "系统证书目录未就绪"
-            [ -d "§TARGET" ] || fail "系统证书目录不存在: §TARGET"
-            command -v nsenter >/dev/null 2>&1 || fail "nsenter 不可用，无法注入 Zygote"
-
-            # 先检查全部目标，发生真实覆盖冲突时不叠加自己的挂载。
             ZYGOTES="§(pidof zygote 2>/dev/null) §(pidof zygote64 2>/dev/null)"
             set -- §ZYGOTES
-            [ "§#" -gt 0 ] || fail "Zygote 尚未就绪"
-            SOURCE_PID=§1
-            HELPER="§MODDIR/bind.sh"
-            for P in §ZYGOTES; do
-              nsenter -t "§P" -m -- /system/bin/sh "§HELPER" "§STAGING" "§TARGET" "§NAME" --check ||
-                fail "证书区被其他挂载覆盖或无法核验: PID §P"
-            done
-
-            # 已发布目录可能仍被旧 App 进程引用。完整重启产生新 boot_id，
-            # 同一轮启动内禁止改写、删除或卸载已发布的证书目录。
-            if [ -e "§STAGING" ] || [ -L "§STAGING" ]; then
-              [ -d "§STAGING" ] && [ ! -L "§STAGING" ] &&
-                cmp -s "§STAGING/§NAME" "§SRC" ||
-                fail "本次启动已有不同的证书目录，请完整重启后应用"
+            if [ "§MODE" = "--early" ]; then
+              if [ "§#" -gt 0 ]; then
+                echo "SKIP: Zygote 已启动，交由后期服务核验"
+                exit 0
+              fi
+              # 使用模块管理器提供的开机挂载视图，不切换或重启 init。
+              PROC_IDS=§§
+              SOURCE_PID=§§
             else
-              STOCK="/proc/§SOURCE_PID/root§TARGET"
-              [ ! -e "§STOCK/§NAME" ] && [ ! -L "§STOCK/§NAME" ] ||
-                fail "系统已有同名证书，已保留原证书库"
-              NEW=§(mktemp -d "§STATE/cacerts.new.XXXXXX") || fail "无法创建临时证书目录"
-              cp -R "§STOCK"/. "§NEW"/ || fail "复制系统证书库失败，未挂载"
-              [ ! -e "§NEW/§NAME" ] && [ ! -L "§NEW/§NAME" ] || fail "副本内已有同名证书"
-              cp -f "§SRC" "§NEW/§NAME" || fail "复制证书到 staging 失败"
-              chown -R 0:0 "§NEW" || fail "无法设置证书所有者"
-              chmod 0755 "§NEW" || fail "无法设置证书目录权限"
-              find "§NEW" -type d -exec chmod 0755 {} \; || fail "无法设置子目录权限"
-              find "§NEW" -type f -exec chmod 0644 {} \; || fail "无法设置证书权限"
-              if command -v chcon >/dev/null 2>&1; then
-                chcon -R u:object_r:system_file:s0 "§NEW" || fail "无法设置证书 SELinux 标签"
-              fi
-              nsenter -t "§SOURCE_PID" -m -- /system/bin/sh "§HELPER" "§NEW" "§TARGET" "§NAME" --verify ||
-                fail "系统证书库副本校验失败，未挂载"
-              [ ! -e "§STAGING" ] && [ ! -L "§STAGING" ] || fail "已有证书目录，未替换"
-              mv -T "§NEW" "§STAGING" || fail "无法发布证书目录"
-              NEW=""
+              command -v nsenter >/dev/null 2>&1 || fail "nsenter 不可用，无法注入 Zygote"
+              [ "§#" -gt 0 ] || fail "Zygote 尚未就绪"
+              PROC_IDS="§ZYGOTES"
+              SOURCE_PID=§1
             fi
-
-            # 所有目标先验证。尚未挂载的 namespace 必须逐个比对系统证书原件。
-            for P in §ZYGOTES; do
-              nsenter -t "§P" -m -- /system/bin/sh "§HELPER" "§STAGING" "§TARGET" "§NAME" --verify ||
-                fail "系统证书库与副本不一致或不可读: PID §P；保持现状，请完整重启"
-            done
-
-            BOUND=0
-            for P in §ZYGOTES; do
-              if nsenter -t "§P" -m -- /system/bin/sh "§HELPER" "§STAGING" "§TARGET" "§NAME"; then
-                BOUND=§((BOUND+1))
+            HELPER="§MODDIR/bind.sh"
+            check_or_bind() {
+              PID="§1"; shift
+              if [ "§PID" = "§§" ]; then
+                sh "§HELPER" "§@"
               else
-                fail "Zygote 证书挂载或核验失败: PID §P，已核验 §BOUND 个；保留现有挂载，请完整重启"
+                nsenter -t "§PID" -m -- /system/bin/sh "§HELPER" "§@"
               fi
-            done
-            CONFLICT=0
-            write_status ok "cert=§NAME" "target=§TARGET" "bound=§BOUND" "conflict=§CONFLICT"
-            echo "=== inject done: §TARGET, bound=§BOUND, conflict=§CONFLICT ==="
+            }
+            inject_target() (
+              TARGET="§1"
+              STAGING="§2"
+              STATUS="§3"
+              NEW=""
+              trap '[ -z "§NEW" ] || rm -rf "§NEW"' EXIT
+              [ -d "§TARGET" ] && [ ! -L "§TARGET" ] &&
+                [ -n "§(ls -A "§TARGET" 2>/dev/null)" ] ||
+                fail "证书目录不可用: §TARGET"
+              # 已发布目录可能仍由旧进程使用。同一 boot_id 下为不同证书选独立目录。
+              if [ -e "§STAGING" ] || [ -L "§STAGING" ]; then
+                if [ -L "§STAGING" ] || [ ! -d "§STAGING" ] || ! cmp -s "§STAGING/§NAME" "§SRC"; then
+                  SHA=§(sha256sum "§SRC") || fail "无法读取模块证书摘要"
+                  SHA=§{SHA%% *}
+                  printf '%s\n' "§SHA" | grep -Eq '^[0-9a-f]{64}§' || fail "模块证书摘要无效"
+                  STAGING="§STAGING.§SHA"
+                fi
+              fi
+              for P in §PROC_IDS; do
+                check_or_bind "§P" "§STAGING" "§TARGET" "§NAME" --check ||
+                  fail "证书区被其他挂载覆盖或无法核验: PID §P"
+              done
+
+              # 预检通过后才可复用已发布副本或创建独立副本。
+              if [ -e "§STAGING" ] || [ -L "§STAGING" ]; then
+                [ -d "§STAGING" ] && [ ! -L "§STAGING" ] &&
+                  cmp -s "§STAGING/§NAME" "§SRC" ||
+                  fail "当前证书副本不可用，已保留现有证书区"
+              else
+                STOCK="/proc/§SOURCE_PID/root§TARGET"
+                [ ! -e "§STOCK/§NAME" ] && [ ! -L "§STOCK/§NAME" ] ||
+                  fail "系统已有同名证书，已保留原证书库"
+                NEW=§(mktemp -d "§STATE/cacerts.new.XXXXXX") || fail "无法创建临时证书目录"
+                cp -R "§STOCK"/. "§NEW"/ || fail "复制系统证书库失败，未挂载"
+                [ ! -e "§NEW/§NAME" ] && [ ! -L "§NEW/§NAME" ] || fail "副本内已有同名证书"
+                cp -f "§SRC" "§NEW/§NAME" || fail "复制证书到 staging 失败"
+                chown -R 0:0 "§NEW" || fail "无法设置证书所有者"
+                chmod 0755 "§NEW" || fail "无法设置证书目录权限"
+                find "§NEW" -type d -exec chmod 0755 {} \; || fail "无法设置子目录权限"
+                find "§NEW" -type f -exec chmod 0644 {} \; || fail "无法设置证书权限"
+                if command -v chcon >/dev/null 2>&1; then
+                  chcon -R u:object_r:system_file:s0 "§NEW" || fail "无法设置证书 SELinux 标签"
+                fi
+                check_or_bind "§SOURCE_PID" "§NEW" "§TARGET" "§NAME" --verify ||
+                  fail "系统证书库副本校验失败，未挂载"
+                [ ! -e "§STAGING" ] && [ ! -L "§STAGING" ] || fail "已有证书目录，未替换"
+                mv -T "§NEW" "§STAGING" || fail "无法发布证书目录"
+                NEW=""
+              fi
+
+              # 所有目标先验证。尚未挂载的 namespace 必须逐个比对系统证书原件。
+              for P in §PROC_IDS; do
+                check_or_bind "§P" "§STAGING" "§TARGET" "§NAME" --verify ||
+                  fail "系统证书库与副本不一致或不可读: PID §P；保持现状，请完整重启"
+              done
+
+              BOUND=0
+              for P in §PROC_IDS; do
+                if check_or_bind "§P" "§STAGING" "§TARGET" "§NAME"; then
+                  BOUND=§((BOUND+1))
+                else
+                  fail "Zygote 证书挂载或核验失败: PID §P，已核验 §BOUND 个；保留现有挂载，请完整重启"
+                fi
+              done
+              write_status ok "cert=§NAME" "target=§TARGET" "bound=§BOUND" "conflict=0"
+              echo "=== inject done: §TARGET, bound=§BOUND, conflict=0 ==="
+            )
+
+            if [ "§SDK" -ge 34 ]; then
+              if ! inject_target "§APEX" "§STAGING" "§STATUS" && [ "§MODE" = "--late" ]; then
+                exit 1
+              fi
+              # 旧系统目录需要使用自己的原件。两个目录分别校验。
+              inject_target "§LEGACY" "§STATE/cacerts_legacy.§BOOT_ID" "§STATE/status.legacy" ||
+                echo "WARN: 旧系统证书区未挂载"
+            else
+              inject_target "§LEGACY" "§STAGING" "§STATUS" || exit 1
+            fi
+            [ "§MODE" = "--late" ] || exit 0
             sh "§MODDIR/prune.sh" "§STATE" "§BOOT_ID" ||
               echo "WARN: 保留无法安全清理的历史证书目录"
             exit 0
@@ -328,10 +379,16 @@ description=由 Magisk 管理的南门 DNS 系统 CA。安装、停用或移除�
         [ -d "§STATE" ] && [ ! -L "§STATE" ] || exit 1
         [ -r "§PROC/1/mountinfo" ] || exit 1
 
-        for DIR in "§STATE"/cacerts_staging.* "§STATE"/inject_lock.*; do
+        for DIR in "§STATE"/cacerts_staging.* "§STATE"/cacerts_legacy.* "§STATE"/inject_lock.*; do
           [ -d "§DIR" ] && [ ! -L "§DIR" ] || continue
-          OLD="§{DIR##*.}"
+          BASE="§{DIR##*/}"
+          KEY="§{BASE#*.}"
+          OLD="§{KEY%%.*}"
           [ "§OLD" != "§BOOT_ID" ] && is_boot_id "§OLD" || continue
+          if [ "§KEY" != "§OLD" ]; then
+            case "§BASE" in cacerts_staging.*|cacerts_legacy.*) ;; *) continue ;; esac
+            printf '%s\n' "§{KEY#*.}" | grep -Eq '^[0-9a-f]{64}§' || continue
+          fi
           case "§DIR" in
             "§STATE"/inject_lock.*) rmdir "§DIR" 2>/dev/null || :; continue ;;
           esac
@@ -340,7 +397,7 @@ description=由 Magisk 管理的南门 DNS 系统 CA。安装、停用或移除�
           SAFE=1
           for PROCESS in "§PROC"/[0-9]*; do
             [ -d "§PROCESS" ] || continue
-            grep -Fq "cacerts_staging.§OLD" "§PROCESS/mountinfo" 2>/dev/null
+            grep -Fq "§BASE" "§PROCESS/mountinfo" 2>/dev/null
             case "§?" in
               0) SAFE=0; break ;;
               1) ;;
@@ -405,9 +462,9 @@ description=由 Magisk 管理的南门 DNS 系统 CA。安装、停用或移除�
 
     private fun readme(name: String) = """# 南门 DNS 系统 CA
 
-模块只包含公开 CA（certs/$name）。在 Magisk 的「模块 → 从存储安装」选择本 ZIP，然后完整重启。
+模块只包含公开 CA（certs/$name）。在模块管理器的「从存储安装」选择本 ZIP，使用该管理器支持的重启方式。临时 Root 环境优先使用软重启。
 停用或移除也从 Magisk 操作，随后完整重启。
-Android 14 及以上检查 Conscrypt APEX 证书区。遇到无法核验的覆盖层时停止挂载。
+启动早期尝试挂载，后期服务在 Zygote 中复核并补挂。Android 14 及以上对 APEX 和旧系统证书区分别校验。
 重启后在 App 的证书页核对状态。
 """
 }

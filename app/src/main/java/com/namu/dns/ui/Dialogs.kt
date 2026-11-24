@@ -91,6 +91,7 @@ fun NamuDialog(
     showDismiss: Boolean = true,
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
+    scrollContent: Boolean = false,
     content: @Composable ColumnScope.() -> Unit = {},
 ) {
     Dialog(onDismissRequest = { if (!loading) onDismiss() }) {
@@ -106,8 +107,13 @@ fun NamuDialog(
                 .clip(RoundedCornerShape(14.dp))
                 .background(NamuColors.Card),
         ) {
+            val bodyModifier = if (scrollContent) {
+                Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())
+            } else {
+                Modifier
+            }
             Column(
-                Modifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 20.dp, bottom = 16.dp),
+                bodyModifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 20.dp, bottom = 16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Text(title, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = NamuColors.TextMain, textAlign = TextAlign.Center)
@@ -976,6 +982,13 @@ fun ConfigNameDialog(
     }
 }
 
+/** 配置导入预览只保留结论：不可用项包含跳过/未知/部分支持段落与非 INFO 诊断。 */
+private fun configUnusableCount(preview: com.namu.dns.core.config.ConfigSourcePreview): Int {
+    val count = preview.skipped.size + preview.unknown.size + preview.partial.size +
+        preview.issues.count { it.level != ConfigIssueLevel.INFO }
+    return if (preview.canImport) count else maxOf(1, count)
+}
+
 @Composable
 fun ConfigImportDialog(
     onDone: (ConfigFileStore.FileInfo) -> Unit,
@@ -1021,7 +1034,7 @@ fun ConfigImportDialog(
 
     NamuDialog(
         title = "导入配置文件",
-        message = "从本地文件选择原生 JSON、Clash、Loon 或小火箭配置；Loon/小火箭导入节点/策略组/规则/DNS，Clash 导入规则与策略组，节点仍走订阅",
+        message = "选择本地配置文件后确认导入。",
         confirmText = if (preview?.canImport == true) "导入" else "仅预览",
         loading = reading,
         confirmEnabled = name.isNotBlank() && text.isNotBlank() && preview?.canImport == true,
@@ -1051,51 +1064,15 @@ fun ConfigImportDialog(
                 filePicker.launch(arrayOf("*/*"))
             }
         }
-        Text(
-            if (text.isBlank()) "尚未选择本地配置文件" else "已选择本地文件：$name · ${text.length} 字符",
-            fontSize = 12.sp,
-            color = if (text.isBlank()) NamuColors.TextSub else NamuColors.Green,
-            modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
-        )
         preview?.let { p ->
             Spacer(Modifier.height(8.dp))
-            Column(
-                Modifier.fillMaxWidth().heightIn(max = 300.dp).verticalScroll(rememberScrollState()),
-            ) {
-                Text(
-                    "来源：${p.displayName} · ${p.rawBytes} 字符",
-                    fontSize = 12.sp,
-                    color = NamuColors.TextMain,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                if (p.supported.isNotEmpty()) {
-                    Text("支持：${p.supported.joinToString("、")}", fontSize = 11.sp, color = NamuColors.Green, modifier = Modifier.fillMaxWidth())
-                }
-                if (p.partial.isNotEmpty()) {
-                    Text("部分支持：${p.partial.joinToString("、")}", fontSize = 11.sp, color = NamuColors.Orange, modifier = Modifier.fillMaxWidth())
-                }
-                if (p.skipped.isNotEmpty()) {
-                    Text("跳过：${p.skipped.joinToString("、")}", fontSize = 11.sp, color = NamuColors.TextSub, modifier = Modifier.fillMaxWidth())
-                }
-                if (p.unknown.isNotEmpty()) {
-                    Text("未知段落/根字段：${p.unknown.joinToString("、")}（原文保留）", fontSize = 11.sp, color = NamuColors.Orange, modifier = Modifier.fillMaxWidth())
-                }
-                p.issues.take(6).forEach { issue ->
-                    Text(
-                        "${if (issue.level == ConfigIssueLevel.ERROR) "错误" else "提示"} ${issue.path}：${issue.message}",
-                        fontSize = 11.sp,
-                        color = if (issue.level == ConfigIssueLevel.ERROR) NamuColors.Red else NamuColors.TextSub,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                }
-                if (p.issues.size > 6) {
-                    Text("另有 ${p.issues.size - 6} 条诊断未展开", fontSize = 11.sp, color = NamuColors.TextSub)
-                }
-                if (!p.canImport) {
-                    Text(p.reason, fontSize = 11.sp, color = NamuColors.Orange, modifier = Modifier.fillMaxWidth())
-                }
-            }
+            val unusable = configUnusableCount(p)
+            Text(
+                if (unusable == 0) "全部可用" else "有 $unusable 个不可用",
+                fontSize = 13.sp,
+                color = if (unusable == 0) NamuColors.Green else NamuColors.Orange,
+                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+            )
         }
         error?.let {
             Text(it, fontSize = 12.sp, color = NamuColors.Red, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())

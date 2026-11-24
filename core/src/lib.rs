@@ -1025,13 +1025,13 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeVersion<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
-    to_jstring(&mut env, "1.13.25".into())
+    to_jstring(&mut env, "1.13.28".into())
 }
 
 /// 给发布产物做独立校验用：即使 JNI 入口被裁剪，`llvm-strings` 仍能在
-/// libnanmen_core.so 里读到 `nanmen_core-1.13.25`，不必只信清单文件。
+/// libnanmen_core.so 里读到 `nanmen_core-1.13.28`，不必只信清单文件。
 #[no_mangle]
-pub static NAMU_CORE_VERSION: [u8; 19] = *b"nanmen_core-1.13.25";
+pub static NAMU_CORE_VERSION: [u8; 19] = *b"nanmen_core-1.13.28";
 
 #[cfg(test)]
 mod rule_test_transport_tests {

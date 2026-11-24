@@ -65,6 +65,8 @@ object Diagnostics {
                 "内核已加载 ${snapshot.filterRules} 条（跳过 ${snapshot.filterSkipped} 条）",
         )
         sb.appendLine("模式：${cfg.mode}，final=${cfg.finalPolicy}")
+        val routing = if (tunnelSpec(cfg).fullRoute) "接管 DNS 和连接" else "仅接管系统 DNS"
+        sb.appendLine("隧道路由配置：$routing，MITM=${cfg.mitm.enabled}")
         sb.appendLine(
             "DNS：上游 ${SystemDns.display(cfg.dnsUpstream, context)}，回落 " +
                 "${SystemDns.display(cfg.dnsFallback, context)}，查询日志=" + cfg.dnsQueryLog,

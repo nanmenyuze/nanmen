@@ -80,8 +80,8 @@ fun MitmScreen() {
     }
     val trustSubtitle = when (trustState) {
         RootCaManager.TrustState.NOT_GENERATED -> "导出模块时会生成公开 CA"
-        RootCaManager.TrustState.GENERATED_NOT_INSTALLED -> trust.detail.ifBlank { "导出模块后，在 Magisk 中安装并完整重启" }
-        RootCaManager.TrustState.INSTALLED_PENDING -> "已发现模块，尚未核实系统信任状态。请确认已在 Magisk 启用并完整重启"
+        RootCaManager.TrustState.GENERATED_NOT_INSTALLED -> trust.detail.ifBlank { "在模块管理器安装，重启后重新核验" }
+        RootCaManager.TrustState.INSTALLED_PENDING -> "请确认模块已启用，并在重启后重新核验"
         RootCaManager.TrustState.ACTIVE -> "已在 Zygote 的系统证书区核对到同一张 CA"
         RootCaManager.TrustState.CONFLICT -> "系统证书区存在其他覆盖层，请在 Magisk 中检查模块"
         RootCaManager.TrustState.INJECT_FAILED -> "模块启动时未完成挂载，可导出安装日志查看原因"
@@ -142,7 +142,7 @@ fun MitmScreen() {
         GroupCard {
             SettingsRow(
                 title = "启用 MITM",
-                subtitle = "解密命中域名列表的 HTTPS：按 URL 拒绝广告请求、正则改写响应体",
+                subtitle = "开启后自动接管连接，按已启用的规则处理 HTTPS",
                 icon = Icons.Rounded.Security,
                 rightContent = {
                     IosSwitch(
@@ -423,8 +423,8 @@ fun MitmScreen() {
             title = "CA 模块安装与更新",
             message = "1. 点「导出 CA 模块 ZIP」，文件会保存到「下载/NamuDNS」。\n" +
                 "2. 在 Magisk、KernelSU 或 APatch 的模块页选择「从本地安装」，选中刚导出的 ZIP。\n" +
-                "3. 安装或覆盖更新后完整重启手机，再回到本页点「重新核验」。\n\n" +
-                "CA 不变时可继续复用同一模块；证书指纹变化后才需要覆盖更新。停用或移除模块也必须完整重启。",
+                "3. 安装或更新后使用模块管理器支持的重启方式。临时 Root 环境优先软重启，再点「重新核验」。\n\n" +
+                "模块脚本升级或 CA 指纹变化后，请重新导出并覆盖安装。停用或移除模块也必须完整重启。",
             confirmText = "知道了",
             showDismiss = false,
             onDismiss = { showCaGuide = false },

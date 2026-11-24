@@ -36,9 +36,10 @@ class TrustModuleGeneratorTest {
         assertTrue(m.containsKey("module.prop"))
         assertTrue(m.containsKey("customize.sh"))
         assertTrue(m.containsKey("service.sh"))
+        assertTrue(String(m.getValue("post-fs-data.sh")).contains("inject.sh\" --early"))
         assertTrue(m.containsKey("inject.sh"))
         assertTrue(m.containsKey("bind.sh"))
-        listOf("post-fs-data.sh", "uninstall.sh", "cleanup-all.sh", "unmount.sh", "remove.sh").forEach {
+        listOf("uninstall.sh", "cleanup-all.sh", "unmount.sh", "remove.sh").forEach {
             assertFalse("unexpected hook: $it", m.containsKey(it))
         }
         assertTrue(m.containsKey("certs/d756baa7.0"))
@@ -111,6 +112,114 @@ class TrustModuleGeneratorTest {
             stage.resolve("12345678.0").writeText("unrelated CA")
             assertEquals(9, verify())
             assertEquals("stock CA", original.readText())
+        } finally {
+            dir.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `soft reboot mounts both stores independently while preserving old staging`() {
+        val dir = kotlin.io.path.createTempDirectory("namu-ca-soft-reboot").toFile()
+        try {
+            val state = dir.resolve("state").apply { mkdir() }
+            val stock = dir.resolve("stock").apply { mkdir() }
+            stock.resolve("01234567.0").writeText("APEX stock CA")
+            val systemStock = dir.resolve("system-stock").apply { mkdir() }
+            systemStock.resolve("12345678.0").writeText("legacy stock CA")
+            val boot = "aaaaaaaa-1234-1234-1234-000000000001"
+            val bootFile = dir.resolve("boot_id").apply { writeText(boot) }
+            val legacy = state.resolve("cacerts_staging.$boot").apply { mkdir() }
+            legacy.resolve("d756baa7.0").writeText("previous CA")
+            for ((name, bytes) in build()) {
+                dir.resolve(name).apply { parentFile?.mkdirs(); writeBytes(bytes) }
+            }
+            val script = dir.resolve("inject.sh")
+            script.writeText(
+                script.readText()
+                    .replace(RootCaManager.STATE_DIR, state.path)
+                    .replace("/proc/sys/kernel/random/boot_id", bootFile.path)
+                    .replace("/apex/com.android.conscrypt/cacerts", stock.path)
+                    .replace("/system/etc/security/cacerts", systemStock.path)
+                    .replace("/proc/\$SOURCE_PID/root\$TARGET", "\$TARGET"),
+            )
+            val bin = dir.resolve("bin").apply { mkdir() }
+            fun stub(name: String, code: String) {
+                bin.resolve(name).apply { writeText("#!/bin/sh\n$code\n"); setExecutable(true) }
+            }
+            stub("getprop", "echo 34")
+            stub("pidof", "test \"\$MOCK_ZYGOTE_MISSING\" != 1 && test \"\$1\" = zygote64 && echo 16197")
+            stub("chown", "exit 0")
+            stub("chcon", "exit 0")
+            stub("nsenter", """
+                shift 5
+                case "${'$'}5" in
+                  --check) [ "${'$'}3" != "${'$'}MOCK_CONFLICT_TARGET" ] ;;
+                  --verify) sh "${'$'}@" ;;
+                  *) [ -f "${'$'}2/${'$'}4" ] ;;
+                esac
+            """.trimIndent())
+
+            fun inject(conflictTarget: String = ""): Int {
+                val process = ProcessBuilder("sh", script.path, "--late")
+                process.environment()["PATH"] = "${bin.path}:${System.getenv("PATH")}"
+                process.environment()["MOCK_CONFLICT_TARGET"] = conflictTarget
+                return process.start().waitFor()
+            }
+            assertEquals(1, inject(conflictTarget = stock.path))
+            assertEquals(listOf(legacy.name), state.list().orEmpty().filter { it.startsWith("cacerts_staging.") })
+            assertEquals(0, inject(conflictTarget = systemStock.path))
+            val secondary = state.resolve("status.legacy")
+            assertTrue("state=error" in secondary.readLines())
+            assertFalse(state.resolve("cacerts_legacy.$boot").exists())
+            val status = state.resolve("status").readLines()
+            val selected = status.single { it.startsWith("staging=") }.substringAfter("=")
+            assertTrue("state=ok" in status)
+            assertTrue(selected.startsWith("${legacy.name}."))
+            assertEquals(fakePem, state.resolve("$selected/d756baa7.0").readText())
+            assertEquals("previous CA", legacy.resolve("d756baa7.0").readText())
+            assertEquals("APEX stock CA", stock.resolve("01234567.0").readText())
+            assertEquals(0, inject())
+            assertTrue("state=ok" in secondary.readLines())
+            val legacyStage = state.resolve("cacerts_legacy.$boot")
+            assertEquals(fakePem, legacyStage.resolve("d756baa7.0").readText())
+            assertEquals("legacy stock CA", legacyStage.resolve("12345678.0").readText())
+            assertFalse(legacyStage.resolve("01234567.0").exists())
+            assertFalse(state.resolve("$selected/12345678.0").exists())
+            assertEquals(0, inject())
+            assertEquals(2, state.list().orEmpty().count { it.startsWith("cacerts_staging.") })
+            assertEquals(1, state.list().orEmpty().count { it.startsWith("cacerts_legacy.") })
+            assertFalse(RootCaManager.isForeignCertOverlay("/adb/namu_mitm_ca/$selected"))
+            assertTrue(RootCaManager.isForeignCertOverlay("/adb/modules/other/cacerts"))
+
+            stub("sh", """
+                case "${'$'}1" in
+                  */bind.sh)
+                    case "${'$'}5" in
+                      --check|--verify) exec /bin/sh "${'$'}@" ;;
+                      *) [ -f "${'$'}2/${'$'}4" ] ;;
+                    esac ;;
+                  *) exec /bin/sh "${'$'}@" ;;
+                esac
+            """.trimIndent())
+            fun runEarlyHook(zygoteMissing: Boolean): Int {
+                val process = ProcessBuilder("/bin/sh", dir.resolve("post-fs-data.sh").path)
+                process.environment()["PATH"] = "${bin.path}:${System.getenv("PATH")}"
+                process.environment()["MOCK_ZYGOTE_MISSING"] = if (zygoteMissing) "1" else "0"
+                return process.start().waitFor()
+            }
+            val freshBoot = "aaaaaaaa-1234-1234-1234-000000000002"
+            bootFile.writeText(freshBoot)
+            assertEquals(0, runEarlyHook(zygoteMissing = false))
+            assertFalse(state.resolve("cacerts_staging.$freshBoot").exists())
+            assertEquals(0, runEarlyHook(zygoteMissing = true))
+            val early = state.resolve("status").readLines()
+            assertTrue("phase=--early" in early)
+            assertTrue("state=ok" in early)
+            assertTrue("phase=--early" in secondary.readLines())
+            assertEquals(fakePem, state.resolve("cacerts_staging.$freshBoot/d756baa7.0").readText())
+            assertEquals(fakePem, state.resolve("cacerts_legacy.$freshBoot/d756baa7.0").readText())
+            assertEquals(0, inject())
+            assertTrue("phase=--late" in state.resolve("status").readLines())
         } finally {
             dir.deleteRecursively()
         }

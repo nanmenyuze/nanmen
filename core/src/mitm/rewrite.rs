@@ -731,11 +731,16 @@ fn valid_host_pattern(p: &str) -> bool {
 
 /// 把 Surge [URL Rewrite] 里 Loon 已支持、Surge 侧没有 RewriteAction 的动作翻译成 Loon 行。
 ///
+/// - `^url - reject-dict|reject-array` → 原样交给 Loon（JSON 对象 / 数组拒绝响应）
 /// - `^url https://new 302|307` → 原样交给 Loon（redirect）
 /// - `^url https://new header`（3 段）→ Loon `url new header`（URL 替换）
 /// - `^url mock|mock-request-body|mock-response-body <body>` → Loon mock 参数形式
 /// 已经是 Loon 参数形式（第三段带 `=`）时原样透传，避免二次包装。
-fn surge_rewrite_to_loon(t: &[String], _last: &str, raw: &str) -> Option<String> {
+fn surge_rewrite_to_loon(t: &[String], last: &str, raw: &str) -> Option<String> {
+    let no_arguments = t.len() == 2 || (t.len() == 3 && t[1] == "-");
+    if no_arguments && matches!(last, "reject-dict" | "reject-array") {
+        return Some(raw.trim().to_string());
+    }
     if t.len() < 3 {
         return None;
     }
@@ -947,6 +952,30 @@ mod tests {
             source: None,
             raw: String::new(),
         }
+    }
+
+    #[test]
+    fn surge_json_rejects_compile_and_match() {
+        use crate::mitm::loon::{LoonAction, RejectKind};
+
+        let dict = r"^https?:\/\/api\.example\.com\/x\/vip\/ads\/materials(?:[\/?]|$) - reject-dict";
+        let array = r"^https://api\.example\.com/ads/list reject-array";
+        let text = format!("[URL Rewrite]\n{dict}\n{array}");
+        let parsed = parse_surge_module(&text);
+        assert_eq!(parsed.ignored, 0);
+        assert_eq!(parsed.loon, vec![dict, array]);
+
+        let engine = MitmEngine::from_config(&MitmConfig {
+            url_rewrites: vec![dict.to_string(), array.to_string()],
+            ..Default::default()
+        });
+        assert!(engine.loon_unsupported.is_empty());
+        assert_eq!(engine.loon_rules.len(), 2);
+        assert!(engine.loon_rules[0].url.is_match("https://api.example.com/x/vip/ads/materials?test=1"));
+        assert!(!engine.loon_rules[0].url.is_match("https://api.example.com/x/vip/ads/materials_extra"));
+        assert!(matches!(engine.loon_rules[0].action, LoonAction::Reject(RejectKind::JsonObject)));
+        assert!(engine.loon_rules[1].url.is_match("https://api.example.com/ads/list"));
+        assert!(matches!(engine.loon_rules[1].action, LoonAction::Reject(RejectKind::JsonArray)));
     }
 
     #[test]

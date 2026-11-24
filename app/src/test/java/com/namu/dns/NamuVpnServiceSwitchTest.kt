@@ -81,4 +81,14 @@ class NamuVpnServiceSwitchTest {
         // establish 回退 1500 时，已应用状态必须记录实际值，不能记配置里的 9000。
         assertEquals(1500, tunnelSpec(base.copy(mtu = 9000), appliedMtu = 1500).mtu)
     }
+    @Test
+    fun mitmTemporarilyEnablesConnectionRoutingWithoutChangingDirectMode() {
+        val light = AppConfig(mode = "dns_only", dnsOnlyFullRoute = false, mtu = 1500)
+        val enabled = light.copy(mitm = light.mitm.copy(enabled = true))
+        assertEquals(TunnelSpec("dns_only", 1500, fullRoute = true), tunnelSpec(enabled))
+        assertEquals(false, enabled.dnsOnlyFullRoute)
+        val disabled = enabled.copy(mitm = enabled.mitm.copy(enabled = false))
+        assertEquals(tunnelSpec(light), tunnelSpec(disabled))
+        assertEquals(true, tunnelSpec(disabled.copy(dnsOnlyFullRoute = true)).fullRoute)
+    }
 }

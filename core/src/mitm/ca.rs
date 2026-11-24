@@ -45,6 +45,22 @@ fn publish_ca(path: &Path, pem: &[u8]) -> io::Result<()> {
         .filter(|dir| !dir.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     fs::create_dir_all(parent)?;
+    // 所有生成者共用同一把锁。保留锁文件，文件描述符关闭时由内核释放锁。
+    let mut lock_options = OpenOptions::new();
+    lock_options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        lock_options.mode(0o600);
+    }
+    let lock = lock_options.open(parent.join(".namu-ca.lock"))?;
+    lock.lock()?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => return Err(io::ErrorKind::AlreadyExists.into()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -65,8 +81,8 @@ fn publish_ca(path: &Path, pem: &[u8]) -> io::Result<()> {
         file.write_all(pem)?;
         file.sync_all()?;
         drop(file);
-        // 原子发布且不覆盖：另一个进程已生成 CA 时，调用者改为读取赢家的证书。
-        fs::hard_link(&temp, path)
+        // 私钥完整写入后再发布，兼容禁止创建硬链接的 Android 环境。
+        fs::rename(&temp, path)
     })();
     let _ = fs::remove_file(temp);
     result
@@ -419,12 +435,12 @@ pub fn system_cert_name(ca_file: &str) -> Result<String, String> {
 /// 导出 CA 供安装：out_dir 下写 namu-ca.pem（证书）与 namu-ca.crt（DER），
 /// 并返回系统证书区文件名。独立于运行中的引擎，未连接时也能生成/导出。
 pub fn export_ca(ca_file: &str, out_dir: &str) -> Result<(String, String, String), String> {
-    let ca = MitmCa::load_or_generate(ca_file).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+    let ca = MitmCa::load_or_generate(ca_file).map_err(|e| format!("读取或生成 CA：{e}"))?;
+    std::fs::create_dir_all(out_dir).map_err(|e| format!("创建证书导出目录：{e}"))?;
     let pem_path = Path::new(out_dir).join("namu-ca.pem");
     let der_path = Path::new(out_dir).join("namu-ca.crt");
-    std::fs::write(&pem_path, ca.ca_pem()).map_err(|e| e.to_string())?;
-    std::fs::write(&der_path, ca.ca_der()).map_err(|e| e.to_string())?;
+    std::fs::write(&pem_path, ca.ca_pem()).map_err(|e| format!("写入 PEM 证书：{e}"))?;
+    std::fs::write(&der_path, ca.ca_der()).map_err(|e| format!("写入 DER 证书：{e}"))?;
     let name = system_cert_name(ca_file)?;
     Ok((
         pem_path.to_string_lossy().to_string(),
@@ -503,6 +519,16 @@ mod tests {
             .expect("must reject mixed CA");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert_eq!(fs::read_to_string(&path).unwrap(), pem);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn publication_preserves_an_existing_file() {
+        let path = tmp_path("existing-ca.pem");
+        fs::write(&path, b"existing CA").unwrap();
+        let err = publish_ca(Path::new(&path), b"new CA").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), b"existing CA");
         fs::remove_file(path).unwrap();
     }
 

@@ -100,8 +100,8 @@ class MitmViewModelTest {
         val h = Harness()
         h.vm.generateTrustModule()
         assertTrue(h.lastMessage().contains("模块已导出"))
-        assertTrue(h.lastMessage().contains("Magisk"))
-        assertTrue(h.lastMessage().contains("完整重启"))
+        assertTrue(h.lastMessage().contains("模块管理器"))
+        assertTrue(h.lastMessage().contains("重启后重新核验"))
         assertEquals("/data/ca.pem", h.modulePem)
         assertFalse(h.vm.busy.value)
     }
@@ -147,18 +147,24 @@ class MitmViewModelTest {
     @Test
     fun `export logs includes current Zygote results when boot log is missing`() = runBlocking<Unit> {
         val published = CompletableDeferred<String>()
+        val foreignRoot = "/adb/modules/example/system/etc/security/cacerts"
+        val mount = "42 12 0:1 $foreignRoot /apex/com.android.conscrypt/cacerts ro - tmpfs tmpfs ro"
         val h = Harness(
             snapshot = RootCaManager.TrustSnapshot(
                 root = RootCaManager.RootInfo(true, RootCaManager.RootKind.KERNELSU),
                 moduleInstalled = true,
                 moduleCertMatches = true,
                 bootId = "current-boot",
+                conflict = true,
+                topSources = listOf(foreignRoot),
+                conflictSources = listOf(foreignRoot),
                 zygoteChecks = listOf(RootCaManager.ZygoteCheck(
                     process = "zygote:123",
                     directoryIds = listOf("1:2", "1:3"),
                     ownsTarget = false,
                     certificateReadable = false,
                     certificateMatches = false,
+                    targetMounts = listOf(mount),
                 )),
             ),
             publishLog = { published.complete(it); "Downloads/log.txt" },
@@ -169,8 +175,11 @@ class MitmViewModelTest {
         assertTrue(report.contains("未读到开机注入日志"))
         assertTrue(report.contains("cert=d756baa7.0"))
         assertTrue(report.contains("current_boot=current-boot"))
-        assertTrue(report.contains("resolved_state=INSTALLED_PENDING"))
+        assertTrue(report.contains("resolved_state=CONFLICT"))
+        assertTrue(report.contains("mount_roots=$foreignRoot"))
+        assertTrue(report.contains("conflict_sources=$foreignRoot"))
         assertTrue(report.contains("zygote:123: ids=1:2,1:3, mount_matches=false"))
+        assertTrue(report.contains("zygote:123: mountinfo=$mount"))
     }
 
     @Test

@@ -25,6 +25,9 @@ data object DataRoute
 data object SettingsRoute
 
 @Serializable
+data object AdvancedSettingsRoute
+
+@Serializable
 data object NodesRoute
 
 @Keep
@@ -40,6 +43,17 @@ data class LogsRoute(val kind: LogKind = LogKind.Runtime)
 
 @Serializable
 data object ConfigDetailRoute
+
+@Keep
+@Serializable
+enum class ConfigSection(val title: String) {
+    General("通用"),
+    Rules("规则"),
+    Sources("配置来源"),
+}
+
+@Serializable
+data class ConfigSectionRoute(val section: ConfigSection)
 
 @Serializable
 data object ModulesRoute
@@ -59,8 +73,7 @@ enum class MainTab(
 ) {
     Home("首页", R.drawable.ic_tab_home, HomeRoute),
     Modules("模块", R.drawable.ic_tab_rules, ModulesRoute),
-    Data("维护", R.drawable.ic_tab_logs, DataRoute),
-    Settings("我的", R.drawable.ic_tab_settings, SettingsRoute),
+    Settings("设置", R.drawable.ic_tab_settings, SettingsRoute),
 }
 
 /** Navigation 的类型安全匹配；destination 为 null 时视为不在任何已知路由。 */

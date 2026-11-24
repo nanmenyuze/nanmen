@@ -12,11 +12,10 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.LibraryBooks
 import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.Lan
-import androidx.compose.material.icons.outlined.Layers
-import androidx.compose.material.icons.outlined.Memory
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Speed
 import androidx.compose.material.icons.outlined.SwapVert
@@ -54,16 +53,102 @@ import org.json.JSONObject
 
 @Composable
 fun SettingsScreen(
-    onRestart: () -> Unit,
-    onOpenLogs: () -> Unit,
+    onOpenConfig: () -> Unit,
     onOpenMitm: () -> Unit,
+    onOpenAdvanced: () -> Unit,
 ) {
     val container = LocalAppContainer.current
     val vm: SettingsViewModel = viewModel(factory = SettingsViewModel.factory(container))
     val state by vm.state.collectAsStateWithLifecycle()
     val cfg = state.config
-    var showPingMethod by remember { mutableStateOf(false) }
     var showTheme by remember { mutableStateOf(false) }
+
+    Column(
+        Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
+    ) {
+        GroupCard {
+            SettingsRow(
+                title = "配置文件",
+                value = container.config.activeName(),
+                icon = Icons.Outlined.Description,
+                chevron = true,
+                onClick = onOpenConfig,
+            )
+            SettingsRow(
+                title = "MITM 管理",
+                subtitle = "证书与 HTTPS 过滤",
+                value = if (cfg.mitm.enabled) "已开启" else null,
+                icon = Icons.Outlined.Security,
+                chevron = true,
+                showDivider = false,
+                onClick = onOpenMitm,
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        GroupCard {
+            SettingsRow(
+                title = "自动连接",
+                subtitle = "开机或默认网络恢复时，在未连接状态下自动启动 VPN",
+                rightContent = {
+                    IosSwitch(
+                        checked = cfg.autoConnect,
+                        onCheckedChange = { vm.setAutoConnect(it) },
+                    )
+                },
+            )
+            SettingsRow(
+                title = "外观",
+                value = when (cfg.themeMode) {
+                    "light" -> "浅色"
+                    "dark" -> "深色"
+                    else -> "跟随系统"
+                },
+                icon = Icons.Outlined.Tune,
+                chevron = true,
+                showDivider = false,
+                onClick = { showTheme = true },
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        GroupCard {
+            SettingsRow(
+                title = "高级设置",
+                subtitle = "网络、脚本和诊断",
+                icon = Icons.Outlined.Tune,
+                chevron = true,
+                showDivider = false,
+                onClick = onOpenAdvanced,
+            )
+        }
+        Spacer(Modifier.height(LocalDockClearance.current + 30.dp))
+    }
+    if (showTheme) {
+        ChoiceDialog(
+            title = "外观",
+            message = "选择浅色、深色，或跟随系统深色模式",
+            options = listOf(
+                "system" to "跟随系统",
+                "light" to "浅色",
+                "dark" to "深色",
+            ),
+            selected = cfg.themeMode,
+            onSelect = {
+                vm.setThemeMode(it)
+                showTheme = false
+            },
+            onDismiss = { showTheme = false },
+        )
+    }
+
+}
+
+@Composable
+fun AdvancedSettingsScreen(onOpenLogs: () -> Unit, onRestart: () -> Unit) {
+    val container = LocalAppContainer.current
+    val vm: SettingsViewModel = viewModel(factory = SettingsViewModel.factory(container))
+    val state by vm.state.collectAsStateWithLifecycle()
+    val cfg = state.config
+    var showPingMethod by remember { mutableStateOf(false) }
     var showDonate by remember { mutableStateOf(false) }
     var showBackup by remember { mutableStateOf(false) }
     var showMigration by remember { mutableStateOf(false) }
@@ -181,17 +266,6 @@ fun SettingsScreen(
                 onClick = { showPingMethod = true },
             )
             SettingsRow(
-                title = "MITM 去广告",
-                subtitle = if (cfg.mitm.enabled) {
-                    "已启用 · 证书、域名与改写规则在此管理"
-                } else {
-                    "HTTPS 解密按 URL 去广告，需安装 CA 证书"
-                },
-                icon = Icons.Outlined.Security,
-                chevron = true,
-                onClick = onOpenMitm,
-            )
-            SettingsRow(
                 title = "金融连接保护",
                 subtitle = "支付、银行、账号安全连接不走 MITM；银行类 App 整包跳过，微信支付宝按域名排除",
                 icon = Icons.Outlined.Security,
@@ -203,8 +277,8 @@ fun SettingsScreen(
                 },
             )
             SettingsRow(
-                title = "诊断",
-                subtitle = "查看内核运行日志与 DNS 查询记录",
+                title = "运行日志",
+                subtitle = "查看内核、规则匹配与连接记录",
                 icon = Icons.Outlined.BugReport,
                 chevron = true,
                 onClick = onOpenLogs,
@@ -222,27 +296,6 @@ fun SettingsScreen(
                 },
             )
             SettingsRow(
-                title = "自动连接",
-                subtitle = "开机或默认网络恢复时，在未连接状态下自动启动 VPN",
-                rightContent = {
-                    IosSwitch(
-                        checked = cfg.autoConnect,
-                        onCheckedChange = { vm.setAutoConnect(it) },
-                    )
-                },
-            )
-            SettingsRow(
-                title = "外观",
-                value = when (cfg.themeMode) {
-                    "light" -> "浅色"
-                    "dark" -> "深色"
-                    else -> "跟随系统"
-                },
-                icon = Icons.Outlined.Tune,
-                chevron = true,
-                onClick = { showTheme = true },
-            )
-            SettingsRow(
                 title = "重新查看引导",
                 subtitle = "重新播放首次使用的三页引导",
                 showDivider = false,
@@ -252,24 +305,6 @@ fun SettingsScreen(
                 },
             )
         }
-        if (showTheme) {
-            ChoiceDialog(
-                title = "外观",
-                message = "选择浅色、深色，或跟随系统深色模式",
-                options = listOf(
-                    "system" to "跟随系统",
-                    "light" to "浅色",
-                    "dark" to "深色",
-                ),
-                selected = cfg.themeMode,
-                onSelect = {
-                    vm.setThemeMode(it)
-                    showTheme = false
-                },
-                onDismiss = { showTheme = false },
-            )
-        }
-
         SectionHeader("隧道")
         GroupCard {
             SettingsRow(
@@ -278,39 +313,17 @@ fun SettingsScreen(
                 value = network.label,
                 icon = Icons.Outlined.Lan,
             )
-            SettingsRow(
-                title = "隧道",
-                subtitle = "TUN 接管全部 DNS，MTU 跟随配置（默认 9000）",
-                value = if (cfg.fakeIp) "Fake-IP" else "直连",
-                icon = Icons.Outlined.Lan,
-                chevron = false,
-            )
-            SettingsRow(
-                title = "代理",
-                subtitle = "节点流量走 ${cfg.finalPolicy} 策略",
-                value = when (cfg.mode) {
-                    "global" -> "全局"
-                    "dns_only" -> "仅 DNS"
-                    "filter_only" -> "纯过滤"
-                    else -> "规则"
-                },
-                icon = Icons.Outlined.Layers,
-                chevron = false,
-            )
-            SettingsRow(
-                title = "TCP",
-                subtitle = "连接由内核逐条转发，断流即释放",
-                value = "按需",
-                icon = Icons.Outlined.SwapVert,
-                chevron = false,
-            )
-            SettingsRow(
-                title = "UDP",
-                subtitle = "DNS 走 UDP 直通，其他 UDP 按规则代理",
-                value = "跟随规则",
-                icon = Icons.Outlined.Memory,
-                showDivider = false,
-            )
+            SwitchRow(title = "巨帧 MTU", subtitle = "${cfg.mtu} 字节", checked = cfg.mtu == 9000) {
+                container.settings.update { current -> current.copy(mtu = if (it) 9000 else 1500) }
+                if (container.runtime.current().connected) onRestart()
+            }
+            SwitchRow(title = "上游 BBR", checked = cfg.bbr) {
+                container.settings.update { current -> current.copy(bbr = it) }
+            }
+            SwitchRow(title = "QUIC 自动回落", checked = cfg.quicFallback, showDivider = false) {
+                container.settings.update { current -> current.copy(quicFallback = it) }
+                if (container.runtime.current().connected) onRestart()
+            }
         }
 
         SectionHeader("备份与维护")
@@ -354,16 +367,6 @@ fun SettingsScreen(
             )
         }
 
-        SectionHeader("说明")
-        GroupCard {
-            SettingsRow(
-                title = "配置文件",
-                subtitle = "通用、自定义规则和规则集 URL 都在「首页 → 当前配置」里管理。",
-                showDivider = false,
-            )
-        }
-
-        FooterText("服务器在首页管理；DNS 查询与运行日志在「数据」页。")
         Spacer(Modifier.height(LocalDockClearance.current + 30.dp))
     }
 
@@ -395,7 +398,6 @@ fun SettingsScreen(
     if (showPrivacy) {
         PrivacyAndLimitsDialog(
             onDismiss = { showPrivacy = false },
-            onOpenMitm = onOpenMitm,
         )
     }
     if (showSsidNames) {

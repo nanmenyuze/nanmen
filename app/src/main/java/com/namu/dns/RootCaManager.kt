@@ -74,6 +74,7 @@ object RootCaManager {
         val ownsTarget: Boolean,
         val certificateReadable: Boolean,
         val certificateMatches: Boolean,
+        val targetMounts: List<String> = emptyList(),
     )
 
     data class TrustSnapshot(
@@ -177,6 +178,12 @@ object RootCaManager {
             echo
             echo "=== status ==="
             cat $STATUS_FILE 2>/dev/null
+            BOOT_ID=${'$'}(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+            if [ -n "${'$'}BOOT_ID" ] && grep -qx "boot_id=${'$'}BOOT_ID" "$STATUS_FILE.legacy" 2>/dev/null; then
+              echo
+              echo "=== legacy status ==="
+              cat "$STATUS_FILE.legacy"
+            fi
         """.trimIndent()
         su(script, 8_000).output.trim()
     }
@@ -207,8 +214,24 @@ object RootCaManager {
                 NAME="$systemName"
                 BOOT_ID=${'$'}(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
                 echo "__BOOT_ID__=${'$'}BOOT_ID"
-                STAGE="$STAGING_DIR.${'$'}BOOT_ID"
+                BASE="cacerts_staging.${'$'}BOOT_ID"
+                STAGE="$STATE_DIR/${'$'}BASE"
                 [ -d "${'$'}STAGE" ] || STAGE="$STAGING_DIR"
+                REPORT=${'$'}(cat "$STATUS_FILE" 2>/dev/null)
+                if [ -n "${'$'}BOOT_ID" ] && printf '%s\n' "${'$'}REPORT" | grep -qx "boot_id=${'$'}BOOT_ID"; then
+                  STAGE_NAME=${'$'}(printf '%s\n' "${'$'}REPORT" | sed -n 's/^staging=//p')
+                  case "${'$'}STAGE_NAME" in
+                    "${'$'}BASE".*)
+                      SUFFIX="${'$'}{STAGE_NAME#"${'$'}BASE".}"
+                      if printf '%s\n' "${'$'}SUFFIX" | grep -Eq '^[0-9a-f]{64}${'$'}' &&
+                         [ -d "$STATE_DIR/${'$'}STAGE_NAME" ] && [ ! -L "$STATE_DIR/${'$'}STAGE_NAME" ]; then
+                        STAGE="$STATE_DIR/${'$'}STAGE_NAME"
+                      fi
+                      ;;
+                  esac
+                else
+                  REPORT=""
+                fi
                 echo __MODULE__=${'$'}([ -d "$MODULE_DIR" ] && echo 1 || echo 0)
                 if [ -f "$MODULE_DIR/certs/$systemName" ]; then
                   echo __CERT_BEGIN__
@@ -255,9 +278,8 @@ object RootCaManager {
                 done
                 echo __STATUS_BEGIN__
                 if [ -n "${'$'}BOOT_ID" ] && [ -f "$MODULE_DIR/module.prop" ] &&
-                   [ ! -e "$MODULE_DIR/disable" ] && [ ! -e "$MODULE_DIR/remove" ] &&
-                   grep -qx "boot_id=${'$'}BOOT_ID" "$STATUS_FILE" 2>/dev/null; then
-                  cat "$STATUS_FILE"
+                   [ ! -e "$MODULE_DIR/disable" ] && [ ! -e "$MODULE_DIR/remove" ]; then
+                  printf '%s\n' "${'$'}REPORT"
                 fi
                 echo __STATUS_END__
             """.trimIndent()
@@ -283,6 +305,7 @@ object RootCaManager {
                     ownsTarget = block.ownsTarget,
                     certificateReadable = block.cert.isNotBlank(),
                     certificateMatches = expectedPem != null && pemCertificateMatches(block.cert, expectedPem),
+                    targetMounts = targetMountLines(block.mounts, block.target).toList(),
                 )
             }
             val mountedInZygote = zygoteChecks.isNotEmpty() &&
@@ -461,8 +484,12 @@ object RootCaManager {
      * 目标证书库顶层 source 是否明确是别人的覆盖层。系统底层分区（/dev/block、/system、
      * /apex）不是冲突；/data/adb/modules/...、tmpfs、overlay 等才是。
      */
+    private val managedStageRoot = Regex(
+        """(?:/data)?/adb/namu_mitm_ca/cacerts_staging(?:\.[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}(?:\.[0-9a-f]{64})?)?""",
+    )
+
     internal fun isForeignCertOverlay(source: String): Boolean {
-        if (source.isBlank() || source == STAGING_DIR) return false
+        if (source.isBlank() || managedStageRoot.matches(source)) return false
         if (source.startsWith("/dev/")) return false
         if (source == "rootfs") return false
         if (source.startsWith("/system/") || source == "/system") return false
@@ -470,10 +497,12 @@ object RootCaManager {
         return true
     }
 
+    private fun targetMountLines(text: String, target: String): Sequence<String> =
+        text.lineSequence().filter { it.split(' ', limit = 6).getOrNull(4) == target }
+
     internal fun explicitMountRoots(text: String, target: String): List<String> =
-        text.lineSequence().mapNotNull { line ->
+        targetMountLines(text, target).mapNotNull { line ->
             val fields = line.split(' ')
-            if (fields.getOrNull(4) != target) return@mapNotNull null
             val separator = fields.indexOf("-")
             if (separator < 6) return@mapNotNull null
             val root = fields[3]

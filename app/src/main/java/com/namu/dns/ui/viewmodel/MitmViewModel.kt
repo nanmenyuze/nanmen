@@ -155,7 +155,7 @@ class MitmViewModel(
         if (result.ok) {
             _systemCertInstalled.value = systemCertCheck(r.systemName)
             messages.show(
-                "模块已导出到 ${result.path}。请在 Magisk 中从存储安装，然后完整重启。",
+                "模块已导出到 ${result.path}。请在模块管理器中从存储安装，重启后重新核验。",
             )
         } else {
             messages.show("模块生成失败：${result.error}")
@@ -194,11 +194,16 @@ class MitmViewModel(
                     appendLine("target=${snapshot.target}")
                     appendLine("module_cert_matches=${snapshot.moduleCertMatches}")
                     appendLine("resolved_state=${RootCaManager.resolveTrustState(_caExists.value, snapshot)}")
+                    appendLine("mount_roots=${snapshot.topSources.joinToString(" | ")}")
+                    appendLine("conflict_sources=${snapshot.conflictSources.joinToString(" | ")}")
                     appendLine("zygote_count=${snapshot.zygoteChecks.size}")
                     for (check in snapshot.zygoteChecks) {
                         appendLine("${check.process}: ids=${check.directoryIds.joinToString(",")}, " +
                             "mount_matches=${check.ownsTarget}, cert_readable=${check.certificateReadable}, " +
                             "cert_matches=${check.certificateMatches}")
+                        for (mount in check.targetMounts) {
+                            appendLine("${check.process}: mountinfo=$mount")
+                        }
                     }
                     if (snapshot.detail.isNotBlank()) appendLine("detail=${snapshot.detail}")
                 }

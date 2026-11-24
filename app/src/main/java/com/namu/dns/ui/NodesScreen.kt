@@ -165,16 +165,7 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
             contentPadding = PaddingValues(bottom = 34.dp),
         ) {
             item {
-                SecondaryTopBar("代理", "流量模式与节点", onBack = onBack)
-                ModeBar(
-                    selected = cfg.mode,
-                    onSelect = { mode ->
-                        settings.update {
-                            it.copy(mode = mode, finalPolicy = if (mode == "filter_only") "direct" else it.finalPolicy)
-                        }
-                        reloadIfUsingProxy()
-                    },
-                )
+                SecondaryTopBar("代理", onBack = onBack)
                 SectionHeader("订阅")
                 GroupCard {
                     SettingsRow(

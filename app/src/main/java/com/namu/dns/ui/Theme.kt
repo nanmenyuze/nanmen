@@ -661,48 +661,6 @@ fun hostOf(url: String): String {
     }
 }
 
-/** 流量模式三档：仅过滤 / 自动分流 / 全局代理；首页代理入口与节点页共用。 */
-@Composable
-fun ModeBar(selected: String, onSelect: (String) -> Unit, modifier: Modifier = Modifier) {
-    val options = listOf(
-        "filter_only" to "仅过滤",
-        "rule" to "自动分流",
-        "global" to "全局代理",
-    )
-    Row(
-        modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text("流量模式", fontSize = 12.sp, color = NamuColors.TextSub)
-        Spacer(Modifier.width(10.dp))
-        Row(
-            Modifier.weight(1f)
-                .clip(androidx.compose.foundation.shape.RoundedCornerShape(10.dp))
-                .background(NamuColors.Fill)
-                .padding(3.dp),
-        ) {
-            options.forEach { (mode, label) ->
-                val on = selected == mode
-                Box(
-                    Modifier.weight(1f)
-                        .clip(androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
-                        .background(if (on) NamuColors.Card else androidx.compose.ui.graphics.Color.Transparent)
-                        .clickable { onSelect(mode) }
-                        .padding(vertical = 7.dp),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text(
-                        label,
-                        fontSize = 13.sp,
-                        fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal,
-                        color = if (on) NamuColors.TextMain else NamuColors.TextSub,
-                    )
-                }
-            }
-        }
-    }
-}
-
 /** 二级页顶栏：左侧返回，标题与首页同一套衬线字。 */
 @Composable
 fun SecondaryTopBar(title: String, subtitle: String = "", onBack: (() -> Unit)? = null) {

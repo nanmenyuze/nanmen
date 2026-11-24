@@ -1,13 +1,7 @@
 package com.namu.dns.ui
 
-import com.namu.dns.core.LocalDockClearance
-
-import com.namu.dns.core.config.DirectFilterScope
-import com.namu.dns.core.config.RoutingMode
 import androidx.compose.foundation.background
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -21,7 +15,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Info
-import androidx.compose.material.icons.rounded.ViewModule
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
@@ -34,30 +27,27 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.namu.dns.App
-import com.namu.dns.Actions
-import com.namu.dns.AppConfig
-import com.namu.dns.ConfigFileStore
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.namu.dns.Actions
+import com.namu.dns.ConfigFileStore
 import com.namu.dns.ConfigStore
 import com.namu.dns.NamuVpnService
-import com.namu.dns.core.LocalAppContainer
 import com.namu.dns.RuleItem
+import com.namu.dns.core.ConfigSection
+import com.namu.dns.core.LocalAppContainer
+import com.namu.dns.core.config.DirectFilterScope
 import com.namu.dns.core.config.ProxyGroupValidation
+import com.namu.dns.core.config.RoutingMode
+import com.namu.dns.core.repository.SettingsRepository
 import kotlinx.coroutines.launch
-import java.io.File
 
 @Composable
-fun ConfigScreen(onOpenDetail: () -> Unit, onRestart: () -> Unit) {
-    var showReset by remember { mutableStateOf(false) }
-    var showRemote by remember { mutableStateOf(false) }
+fun ConfigScreen(onOpenDetail: () -> Unit) {
     var showCreate by remember { mutableStateOf(false) }
     var showImport by remember { mutableStateOf(false) }
-    var showTest by remember { mutableStateOf(false) }
     var infoFile by remember { mutableStateOf<ConfigFileStore.FileInfo?>(null) }
     var revision by remember { mutableStateOf(0) }
     val container = LocalAppContainer.current
@@ -106,110 +96,43 @@ fun ConfigScreen(onOpenDetail: () -> Unit, onRestart: () -> Unit) {
     Column(
         Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
     ) {
-        SectionHeader("规则与配置")
+        SectionHeader("当前配置")
         GroupCard {
             SettingsRow(
-                title = "当前配置",
+                title = "编辑当前配置",
                 value = activeName,
                 chevron = true,
-                onClick = onOpenDetail,
-            )
-            SettingsRow(
-                title = "新建配置文件",
-                subtitle = "把当前设置另存为一份独立配置",
-                chevron = true,
-                onClick = { showCreate = true },
-            )
-            SettingsRow(
-                title = "导入配置文件…",
-                subtitle = "原生 JSON / Clash / Loon / 小火箭；Loon/小火箭仅预览",
-                chevron = true,
-                onClick = { showImport = true },
-            )
-            SettingsRow(
-                title = "从 URL 导入配置",
-                subtitle = "从你的服务器拉取 DNS、路由和规则清单",
-                chevron = true,
-                onClick = { showRemote = true },
-            )
-            SettingsRow(
-                title = "测试规则",
-                subtitle = "输入域名或 IP，查看会命中哪条规则",
-                chevron = true,
-                onClick = { showTest = true },
-            )
-            SettingsRow(
-                title = "恢复默认配置",
-                subtitle = "清空规则集和手动规则，恢复基础 DNS 与内网直连",
-                chevron = true,
                 showDivider = false,
-                onClick = { showReset = true },
+                onClick = onOpenDetail,
             )
         }
 
-        SectionHeader("本地文件")
+        SectionHeader(
+            text = "本地配置",
+            trailing = {
+                Row {
+                    TextAction("新建") { showCreate = true }
+                    TextAction("导入文件") { showImport = true }
+                }
+            },
+        )
         GroupCard {
             if (files.isEmpty()) {
-                SettingsRow(
-                    title = "还没有配置文件",
-                    subtitle = "点上方「新建配置文件」开始",
-                    showDivider = false,
-                )
+                SettingsRow(title = "暂无配置文件", showDivider = false)
             } else {
                 files.forEachIndexed { index, f ->
                     ConfigFileRow(
                         info = f,
                         showDivider = index != files.lastIndex,
-                        onActivate = {
-                            if (f.active) onOpenDetail() else activate(f.name, openDetail = true)
-                        },
+                        onActivate = { activate(f.name) },
                         onInfo = { infoFile = f },
                     )
                 }
             }
         }
-
-        FooterText("橙点代表默认配置，蓝色勾代表正在使用的配置。切换会整体替换 DNS、规则与模块，服务器节点保持不变。")
-        Spacer(Modifier.height(LocalDockClearance.current + 34.dp))
+        Spacer(Modifier.height(24.dp))
     }
 
-    if (showReset) {
-        NamuDialog(
-            title = "恢复默认配置",
-            message = "将清空远端配置、规则集 URL、手动规则和本地拦截域名；服务器节点和模块会保留。",
-            confirmText = "恢复",
-            confirmColor = NamuColors.Red,
-            onDismiss = { showReset = false },
-            onConfirm = {
-                val nodes = cfg.nodes
-                val selected = cfg.selected
-                val subscription = cfg.subscription
-                val modules = cfg.moduleSources
-                settings.update { current -> current.copy(
-                    nodes = nodes,
-                    selected = selected,
-                    subscription = subscription,
-                    moduleSources = modules,
-                    mode = "dns_only",
-                    finalPolicy = "direct",
-                ) }
-                ConfigStore.rebuildModules(context, settings.current())
-                revision++
-                showReset = false
-                if (runtime.current().connected) onRestart()
-            },
-        ) {}
-    }
-    if (showRemote) {
-        RemoteConfigDialog(
-            onDismiss = { showRemote = false },
-            onDone = {
-                showRemote = false
-                revision++
-                if (runtime.current().connected) onRestart()
-            },
-        )
-    }
     if (showCreate) {
         ConfigNameDialog(
             title = "新建配置文件",
@@ -234,9 +157,6 @@ fun ConfigScreen(onOpenDetail: () -> Unit, onRestart: () -> Unit) {
             },
             onDismiss = { showImport = false },
         )
-    }
-    if (showTest) {
-        RuleTestDialog(onDismiss = { showTest = false })
     }
     infoFile?.let { f ->
         ConfigFileInfoDialog(
@@ -283,107 +203,55 @@ private fun ConfigFileRow(
     Row(
         Modifier
             .fillMaxWidth()
-            .clickable { onActivate() }
+            .clickable(enabled = !info.active, onClick = onActivate)
             .padding(start = 16.dp, end = 12.dp, top = 10.dp, bottom = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(
-            Modifier
-                .size(7.dp)
-                .clip(RoundedCornerShape(50))
-                .background(if (info.isDefault) NamuColors.Orange else Color.Transparent),
-        )
-        Spacer(Modifier.width(10.dp))
         Column(Modifier.weight(1f)) {
             Text(info.name, fontSize = 16.sp, color = NamuColors.TextMain)
-            Spacer(Modifier.height(2.dp))
-            Text(
-                "${formatConfigTime(info.modified)} · ${formatBytes(info.size)}",
-                fontSize = 11.sp,
-                color = NamuColors.TextSub,
-            )
+            if (info.isDefault) {
+                Text("默认配置", fontSize = 12.sp, color = NamuColors.TextSub)
+            }
         }
         if (info.active) {
             CheckMark()
             Spacer(Modifier.width(10.dp))
         }
         IconButton(onClick = onInfo, modifier = Modifier.size(48.dp)) {
-            Box(
-                Modifier
-                    .size(24.dp)
-                    .clip(RoundedCornerShape(50))
-                    .background(NamuColors.Blue),
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(
-                    Icons.Rounded.Info,
-                    contentDescription = "配置详情",
-                    tint = Color.White,
-                    modifier = Modifier.size(14.dp),
-                )
-            }
+            Icon(
+                Icons.Rounded.Info,
+                contentDescription = "管理 ${info.name}",
+                tint = NamuColors.TextSub,
+                modifier = Modifier.size(20.dp),
+            )
         }
     }
-    if (showDivider) RowDivider(33.dp)
+    if (showDivider) RowDivider()
 }
 
-private fun formatConfigTime(ts: Long): String {
-    if (ts <= 0L) return "-"
-    return try {
-        val fmt = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault())
-        fmt.format(java.util.Date(ts))
-    } catch (_: Exception) {
-        "-"
+internal fun SettingsRepository.applyRouting(mode: String, fullRoute: Boolean): Boolean {
+    val current = current()
+    if (current.mode == mode && current.dnsOnlyFullRoute == fullRoute) return false
+    update {
+        it.copy(
+            mode = mode,
+            dnsOnlyFullRoute = fullRoute,
+            finalPolicy = if (mode == DirectFilterScope.Connections.mode && it.mode != mode) "direct" else it.finalPolicy,
+        )
     }
+    return true
 }
 
 @Composable
-fun ConfigDetailScreen(
-    onRestart: () -> Unit,
-    onOpenModules: () -> Unit,
-    onOpenMitm: () -> Unit,
-    onManageProfiles: () -> Unit,
-) {
+fun ConfigDetailScreen(onOpenSection: (ConfigSection) -> Unit) {
     val container = LocalAppContainer.current
     val settings = container.settings
     val cfg by settings.config.collectAsStateWithLifecycle()
-    val runtime = container.runtime
-    val messages = container.messages
-    val scope = rememberCoroutineScope()
-    val routingMode = RoutingMode.fromConfig(cfg.mode)
-    val filterScope = DirectFilterScope.fromConfig(cfg.mode, cfg.dnsOnlyFullRoute)
-    var showRoutingMode by remember { mutableStateOf(false) }
-    var showFilterScope by remember { mutableStateOf(false) }
-
-    fun applyRouting(mode: String, fullRoute: Boolean) {
-        val current = settings.current()
-        if (current.mode == mode && current.dnsOnlyFullRoute == fullRoute) return
-        settings.update {
-            it.copy(
-                mode = mode,
-                dnsOnlyFullRoute = fullRoute,
-                finalPolicy = if (mode == DirectFilterScope.Connections.mode && it.mode != mode) "direct" else it.finalPolicy,
-            )
-        }
-        if (runtime.current().connected) onRestart()
-    }
-
-    var showDns by remember { mutableStateOf(false) }
-    var showBlockMode by remember { mutableStateOf(false) }
-    var showFinalPolicy by remember { mutableStateOf(false) }
-    var showAddRule by remember { mutableStateOf(false) }
-    var ruleQuery by remember { mutableStateOf("") }
-    var showCustomAds by remember { mutableStateOf(false) }
-    var showRemote by remember { mutableStateOf(false) }
-    var showRuleSources by remember { mutableStateOf(false) }
-    var showRulesUpdate by remember { mutableStateOf(false) }
     var showGroups by remember { mutableStateOf(false) }
-    var showHostMap by remember { mutableStateOf(false) }
-    var updatingIp by remember { mutableStateOf(false) }
     val groupIssues = remember(cfg.proxyGroups, cfg.nodes, cfg.groupSelections) {
         ProxyGroupValidation.validate(cfg.proxyGroups, cfg.nodes.map { it.name }, cfg.groupSelections)
     }
-
+    val errors = groupIssues.count { it.level == com.namu.dns.core.config.ConfigIssueLevel.ERROR }
     Column(
         Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
     ) {
@@ -391,20 +259,168 @@ fun ConfigDetailScreen(
         GroupCard {
             SettingsRow(
                 title = container.config.activeName(),
-                subtitle = "配置文件 · 切换后整体替换 DNS、规则与模块",
                 value = "使用中",
                 valueColor = NamuColors.Green,
+                showDivider = false,
+            )
+        }
+        SectionHeader("配置内容")
+        GroupCard {
+            SettingsRow(
+                title = ConfigSection.General.title,
+                value = configDnsLabel(cfg.dnsUpstream),
                 chevron = true,
-                onClick = onManageProfiles,
+                onClick = { onOpenSection(ConfigSection.General) },
             )
             SettingsRow(
-                title = "运行模式",
-                value = routingMode.title,
+                title = ConfigSection.Rules.title,
+                value = "${cfg.rules.size} 条自定义规则",
                 chevron = true,
-                showDivider = routingMode == RoutingMode.Direct,
-                onClick = { showRoutingMode = true },
+                onClick = { onOpenSection(ConfigSection.Rules) },
             )
-            if (routingMode == RoutingMode.Direct) {
+            SettingsRow(
+                title = ConfigSection.Sources.title,
+                value = if (cfg.remoteConfigUrl.isNotBlank()) "已配置远端" else null,
+                chevron = true,
+                onClick = { onOpenSection(ConfigSection.Sources) },
+            )
+            SettingsRow(
+                title = "策略组",
+                value = if (errors > 0) "$errors 个错误" else "${cfg.proxyGroups.size} 个",
+                valueColor = if (errors > 0) NamuColors.Red else NamuColors.TextSub,
+                chevron = true,
+                showDivider = false,
+                onClick = { showGroups = true },
+            )
+        }
+        Spacer(Modifier.height(24.dp))
+    }
+
+    if (showGroups) {
+        ProxyGroupsDialog(
+            groups = cfg.proxyGroups,
+            nodes = cfg.nodes.map { it.name },
+            selections = cfg.groupSelections,
+            onDismiss = { showGroups = false },
+        )
+    }
+}
+
+@Composable
+fun ConfigSectionScreen(section: ConfigSection, onRestart: () -> Unit) {
+    when (section) {
+        ConfigSection.General -> ConfigGeneralScreen(onRestart)
+        ConfigSection.Rules -> ConfigRulesScreen(onRestart)
+        ConfigSection.Sources -> ConfigSourcesScreen(onRestart)
+    }
+}
+
+@Composable
+private fun ConfigGeneralScreen(onRestart: () -> Unit) {
+    val container = LocalAppContainer.current
+    val settings = container.settings
+    val cfg by settings.config.collectAsStateWithLifecycle()
+    val runtime = container.runtime
+    val routingMode = RoutingMode.fromConfig(cfg.mode)
+    val filterScope = DirectFilterScope.fromConfig(cfg.mode, cfg.dnsOnlyFullRoute)
+    var showFilterScope by remember { mutableStateOf(false) }
+    var showDns by remember { mutableStateOf(false) }
+    var showHostMap by remember { mutableStateOf(false) }
+
+    Column(
+        Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
+    ) {
+        SectionHeader("DNS")
+        GroupCard {
+            SettingsRow(
+                title = "DNS 上游",
+                value = configDnsLabel(cfg.dnsUpstream),
+                chevron = true,
+                onClick = { showDns = true },
+            )
+            if (cfg.dnsBootstrap.isNotBlank()) {
+                SettingsRow(
+                    title = "Bootstrap IP",
+                    value = cfg.dnsBootstrap,
+                )
+            }
+            if (cfg.dnsHeaderName.isNotBlank()) {
+                SettingsRow(
+                    title = "DoH 请求头",
+                    value = cfg.dnsHeaderName,
+                )
+            }
+            SwitchRow(
+                title = "备用 DNS",
+                subtitle = "${configDnsLabel(cfg.dnsFallback)} · 关闭后禁止回退",
+                checked = cfg.allowDnsFallback,
+            ) {
+                settings.update { current -> current.copy(allowDnsFallback = it) }
+                if (runtime.current().connected) onRestart()
+            }
+            SwitchRow(
+                title = "异常应答复核",
+                subtitle = "使用备用 DNS 复核异常地址",
+                checked = cfg.fallbackFilter,
+            ) {
+                settings.update { current -> current.copy(fallbackFilter = it) }
+                if (runtime.current().connected) onRestart()
+            }
+            SwitchRow(
+                title = "非 CN IP 复核",
+                subtitle = "非中国大陆 IP 也交给备用 DNS 复核",
+                checked = cfg.fallbackGeoCheck,
+            ) {
+                settings.update { current -> current.copy(fallbackGeoCheck = it) }
+                if (runtime.current().connected) onRestart()
+            }
+            SwitchRow(
+                title = "DNS 查询日志",
+                checked = cfg.dnsQueryLog,
+            ) {
+                settings.update { current -> current.copy(dnsQueryLog = it) }
+                if (runtime.current().connected) onRestart()
+            }
+            SwitchRow(
+                title = "关闭 AAAA",
+                subtitle = "适用于仅支持 IPv4 出口的节点",
+                checked = cfg.blockAaaa,
+            ) {
+                settings.update { current -> current.copy(blockAaaa = it) }
+                if (runtime.current().connected) onRestart()
+            }
+            SettingsRow(
+                title = "Host 映射",
+                value = "${cfg.mitm.hostMappings.size} 条",
+                chevron = true,
+                showDivider = false,
+                onClick = { showHostMap = true },
+            )
+        }
+
+        SectionHeader("连接处理")
+        GroupCard {
+            SwitchRow(
+                title = "Fake-IP",
+                subtitle = "仅在接管连接时生效",
+                checked = cfg.fakeIp,
+            ) {
+                settings.update { current -> current.copy(fakeIp = it) }
+                if (runtime.current().connected) onRestart()
+            }
+            SwitchRow(
+                title = "TLS / HTTP 域名嗅探",
+                subtitle = "从连接中识别域名",
+                checked = cfg.sniff,
+                showDivider = false,
+            ) {
+                settings.update { current -> current.copy(sniff = it) }
+                if (runtime.current().connected) onRestart()
+            }
+        }
+        if (routingMode == RoutingMode.Direct) {
+            SectionHeader("过滤")
+            GroupCard {
                 SettingsRow(
                     title = "过滤范围",
                     value = filterScope.title,
@@ -414,74 +430,78 @@ fun ConfigDetailScreen(
                 )
             }
         }
+        Spacer(Modifier.height(24.dp))
+    }
 
-        SectionHeader("通用")
+    if (showDns) {
+        DnsDialog(
+            current = cfg.dnsUpstream,
+            onDismiss = { showDns = false },
+            onSelect = { url ->
+                settings.update { current -> current.copy(dnsUpstream = url) }
+                showDns = false
+                if (runtime.current().connected) onRestart()
+            },
+        )
+    }
+    if (showFilterScope) {
+        ChoiceDialog(
+            title = "过滤范围",
+            message = "轻量模式只接管系统 DNS。全量接管会让其他连接也经过 VPN，自带 DoH 的应用仍可能绕过 DNS 过滤。",
+            options = DirectFilterScope.entries.map { it.name to it.title },
+            selected = filterScope.name,
+            onSelect = { key ->
+                showFilterScope = false
+                val selected = DirectFilterScope.valueOf(key)
+                val current = settings.current()
+                // 连接层过滤始终全量接管，保留原有 DNS-only 开关供切回时使用。
+                val fullRoute = if (selected == DirectFilterScope.Connections) current.dnsOnlyFullRoute else selected.fullRoute
+                if (settings.applyRouting(selected.mode, fullRoute) && runtime.current().connected) onRestart()
+            },
+            onDismiss = { showFilterScope = false },
+        )
+    }
+    if (showHostMap) {
+        HostMapDialog(
+            initial = cfg.mitm.hostMappings,
+            onDismiss = { showHostMap = false },
+            onDone = { map ->
+                // Host 是配置态：写回后走一次热重载，新 DNS 引擎不继承旧缓存。
+                settings.update { current -> current.copy(mitm = current.mitm.copy(hostMappings = map)) }
+                showHostMap = false
+                if (runtime.current().connected) onRestart()
+            },
+        )
+    }
+}
+
+@Composable
+private fun ConfigRulesScreen(onRestart: () -> Unit) {
+    val container = LocalAppContainer.current
+    val settings = container.settings
+    val cfg by settings.config.collectAsStateWithLifecycle()
+    val runtime = container.runtime
+    val messages = container.messages
+    val scope = rememberCoroutineScope()
+    var showBlockMode by remember { mutableStateOf(false) }
+    var showFinalPolicy by remember { mutableStateOf(false) }
+    var showAddRule by remember { mutableStateOf(false) }
+    var ruleQuery by remember { mutableStateOf("") }
+    var showCustomAds by remember { mutableStateOf(false) }
+    var updatingIp by remember { mutableStateOf(false) }
+    var showTest by remember { mutableStateOf(false) }
+    var showReset by remember { mutableStateOf(false) }
+
+    Column(
+        Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
+    ) {
+        Spacer(Modifier.height(12.dp))
         GroupCard {
-            SettingsRow(
-                title = "DNS 上游",
-                subtitle = "默认跟随手机 Wi‑Fi/蜂窝 DNS；也可选 DoH/DoT/UDP",
-                value = configDnsLabel(cfg.dnsUpstream),
-                chevron = true,
-                onClick = { showDns = true },
-            )
-            SettingsRow(
-                title = "Bootstrap IP",
-                subtitle = "首次解析 DoH 域名时直接使用该地址",
-                value = cfg.dnsBootstrap.ifBlank { "未设置" },
-            )
-            SettingsRow(
-                title = "自定义 Header",
-                subtitle = "DoH 鉴权头，随上游请求发送",
-                value = if (cfg.dnsHeaderName.isBlank()) "未设置" else "${cfg.dnsHeaderName} · 已配置",
-            )
-            SwitchRow(
-                title = "备用 DNS",
-                subtitle = "主 DNS 失败/熔断或触发复核时使用 ${configDnsLabel(cfg.dnsFallback)}；支持 udp://、tls://、https://，关闭即 fail-closed",
-                checked = cfg.allowDnsFallback,
-            ) {
-                settings.update { current -> current.copy(allowDnsFallback = it) }
-                if (runtime.current().connected) onRestart()
-            }
-            SwitchRow(
-                title = "异常应答复核",
-                subtitle = "只复核私网、保留、广播等明显异常；境外 IP 本身不当作污染",
-                checked = cfg.fallbackFilter,
-            ) {
-                settings.update { current -> current.copy(fallbackFilter = it) }
-                if (runtime.current().connected) onRestart()
-            }
-            SwitchRow(
-                title = "非 CN IP 复核",
-                subtitle = "额外把非中国大陆 IP 交给备用 DNS 复核；会增加查询与等待，默认关闭",
-                checked = cfg.fallbackGeoCheck,
-            ) {
-                settings.update { current -> current.copy(fallbackGeoCheck = it) }
-                if (runtime.current().connected) onRestart()
-            }
-            SettingsRow(
-                title = "拦截 TTL",
-                subtitle = "NXDOMAIN 携带的 SOA 与本地拦截缓存时长，减少广告 SDK 反复查询",
-                value = "${cfg.blockTtl} 秒",
-                chevron = true,
-                onClick = {
-                    val next = when (cfg.blockTtl) {
-                        15 -> 30
-                        30 -> 60
-                        60 -> 120
-                        120 -> 300
-                        else -> 15
-                    }
-                    settings.update { current -> current.copy(blockTtl = next) }
-                    if (runtime.current().connected) onRestart()
-                },
-            )
-            SwitchRow(
-                title = "自动更新",
-                subtitle = if (cfg.remoteConfigUrl.isNotBlank()) "按远端配置的 update_interval 检查" else "超过 12 小时拉取手动规则 URL",
-                checked = cfg.autoUpdateRules,
-            ) {
-                settings.update { current -> current.copy(autoUpdateRules = it) }
-            }
+            SettingsRow(title = "测试规则", chevron = true, showDivider = false, onClick = { showTest = true })
+        }
+
+        SectionHeader("拦截")
+        GroupCard {
             SwitchRow(
                 title = "订阅广告规则",
                 subtitle = "仅控制订阅规则文件，自定义规则的拦截不受影响",
@@ -496,75 +516,76 @@ fun ConfigDetailScreen(
                 chevron = true,
                 onClick = { showBlockMode = true },
             )
+            SettingsRow(
+                title = "拦截 TTL",
+                subtitle = "拦截结果的缓存时长",
+                value = "${cfg.blockTtl} 秒",
+                chevron = true,
+                onClick = {
+                    val next = when (cfg.blockTtl) {
+                        15 -> 30
+                        30 -> 60
+                        60 -> 120
+                        120 -> 300
+                        else -> 15
+                    }
+                    settings.update { current -> current.copy(blockTtl = next) }
+                    if (runtime.current().connected) onRestart()
+                },
+            )
+            SettingsRow(
+                title = "本地拦截域名",
+                showDivider = false,
+                value = "${cfg.customAds.size} 条",
+                chevron = true,
+                onClick = { showCustomAds = true },
+            )
+        }
+
+        SectionHeader("分流")
+        GroupCard {
             SwitchRow(
-                title = "DNS 查询日志",
-                subtitle = "记录域名、拦截/放行、缓存或上游、耗时",
-                checked = cfg.dnsQueryLog,
+                title = "国内域名 / IP 直连",
+                checked = cfg.cnDirect,
             ) {
-                settings.update { current -> current.copy(dnsQueryLog = it) }
-                if (runtime.current().connected) onRestart()
-            }
-            SwitchRow(
-                title = "Fake-IP",
-                subtitle = "TUN 模式下用虚拟地址加速分流；仅 DNS 模式自动停用",
-                checked = cfg.fakeIp,
-            ) {
-                settings.update { current -> current.copy(fakeIp = it) }
-                if (runtime.current().connected) onRestart()
-            }
-            SwitchRow(
-                title = "关闭 AAAA",
-                subtitle = "节点只有 IPv4 出口时开启，避免 App 拿到 IPv6 地址后连不通",
-                checked = cfg.blockAaaa,
-            ) {
-                settings.update { current -> current.copy(blockAaaa = it) }
+                settings.update { current -> current.copy(cnDirect = it) }
                 if (runtime.current().connected) onRestart()
             }
             SettingsRow(
-                title = "Host 映射",
-                value = "${cfg.mitm.hostMappings.size} 条",
-                subtitle = "域名到 IP / CNAME / 指定上游；模块 [Host] 自动合并，保存后清 DNS 缓存生效",
+                title = "最终策略",
+                subtitle = "所有规则都未命中时的处理方式",
+                value = when {
+                    cfg.finalPolicy == "direct" -> "全部直连"
+                    cfg.finalPolicy.startsWith("node:") -> "节点 ${cfg.finalPolicy.removePrefix("node:")}"
+                    else -> "走代理节点"
+                },
                 chevron = true,
-                onClick = { showHostMap = true },
+                onClick = { showFinalPolicy = true },
             )
-            SwitchRow(
-                title = "QUIC 假活自动回落",
-                subtitle = "蜂窝网络下 UDP 假活（发得出去、收不到回包）时，判定该目标 QUIC 不可用，" +
-                    "之后丢弃它的 QUIC 包让 App 走 TCP；关闭后完全由 App 自己超时回退",
-                checked = cfg.quicFallback,
-            ) {
-                settings.update { current -> current.copy(quicFallback = it) }
-                if (runtime.current().connected) onRestart()
-            }
-            SwitchRow(
-                title = "巨帧 MTU 9000",
-                subtitle = "App↔VPN 是本机内存拷贝，巨帧把包数降约 6 倍（吞吐/耗电同受益）；" +
-                    "出公网 MSS 由系统 TCP 自协商不受影响。个别 App 异常时关闭回 1500，重连生效",
-                checked = cfg.mtu == 9000,
-            ) {
-                settings.update { current -> current.copy(mtu = if (it) 9000 else 1500) }
-                if (runtime.current().connected) onRestart()
-            }
-            SwitchRow(
-                title = "上游 BBR 拥塞控制",
-                subtitle = "直连/节点出口按 socket 设 BBR：丢包 Wi-Fi/跨省长 RTT 上不等丢包信号维持速率；" +
-                    "内核不支持时自动回退 cubic，诊断可见生效计数",
-                checked = cfg.bbr,
-            ) {
-                settings.update { current -> current.copy(bbr = it) }
-            }
-            SwitchRow(
-                title = "TLS / HTTP 域名嗅探",
-                subtitle = "没有 DNS 映射时，从首包读取 SNI / Host",
-                checked = cfg.sniff,
+            SettingsRow(
+                title = "国内 IP 库",
                 showDivider = false,
-            ) {
-                settings.update { current -> current.copy(sniff = it) }
-                if (runtime.current().connected) onRestart()
-            }
+                value = if (updatingIp) "更新中…" else "更新",
+                onClick = {
+                    if (!updatingIp) {
+                        scope.launch {
+                            updatingIp = true
+                            try {
+                                val n = Actions.updateCnIp("https://raw.githubusercontent.com/17mon/china_ip_list/master/china_ip_list.txt")
+                                messages.show("国内 IP 库已更新：$n 条")
+                                if (runtime.current().connected) onRestart()
+                            } catch (e: Exception) {
+                                messages.show("更新失败：${e.message}")
+                            } finally {
+                                updatingIp = false
+                            }
+                        }
+                    }
+                },
+            )
         }
 
-        SectionHeader("规则", trailing = { TextAction("添加") { showAddRule = true } })
+        SectionHeader("自定义规则", trailing = { TextAction("添加") { showAddRule = true } })
         if (cfg.rules.isNotEmpty()) {
             NamuTextField(
                 value = ruleQuery,
@@ -579,7 +600,6 @@ fun ConfigDetailScreen(
             if (cfg.rules.isEmpty()) {
                 SettingsRow(
                     title = "暂无自定义规则",
-                    subtitle = "添加后按顺序匹配；未命中时按最终策略处理",
                     showDivider = false,
                 )
             } else {
@@ -590,7 +610,7 @@ fun ConfigDetailScreen(
                         it.action.contains(ruleQuery, ignoreCase = true)
                 }
                 if (visibleRules.isEmpty()) {
-                    SettingsRow(title = "没有匹配的规则", subtitle = "换个关键字试试", showDivider = false)
+                    SettingsRow(title = "没有匹配的规则", showDivider = false)
                 }
                 visibleRules.forEachIndexed { index, rule ->
                     RuleRow(
@@ -618,207 +638,19 @@ fun ConfigDetailScreen(
                 }
             }
         }
-        SectionHeader("MITM", trailing = { TextAction("管理") { onOpenMitm() } })
+
+        SectionHeader("重置")
         GroupCard {
             SettingsRow(
-                title = "MITM 去广告",
-                value = if (cfg.mitm.enabled) "已启用" else "未启用",
-                subtitle = "解密命中域名的 HTTPS，拒绝广告请求并改写响应",
-            )
-            SettingsRow(
-                title = "手动域名 / 跳过域名",
-                value = "${cfg.mitm.hostnames.size} / ${cfg.mitm.skipHostnames.size}",
-                subtitle = "模块 [MITM]/重写规则自动合并；证书与明细在 MITM 页管理",
-            )
-            SettingsRow(
-                title = "证书与规则管理",
+                title = "重置路由设置",
                 chevron = true,
                 showDivider = false,
-                onClick = onOpenMitm,
+                onClick = { showReset = true },
             )
         }
-        GroupCard {
-            SettingsRow(
-                title = "本地拦截域名",
-                subtitle = "手动维护，不依赖规则集 URL",
-                value = "${cfg.customAds.size} 条",
-                chevron = true,
-                onClick = { showCustomAds = true },
-            )
-            SwitchRow(
-                title = "国内域名 / IP 直连",
-                subtitle = "国内站点不经过代理节点",
-                checked = cfg.cnDirect,
-            ) {
-                settings.update { current -> current.copy(cnDirect = it) }
-                if (runtime.current().connected) onRestart()
-            }
-            SettingsRow(
-                title = "最终策略",
-                subtitle = "所有规则都未命中时的处理方式",
-                value = when {
-                    cfg.finalPolicy == "direct" -> "全部直连"
-                    cfg.finalPolicy.startsWith("node:") -> "节点 ${cfg.finalPolicy.removePrefix("node:")}"
-                    else -> "走代理节点"
-                },
-                chevron = true,
-                onClick = { showFinalPolicy = true },
-            )
-            SettingsRow(
-                title = "更新国内 IP 库",
-                subtitle = "用于国内直连判断",
-                showDivider = false,
-                rightContent = {
-                    if (updatingIp) {
-                        androidx.compose.material3.CircularProgressIndicator(
-                            Modifier.height(18.dp).width(18.dp),
-                            color = NamuColors.TextSub,
-                            strokeWidth = 2.dp,
-                        )
-                    } else {
-                        Text("更新", fontSize = 14.sp, color = NamuColors.Blue)
-                    }
-                },
-                onClick = {
-                    if (!updatingIp) {
-                        scope.launch {
-                            updatingIp = true
-                            try {
-                                val n = com.namu.dns.Actions.updateCnIp("https://raw.githubusercontent.com/17mon/china_ip_list/master/china_ip_list.txt")
-                                messages.show("国内 IP 库已更新：$n 条")
-                                if (runtime.current().connected) onRestart()
-                            } catch (e: Exception) {
-                                messages.show("更新失败：${e.message}")
-                            } finally {
-                                updatingIp = false
-                            }
-                        }
-                    }
-                },
-            )
-        }
-
-        SectionHeader("规则集 URL")
-        GroupCard {
-            SettingsRow(
-                title = "远端配置",
-                subtitle = if (cfg.remoteConfigUrl.isBlank()) {
-                    "配置 URL 下发 DNS、模式和规则集清单"
-                } else {
-                    "${cfg.remoteConfigName.ifBlank { "已配置" }} · ${formatAgo(cfg.remoteConfigUpdatedAt)}"
-                },
-                value = if (cfg.remoteConfigUrl.isBlank()) "未配置" else "已同步",
-                valueColor = if (cfg.remoteConfigUrl.isBlank()) NamuColors.Orange else NamuColors.Green,
-                chevron = true,
-                onClick = { showRemote = true },
-            )
-            SettingsRow(
-                title = "规则集 URL",
-                subtitle = if (cfg.ruleSources.isEmpty()) {
-                    "尚未导入 DNS 过滤规则集"
-                } else {
-                    "${cfg.ruleSources.size} 个来源 · ${cfg.ruleSources.sumOf { it.lines }} 行"
-                },
-                value = if (cfg.ruleSources.isEmpty()) "无" else "已配置",
-                valueColor = if (cfg.ruleSources.isEmpty()) NamuColors.Orange else NamuColors.Green,
-                chevron = true,
-                onClick = { showRuleSources = true },
-            )
-            if (cfg.ruleSources.isEmpty()) {
-                SettingsRow(
-                    title = "手动规则 URL",
-                    subtitle = if (cfg.rulesUrl.isBlank()) "未设置" else cfg.rulesUrl,
-                    value = if (cfg.rulesUrl.isBlank()) "" else "已设置",
-                    chevron = true,
-                    showDivider = false,
-                    onClick = { showRulesUpdate = true },
-                )
-            }
-        }
-
-        SectionHeader("策略组")
-        GroupCard {
-            val errors = groupIssues.count { it.level == com.namu.dns.core.config.ConfigIssueLevel.ERROR }
-            SettingsRow(
-                title = "策略组与选择",
-                subtitle = when {
-                    cfg.proxyGroups.isEmpty() -> "select / url-test / fallback；可嵌套引用"
-                    errors > 0 -> "$errors 个错误：循环、空组或引用失效"
-                    else -> "${cfg.proxyGroups.size} 个组；规则可直接引用组名"
-                },
-                value = if (cfg.proxyGroups.isEmpty()) "无" else "${cfg.proxyGroups.size} 个",
-                valueColor = if (errors > 0) NamuColors.Red else if (cfg.proxyGroups.isEmpty()) NamuColors.TextSub else NamuColors.Green,
-                chevron = true,
-                showDivider = false,
-                onClick = { showGroups = true },
-            )
-        }
-
-        SectionHeader("模块")
-        GroupCard {
-            val enabled = cfg.moduleSources.count { it.enabled }
-            SettingsRow(
-                title = "模块规则",
-                subtitle = if (cfg.moduleSources.isEmpty()) {
-                    "导入 .sgmodule，按 App 生效"
-                } else {
-                    "${cfg.moduleSources.size} 个模块 · ${enabled} 个启用 · ${cfg.moduleSources.sumOf { it.blockRules }} 条拦截"
-                },
-                value = if (cfg.moduleSources.isEmpty()) "无" else "${cfg.moduleSources.size} 个",
-                valueColor = if (cfg.moduleSources.isEmpty()) NamuColors.Orange else NamuColors.Green,
-                chevron = true,
-                showDivider = false,
-                onClick = onOpenModules,
-            )
-        }
-
-        FooterText("规则按顺序匹配：自定义规则 → 国内直连 → 最终策略。规则集 URL 由本地过滤，未命中的查询才发往 DNS 上游。")
-        Spacer(Modifier.height(34.dp))
+        Spacer(Modifier.height(24.dp))
     }
 
-    if (showDns) {
-        DnsDialog(
-            current = cfg.dnsUpstream,
-            onDismiss = { showDns = false },
-            onSelect = { url ->
-                settings.update { current -> current.copy(dnsUpstream = url) }
-                showDns = false
-                if (runtime.current().connected) onRestart()
-            },
-        )
-    }
-    if (showRoutingMode) {
-        ChoiceDialog(
-            title = "运行模式",
-            message = "选择当前配置如何处理流量",
-            options = RoutingMode.entries.map { it.key to it.title },
-            selected = routingMode.key,
-            onSelect = { key ->
-                showRoutingMode = false
-                val selected = RoutingMode.entries.first { it.key == key }
-                val current = settings.current()
-                applyRouting(selected.modeFor(current.mode), current.dnsOnlyFullRoute)
-            },
-            onDismiss = { showRoutingMode = false },
-        )
-    }
-    if (showFilterScope) {
-        ChoiceDialog(
-            title = "过滤范围",
-            message = "轻量模式只接管系统 DNS。全量接管会让其他连接也经过 VPN，自带 DoH 的应用仍可能绕过 DNS 过滤。",
-            options = DirectFilterScope.entries.map { it.name to it.title },
-            selected = filterScope.name,
-            onSelect = { key ->
-                showFilterScope = false
-                val selected = DirectFilterScope.valueOf(key)
-                val current = settings.current()
-                // 连接层过滤始终全量接管，保留原有 DNS-only 开关供切回时使用。
-                val fullRoute = if (selected == DirectFilterScope.Connections) current.dnsOnlyFullRoute else selected.fullRoute
-                applyRouting(selected.mode, fullRoute)
-            },
-            onDismiss = { showFilterScope = false },
-        )
-    }
     if (showBlockMode) {
         ChoiceDialog(
             title = "拦截响应",
@@ -859,26 +691,6 @@ fun ConfigDetailScreen(
             },
         )
     }
-    if (showGroups) {
-        ProxyGroupsDialog(
-            groups = cfg.proxyGroups,
-            nodes = cfg.nodes.map { it.name },
-            selections = cfg.groupSelections,
-            onDismiss = { showGroups = false },
-        )
-    }
-    if (showHostMap) {
-        HostMapDialog(
-            initial = cfg.mitm.hostMappings,
-            onDismiss = { showHostMap = false },
-            onDone = { map ->
-                // Host 是配置态：写回后走一次热重载，新 DNS 引擎不继承旧缓存。
-                settings.update { current -> current.copy(mitm = current.mitm.copy(hostMappings = map)) }
-                showHostMap = false
-                if (runtime.current().connected) onRestart()
-            },
-        )
-    }
     if (showCustomAds) {
         CustomAdsDialog(
             onDismiss = { showCustomAds = false },
@@ -888,6 +700,91 @@ fun ConfigDetailScreen(
             },
         )
     }
+    if (showTest) {
+        RuleTestDialog(onDismiss = { showTest = false })
+    }
+    if (showReset) {
+        NamuDialog(
+            title = "重置路由设置",
+            message = "当前配置将切到「仅过滤」，最终策略设为直连。",
+            confirmText = "重置",
+            confirmColor = NamuColors.Red,
+            onDismiss = { showReset = false },
+            onConfirm = {
+                settings.update { it.copy(mode = "dns_only", finalPolicy = "direct") }
+                ConfigStore.rebuildModules(container.context, settings.current())
+                showReset = false
+                if (runtime.current().connected) onRestart()
+            },
+        )
+    }
+}
+
+@Composable
+private fun ConfigSourcesScreen(onRestart: () -> Unit) {
+    val container = LocalAppContainer.current
+    val settings = container.settings
+    val cfg by settings.config.collectAsStateWithLifecycle()
+    val runtime = container.runtime
+    var showRemote by remember { mutableStateOf(false) }
+    var showRuleSources by remember { mutableStateOf(false) }
+    var showRulesUpdate by remember { mutableStateOf(false) }
+
+    Column(
+        Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
+    ) {
+        SectionHeader("远端配置")
+        GroupCard {
+            SettingsRow(
+                title = "远端配置",
+                subtitle = if (cfg.remoteConfigUrl.isBlank()) {
+                    null
+                } else {
+                    "${cfg.remoteConfigName.ifBlank { "已配置" }} · ${formatAgo(cfg.remoteConfigUpdatedAt)}"
+                },
+                value = if (cfg.remoteConfigUrl.isBlank()) "未配置" else "已同步",
+                valueColor = if (cfg.remoteConfigUrl.isBlank()) NamuColors.Orange else NamuColors.Green,
+                chevron = true,
+                onClick = { showRemote = true },
+            )
+            SwitchRow(
+                title = "自动更新",
+                subtitle = if (cfg.remoteConfigUrl.isNotBlank()) "按远端配置的间隔检查" else "手动规则 URL 每 12 小时更新",
+                checked = cfg.autoUpdateRules,
+                showDivider = false,
+            ) {
+                settings.update { current -> current.copy(autoUpdateRules = it) }
+            }
+        }
+
+        SectionHeader("规则来源")
+        GroupCard {
+            SettingsRow(
+                title = "规则集",
+                showDivider = cfg.ruleSources.isEmpty(),
+                subtitle = if (cfg.ruleSources.isEmpty()) {
+                    null
+                } else {
+                    "${cfg.ruleSources.sumOf { it.lines }} 行"
+                },
+                value = if (cfg.ruleSources.isEmpty()) "无" else "${cfg.ruleSources.size} 个",
+                chevron = true,
+                onClick = { showRuleSources = true },
+            )
+            if (cfg.ruleSources.isEmpty()) {
+                SettingsRow(
+                    title = "手动规则 URL",
+                    value = if (cfg.rulesUrl.isBlank()) "未设置" else "已设置",
+                    chevron = true,
+                    showDivider = false,
+                    onClick = { showRulesUpdate = true },
+                )
+            }
+        }
+
+        Spacer(Modifier.height(24.dp))
+    }
+
     if (showRemote) {
         RemoteConfigDialog(
             onDismiss = { showRemote = false },
@@ -921,7 +818,7 @@ fun ConfigDetailScreen(
 private fun RuleRow(rule: RuleItem, showDivider: Boolean, onToggle: () -> Unit, onDelete: () -> Unit) {
     SettingsRow(
         title = rule.value,
-        subtitle = ruleTypeLabel(rule.type) + if (!rule.enabled) " · 已禁用（不下发内核）" else "",
+        subtitle = ruleTypeLabel(rule.type) + if (!rule.enabled) " · 已禁用" else "",
         showDivider = showDivider,
         rightContent = {
             Text(
