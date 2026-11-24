@@ -46,6 +46,23 @@ class SettingsViewModel(
         settings.update { it.copy(autoConnect = enabled) }
     }
 
+    /** U6：SSID 默认关；启用只改本地标志，位置权限由独立入口申请。 */
+    fun setSsidEnabled(enabled: Boolean) {
+        settings.update { it.copy(ssidTriggerEnabled = enabled) }
+    }
+
+    fun setSsidLocationOptIn(optedIn: Boolean) {
+        settings.update { it.copy(ssidLocationOptIn = optedIn) }
+    }
+
+    fun setSsidNames(text: String) {
+        val names = text.split(',', ';', '\n')
+            .map { it.trim().trim('"') }
+            .filter { it.isNotBlank() && it != "*" }
+            .distinct()
+        settings.update { it.copy(ssidTriggerNames = names) }
+    }
+
     fun setPingMethod(method: String) {
         if (method != "tcp" && method != "tls") return
         settings.update { it.copy(pingMethod = method) }

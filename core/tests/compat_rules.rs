@@ -20,6 +20,7 @@ fn rule(kind: &str, value: &str, action: &str) -> RuleConf {
         value: value.into(),
         action: action.into(),
         source: None,
+        meta: None,
     }
 }
 

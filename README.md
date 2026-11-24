@@ -1,6 +1,39 @@
-# 南门DNS 2.9.1
+# 南门DNS 3.0 正式版（内核 1.13.25，versionCode 111）
+
+> 2026-11-24 3.0 正式版：合并 r10「壳骨架 UI」完整源码与 r10「启动与证书修复」增量，应用版本改为 `3.0` / `versionCode 111`，内核递增为 `nanmen_core 1.13.25`。本版包含 r10 壳层与 UI 骨架、证书生成/发布原子化、启动配置重载修复，以及此前 2.9.5 的证书状态、MITM 页、mountinfo 与迁移修复。
+> 验收：Rust 356/356、Kotlin 225/225、lint 0 error / 27 warning；双 ABI `.so` 均含 `nanmen_core-1.13.25` 标记；APK v3 签名通过。
+
+## 下载
+
+- **[下载南门DNS 3.0 正式版 APK](https://github.com/nanmenyuze/nanmen/releases/download/v3.0/NanmenDNS-3.0-official.apk)**
+- [下载完整源码 zip](https://github.com/nanmenyuze/nanmen/releases/download/v3.0/NanmenDNS-3.0-source.zip)
+- [查看 3.0 发布说明](https://github.com/nanmenyuze/nanmen/releases/tag/v3.0)
+
+> 当前版本：`3.0` / `versionCode 111` / 内核 `1.13.25`。APK 与源码包均可在 Release 页面直接下载。
+
+# 南门DNS 2.9.2（G2 出口）
 
 > 内核 crate / JNI：`nanmen_core` / `libnanmen_core.so`；许可证：**GPL-3.0-only**（见 `LICENSE`、`NOTICE`、`THIRD_PARTY_NOTICES.md`）。
+
+> 2026-11-23 G2 出口（测试版本名 2.9.2，内核 1.13.24，versionCode 107）：S1–S6 全部落地，**不开放 3.0 UI**。versionCode 107 用于区分 G1 的 106，避免覆盖安装歧义。
+> - S1 组模型：`groupSelections` 改为 Profile 字段，`ConfigFile` 升 v4；`GroupValidator` 校验重复组、缺成员、自引用/环、过期选择，并输出 `profile\0group` 旧→新映射；切换/导入前拦截硬错误。
+> - S2 迁移：`ProfileMigration` 逐份 dry-run、备份、原子写入与回滚；备份目录 `files/configs/profile-migration-backup/`，清单 `.profile-migration-v4.json`；迁移有改动时重载 active `.conf`。
+> - S3 模块库/排序：`ModuleSource.order`，`orderedModules()` 按显式顺序重建；`ModuleOrder.move/setEnabled/mergeSync` 保证拖拽不改 id、同步不覆盖 `enabled/order`。
+> - S4 结构回归：2.9.1 的 13 条修复全部保留，逐项证据见 `docs/3.0_G2_EXIT.md`。
+> - S5 B 档：`supportedRouteTypes` 增 `UID`；jq/data-path、Map Remote、`$notification` 保持接入；脚本 `$environment` 补 `nodeName/nodeType/nodeServer/nodePort`（不含凭据）；GeoIP 仍只声明 CN。
+> - S6 C 壳：`ssidTriggerEnabled/ssidTriggerNames/ssidLocationOptIn` 默认关，本地 opt-in 后才读 SSID；Android 13+ 增加 `NEARBY_WIFI_DEVICES`（neverForLocation），因平台仍将当前 SSID 归为 location-sensitive，读取时保留 FINE_LOCATION 并只做本地名单比较，不存、不上报位置；`[General]` 的 skip-proxy/bypass/ssid-trigger/proxy-test-url/test-timeout/force-close-connections 映射到壳层，其余键只审计。
+> - 验收：Rust 347/347、Kotlin 209/209、lint 0 error / 38 warning；迁移 dry-run + 回滚演练通过；v2 本地小时桶读入即升级为 v3 UTC，避免改时区二次校正；两套 ABI 16K 对齐，证书与 2.9.1/2.9.2 连续。
+> - 定位：G2 是数据层/壳层出口，不是 3.0 正式 UI；3.0 视觉与交互仍未开放。
+
+> 2.9.2 测试版 G1 预演（内核 1.13.23，versionCode 106）：只做 3.0 数据层与最小四态预演，不改 3.0 组结构、不重做视觉。
+> - D0 归因：统一 `{ruleId, sourceType, sourceId, sourceName, order}`，覆盖 DNS/Host/Loon/Body/WS/Script/分流；配置缺元数据时兜底到 `config`，未知统一 `unknown|unknown`，不虚增模块分布。
+> - D1 per-source：今日/累计命中只在生效首条规则累加；bypass/无规则不计；今日按设备本地自然日清零，累计不清。
+> - D2 最近命中：内存 200 条、持久化 50 条；只存域名＋模块＋时间＋动作，不存 path/query/body/headers；默认开、可关可清空，关闭后不再写盘。
+> - D3 小时历史：168＋当前桶，**UTC 整点对齐**，显示层按设备时区转换（跨时区旅行桶边界不跳）；原子写、损坏读盘进 error 态并可重建；v3 起写 UTC，旧 v2 本地小时桶读入时按当前 UTC 偏移校正。
+> - D4 ShellFacade：loading/empty/error/success 四态；空态优先级按“未启动→引导；已启动窗口 0 且 ring 空→空态；窗口 0 但 ring 有→成功态显示 0、拦截率—、标注本窗口暂无查询”；历史命中不进当前窗口。
+> - D5 Script Loon 语义：每阶段首条条件 true 的脚本；`$done()` 放弃请求断开（cron/generic 除外）、`$done({})` 透传、`$done({response…})` 终止响应并禁后续脚本；Rewrite↔Script disable 表落地 h1/h2；模块级 `legacy-chain` 默认关，仅作 2.8 旧模块兜底。
+> - 验收：Rust 345/345（含 D1–D3/D5 新增用例）、Kotlin 199/199、lint 0 error / 38 warning / 4 information；两套 ABI 16K 对齐，证书与 2.9.1 连续。
+> - 定位：2.9.2 是 **G1 数据层预演**，不是 3.0 壳正式版本；3.0 组/配置重构仍未开工。G1 评审证据见 `docs/2.9.2_PREVIEW_G1.md`。
 
 > 2.9.1 正式版（内核 1.13.22，versionCode 105）：壳层与调度审计修复。
 > - 配置异步保存：入队时冻结 active 配置名和配置快照，改完 A 立刻切 B 不会再把 A 写进 B。

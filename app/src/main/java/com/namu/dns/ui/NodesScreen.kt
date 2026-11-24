@@ -31,11 +31,13 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.CloudOff
+import androidx.compose.material.icons.rounded.Info
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.SearchOff
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
@@ -52,7 +54,9 @@ import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -62,13 +66,14 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.namu.dns.Actions
 import com.namu.dns.UiPrefs
 import com.namu.dns.core.LocalAppContainer
+import com.namu.dns.core.config.RoutingMode
 import com.namu.dns.NodeInfo
 import com.namu.dns.ui.viewmodel.NodesViewModel
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun NodesScreen(onRestart: () -> Unit) {
+fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
     val container = LocalAppContainer.current
     val vm: NodesViewModel = viewModel(factory = NodesViewModel.factory(container))
     val settings = container.settings
@@ -77,14 +82,30 @@ fun NodesScreen(onRestart: () -> Unit) {
     val runtime = container.runtime
     val messages = container.messages
     val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
     val haptic = LocalHapticFeedback.current
     var showSub by remember { mutableStateOf(false) }
+    var showAddNode by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
     var refreshing by remember { mutableStateOf(false) }
     var selectionMode by remember { mutableStateOf(false) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
+    var showDeleteAllConfirm by remember { mutableStateOf(false) }
+    var detailNode by remember { mutableStateOf<NodeInfo?>(null) }
     val selected = remember { mutableStateMapOf<String, Boolean>() }
     val scope = rememberCoroutineScope()
+
+    fun reloadIfUsingProxy() {
+        if (runtime.current().connected && RoutingMode.fromConfig(settings.current().mode) != RoutingMode.Direct) {
+            onRestart()
+        }
+    }
+
+    fun selectNode(name: String) {
+        if (settings.current().selected == name) return
+        settings.update { it.copy(selected = name) }
+        reloadIfUsingProxy()
+    }
 
     val prefs = remember { context.getSharedPreferences("namu_nodes", Context.MODE_PRIVATE) }
     var collapsed by remember {
@@ -111,7 +132,7 @@ fun NodesScreen(onRestart: () -> Unit) {
         }
         clearSelection()
         showDeleteConfirm = false
-        if (runtime.current().connected) onRestart()
+        reloadIfUsingProxy()
     }
 
     val sortMode = UiPrefs.nodeSort
@@ -144,14 +165,51 @@ fun NodesScreen(onRestart: () -> Unit) {
             contentPadding = PaddingValues(bottom = 34.dp),
         ) {
             item {
+                SecondaryTopBar("代理", "流量模式与节点", onBack = onBack)
+                ModeBar(
+                    selected = cfg.mode,
+                    onSelect = { mode ->
+                        settings.update {
+                            it.copy(mode = mode, finalPolicy = if (mode == "filter_only") "direct" else it.finalPolicy)
+                        }
+                        reloadIfUsingProxy()
+                    },
+                )
                 SectionHeader("订阅")
                 GroupCard {
                     SettingsRow(
                         title = "导入 / 更新订阅",
                         subtitle = if (cfg.nodes.isEmpty()) "支持 Clash 配置和 Base64 节点链接" else "当前共 ${cfg.nodes.size} 个服务器",
                         chevron = true,
-                        showDivider = false,
+                        showDivider = true,
                         onClick = { showSub = true },
+                    )
+                    SettingsRow(
+                        title = "手动添加节点",
+                        subtitle = "按协议逐项填写；SS / Trojan / VLESS / VMess / SOCKS5",
+                        chevron = true,
+                        onClick = { showAddNode = true },
+                    )
+                    SettingsRow(
+                        title = "导出节点",
+                        subtitle = "复制可分享的节点链接",
+                        onClick = {
+                            val links = settings.current().nodes.mapNotNull { it.shareLink().takeIf(String::isNotBlank) }
+                            if (links.isEmpty()) {
+                                messages.show("还没有可导出的节点")
+                            } else {
+                                clipboard.setText(AnnotatedString(links.joinToString("\n")))
+                                messages.show("已复制 ${links.size} 个节点链接")
+                            }
+                        },
+                    )
+                    SettingsRow(
+                        title = "删除所有节点",
+                        showDivider = false,
+                        onClick = {
+                            if (settings.current().nodes.isEmpty()) messages.show("当前没有节点")
+                            else showDeleteAllConfirm = true
+                        },
                     )
                 }
             }
@@ -254,16 +312,14 @@ fun NodesScreen(onRestart: () -> Unit) {
                                     if (selectionMode) {
                                         if (selected[node.name] == true) selected.remove(node.name)
                                         else selected[node.name] = true
-                                    } else if (cfg.selected != node.name) {
-                                        settings.update { current -> current.copy(selected = node.name) }
-                                        if (runtime.current().connected) onRestart()
-                                    }
+                                    } else selectNode(node.name)
                                 },
                                 onLongPress = {
                                     selectionMode = true
                                     selected[node.name] = true
                                 },
                                 onTest = { vm.test(node) },
+                                onInfo = { detailNode = node },
                             )
                         }
                     }
@@ -287,7 +343,26 @@ fun NodesScreen(onRestart: () -> Unit) {
             onDismiss = { showSub = false },
             onDone = {
                 showSub = false
-                if (runtime.current().connected) onRestart()
+                reloadIfUsingProxy()
+            },
+        )
+    }
+    if (showAddNode) {
+        AddNodeDialog(
+            onDismiss = { showAddNode = false },
+            onDone = { node ->
+                val unique = if (cfg.nodes.any { it.name == node.name }) {
+                    node.copy(name = "${node.name} 2")
+                } else node
+                settings.update { current ->
+                    current.copy(
+                        nodes = current.nodes + unique,
+                        selected = current.selected ?: unique.name,
+                    )
+                }
+                showAddNode = false
+                messages.show("已添加 ${unique.name}")
+                reloadIfUsingProxy()
             },
         )
     }
@@ -299,6 +374,44 @@ fun NodesScreen(onRestart: () -> Unit) {
             confirmColor = NamuColors.Red,
             onConfirm = { deleteSelected() },
             onDismiss = { showDeleteConfirm = false },
+        ) {}
+    }
+    detailNode?.let { node ->
+        NodeInfoDialog(
+            node = node,
+            selected = cfg.selected == node.name,
+            onSelect = {
+                detailNode = null
+                selectNode(node.name)
+            },
+            onDelete = {
+                detailNode = null
+                settings.update { current ->
+                    val remaining = current.nodes.filterNot { it.name == node.name }
+                    current.copy(
+                        nodes = remaining,
+                        selected = if (current.selected == node.name) remaining.firstOrNull()?.name else current.selected,
+                    )
+                }
+                reloadIfUsingProxy()
+            },
+            onDismiss = { detailNode = null },
+        )
+    }
+    if (showDeleteAllConfirm) {
+        NamuDialog(
+            title = "删除所有节点？",
+            message = "将清空设备中的 ${cfg.nodes.size} 个节点，保留订阅链接和规则配置。",
+            confirmText = "删除",
+            confirmColor = NamuColors.Red,
+            onConfirm = {
+                showDeleteAllConfirm = false
+                settings.update { it.copy(nodes = emptyList(), selected = null) }
+                clearSelection()
+                reloadIfUsingProxy()
+                messages.show("已删除所有节点")
+            },
+            onDismiss = { showDeleteAllConfirm = false },
         ) {}
     }
 }
@@ -350,6 +463,7 @@ private fun NodeRow(
     onClick: () -> Unit,
     onLongPress: () -> Unit,
     onTest: () -> Unit,
+    onInfo: () -> Unit,
 ) {
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
@@ -454,6 +568,11 @@ private fun NodeRow(
                     contentAlignment = Alignment.Center,
                 ) {
                     Text("测", fontSize = 12.sp, color = NamuColors.Blue)
+                }
+            }
+            if (!selectionMode) {
+                IconButton(onClick = onInfo) {
+                    Icon(Icons.Rounded.Info, "节点详情", tint = NamuColors.TextSub, modifier = Modifier.size(17.dp))
                 }
             }
             if (!selectionMode && selected) {

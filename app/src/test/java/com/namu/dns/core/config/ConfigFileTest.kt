@@ -14,6 +14,31 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ConfigFileTest {
+    @Test
+    fun explicitDnsScopeSurvivesProfileSwitchAndReload() {
+        for (fullRoute in listOf(false, true)) {
+            val profile = ConfigFile.fromAppConfig(AppConfig(dnsOnlyFullRoute = fullRoute))
+            val loaded = ConfigFile.fromJson(profile.toJson())
+                .toAppConfig(AppConfig(dnsOnlyFullRoute = !fullRoute))
+            assertEquals(fullRoute, loaded.dnsOnlyFullRoute)
+        }
+    }
+
+    @Test
+    fun legacyProfileWithoutDnsScopeKeepsDeviceValue() {
+        val oldProfile = ConfigFile.fromJson("""{"version":4,"general":{"mode":"dns_only"}}""")
+        assertTrue(oldProfile.toAppConfig().dnsOnlyFullRoute)
+        assertFalse(oldProfile.toAppConfig(AppConfig(dnsOnlyFullRoute = false)).dnsOnlyFullRoute)
+    }
+
+    @Test
+    fun filterOnlyRemainsASelectedDirectScope() {
+        val mode = RoutingMode.fromConfig("filter_only")
+        assertEquals(RoutingMode.Direct, mode)
+        assertEquals("filter_only", mode.modeFor("filter_only"))
+        assertEquals(DirectFilterScope.Connections, DirectFilterScope.fromConfig("filter_only", false))
+    }
+
     private fun sampleConfig() = AppConfig(
         mode = "global",
         dnsUpstream = "https://dns.example.com/dns-query",
@@ -102,7 +127,7 @@ class ConfigFileTest {
         root.put("futureSection", JSONObject().put("enabled", true))
         root.put("futureFlag", "keep")
         val imported = ConfigFile.fromExternal(root.toString(), AppConfig())!!
-        assertEquals(3, imported.modelVersion)
+        assertEquals(4, imported.modelVersion)
         assertTrue(imported.unknownRoot.containsKey("futureSection"))
         assertTrue(imported.unknownRoot.containsKey("futureFlag"))
 
@@ -125,14 +150,16 @@ class ConfigFileTest {
 
 
     @Test
-    fun `proxy groups survive config round trip but selections stay device side`() {
+    fun `proxy groups and per-profile selections survive config round trip`() {
         val cfg = sampleConfig()
         val file = ConfigFile.fromAppConfig(cfg)
         val text = file.toJson()
         val decoded = ConfigFile.fromJson(text)
         assertEquals(cfg.proxyGroups, decoded.proxyGroups)
-        // .conf 不写设备侧选择，避免把 A 设备的选择带到 B 设备。
-        assertTrue(!JSONObject(text).has("groupSelections"))
+        // S1 起组选择属于 Profile，随 .conf 保存。
+        assertEquals(cfg.groupSelections, JSONObject(text).optJSONObject("groupSelections")?.let { o ->
+            o.keys().asSequence().associateWith { o.getString(it) }
+        })
         val applied = decoded.toAppConfig(cfg)
         assertEquals(cfg.groupSelections, applied.groupSelections)
     }

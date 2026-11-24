@@ -4,25 +4,27 @@ import com.namu.dns.core.LocalDockClearance
 import com.namu.dns.AppUidResolver
 import com.namu.dns.UidTablePublisher
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Delete
-import androidx.compose.material.icons.rounded.FileDownload
-import androidx.compose.material.icons.rounded.FileUpload
-import androidx.compose.material.icons.rounded.History
-import androidx.compose.material3.AlertDialog
+import androidx.compose.material.icons.outlined.Insights
+import androidx.compose.material.icons.outlined.History
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -30,10 +32,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.runtime.rememberCoroutineScope
@@ -46,6 +52,10 @@ import com.namu.dns.NamuVpnService
 import com.namu.dns.NetworkStatus
 import com.namu.dns.PrivateDnsController
 import com.namu.dns.core.LocalAppContainer
+import com.namu.dns.core.config.RoutingMode
+import com.namu.dns.core.repository.HitsUiState
+import com.namu.dns.core.repository.ShellPhase
+import com.namu.dns.core.repository.windowPoints
 import com.namu.dns.ui.viewmodel.DataViewModel
 import kotlinx.coroutines.launch
 
@@ -53,8 +63,8 @@ import kotlinx.coroutines.launch
 fun DataScreen(
     onOpenLogs: () -> Unit,
     onOpenDnsLogs: () -> Unit,
-    onOpenNodes: () -> Unit,
     onRestart: () -> Unit,
+    onStartVpn: () -> Unit = {},
 ) {
     val container = LocalAppContainer.current
     val vm: DataViewModel = viewModel(factory = DataViewModel.factory(container))
@@ -62,8 +72,6 @@ fun DataScreen(
     val stats = state.stats.stats
     val cfg = state.config
     val runtime = state.runtime
-    val clipboard = LocalClipboardManager.current
-    var confirmDeleteAll by remember { mutableStateOf(false) }
     var showLive by remember { mutableStateOf(false) }
     var showRuleTest by remember { mutableStateOf(false) }
     val ctx = LocalContext.current
@@ -75,6 +83,18 @@ fun DataScreen(
             .background(NamuColors.Bg)
             .verticalScroll(rememberScrollState()),
     ) {
+        SectionHeader("DNS 过滤与查询统计")
+        HitWindowSelector(selected = state.hits.windowHours) { vm.setHitWindow(it) }
+        GroupCard {
+            HitAnalytics(
+                state = state.hits,
+                onRetry = { vm.repairHits() },
+                onStartVpn = onStartVpn,
+                onHistoryEnabled = { vm.setHitHistoryEnabled(it) },
+                onClear = { vm.clearHits() },
+            )
+        }
+
         SectionHeader("流量统计")
         GroupCard {
             Row(Modifier.fillMaxWidth().padding(top = 16.dp, bottom = 6.dp)) {
@@ -289,12 +309,14 @@ fun DataScreen(
         SectionHeader("连接")
         GroupCard {
             val net = NetworkStatus.current(ctx)
+            val observesConnections = cfg.mode != "dns_only" || cfg.dnsOnlyFullRoute
             SettingsRow(
                 title = "实时连接",
-                subtitle = "逐连接五元组、归属应用、动作与命中规则",
-                value = "${stats.activeConns} 活跃",
-                chevron = true,
-                onClick = { showLive = true },
+                subtitle = if (observesConnections) "查看连接、归属应用和命中规则"
+                    else "仅系统 DNS 模式不采集普通连接",
+                value = if (observesConnections) "${stats.activeConns} 活跃" else null,
+                chevron = observesConnections,
+                onClick = if (observesConnections) ({ showLive = true }) else null,
             )
             SettingsRow(
                 title = "当前网络",
@@ -319,13 +341,8 @@ fun DataScreen(
                 value = container.nodeLabel(),
             )
             SettingsRow(
-                title = "全局路由",
-                value = when (cfg.mode) {
-                    "global" -> "代理"
-                    "dns_only" -> "直连"
-                    "filter_only" -> "纯过滤"
-                    else -> "配置"
-                },
+                title = "运行模式",
+                value = RoutingMode.fromConfig(cfg.mode).title,
                 showDivider = false,
             )
         }
@@ -335,7 +352,7 @@ fun DataScreen(
             SettingsRow(
                 title = "自动删除",
                 subtitle = "每次连接前清空上一次的运行日志与 DNS 记录",
-                icon = Icons.Rounded.History,
+                icon = Icons.Outlined.History,
                 rightContent = {
                     IosSwitch(
                         checked = cfg.autoClearLogs,
@@ -362,43 +379,6 @@ fun DataScreen(
             )
         }
 
-        SectionHeader("服务器节点")
-        GroupCard {
-            SettingsRow(
-                title = "导入节点…",
-                subtitle = "从订阅链接、Base64 或 Clash 配置导入",
-                icon = Icons.Rounded.FileDownload,
-                chevron = true,
-                onClick = onOpenNodes,
-            )
-            SettingsRow(
-                title = "导出节点",
-                subtitle = "把当前 ${cfg.nodes.size} 个节点链接复制到剪贴板",
-                icon = Icons.Rounded.FileUpload,
-                chevron = false,
-                onClick = {
-                    val text = cfg.nodes.joinToString("\n") { it.shareLink() }
-                    if (text.isBlank()) {
-                        vm.showMessage("还没有可导出的节点")
-                    } else {
-                        clipboard.setText(AnnotatedString(text))
-                        vm.showMessage("已复制 ${cfg.nodes.size} 个节点链接")
-                    }
-                },
-            )
-            SettingsRow(
-                title = "删除所有节点",
-                icon = Icons.Rounded.Delete,
-                iconTint = NamuColors.Red,
-                chevron = false,
-                showDivider = false,
-                onClick = {
-                    if (cfg.nodes.isEmpty()) vm.showMessage("当前没有节点")
-                    else confirmDeleteAll = true
-                },
-            )
-        }
-
         FooterText("流量统计从本次 VPN 连接开始累计；断开后保留最后一次会话统计，下次连接时重置。")
         Spacer(Modifier.height(LocalDockClearance.current + 34.dp))
     }
@@ -414,24 +394,6 @@ fun DataScreen(
     }
     if (showRuleTest) {
         RuleTestDialog(onDismiss = { showRuleTest = false })
-    }
-    if (confirmDeleteAll) {
-        AlertDialog(
-            onDismissRequest = { confirmDeleteAll = false },
-            title = { Text("删除所有节点？") },
-            text = { Text("将清空当前 ${cfg.nodes.size} 个服务器节点，订阅链接和配置不受影响。") },
-            confirmButton = {
-                TextButton(onClick = {
-                    confirmDeleteAll = false
-                    vm.clearAllNodes()
-                    if (runtime.connected) onRestart()
-                    vm.showMessage("已删除所有节点")
-                }) { Text("删除", color = NamuColors.Red) }
-            },
-            dismissButton = {
-                TextButton(onClick = { confirmDeleteAll = false }) { Text("取消") }
-            },
-        )
     }
 }
 
@@ -458,3 +420,210 @@ private fun formatUptime(ms: Long): String {
 private fun msToText(ms: Long): String =
     if (ms < 1000) "${ms}ms" else "%.1fs".format(ms / 1000.0)
 
+
+
+@Composable
+private fun HitWindowSelector(selected: Int, onSelect: (Int) -> Unit) {
+    Row(
+        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp)
+            .heightIn(min = 48.dp)
+            .background(NamuColors.Fill, RoundedCornerShape(12.dp))
+            .padding(3.dp),
+    ) {
+        listOf(24 to "24 小时", 168 to "7 天").forEach { (hours, label) ->
+            val active = selected == hours
+            Box(
+                Modifier.weight(1f).heightIn(min = 42.dp)
+                    .clip(RoundedCornerShape(9.dp))
+                    .background(if (active) NamuColors.Card else androidx.compose.ui.graphics.Color.Transparent)
+                    .clickable { onSelect(hours) },
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    label,
+                    fontSize = 13.sp,
+                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                    color = if (active) NamuColors.Brand else NamuColors.TextSub,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun HitAnalytics(
+    state: HitsUiState,
+    onRetry: () -> Unit,
+    onStartVpn: () -> Unit,
+    onHistoryEnabled: (Boolean) -> Unit,
+    onClear: () -> Unit,
+) {
+    when (state.phase) {
+        ShellPhase.LOADING -> NamuLoadingPanel("正在读取命中历史…")
+        ShellPhase.EMPTY -> NamuEmptyPanel(
+            title = if (state.needsVpnGuide) "先启动 VPN" else "本窗口暂无查询",
+            body = if (state.needsVpnGuide) {
+                "启动后只在本机保存域名、模块与时间；不保存 path、query、body、headers。"
+            } else {
+                "当前窗口没有查询；最近命中仍保留在本机，可随时清空。"
+            },
+            action = if (state.needsVpnGuide) "启动 VPN" else null,
+            onAction = if (state.needsVpnGuide) onStartVpn else null,
+            icon = Icons.Outlined.Insights,
+        )
+        ShellPhase.ERROR -> NamuErrorPanel(state.message, onRetry = onRetry)
+        ShellPhase.SUCCESS -> {
+            val win = state.window
+            val points = windowPoints(state.snapshot, win, days = state.windowHours >= 168)
+            Row(Modifier.fillMaxWidth().padding(top = 16.dp, bottom = 8.dp)) {
+                DataMetric(win.queries.toString(), "查询", Modifier.weight(1f))
+                DataMetric(win.blocked.toString(), "已拦截", Modifier.weight(1f))
+            }
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                NamuIcon(Icons.Outlined.Insights, tint = NamuColors.Brand, size = 18.dp)
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    if (state.windowHours >= 168) "近 7 天 DNS 查询趋势" else "近 24 小时 DNS 查询趋势",
+                    fontSize = 12.sp, color = NamuColors.TextSub, modifier = Modifier.weight(1f),
+                )
+                Text("峰值 ${points.maxOfOrNull { it.queries } ?: 0L}", fontSize = 12.sp, color = NamuColors.TextMain)
+            }
+            HitTrendChart(points, Modifier.fillMaxWidth().height(132.dp).padding(horizontal = 16.dp, vertical = 6.dp))
+            Row(Modifier.fillMaxWidth().padding(horizontal = 18.dp)) {
+                Text(points.firstOrNull()?.label ?: "—", fontSize = 10.sp, color = NamuColors.TextTertiary)
+                Spacer(Modifier.weight(1f))
+                Text(points.lastOrNull()?.label ?: "—", fontSize = 10.sp, color = NamuColors.TextTertiary)
+            }
+            if (win.queries == 0L) {
+                Text(
+                    "本窗口暂无查询",
+                    modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+                    fontSize = 12.sp, color = NamuColors.TextSub, textAlign = TextAlign.Center,
+                )
+            }
+            RowDivider(16.dp)
+            val cacheRate = win.cacheRate
+            Column(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 12.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("缓存命中率", style = NamuTokens.Type.Body, modifier = Modifier.weight(1f))
+                    Text(cacheRate.percent(), style = NamuTokens.Type.Title, color = NamuColors.TextMain)
+                }
+                if (cacheRate != null) {
+                    val fraction = cacheRate.toFloat().coerceIn(0f, 1f)
+                    Box(Modifier.fillMaxWidth().padding(top = 7.dp).height(5.dp).background(
+                        NamuColors.TrackOff, RoundedCornerShape(8.dp),
+                    )) {
+                        if (fraction > 0f) {
+                            Box(Modifier.fillMaxWidth(fraction).height(5.dp).background(
+                                NamuColors.Brand, RoundedCornerShape(8.dp),
+                            ))
+                        }
+                    }
+                }
+                Text(
+                    "${win.cacheHit} / ${win.cacheLookups} 次缓存查询 · 拦截率 ${win.blockedRate.percent()}",
+                    style = NamuTokens.Type.Caption,
+                    color = NamuColors.TextSub,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+            }
+            if (win.perSource.isNotEmpty()) {
+                RowDivider(16.dp)
+                Text(
+                    "按模块分布",
+                    modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 4.dp),
+                    fontSize = 12.sp, color = NamuColors.TextSub,
+                )
+                val max = win.perSource.maxOfOrNull { it.windowHits }?.coerceAtLeast(1L) ?: 1L
+                win.perSource.take(6).forEach { row ->
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            row.sourceName.ifBlank { "未归因" },
+                            fontSize = 12.sp, color = NamuColors.TextMain,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.width(120.dp),
+                        )
+                        Box(
+                            Modifier.weight(1f).height(5.dp).clip(RoundedCornerShape(50))
+                                .background(NamuColors.Fill),
+                        ) {
+                            Box(
+                                Modifier.fillMaxWidth((row.windowHits.toFloat() / max).coerceIn(0.02f, 1f))
+                                    .height(5.dp).clip(RoundedCornerShape(50))
+                                    .background(NamuColors.Brand),
+                            )
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Text("${row.windowHits}", fontSize = 11.sp, color = NamuColors.TextSub)
+                    }
+                }
+            }
+            RowDivider(16.dp)
+            Row(
+                Modifier.fillMaxWidth().heightIn(min = 52.dp).padding(horizontal = 16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("记录命中摘要", fontSize = 13.sp, color = NamuColors.TextMain)
+                    Text("只存域名、模块、时间；可关闭，关闭后不再写盘。", fontSize = 11.sp, color = NamuColors.TextSub)
+                }
+                IosSwitch(checked = state.historyEnabled, onCheckedChange = onHistoryEnabled)
+                MiniTextAction("清空", color = NamuColors.Red) { onClear() }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HitTrendChart(points: List<com.namu.dns.core.repository.DayPoint>, modifier: Modifier = Modifier) {
+    if (points.isEmpty()) {
+        Box(modifier, contentAlignment = Alignment.Center) {
+            Text("暂无趋势数据", fontSize = 12.sp, color = NamuColors.TextTertiary)
+        }
+        return
+    }
+    val max = points.maxOf { it.queries }.coerceAtLeast(1L)
+    Canvas(modifier) {
+        val pad = 4f
+        val w = size.width
+        val h = size.height
+        val step = if (points.size <= 1) 0f else (w - pad * 2) / (points.size - 1)
+        repeat(3) { i ->
+            val y = pad + (h - pad * 2) * i / 2f
+            drawLine(
+                NamuColors.Separator.copy(alpha = 0.7f),
+                Offset(0f, y),
+                Offset(w, y),
+                strokeWidth = 1f,
+            )
+        }
+        val line = Path()
+        points.forEachIndexed { i, p ->
+            val x = if (points.size == 1) w / 2 else pad + step * i
+            val y = h - pad - (h - pad * 2) * (p.queries.toFloat() / max)
+            if (i == 0) line.moveTo(x, y) else line.lineTo(x, y)
+        }
+        val area = Path().apply {
+            addPath(line)
+            lineTo(pad + step * (points.size - 1), h - pad)
+            lineTo(pad, h - pad)
+            close()
+        }
+        if (points.size > 1) drawPath(area, NamuColors.Brand.copy(alpha = 0.12f))
+        drawPath(line, NamuColors.Brand, style = Stroke(width = 2f))
+        points.forEachIndexed { i, p ->
+            if (p.queries <= 0L) return@forEachIndexed
+            val x = if (points.size == 1) w / 2 else pad + step * i
+            val y = h - pad - (h - pad * 2) * (p.queries.toFloat() / max)
+            drawCircle(NamuColors.Brand, radius = 2.4f, center = Offset(x, y))
+        }
+    }
+}
+
+private fun Number?.percent(): String = this?.let { "${(it.toDouble() * 100).toInt()}%" } ?: "—"

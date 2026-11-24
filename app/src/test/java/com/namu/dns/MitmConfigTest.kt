@@ -245,4 +245,63 @@ class MitmConfigTest {
             MitmManager.toggleSkip(base, "API.EXAMPLE.COM"),
         )
     }
+
+    @Test
+    fun `disabled script stays visible while enabled ones still register`() {
+        val module = """
+            [Script]
+            http-request ^https://api\.example\.com/v1 script-path=https://cdn.example.com/a.js enable=false tag=关掉的脚本
+            http-response ^https://api\.example\.com/v1 script-path=https://cdn.example.com/b.js enable=0 tag=另一条关掉的
+            http-request ^https://api\.example\.com/v2 script-path=https://cdn.example.com/c.js tag=开着的
+        """.trimIndent()
+        val parsed = ModuleParser.parse(module)
+        assertEquals("禁用不等于丢弃，条目必须保留", 3, parsed.scripts.size)
+        assertEquals(2, parsed.scripts.count { !it.enabled })
+        val on = parsed.scripts.single { it.enabled }
+        assertEquals("^https://api\\.example\\.com/v2", on.pattern)
+        assertTrue(parsed.scriptIssues.isEmpty())
+    }
+
+    @Test
+    fun `enable switch reference is deferred to the kernel`() {
+        val module = """
+            [Argument]
+            enabled = switch,true
+            [Script]
+            http-request ^https://api\.example\.com/v1 script-path=https://cdn.example.com/a.js enable=${'$'}{enabled} tag=随开关
+        """.trimIndent()
+        val parsed = ModuleParser.parse(module)
+        val rule = parsed.scripts.single()
+        assertEquals("enabled", rule.enableParam)
+        // 引用必须留给运行期求值，不能在解析时烘焙成禁用。
+        assertTrue(rule.enabled)
+    }
+
+    @Test
+    fun `enable flag round trips to the rust kernel json`() {
+        val cfg = com.namu.dns.core.config.ScriptConfig(
+            name = "off",
+            pattern = "^https://api\\.test/",
+            source = "\$done({});",
+            enabled = false,
+        )
+        assertEquals(false, cfg.toJsonObject().getBoolean("enable"))
+        val back = com.namu.dns.core.config.ScriptConfig.fromJsonObject(cfg.toJsonObject())
+        assertFalse(back.enabled)
+        // 老配置没有该键：必须回落启用，不能把存量脚本全变禁用。
+        assertTrue(com.namu.dns.core.config.ScriptConfig.fromJsonObject(org.json.JSONObject()).enabled)
+    }
+
+    @Test
+    fun `enable param survives json round trip`() {
+        val cfg = com.namu.dns.core.config.ScriptConfig(
+            name = "switch",
+            pattern = "^https://api\\.test/",
+            source = "\$done({});",
+            enableParam = "enabled",
+        )
+        val back = com.namu.dns.core.config.ScriptConfig.fromJsonObject(cfg.toJsonObject())
+        assertEquals("enabled", back.enableParam)
+        assertTrue(back.enabled)
+    }
 }

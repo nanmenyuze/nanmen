@@ -1332,17 +1332,28 @@ fn decide_detail_for(
             Action::Direct
         }
         _ => {
-            let (a, d) = ctx
+            let (a, d, identity) = ctx
                 .rules
                 .read()
                 .unwrap_or_else(|p| p.into_inner())
-                .decide_input(&crate::engine::MatchInput {
+                .decide_input_attributed(&crate::engine::MatchInput {
                     domain,
                     ip,
                     port,
                     kind,
                     uid,
                 });
+            if let Some(meta) = identity {
+                let host = domain
+                    .map(|d| d.to_string())
+                    .unwrap_or_else(|| ip.to_string());
+                let action = if matches!(a, Action::Block) {
+                    "block"
+                } else {
+                    "route"
+                };
+                ctx.stats.hits.record_hit(&meta, &host, action);
+            }
             detail = d;
             a
         }

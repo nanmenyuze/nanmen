@@ -3,6 +3,7 @@ package com.namu.dns.core.config
 import kotlinx.serialization.Serializable
 import org.json.JSONArray
 import org.json.JSONObject
+import com.namu.dns.RuleMeta
 
 /**
  * 配置文件里的 MITM 分区（对齐小火箭：[MITM] hostname 归属 .conf）。
@@ -46,6 +47,14 @@ data class ScriptConfig(
     val scriptPath: String = "",
     /** Loon 单条 argument 的原始字符串（区别于 [Argument] 的对象形式）。 */
     val argumentText: String = "",
+    /** D5：仅 2.8 旧模块兜底，默认关；开启后该模块允许多脚本链式执行。 */
+    val legacyChain: Boolean = false,
+    /** D0 归因身份。 */
+    val meta: RuleMeta? = null,
+    /** Loon `enable`（缺省 true）：false 时条目保留可见，内核不执行。 */
+    val enabled: Boolean = true,
+    /** `enable=${name}`：启用状态由插件 [Argument] 开关驱动，改开关即时生效。 */
+    val enableParam: String = "",
 ) {
     fun toJsonObject(): JSONObject = JSONObject().apply {
         put("name", name)
@@ -63,6 +72,10 @@ data class ScriptConfig(
         put("requiresBody", requiresBody)
         put("binaryBodyMode", binaryBodyMode)
         if (argumentText.isNotBlank()) put("argumentText", argumentText)
+        if (legacyChain) put("legacyChain", true)
+        if (!enabled) put("enable", false)
+        if (enableParam.isNotBlank()) put("enableParam", enableParam)
+        meta?.let { put("meta", it.toJson()) }
     }
 
     companion object {
@@ -95,6 +108,10 @@ data class ScriptConfig(
             binaryBodyMode = o.optBoolean("binaryBodyMode", false),
             scriptPath = o.optString("scriptPath", ""),
             argumentText = o.optString("argumentText", ""),
+            legacyChain = o.optBoolean("legacyChain", false),
+            enabled = o.optBoolean("enable", true),
+            enableParam = o.optString("enableParam", ""),
+            meta = if (o.has("meta") && !o.isNull("meta")) RuleMeta.fromJson(o.getJSONObject("meta")) else null,
         )
     }
 }
@@ -129,6 +146,8 @@ data class MitmConfig(
     val poolEnabled: Boolean = false,
     /** 池化连接空闲上限（秒）。 */
     val poolIdleSecs: Long = 30,
+    /** D0 规则身份表；按 section|key 索引，由 ConfigStore 从模块与手写配置合并生成。 */
+    @kotlinx.serialization.Transient val ruleMeta: List<RuleMeta> = emptyList(),
 ) {
     val isEmpty: Boolean
         get() = !enabled && hostnames.isEmpty() && skipHostnames.isEmpty() &&
@@ -154,6 +173,7 @@ data class MitmConfig(
         put("apps", JSONArray(apps))
         put("poolEnabled", poolEnabled)
         put("poolIdleSecs", poolIdleSecs)
+        if (ruleMeta.isNotEmpty()) put("ruleMeta", JSONArray(ruleMeta.map { it.toJson() }))
     }
 
     companion object {
@@ -199,6 +219,11 @@ data class MitmConfig(
                 apps = arr("apps"),
                 poolEnabled = o.optBoolean("poolEnabled", false),
                 poolIdleSecs = o.optLong("poolIdleSecs", 30),
+                ruleMeta = o.optJSONArray("ruleMeta")?.let { a ->
+                    (0 until a.length()).mapNotNull { i ->
+                        a.optJSONObject(i)?.let { RuleMeta.fromJson(it) }
+                    }
+                } ?: emptyList(),
             )
         }
     }

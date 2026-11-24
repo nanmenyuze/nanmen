@@ -68,14 +68,55 @@ import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.disabled
+import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+
+/** U0：3.0 壳的设计令牌；页面不再各自散落 13/14/16/28sp 与随手圆角。 */
+object NamuTokens {
+    val Brand = Color(0xFF1663FF)
+    val Ink = Color(0xFF1C1C1E)
+    val Sub = Color(0xFF5B616E)
+    val Tertiary = Color(0xFF6B7280)
+    val Bg = Color(0xFFFCF9F8)
+    val Card = Color(0xFFFFFDFC)
+    val Border = Color(0xFFE8E3E5)
+    val Success = Color(0xFF1F9D6A)
+    val Warning = Color(0xFFC77700)
+    val Danger = Color(0xFFD92D20)
+
+    val Space2 = 2.dp
+    val Space4 = 4.dp
+    val Space8 = 8.dp
+    val Space12 = 12.dp
+    val Space16 = 16.dp
+    val Space20 = 20.dp
+    val Space24 = 24.dp
+    val Space32 = 32.dp
+
+    val RadiusCard = 16.dp
+    val RadiusRow = 14.dp
+    val RadiusControl = 12.dp
+
+    /** 20dp / 2px 线性图标；新页面统一走 NamuIcon。 */
+    val IconSize = 20.dp
+    val IconStroke = 2.dp
+
+    object Type {
+        val Display = TextStyle(fontSize = 28.sp, lineHeight = 34.sp, fontWeight = FontWeight.SemiBold)
+        val Title = TextStyle(fontSize = 20.sp, lineHeight = 26.sp, fontWeight = FontWeight.SemiBold)
+        val Body = TextStyle(fontSize = 15.sp, lineHeight = 22.sp)
+        val Caption = TextStyle(fontSize = 12.sp, lineHeight = 17.sp)
+    }
+}
 
 object NamuColors {
     // UI 主题状态放在这里，所有颜色 getter 读取同一个 state；
@@ -87,21 +128,27 @@ object NamuColors {
         if (darkState.value != dark) darkState.value = dark
     }
 
-    val Bg: Color get() = if (isDark) Color(0xFF141D1A) else Color(0xFFF4F7F5)
-    val Card: Color get() = if (isDark) Color(0xFF1C1C1E) else Color(0xFFFFFFFF)
-    val CardPressed: Color get() = if (isDark) Color(0xFF2C2C2E) else Color(0xFFE5E5EA)
-    val Separator: Color get() = if (isDark) Color(0xFF38383A) else Color(0xFFE3E3E8)
+    val Bg: Color get() = if (isDark) Color(0xFF101418) else NamuTokens.Bg
+    val Card: Color get() = if (isDark) Color(0xFF1C1C1E) else NamuTokens.Card
+    val CardPressed: Color get() = if (isDark) Color(0xFF2C2C2E) else Color(0xFFEFF3F8)
+    val Separator: Color get() = if (isDark) Color(0xFF38383A) else NamuTokens.Border
     val Fill: Color get() = if (isDark) Color(0xFF1C1C1E) else Color(0xFFF2F2F7)
     val FillPressed: Color get() = if (isDark) Color(0xFF2C2C2E) else Color(0xFFE8E8ED)
-    val Blue: Color get() = if (isDark) Color(0xFF0A84FF) else Color(0xFF007AFF)
-    val Accent: Color get() = if (isDark) Color(0xFF9EDAC0) else Color(0xFF165C47)
+    val Blue: Color get() = NamuTokens.Brand
+    /** 品牌主色 #1663FF：叶标识与选中态使用；绿色只表达运行状态。 */
+    val Brand: Color get() = NamuTokens.Brand
+    /** 选中态统一走品牌色，绿色不再承担导航/品牌装饰。 */
+    val Accent: Color get() = NamuTokens.Brand
     val Green: Color get() = if (isDark) Color(0xFF30D158) else Color(0xFF34C759)
-    val Red: Color get() = if (isDark) Color(0xFFFF453A) else Color(0xFFFF3B30)
-    val Orange: Color get() = if (isDark) Color(0xFFFF9F0A) else Color(0xFFFF9500)
+    val Red: Color get() = if (isDark) Color(0xFFFF453A) else NamuTokens.Danger
+    /** 图形/文字同色：第四五轮统一色板后不再分场景取值，保留别名供图形调用点使用。 */
+    val GreenFill: Color get() = Green
+    val RedFill: Color get() = Red
+    val Orange: Color get() = if (isDark) Color(0xFFFF9F0A) else NamuTokens.Warning
     val Teal: Color get() = if (isDark) Color(0xFF64D2FF) else Color(0xFF30B0C7)
     val TextMain: Color get() = if (isDark) Color(0xFFF2F2F7) else Color(0xFF1C1C1E)
-    val TextSub: Color get() = if (isDark) Color(0xFFAEAEB2) else Color(0xFF596760)
-    val TextTertiary: Color get() = if (isDark) Color(0xFF636366) else Color(0xFFC7C7CC)
+    val TextSub: Color get() = if (isDark) Color(0xFFAEAEB2) else NamuTokens.Sub
+    val TextTertiary: Color get() = if (isDark) Color(0xFF8E8E93) else NamuTokens.Tertiary
     val TrackOff: Color get() = if (isDark) Color(0xFF3A3A3C) else Color(0xFFE9E9EA)
 }
 
@@ -114,9 +161,9 @@ fun NamuTheme(
     MaterialTheme(
         colorScheme = if (darkTheme) {
             darkColorScheme(
-                primary = NamuColors.Blue,
+                primary = NamuColors.Brand,
                 onPrimary = Color.White,
-                secondary = NamuColors.Teal,
+                secondary = NamuColors.Brand,
                 background = NamuColors.Bg,
                 surface = NamuColors.Card,
                 surfaceVariant = NamuColors.Fill,
@@ -127,9 +174,9 @@ fun NamuTheme(
             )
         } else {
             lightColorScheme(
-                primary = NamuColors.Blue,
+                primary = NamuColors.Brand,
                 onPrimary = Color.White,
-                secondary = NamuColors.Teal,
+                secondary = NamuColors.Brand,
                 background = NamuColors.Bg,
                 surface = NamuColors.Card,
                 surfaceVariant = NamuColors.Fill,
@@ -141,6 +188,17 @@ fun NamuTheme(
         },
         content = content,
     )
+}
+
+/** U0：新页面统一入口，20dp / 2px 线性图标。 */
+@Composable
+fun NamuIcon(
+    icon: ImageVector,
+    desc: String? = null,
+    tint: Color = NamuColors.TextMain,
+    size: Dp = NamuTokens.IconSize,
+) {
+    Icon(icon, contentDescription = desc, tint = tint, modifier = Modifier.size(size))
 }
 
 @Composable
@@ -182,6 +240,34 @@ fun SectionHeader(text: String, trailing: @Composable (() -> Unit)? = null) {
     }
 }
 
+@Composable
+fun PrimaryTopBar(title: String, subtitle: String = "") {
+    Column(
+        Modifier.fillMaxWidth()
+            .background(NamuColors.Bg)
+            .statusBarsPadding()
+            .padding(start = 22.dp, end = 22.dp, top = 16.dp, bottom = 10.dp)
+    ) {
+        Text(
+            title,
+            modifier = Modifier.semantics { heading() },
+            fontSize = 30.sp,
+            lineHeight = 37.sp,
+            fontWeight = FontWeight.SemiBold,
+            fontFamily = FontFamily.Serif,
+            color = NamuColors.TextMain,
+        )
+        if (subtitle.isNotEmpty()) {
+            Text(
+                subtitle,
+                modifier = Modifier.padding(top = 3.dp),
+                fontSize = 12.sp,
+                color = NamuColors.TextSub,
+            )
+        }
+    }
+}
+
 /** iOS / Shadowrocket 风格的蓝色顶部导航栏。 */
 @Composable
 fun ShadowTopBar(
@@ -215,34 +301,16 @@ fun ShadowTopBar(
 
 @Composable
 fun GroupCard(glow: Boolean = false, content: @Composable ColumnScope.() -> Unit) {
-    // 每张卡片进屏时轻微上浮 + 淡入，和 iOS 分组列表的节奏一致。
-    var visible by remember { mutableStateOf(false) }
-    LaunchedEffect(Unit) { visible = true }
-    val a by animateFloatAsState(if (visible) 1f else 0f, tween(200), label = "card-alpha")
-    val dy by animateDpAsState(if (visible) 0.dp else 10.dp, tween(260), label = "card-offset")
-    // 已连接时卡片边缘做很轻的呼吸描边；glow=false 的卡片绝不创建无限动画，
-    // 否则每个列表页每张卡都会 1.6 秒循环请求帧，亮屏白耗电。
-    val pulse = if (glow) {
-        rememberInfiniteTransition(label = "glow").animateFloat(
-            initialValue = 0.18f,
-            targetValue = 0.5f,
-            animationSpec = infiniteRepeatable(tween(1600), RepeatMode.Reverse),
-            label = "glow-alpha",
-        ).value
-    } else {
-        0f
-    }
+    // U5：卡片不做进屏/呼吸循环动效；只保留静态分组语义，避免每张卡持续请求帧。
     Column(
         Modifier
             .fillMaxWidth()
             .padding(horizontal = 12.dp)
-            .offset(y = dy)
-            .alpha(a)
-            .shadow(0.5.dp, RoundedCornerShape(14.dp))
-            .clip(RoundedCornerShape(14.dp))
+            .shadow(0.5.dp, RoundedCornerShape(NamuTokens.RadiusCard))
+            .clip(RoundedCornerShape(NamuTokens.RadiusCard))
             .background(NamuColors.Card)
             .then(
-                if (glow) Modifier.border(1.dp, NamuColors.Blue.copy(alpha = pulse), RoundedCornerShape(14.dp))
+                if (glow) Modifier.border(1.dp, NamuColors.Brand.copy(alpha = 0.35f), RoundedCornerShape(NamuTokens.RadiusCard))
                 else Modifier,
             ),
         content = content,
@@ -269,13 +337,15 @@ fun SettingsRow(
     chevron: Boolean = false,
     showDivider: Boolean = true,
     icon: ImageVector? = null,
-    iconTint: Color = NamuColors.Blue,
+    iconTint: Color = NamuColors.Brand,
     rightContent: (@Composable RowScope.() -> Unit)? = null,
     onClick: (() -> Unit)? = null,
 ) {
+    // U5：带 chevron 的整行只负责导航；switch / 右侧按钮独占命中区；
+    // 无 chevron 且右侧有控件/数字的状态行不可点。
+    val rowClickable = onClick != null && (chevron || rightContent == null)
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
-    // iOS 列表点按反馈：轻微内缩 + 淡灰底，不用水波纹。
     val scale by animateFloatAsState(if (pressed) 0.985f else 1f, spring(stiffness = 420f), label = "row-scale")
     val pressBg by animateColorAsState(
         if (pressed) NamuColors.FillPressed else Color.Transparent,
@@ -285,11 +355,11 @@ fun SettingsRow(
     Column(
         Modifier
             .fillMaxWidth()
-            .graphicsLayer { scaleX = scale; scaleY = scale }
+            .graphicsLayer { if (rowClickable) { scaleX = scale; scaleY = scale } }
             .background(pressBg)
             .then(
-                if (onClick != null) {
-                    Modifier.clickable(interactionSource = interaction, indication = null) { onClick() }
+                if (rowClickable) {
+                    Modifier.clickable(interactionSource = interaction, indication = null) { onClick?.invoke() }
                 } else {
                     Modifier
                 },
@@ -303,23 +373,14 @@ fun SettingsRow(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             if (icon != null) {
-                Icon(icon, contentDescription = null, tint = iconTint, modifier = Modifier.size(21.dp))
+                Icon(icon, contentDescription = null, tint = iconTint, modifier = Modifier.size(NamuTokens.IconSize))
                 Spacer(Modifier.width(13.dp))
             }
             Column(Modifier.weight(1f)) {
                 Text(title, fontSize = 16.sp, color = NamuColors.TextMain)
                 if (subtitle != null) {
                     Spacer(Modifier.height(1.dp))
-                    AnimatedContent(
-                        targetState = subtitle,
-                        transitionSpec = {
-                            (fadeIn(tween(180)) + slideInVertically(tween(200)) { it / 3 }) togetherWith
-                                (fadeOut(tween(110)) + slideOutVertically(tween(160)) { -it / 4 })
-                        },
-                        label = "row-subtitle",
-                    ) { text ->
-                        Text(text, fontSize = 12.sp, color = NamuColors.TextSub, lineHeight = 16.sp)
-                    }
+                    Text(subtitle, fontSize = 12.sp, color = NamuColors.TextSub, lineHeight = 16.sp)
                 }
             }
             if (rightContent != null) {
@@ -447,8 +508,8 @@ fun IosButton(
         enabled = enabled && !loading,
         shape = RoundedCornerShape(12.dp),
         colors = ButtonDefaults.buttonColors(
-            containerColor = NamuColors.Blue,
-            disabledContainerColor = NamuColors.Blue.copy(alpha = 0.4f),
+            containerColor = NamuColors.Brand,
+            disabledContainerColor = NamuColors.Brand.copy(alpha = 0.4f),
             contentColor = Color.White,
         ),
         modifier = modifier.fillMaxWidth().height(50.dp),
@@ -473,7 +534,7 @@ fun FooterText(text: String) {
 }
 
 @Composable
-fun CheckMark(color: Color = NamuColors.Blue) {
+fun CheckMark(color: Color = NamuColors.Brand) {
     Canvas(Modifier.size(19.dp, 15.dp)) {
         val w = size.width
         val h = size.height
@@ -597,5 +658,76 @@ fun hostOf(url: String): String {
         java.net.URI(url).host ?: url
     } catch (_: Exception) {
         url
+    }
+}
+
+/** 流量模式三档：仅过滤 / 自动分流 / 全局代理；首页代理入口与节点页共用。 */
+@Composable
+fun ModeBar(selected: String, onSelect: (String) -> Unit, modifier: Modifier = Modifier) {
+    val options = listOf(
+        "filter_only" to "仅过滤",
+        "rule" to "自动分流",
+        "global" to "全局代理",
+    )
+    Row(
+        modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("流量模式", fontSize = 12.sp, color = NamuColors.TextSub)
+        Spacer(Modifier.width(10.dp))
+        Row(
+            Modifier.weight(1f)
+                .clip(androidx.compose.foundation.shape.RoundedCornerShape(10.dp))
+                .background(NamuColors.Fill)
+                .padding(3.dp),
+        ) {
+            options.forEach { (mode, label) ->
+                val on = selected == mode
+                Box(
+                    Modifier.weight(1f)
+                        .clip(androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
+                        .background(if (on) NamuColors.Card else androidx.compose.ui.graphics.Color.Transparent)
+                        .clickable { onSelect(mode) }
+                        .padding(vertical = 7.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        label,
+                        fontSize = 13.sp,
+                        fontWeight = if (on) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (on) NamuColors.TextMain else NamuColors.TextSub,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** 二级页顶栏：左侧返回，标题与首页同一套衬线字。 */
+@Composable
+fun SecondaryTopBar(title: String, subtitle: String = "", onBack: (() -> Unit)? = null) {
+    Column(
+        Modifier.fillMaxWidth()
+            .background(NamuColors.Bg)
+            .statusBarsPadding()
+            .padding(start = 10.dp, end = 22.dp, top = 6.dp, bottom = 8.dp)
+    ) {
+        if (onBack != null) {
+            TextAction("‹ 返回", color = NamuColors.TextSub) { onBack() }
+        }
+        Column(Modifier.padding(start = 12.dp, top = 2.dp)) {
+            Text(
+                title,
+                modifier = Modifier.semantics { heading() },
+                fontSize = 28.sp,
+                lineHeight = 34.sp,
+                fontWeight = FontWeight.SemiBold,
+                fontFamily = FontFamily.Serif,
+                color = NamuColors.TextMain,
+            )
+            if (subtitle.isNotEmpty()) {
+                Text(subtitle, fontSize = 12.sp, color = NamuColors.TextSub, modifier = Modifier.padding(top = 2.dp))
+            }
+        }
     }
 }

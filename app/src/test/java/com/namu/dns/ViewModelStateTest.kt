@@ -1,6 +1,8 @@
 package com.namu.dns
 
 import com.namu.dns.core.repository.DefaultNodeRepository
+import com.namu.dns.core.repository.HitRepository
+import com.namu.dns.core.repository.HitsUiState
 import com.namu.dns.core.repository.LogRepository
 import com.namu.dns.core.repository.LogsUiState
 import com.namu.dns.core.repository.StatsRepository
@@ -48,6 +50,17 @@ class ViewModelStateTest {
         override fun current() = _state.value
         override fun poll() = Unit
         override fun resetSession() = Unit
+    }
+
+    private class FakeHits : HitRepository {
+        private val _state = MutableStateFlow(HitsUiState())
+        override val state: StateFlow<HitsUiState> = _state.asStateFlow()
+        override fun current() = _state.value
+        override fun poll() = Unit
+        override fun setWindow(hours: Int) = Unit
+        override fun repair() = Unit
+        override fun clear() = Unit
+        override fun setEnabled(enabled: Boolean) = Unit
     }
 
     private class FakeLogs : LogRepository {
@@ -142,7 +155,7 @@ class ViewModelStateTest {
             AppConfig(autoClearLogs = false, nodes = listOf(NodeInfo("n1", "ss", "1.1.1.1", 443))),
         )
         val runtime = DefaultRuntimeRepository()
-        val vm = DataViewModel(settings, runtime, FakeStats(), FakeLogs(), DefaultNodeRepository(settings), DefaultMessageRepository())
+        val vm = DataViewModel(settings, runtime, FakeStats(), FakeHits(), FakeLogs(), DefaultNodeRepository(settings), DefaultMessageRepository())
         vm.state.test {
             assertEquals(0, awaitItem().logs.runtime.size)
             settings.update { it.copy(autoClearLogs = true) }

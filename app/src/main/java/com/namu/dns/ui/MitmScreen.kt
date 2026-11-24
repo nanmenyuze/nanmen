@@ -9,13 +9,15 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Download
+import androidx.compose.material.icons.rounded.Info
+import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.Security
-import androidx.compose.material.icons.rounded.Shield
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -28,6 +30,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
@@ -38,6 +41,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.namu.dns.ui.viewmodel.MitmViewModel
 import com.namu.dns.ConfigStore
 import com.namu.dns.MitmManager
+import com.namu.dns.RootCaManager
 import com.namu.dns.core.LocalAppContainer
 import org.json.JSONObject
 
@@ -59,14 +63,38 @@ fun MitmScreen() {
     val busy by vm.busy.collectAsStateWithLifecycle()
     val caExists by vm.caExists.collectAsStateWithLifecycle()
     val caFingerprint by vm.caFingerprint.collectAsStateWithLifecycle()
-    val systemCertInstalled by vm.systemCertInstalled.collectAsStateWithLifecycle()
     val trust by vm.trust.collectAsStateWithLifecycle()
+    val trustState = remember(caExists, trust) {
+        RootCaManager.resolveTrustState(caExists, trust)
+    }
+    val trustValue = when (trustState) {
+        RootCaManager.TrustState.NOT_GENERATED -> "未生成"
+        RootCaManager.TrustState.GENERATED_NOT_INSTALLED -> "已生成未安装"
+        RootCaManager.TrustState.INSTALLED_PENDING -> "已安装待生效"
+        RootCaManager.TrustState.ACTIVE -> "已生效"
+        RootCaManager.TrustState.CONFLICT -> "证书区冲突"
+        RootCaManager.TrustState.INJECT_FAILED -> "安装未完成"
+        RootCaManager.TrustState.REMOVED -> "已卸载"
+        RootCaManager.TrustState.RESIDUAL -> "残留异常"
+        RootCaManager.TrustState.UNVERIFIABLE -> "无法核验"
+    }
+    val trustSubtitle = when (trustState) {
+        RootCaManager.TrustState.NOT_GENERATED -> "导出模块时会生成公开 CA"
+        RootCaManager.TrustState.GENERATED_NOT_INSTALLED -> trust.detail.ifBlank { "导出模块后，在 Magisk 中安装并完整重启" }
+        RootCaManager.TrustState.INSTALLED_PENDING -> "已发现模块，尚未核实系统信任状态。请确认已在 Magisk 启用并完整重启"
+        RootCaManager.TrustState.ACTIVE -> "已在 Zygote 的系统证书区核对到同一张 CA"
+        RootCaManager.TrustState.CONFLICT -> "系统证书区存在其他覆盖层，请在 Magisk 中检查模块"
+        RootCaManager.TrustState.INJECT_FAILED -> "模块启动时未完成挂载，可导出安装日志查看原因"
+        RootCaManager.TrustState.REMOVED -> "已移除"
+        RootCaManager.TrustState.RESIDUAL -> "仍能读到这张 CA，请检查 Magisk 模块和系统凭据"
+        RootCaManager.TrustState.UNVERIFIABLE -> trust.detail.ifBlank { "当前无法核对系统证书区" }
+    }
     val mitm = cfg.mitm
     var showHosts by remember { mutableStateOf(false) }
     var showSkip by remember { mutableStateOf(false) }
     var showApps by remember { mutableStateOf(false) }
     var showScriptArgs by remember { mutableStateOf(false) }
-    var confirmRemoveCa by remember { mutableStateOf(false) }
+    var showCaGuide by remember { mutableStateOf(false) }
     var hostsText by remember { mutableStateOf("") }
     var skipText by remember { mutableStateOf("") }
 
@@ -129,32 +157,19 @@ fun MitmScreen() {
                 subtitle = "首次导出时自动生成并长期复用；卸载应用前请先移除已安装证书",
                 showDivider = true,
             )
-            SettingsRow(
-                title = "CA SHA-256 指纹",
-                subtitle = caFingerprint ?: "生成 CA 后显示；安装时请与系统证书详情的指纹核对",
-                showDivider = true,
+            FingerprintRow(
+                fingerprint = caFingerprint,
+                onCopy = {
+                    caFingerprint?.let {
+                        clipboard.setText(AnnotatedString(it))
+                        container.messages.show("CA SHA-256 指纹已复制")
+                    }
+                },
             )
             SettingsRow(
                 title = "系统证书区（模块）",
-                value = when {
-                    !caExists -> "未生成"
-                    trust.status.done && trust.status.state != "ok" -> "注入失败"
-                    systemCertInstalled -> "已检测到"
-                    trust.moduleInstalled && trust.moduleCertMatches -> "已安装"
-                    trust.conflict -> "挂载冲突"
-                    trust.moduleInstalled -> "需更新"
-                    else -> "未检测到"
-                },
-                subtitle = when {
-                    !caExists -> "生成 CA 后可一键安装系统信任模块"
-                    trust.status.done && trust.status.state != "ok" ->
-                        "上次注入失败：${trust.status.lines["error"].orEmpty().ifBlank { "请查看 ${com.namu.dns.RootCaManager.LOG_FILE}" }}；可点下方「一键安装/更新」重试"
-                    systemCertInstalled -> "当前 CA 已在系统证书区生效；模块方式重启不丢"
-                    trust.conflict -> "目标证书库最上层不是南门DNS：${trust.topSources.joinToString().ifBlank { "未知来源" }}，请点下方「重新注入」"
-                    trust.moduleInstalled && !trust.moduleCertMatches -> "模块内证书与当前 CA 不一致，请一键更新模块"
-                    trust.moduleInstalled -> "模块已写入并注入 Zygote；新启动的 App 直接信任，已运行 App 请强杀重开"
-                    else -> "尚未安装模块；有 Root 可一键写入并立即注入"
-                },
+                value = trustValue,
+                subtitle = trustSubtitle,
                 showDivider = true,
             )
             SettingsRow(
@@ -166,44 +181,46 @@ fun MitmScreen() {
                     com.namu.dns.RootCaManager.RootKind.NONE ->
                         if (trust.root.available) "未识别" else "未授权"
                 },
-                subtitle = trust.root.detail.take(120).ifBlank {
-                    "一键安装需要 Root；未授权时只导出模块 zip，手动安装"
-                },
+                subtitle = "Root 用于核验。模块在 Magisk、KernelSU 或 APatch 中安装、停用或移除",
+                showDivider = true,
+            )
+            SettingsRow(
+                title = "重新核验",
+                subtitle = "重新检查 CA 指纹、Root 模块与系统证书区；从模块管理器返回也会自动核验",
+                icon = Icons.Rounded.Refresh,
+                chevron = true,
                 showDivider = false,
+                onClick = {
+                    if (!busy) {
+                        vm.refresh()
+                        container.messages.show("已发起证书与模块重新核验")
+                    }
+                },
             )
         }
 
         SectionHeader("证书安装")
         GroupCard {
             SettingsRow(
-                title = "一键安装 / 更新系统 CA",
-                subtitle = "有 Root：写入 /data/adb/modules/namu_mitm_ca，按 staging + bind 幂等注入 Zygote；无 Root：自动导出模块 zip 手动装",
-                icon = Icons.Rounded.Shield,
-                value = when {
-                    busy -> "处理中…"
-                    trust.conflict || (trust.moduleInstalled && !trust.moduleCertMatches) -> "需要更新"
-                    else -> null
-                },
+                title = "安装与更新指引",
+                subtitle = "Magisk / KernelSU / APatch 的模块安装、更新、停用与重启步骤",
+                icon = Icons.Rounded.Info,
                 chevron = true,
-                onClick = { vm.installSystemCa() },
+                onClick = { showCaGuide = true },
             )
+            if (trust.root.available) {
+                SettingsRow(
+                    title = "导出安装日志",
+                    subtitle = "导出到「下载/NamuDNS」",
+                    icon = Icons.Rounded.Download,
+                    value = if (busy) "处理中…" else null,
+                    chevron = true,
+                    onClick = { vm.exportInjectionLog() },
+                )
+            }
             SettingsRow(
-                title = "移除系统 CA",
-                subtitle = "只 unmount source 指向南门DNS staging 的层，再删模块/日志/状态；不碰 APEX 自身或其他模块",
-                icon = Icons.Rounded.Security,
-                value = when {
-                    trust.moduleInstalled -> "可移除"
-                    systemCertInstalled -> "手动安装"
-                    else -> "未安装"
-                },
-                chevron = trust.moduleInstalled,
-                onClick = {
-                    if (trust.moduleInstalled) confirmRemoveCa = true
-                },
-            )
-            SettingsRow(
-                title = "仅导出模块 zip（手动安装）",
-                subtitle = "导出到「下载/NamuDNS」，文件名带 CA 指纹前 8 位；适合没有 Root 或想自己管理模块的情况",
+                title = "导出 CA 模块 ZIP",
+                subtitle = "Magisk / KernelSU / APatch；导出到「下载/NamuDNS」，只包含公开 CA",
                 icon = Icons.Rounded.Download,
                 value = if (busy) "处理中…" else null,
                 chevron = true,
@@ -211,7 +228,7 @@ fun MitmScreen() {
             )
             SettingsRow(
                 title = "仅导出证书文件",
-                subtitle = "PEM + DER 存到应用私有目录 mitm/export，可自行处理",
+                subtitle = "PEM + DER 与模块 zip 使用同一出口：公共「下载/NamuDNS」；无存储权限也可在文件管理器打开",
                 icon = Icons.Rounded.Download,
                 chevron = true,
                 showDivider = false,
@@ -401,19 +418,66 @@ fun MitmScreen() {
             onDismiss = { showScriptArgs = false },
         )
     }
-    if (confirmRemoveCa) {
+    if (showCaGuide) {
         NamuDialog(
-            title = "移除系统 CA？",
-            message = "将卸载南门DNS 自己注入的证书层，并删除模块、日志和状态。不会碰 APEX 自身或其他模块。移除后已运行 App 可能仍缓存旧证书，建议强杀重开。",
-            confirmText = "移除",
-            onConfirm = {
-                confirmRemoveCa = false
-                vm.removeSystemCa()
-            },
-            onDismiss = { confirmRemoveCa = false },
+            title = "CA 模块安装与更新",
+            message = "1. 点「导出 CA 模块 ZIP」，文件会保存到「下载/NamuDNS」。\n" +
+                "2. 在 Magisk、KernelSU 或 APatch 的模块页选择「从本地安装」，选中刚导出的 ZIP。\n" +
+                "3. 安装或覆盖更新后完整重启手机，再回到本页点「重新核验」。\n\n" +
+                "CA 不变时可继续复用同一模块；证书指纹变化后才需要覆盖更新。停用或移除模块也必须完整重启。",
+            confirmText = "知道了",
+            showDismiss = false,
+            onDismiss = { showCaGuide = false },
+            onConfirm = { showCaGuide = false },
+        )
+    }
+
+}
+
+/**
+ * 指纹是逐段核对的字符串，必须等宽、可换行、可复制；不能塞进 13sp 辅助字号的
+ * subtitle，也不能靠整行暗点。复制按钮独立 48dp 命中区。
+ */
+@Composable
+private fun FingerprintRow(
+    fingerprint: String?,
+    onCopy: () -> Unit,
+) {
+    Column(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .heightIn(min = 48.dp)
+                .padding(horizontal = 16.dp, vertical = 9.dp),
+            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
         ) {
-            Text("卸载即恢复系统原证书库。", fontSize = 12.sp, color = NamuColors.TextSub)
+            Column(Modifier.weight(1f)) {
+                Text("CA SHA-256 指纹", fontSize = 16.sp, color = NamuColors.TextMain)
+                Text(
+                    if (fingerprint == null) "生成 CA 后显示" else "与系统证书详情逐段核对",
+                    fontSize = 12.sp,
+                    color = NamuColors.TextSub,
+                )
+            }
+            MiniTextAction(
+                text = "复制",
+                enabled = fingerprint != null,
+                onClick = onCopy,
+            )
         }
+        if (fingerprint != null) {
+            Text(
+                fingerprint,
+                fontSize = 12.sp,
+                lineHeight = 17.sp,
+                fontFamily = FontFamily.Monospace,
+                color = NamuColors.TextMain,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
+            )
+        }
+        RowDivider(16.dp)
     }
 }
 

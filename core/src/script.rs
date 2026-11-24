@@ -76,12 +76,42 @@ impl ScriptMessage {
 fn default_script_timeout() -> u64 {
     DEFAULT_TIMEOUT_MS
 }
+fn default_true() -> bool {
+    true
+}
+/// 手写 Default：derive 会把 `enable` 置成 false，等于让所有老配置脚本静默停摆。
+/// 其余字段沿用 derive 口径（timeout/max_size 为 0，编译期再 clamp）。
+impl Default for ScriptRuleConf {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            phase: String::new(),
+            pattern: String::new(),
+            condition: String::new(),
+            source: String::new(),
+            arguments: HashMap::new(),
+            argument_types: HashMap::new(),
+            argument_values: HashMap::new(),
+            cron: String::new(),
+            trigger: String::new(),
+            argument_text: None,
+            timeout_ms: 0,
+            max_size: 0,
+            requires_body: false,
+            binary_body_mode: false,
+            meta: None,
+            legacy_chain: false,
+            enable: true,
+            enable_param: String::new(),
+        }
+    }
+}
 fn default_script_max_size() -> usize {
     2 * 1024 * 1024
 }
 
 /// 一条脚本规则（配置/模块合并后的中间表示）。
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScriptRuleConf {
     #[serde(default)]
@@ -129,6 +159,20 @@ pub struct ScriptRuleConf {
     /// `binary-body-mode=true`：`$request/$response.body` 以 Uint8Array 暴露。
     #[serde(default, alias = "binary_body_mode")]
     pub binary_body_mode: bool,
+    /// D0：稳定规则身份；缺省时由脚本名/阶段兜底。
+    #[serde(default)]
+    pub meta: Option<crate::hits::RuleMeta>,
+    /// 模块 legacy-chain：true 时沿用 2.8 的多脚本链式执行；默认 false = Loon 首条语义。
+    #[serde(default, alias = "legacy_chain")]
+    pub legacy_chain: bool,
+    /// Loon `enable`（缺省 true）。false 时条目仍保留在配置里供界面显示，
+    /// 但不进编译结果、不参与执行，也不计"不支持"。
+    #[serde(default = "default_true", alias = "enabled")]
+    pub enable: bool,
+    /// `enable=${name}`：启用状态由插件 [Argument] 的开关决定。编译期只记参数名，
+    /// 运行时按当前值求值——用户拨开关立即生效，不必重新解析整个模块。
+    #[serde(default)]
+    pub enable_param: String,
 }
 
 #[derive(Clone)]
@@ -154,6 +198,10 @@ pub struct CompiledScriptRule {
     pub max_size: usize,
     pub requires_body: bool,
     pub binary_body_mode: bool,
+    pub meta: Option<crate::hits::RuleMeta>,
+    pub legacy_chain: bool,
+    /// `enable=${name}` 的参数名；空 = 不看参数（静态启用）。
+    pub enable_param: String,
 }
 
 /// 已编译脚本集合；非法正则/阶段/空源码不会进入执行列表。
@@ -161,6 +209,9 @@ pub struct CompiledScriptRule {
 pub struct ScriptEngine {
     pub rules: Vec<CompiledScriptRule>,
     pub unsupported: Vec<String>,
+    /// Loon `disable=1` 的条目名；保留是为了让界面能显示"已禁用"，
+    /// 且不与 `unsupported`（语法/能力不支持）混为一谈。
+    pub disabled: Vec<String>,
     pub store: Arc<ScriptStore>,
     /// script key → 运行期当前值；只影响 `$argument` 注入，不重编译脚本。
     argument_overrides: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
@@ -168,6 +219,15 @@ pub struct ScriptEngine {
 
 fn script_key(phase: &str, pattern: &str, name: &str) -> String {
     format!("{}|{}|{}", phase.trim().to_ascii_lowercase(), pattern, name)
+}
+
+/// D5：Loon 默认每阶段只执行首条条件为 true 的脚本；
+/// 仅当首条脚本所属模块显式开启 legacy-chain 时保留 2.8 的链式集合。
+pub fn select_phase_hits(mut hits: Vec<CompiledScriptRule>) -> Vec<CompiledScriptRule> {
+    if !hits.first().map(|r| r.legacy_chain).unwrap_or(false) {
+        hits.truncate(1);
+    }
+    hits
 }
 
 impl CompiledScriptRule {
@@ -182,7 +242,18 @@ impl ScriptEngine {
     pub fn from_config(confs: &[ScriptRuleConf], store_file: &str) -> Self {
         let mut rules = Vec::new();
         let mut unsupported = Vec::new();
+        let mut disabled = Vec::new();
         for c in confs {
+            if !c.enable {
+                // Loon enable=false：脚本完全不执行。放在所有校验之前，
+                // 保持"禁用优先于其他错误"的口径——一条关掉的坏脚本不该报错。
+                disabled.push(if c.name.trim().is_empty() {
+                    c.pattern.trim().to_string()
+                } else {
+                    c.name.clone()
+                });
+                continue;
+            }
             let phase = match c.phase.trim().to_ascii_lowercase().as_str() {
                 "request" => ScriptPhase::Request,
                 "response" => ScriptPhase::Response,
@@ -268,6 +339,9 @@ impl ScriptEngine {
                 max_size: c.max_size.clamp(4096, 8 * 1024 * 1024),
                 requires_body: c.requires_body,
                 binary_body_mode: c.binary_body_mode,
+                meta: c.meta.clone(),
+                legacy_chain: c.legacy_chain,
+                enable_param: c.enable_param.trim().to_string(),
             });
         }
         let mut overrides = HashMap::new();
@@ -279,6 +353,7 @@ impl ScriptEngine {
         Self {
             rules,
             unsupported,
+            disabled,
             store: Arc::new(ScriptStore::new(store_file)),
             argument_overrides: Arc::new(Mutex::new(overrides)),
         }
@@ -305,11 +380,25 @@ impl ScriptEngine {
         })
     }
 
+    /// 脚本当前是否启用。静态 `enable=false` 编译期已剔除，这里只处理
+    /// `enable=${name}`：按运行期参数值求值，拨开关后下一次请求即生效。
+    fn rule_enabled(&self, rule: &CompiledScriptRule) -> bool {
+        if rule.enable_param.is_empty() {
+            return true;
+        }
+        let values = self.effective_argument_values(rule);
+        match values.get(&rule.enable_param).map(|v| v.trim().to_ascii_lowercase()) {
+            // 参数缺失/空值时沿用默认开关，不静默停掉脚本。
+            None => true,
+            Some(v) => !matches!(v.as_str(), "0" | "false" | "no" | "off"),
+        }
+    }
+
     /// 预筛命中（只看 URL pattern）；has_phase/正文预算等早期判断使用。
     pub fn hits(&self, url: &str, phase: ScriptPhase) -> Vec<&CompiledScriptRule> {
         self.rules
             .iter()
-            .filter(|r| r.phase == phase && r.url.is_match(url))
+            .filter(|r| r.phase == phase && r.url.is_match(url) && self.rule_enabled(r))
             .collect()
     }
 
@@ -327,6 +416,7 @@ impl ScriptEngine {
                 r.phase == phase
                     && r.url.is_match(url)
                     && r.cond.as_ref().map_or(true, |c| c.matches(url, headers))
+                    && self.rule_enabled(r)
             })
             .collect()
     }
@@ -341,7 +431,7 @@ impl ScriptEngine {
         self.rules
             .iter()
             .filter(|r| {
-                if r.phase != phase || !r.url.is_match(url) {
+                if r.phase != phase || !r.url.is_match(url) || !self.rule_enabled(r) {
                     return false;
                 }
                 let Some(cond) = &r.cond else { return true };
@@ -441,6 +531,8 @@ pub struct ScriptBatchResult {
     pub matched: usize,
     pub skipped: bool,
     pub short_circuit: bool,
+    /// Loon `$done()`：放弃请求并断开；仅 http 阶段。
+    pub aborted: bool,
     pub done_calls: usize,
     pub http_calls: usize,
     pub timed_out: bool,
@@ -454,6 +546,8 @@ pub struct ScriptBatchResult {
 pub struct ScriptOutcome {
     pub message: ScriptMessage,
     pub short_circuit_response: bool,
+    /// `$done()` 无参数：放弃请求并断开。
+    pub aborted: bool,
     pub done_calls: usize,
     pub http_calls: usize,
     pub notifications: Vec<String>,
@@ -463,9 +557,24 @@ pub struct ScriptOutcome {
     pub timed_out: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum DoneKind {
+    #[default]
+    None,
+    /// `$done()` / `$done(undefined)`：放弃请求断开（cron/generic 为正常结束）。
+    Abort,
+    /// `$done({})`：透传。
+    Pass,
+    /// `$done({response: ...})`：请求阶段终止响应。
+    Response,
+    /// `$done({url/headers/body/status...})`：改包后继续。
+    Modified,
+}
+
 #[derive(Debug, Clone)]
 struct DoneState {
     called: bool,
+    kind: DoneKind,
     calls: usize,
     url: Option<String>,
     method: Option<String>,
@@ -480,6 +589,7 @@ impl Default for DoneState {
     fn default() -> Self {
         Self {
             called: false,
+            kind: DoneKind::None,
             calls: 0,
             url: None,
             method: None,
@@ -805,15 +915,31 @@ fn value_bytes(v: &Value<'_>) -> Option<Vec<u8>> {
     None
 }
 
+fn abort_done_state() -> DoneState {
+    DoneState {
+        called: true,
+        kind: DoneKind::Abort,
+        calls: 1,
+        ..Default::default()
+    }
+}
+
 fn parse_done_value(value: &Value<'_>) -> DoneState {
     let mut d = DoneState {
         called: true,
         calls: 1,
         ..Default::default()
     };
+    if value.is_undefined() || value.is_null() {
+        d.kind = DoneKind::Abort;
+        return d;
+    }
     let Some(obj) = value.as_object() else {
+        // 非对象参数按 Loon 的口径视为放弃请求，避免把 `$done("x")` 当成透传。
+        d.kind = DoneKind::Abort;
         return d;
     };
+    d.kind = DoneKind::Pass;
     d.url = object_string(obj, "url");
     d.method = object_string(obj, "method");
     d.status = object_u16(obj, "status").or_else(|| object_u16(obj, "statusCode"));
@@ -829,6 +955,7 @@ fn parse_done_value(value: &Value<'_>) -> DoneState {
     }
     if let Ok(v) = obj.get::<_, Value>("response") {
         if let Some(resp) = v.as_object() {
+            d.kind = DoneKind::Response;
             d.nested_response = true;
             d.status = object_u16(resp, "status").or_else(|| object_u16(resp, "statusCode"));
             d.headers = object_headers_value(resp, "headers");
@@ -842,6 +969,16 @@ fn parse_done_value(value: &Value<'_>) -> DoneState {
                 }
             }
         }
+    }
+    if d.kind == DoneKind::Pass
+        && (d.url.is_some()
+            || d.method.is_some()
+            || d.status.is_some()
+            || d.headers.is_some()
+            || d.body.is_some()
+            || d.body_bytes.is_some())
+    {
+        d.kind = DoneKind::Modified;
     }
     d
 }
@@ -1269,6 +1406,7 @@ fn run_script_with_runtime(
     let stats = Arc::new(RuntimeStats::new());
     let mut evaluated = message.clone();
     let mut short_circuit = false;
+    let mut aborted = false;
     let mut eval_error: Option<String> = None;
     let context = match Context::full(rt) {
         Ok(c) => c,
@@ -1481,8 +1619,11 @@ fn run_script_with_runtime(
         // Loon 的 setInterval 当前也只执行一次；保持一致，避免无限循环。
         globals.set("setInterval", set_timer)?;
         let done2 = done.clone();
-        let done_fn = Function::new(ctx.clone(), move |v: Value| {
-            let mut d = parse_done_value(&v);
+        let done_fn = Function::new(ctx.clone(), move |v: Opt<Value>| {
+            let mut d = match v.0 {
+                Some(value) => parse_done_value(&value),
+                None => abort_done_state(),
+            };
             let mut state = done2.lock().unwrap();
             state.calls += d.calls;
             if !state.called {
@@ -1616,13 +1757,21 @@ fn run_script_with_runtime(
                 evaluated = read_message(&rq, phase_base, phase);
             }
             if done_now.called {
-                if done_now.nested_response {
-                    evaluated = apply_done(phase_base, &done_now, ScriptPhase::Response);
-                    if phase == ScriptPhase::Request {
-                        short_circuit = true;
+                match done_now.kind {
+                    DoneKind::Abort => {
+                        if phase != ScriptPhase::Cron {
+                            aborted = true;
+                        }
                     }
-                } else {
-                    evaluated = apply_done(&evaluated, &done_now, phase);
+                    DoneKind::Response => {
+                        evaluated = apply_done(phase_base, &done_now, ScriptPhase::Response);
+                        if phase == ScriptPhase::Request {
+                            short_circuit = true;
+                        }
+                    }
+                    DoneKind::Pass | DoneKind::Modified | DoneKind::None => {
+                        evaluated = apply_done(&evaluated, &done_now, phase);
+                    }
                 }
             }
             Ok::<(), rquickjs::Error>(())
@@ -1669,6 +1818,7 @@ fn run_script_with_runtime(
     }
     out.message = evaluated;
     out.short_circuit_response = short_circuit;
+    out.aborted = aborted;
     out
 }
 
@@ -1803,6 +1953,12 @@ impl ScriptWorkerPool {
 
     pub fn note_skipped(&self) {
         self.stats.skipped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 排队超时等「已命中但没能执行」的情形计入失败，不计跳过：
+    /// 跳过只应表示脚本自身不适用，不得用来掩盖并发限流造成的结果丢失。
+    pub fn note_failed(&self) {
+        self.stats.failed.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn health(&self) -> ScriptPoolHealth {
@@ -2300,6 +2456,123 @@ mod tests {
     }
 
     #[test]
+    fn disabled_script_is_reported_but_never_compiled_or_hit() {
+        let confs = vec![
+            ScriptRuleConf {
+                name: "off".into(),
+                phase: "request".into(),
+                pattern: r"^https://api\.example\.com/".into(),
+                source: "$done({});".into(),
+                enable: false,
+                ..Default::default()
+            },
+            // 关掉的坏脚本不该报 unsupported：enable 优先级高于语法校验，
+            // 否则界面会把「用户主动关掉」误显示成「语法不支持」。
+            ScriptRuleConf {
+                name: "off-broken".into(),
+                phase: "stream".into(),
+                pattern: "(".into(),
+                source: String::new(),
+                enable: false,
+                ..Default::default()
+            },
+            ScriptRuleConf {
+                name: "on".into(),
+                phase: "request".into(),
+                pattern: r"^https://api\.example\.com/".into(),
+                source: "$done({});".into(),
+                ..Default::default()
+            },
+        ];
+        let engine = ScriptEngine::from_config(&confs, "");
+        assert_eq!(engine.rules.len(), 1, "禁用条目不进执行列表");
+        assert_eq!(engine.rules[0].name, "on");
+        assert!(
+            engine.unsupported.is_empty(),
+            "禁用优先，不该报不支持: {:?}",
+            engine.unsupported
+        );
+        assert_eq!(engine.disabled, vec!["off".to_string(), "off-broken".to_string()]);
+        assert_eq!(
+            engine
+                .hits("https://api.example.com/v1", ScriptPhase::Request)
+                .len(),
+            1,
+            "禁用条目不参与命中"
+        );
+    }
+
+    #[test]
+    fn script_conf_reads_enable_flag_from_kernel_json() {
+        // 外壳按 camelCase 下发；`enabled` 作为别名兜住手写配置。
+        let c: ScriptRuleConf =
+            serde_json::from_str(r#"{"name":"a","phase":"request","source":"$done({})","enable":false}"#)
+                .unwrap();
+        assert!(!c.enable);
+        let c2: ScriptRuleConf = serde_json::from_str(r#"{"enabled":false}"#).unwrap();
+        assert!(!c2.enable);
+        let c3: ScriptRuleConf = serde_json::from_str(r#"{"name":"b"}"#).unwrap();
+        assert!(c3.enable, "缺省必须是启用，不能把老配置变成禁用");
+    }
+
+    #[test]
+    fn enable_param_follows_argument_switch_without_recompiling() {
+        let mut args = HashMap::new();
+        args.insert("enabled".to_string(), "false".to_string());
+        let conf = ScriptRuleConf {
+            name: "switch".into(),
+            phase: "request".into(),
+            pattern: r"^https://api\.example\.com/".into(),
+            source: r#"$done({body:"hit"});"#.into(),
+            arguments: args,
+            enable_param: "enabled".into(),
+            ..Default::default()
+        };
+        let engine = ScriptEngine::from_config(&[conf], "");
+        assert_eq!(engine.rules.len(), 1, "参数驱动的条目要编译，只是运行时判启用");
+        assert!(
+            engine
+                .hits("https://api.example.com/v1", ScriptPhase::Request)
+                .is_empty(),
+            "开关是 false 时不得命中"
+        );
+        // 拨开关：只改运行期值，不重解析模块。
+        let mut on = HashMap::new();
+        on.insert("enabled".to_string(), "true".to_string());
+        engine.set_argument_values(&engine.rules[0].key, on);
+        assert_eq!(
+            engine
+                .hits("https://api.example.com/v1", ScriptPhase::Request)
+                .len(),
+            1,
+            "开关拨到 true 后立刻生效"
+        );
+    }
+
+    #[test]
+    fn enable_param_without_value_stays_enabled() {
+        // Loon：参数缺失时沿用默认开关，不能静默把脚本停掉。
+        let mut args = HashMap::new();
+        args.insert("enabled".to_string(), String::new());
+        let conf = ScriptRuleConf {
+            name: "switch".into(),
+            phase: "request".into(),
+            pattern: r"^https://api\.example\.com/".into(),
+            source: "$done({});".into(),
+            arguments: args,
+            enable_param: "enabled".into(),
+            ..Default::default()
+        };
+        let engine = ScriptEngine::from_config(&[conf], "");
+        assert_eq!(
+            engine
+                .hits("https://api.example.com/v1", ScriptPhase::Request)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn script_condition_tree_matches_method_body_status_and_argument() {
         let mut args = HashMap::new();
         args.insert("region".to_string(), "CN".to_string());
@@ -2649,4 +2922,92 @@ mod tests {
         assert_eq!(health.completed, 2);
         assert_eq!(health.timed_out, 1);
     }
+    #[test]
+    fn loon_done_empty_aborts_and_empty_object_passes() {
+        let out = run_script(
+            "$done();",
+            ScriptPhase::Request,
+            &req(),
+            &ScriptOptions::default(),
+        );
+        assert!(out.error.is_none());
+        assert!(out.aborted, "$done() 应放弃请求并断开");
+        assert!(!out.short_circuit_response);
+
+        let out = run_script(
+            "$done({});",
+            ScriptPhase::Request,
+            &req(),
+            &ScriptOptions::default(),
+        );
+        assert!(out.error.is_none());
+        assert!(!out.aborted, "$done({{}}) 应透传");
+        assert_eq!(out.message.body, req().body);
+    }
+
+    #[test]
+    fn loon_done_nested_response_short_circuits_request() {
+        let out = run_script(
+            r#"$done({response:{status:403,headers:{"content-type":"text/plain"},body:"blocked"}});"#,
+            ScriptPhase::Request,
+            &req(),
+            &ScriptOptions::default(),
+        );
+        assert!(out.error.is_none());
+        assert!(out.short_circuit_response, "$done({{response}}) 应终止请求");
+        assert_eq!(out.message.status, 403);
+        assert_eq!(out.message.body, "blocked");
+    }
+
+    #[test]
+    fn loon_done_modified_keeps_request_going() {
+        let out = run_script(
+            r#"$done({url:"https://api.example.com/v2",headers:[["x-a","1"]],body:"patched"});"#,
+            ScriptPhase::Request,
+            &req(),
+            &ScriptOptions::default(),
+        );
+        assert!(out.error.is_none());
+        assert!(!out.aborted);
+        assert!(!out.short_circuit_response);
+        assert_eq!(out.message.url, "https://api.example.com/v2");
+        assert_eq!(out.message.body, "patched");
+    }
+
+    #[test]
+    fn cron_done_empty_is_normal_end() {
+        let out = run_script(
+            "$done();",
+            ScriptPhase::Cron,
+            &req(),
+            &ScriptOptions::default(),
+        );
+        assert!(out.error.is_none());
+        assert!(!out.aborted, "cron/generic 的 $done() 是正常结束");
+    }
+
+    #[test]
+    fn loon_default_selects_first_script_and_legacy_chain_keeps_all() {
+        let base = ScriptRuleConf {
+            phase: "request".into(),
+            pattern: "^https://api\\.example\\.com/".into(),
+            source: "$done({});".into(),
+            ..Default::default()
+        };
+        let a = ScriptRuleConf { name: "a".into(), ..base.clone() };
+        let b = ScriptRuleConf { name: "b".into(), ..base.clone() };
+        let engine = ScriptEngine::from_config(&[a, b], "/tmp/namu-script-select.json");
+        let hits = engine.hits("https://api.example.com/v1", ScriptPhase::Request)
+            .into_iter().cloned().collect::<Vec<_>>();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(select_phase_hits(hits).len(), 1, "Loon 每阶段只跑首条");
+
+        let legacy_a = ScriptRuleConf { name: "a".into(), legacy_chain: true, ..base.clone() };
+        let legacy_b = ScriptRuleConf { name: "b".into(), legacy_chain: true, ..base };
+        let engine = ScriptEngine::from_config(&[legacy_a, legacy_b], "/tmp/namu-script-select2.json");
+        let hits = engine.hits("https://api.example.com/v1", ScriptPhase::Request)
+            .into_iter().cloned().collect::<Vec<_>>();
+        assert_eq!(select_phase_hits(hits).len(), 2, "legacy-chain 保留旧链式行为");
+    }
+
 }

@@ -8,6 +8,38 @@ import org.json.JSONObject
 import java.io.File
 
 object ConfigStore {
+    /** S3：模块顺序以显式 order 为准；旧模块 order=-1 时按列表下标兜底，不重排。 */
+    fun orderedModules(cfg: AppConfig): List<ModuleSource> =
+        cfg.moduleSources.withIndex()
+            .sortedWith(compareBy({ if (it.value.order >= 0) it.value.order else Int.MAX_VALUE / 2 + it.index }, { it.index }))
+            .map { it.value }
+
+    private fun shortRuleId(vararg parts: String): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(parts.joinToString("|").toByteArray())
+        return digest.joinToString("") { "%02x".format(it) }.take(12)
+    }
+
+    private fun makeMeta(
+        section: String,
+        key: String,
+        sourceId: String,
+        sourceName: String,
+        order: Long,
+    ): RuleMeta = RuleMeta(
+        section = section,
+        key = key,
+        ruleId = shortRuleId(sourceId, section, key),
+        sourceType = section,
+        sourceId = sourceId.ifBlank { "config" },
+        sourceName = sourceName.ifBlank { "当前配置" },
+        order = order,
+    )
+
+    /** 配置文件自身的规则身份；模块规则优先，手写/当前配置只在同名 key 上补位。 */
+    private fun configMeta(section: String, key: String, order: Long): RuleMeta =
+        makeMeta(section, key, "config", "当前配置", order)
+
     /** 配置文件落盘统一走单线程队列：不阻塞主线程，且保证写入顺序。 */
     private val fileIo = java.util.concurrent.Executors.newSingleThreadExecutor()
 
@@ -136,6 +168,18 @@ object ConfigStore {
         val moduleMitm = if (cfg.moduleSources.any { it.enabled }) {
             runCatching { JSONObject(moduleMitmFile(context).readText()) }.getOrNull()
         } else null
+        val hostMeta = LinkedHashMap<String, RuleMeta>()
+        moduleMitm?.optJSONArray("ruleMeta")?.let { a ->
+            for (i in 0 until a.length()) {
+                val m = a.optJSONObject(i)?.let { RuleMeta.fromJson(it) }
+                if (m != null && m.section == "host") hostMeta[m.key] = m
+            }
+        }
+        var hostMetaOrder = (hostMeta.values.maxOfOrNull { it.order } ?: -1L) + 1
+        cfg.mitm.hostMappings.forEach { (k, _) ->
+            val key = k.trim().lowercase()
+            if (key.isNotBlank()) hostMeta[key] = configMeta("host", key, hostMetaOrder++)
+        }
         root.put("mode", cfg.mode)
         root.put("selected", cfg.selected ?: "")
         root.put("final_policy", cfg.finalPolicy)
@@ -146,6 +190,8 @@ object ConfigStore {
         root.put("fake_ip", cfg.fakeIp)
         // Fake-IP 映射落盘（内核 1.1.0：mihomo/sing-box cache_file 同款），重启后连接层仍能反查域名
         root.put("fake_ip_file", File(context.filesDir, "namu_fakeip.json").absolutePath)
+        // D2/D3：轻量命中摘要与小时历史；关闭命中摘要后内核不写盘。
+        root.put("hit_history_file", File(File(context.filesDir, "stats"), "history.json").absolutePath)
         root.put("sniff", cfg.sniff)
         root.put("mtu", cfg.mtu.coerceIn(1280, 9000))
         root.put("bbr", cfg.bbr)
@@ -188,6 +234,7 @@ object ConfigStore {
                     }
                     merged.forEach { (k, v) -> put(k, v) }
                 })
+                put("host_meta", JSONArray(hostMeta.values.map { it.toJson() }))
                 put("cache_ttl", cfg.dnsCacheTtl)
                 put("cache_size", 2048)
                 put("block_ttl", cfg.blockTtl)
@@ -230,13 +277,39 @@ object ConfigStore {
             if (unresolved.isNotEmpty()) {
                 android.util.Log.w("NamuUid", "包名规则未解析（应用可能未安装）：$unresolved")
             }
-            expanded.forEach { put(it.copy(source = it.source.ifBlank { "配置" }).toJson()) }
+            var order = 0L
+            expanded.forEach { rule ->
+                val key = "${rule.type}|${rule.value}|${rule.action}"
+                put(
+                    rule.copy(
+                        source = rule.source.ifBlank { "配置" },
+                        meta = rule.meta ?: configMeta("dns", key, order++),
+                    ).toJson(),
+                )
+            }
             if (moduleRules != null) {
                 for (i in 0 until moduleRules.length()) put(moduleRules.get(i))
             }
         })
         // MITM 分区：active 配置 + 启用模块合并。内核 1.11 消费；
         // url_rewrites/header_rewrites 下发原始模块规则行，由内核统一解析成结构化规则。
+        val mitmMeta = LinkedHashMap<String, RuleMeta>()
+        moduleMitm?.optJSONArray("ruleMeta")?.let { a ->
+            for (i in 0 until a.length()) {
+                val m = a.optJSONObject(i)?.let { RuleMeta.fromJson(it) }
+                if (m != null && m.section != "host") mitmMeta["${m.section}|${m.key}"] = m
+            }
+        }
+        var mitmMetaOrder = (mitmMeta.values.maxOfOrNull { it.order } ?: -1L) + 1
+        fun putConfigMitmMeta(section: String, key: String) {
+            mitmMeta["$section|$key"] = configMeta(section, key, mitmMetaOrder++)
+        }
+        cfg.mitm.urlRewrites.forEach { putConfigMitmMeta("url", it) }
+        cfg.mitm.headerRewrites.forEach { putConfigMitmMeta("header", it) }
+        cfg.mitm.loonRewrites.forEach { putConfigMitmMeta("loon", it) }
+        cfg.mitm.bodyRewrites.forEach { putConfigMitmMeta("body", it) }
+        cfg.mitm.wsRewrites.forEach { putConfigMitmMeta("ws", it) }
+        cfg.mitm.scripts.forEach { putConfigMitmMeta("script", scriptKey(it)) }
         root.put("mitm", JSONObject().apply {
             val hosts = LinkedHashSet(cfg.mitm.hostnames)
             val skips = LinkedHashSet(cfg.mitm.skipHostnames)
@@ -246,7 +319,10 @@ object ConfigStore {
             val body = LinkedHashSet(cfg.mitm.bodyRewrites)
             val wsRules = LinkedHashSet(cfg.mitm.wsRewrites)
             val scripts = LinkedHashMap<String, ScriptConfig>()
-            cfg.mitm.scripts.forEach { scripts[scriptKey(it)] = it }
+            cfg.mitm.scripts.forEach { sc ->
+                val key = scriptKey(sc)
+                scripts[key] = sc.copy(meta = sc.meta ?: configMeta("script", key, 0))
+            }
             moduleMitm?.let { m ->
                 m.optJSONArray("hostnames")?.let { a -> for (i in 0 until a.length()) hosts.add(a.optString(i)) }
                 m.optJSONArray("skipHostnames")?.let { a -> for (i in 0 until a.length()) skips.add(a.optString(i)) }
@@ -293,7 +369,16 @@ object ConfigStore {
                 put("language", java.util.Locale.getDefault().language)
                 put("timezone", java.util.TimeZone.getDefault().id)
                 put("packageName", context.packageName)
+                // S5 NodeInfo：脚本可读取当前节点摘要；不含密码/UUID 等凭据。
+                val node = cfg.nodes.firstOrNull { it.name == cfg.selected } ?: cfg.nodes.firstOrNull()
+                if (node != null) {
+                    put("nodeName", node.name)
+                    put("nodeType", node.type)
+                    put("nodeServer", node.server)
+                    put("nodePort", node.port)
+                }
             })
+            put("rule_meta", JSONArray(mitmMeta.values.map { it.toJson() }))
             // CA 必须与 MitmManager.caFile 保持一致；未导出前内核会自行生成。
             put("ca_file", File(File(dir, "mitm"), "ca.pem").absolutePath)
             put("body_limit", 2 * 1024 * 1024)
@@ -307,12 +392,31 @@ object ConfigStore {
             put("finance", FinanceProtect.toJson(context, cfg.financeProtect))
         })
         root.put(
+            "rule_meta",
+            JSONArray().apply {
+                moduleMitm?.optJSONArray("dnsRuleMeta")?.let { a ->
+                    for (i in 0 until a.length()) put(a.get(i))
+                }
+            },
+        )
+        root.put(
             "ads_files",
             JSONArray().apply { ads.forEach { put(it.absolutePath) } },
         )
         root.put("cn_domains_file", File(dir, "cn_domains.txt").absolutePath)
         root.put("cn_ip_file", File(dir, "cnip.txt").absolutePath)
         return root.toString()
+    }
+
+    /** S6：Profile 名单 + 模块 [General] 的 ssid-trigger 合并；仍要求本地 opt-in。 */
+    fun effectiveSsidTriggers(context: Context, cfg: AppConfig): List<String> {
+        val out = LinkedHashSet(cfg.ssidTriggerNames.map { it.trim() }.filter { it.isNotBlank() })
+        runCatching { JSONObject(moduleMitmFile(context).readText()) }
+            .getOrNull()
+            ?.optJSONObject("generalEffects")
+            ?.optJSONArray("ssidTriggers")
+            ?.let { a -> for (i in 0 until a.length()) a.optString(i, "").trim().takeIf { it.isNotBlank() }?.let { out.add(it) } }
+        return out.toList()
     }
 
     fun rulesFile(context: Context): File = File(context.filesDir, "ads_url.txt")
@@ -375,10 +479,13 @@ object ConfigStore {
         val wsRewrites = LinkedHashSet<String>()
         val hostMappings = LinkedHashMap<String, String>()
         val scripts = LinkedHashMap<String, ScriptConfig>()
+        val dnsMeta = LinkedHashMap<String, RuleMeta>()
+        val mitmMeta = LinkedHashMap<String, RuleMeta>()
+        var ruleOrder = 0L
         val scriptIssues = LinkedHashSet<String>()
         val ruleSetIssues = LinkedHashSet<String>()
         var ignored = 0
-        cfg.moduleSources.filter { it.enabled }.forEach { src ->
+        orderedModules(cfg).filter { it.enabled }.forEach { src ->
             val file = moduleFile(context, src.id)
             if (!file.exists() || file.length() == 0L) return@forEach
             val parsed = runCatching { ModuleParser.parse(file.readText()) }.getOrNull()
@@ -386,9 +493,24 @@ object ConfigStore {
                 ruleSetIssues.add("${src.name.ifBlank { "模块" }}：模块正文解析失败，整份模块不会生效")
                 return@forEach
             }
-            blocks.addAll(parsed.blockLines)
-            allows.addAll(parsed.allowLines)
-            routes.addAll(parsed.routeRules.map { it.copy(source = src.name.ifBlank { "模块" }) })
+            parsed.blockLines.forEach { line ->
+                if (blocks.add(line)) {
+                    dnsMeta[line] = makeMeta("dns", line, src.id, src.name, ruleOrder++)
+                }
+            }
+            parsed.allowLines.forEach { line ->
+                if (allows.add(line)) {
+                    dnsMeta[line] = makeMeta("dns", line, src.id, src.name, ruleOrder++)
+                }
+            }
+            parsed.routeRules.forEach { rule ->
+                routes.add(
+                    rule.copy(
+                        source = src.name.ifBlank { "模块" },
+                        meta = makeMeta("route", "${rule.type}|${rule.value}|${rule.action}", src.id, src.name, ruleOrder++),
+                    ),
+                )
+            }
             // 规则集：用已缓存内容展开；未缓存/为空时跳过（导入/同步阶段负责拉取）。
             // 展开结果与跳过原因统一进 modules_mitm.json，避免「一条都没生效」无人察觉。
             parsed.ruleSets.forEach rsLoop@{ rs ->
@@ -405,7 +527,19 @@ object ConfigStore {
                     rs.action,
                     src.name.ifBlank { "模块" } + "·规则集",
                 )
-                routes.addAll(res.items)
+                routes.addAll(
+                    res.items.map { rule ->
+                        rule.copy(
+                            meta = rule.meta ?: makeMeta(
+                                "route",
+                                "${rule.type}|${rule.value}|${rule.action}",
+                                src.id,
+                                src.name.ifBlank { "模块" } + "·规则集",
+                                ruleOrder++,
+                            ),
+                        )
+                    },
+                )
                 if (res.note != null || res.items.isEmpty()) {
                     ruleSetIssues.add(
                         "$label：${res.format} 展开 ${res.items.size} 条" +
@@ -417,32 +551,70 @@ object ConfigStore {
             mitmSkips.addAll(parsed.mitmSkipHostnames)
             parsed.generalOptions.forEach { (k, v) -> if (!generalOptions.containsKey(k)) generalOptions[k] = v }
             parsed.mitmOptions.forEach { (k, v) -> if (!mitmOptions.containsKey(k)) mitmOptions[k] = v }
-            urlRewrites.addAll(parsed.urlRewrites)
-            headerRewrites.addAll(parsed.headerRewrites)
-            loonRewrites.addAll(parsed.loonRewrites)
-            bodyRewrites.addAll(parsed.bodyRewrites)
-            wsRewrites.addAll(parsed.wsRewrites)
+            parsed.urlRewrites.forEach { line ->
+                if (urlRewrites.add(line)) {
+                    mitmMeta["url|$line"] = makeMeta("url", line, src.id, src.name, ruleOrder++)
+                }
+            }
+            parsed.headerRewrites.forEach { line ->
+                if (headerRewrites.add(line)) {
+                    mitmMeta["header|$line"] = makeMeta("header", line, src.id, src.name, ruleOrder++)
+                }
+            }
+            parsed.loonRewrites.forEach { line ->
+                if (loonRewrites.add(line)) {
+                    mitmMeta["loon|$line"] = makeMeta("loon", line, src.id, src.name, ruleOrder++)
+                }
+            }
+            parsed.bodyRewrites.forEach { line ->
+                if (bodyRewrites.add(line)) {
+                    mitmMeta["body|$line"] = makeMeta("body", line, src.id, src.name, ruleOrder++)
+                }
+            }
+            parsed.wsRewrites.forEach { line ->
+                if (wsRewrites.add(line)) {
+                    mitmMeta["ws|$line"] = makeMeta("ws", line, src.id, src.name, ruleOrder++)
+                }
+            }
             parsed.hostMappings.forEach { (k, v) ->
                 // 先加载的模块优先；重复 key 不让后加载模块静默覆盖。
-                if (!hostMappings.containsKey(k)) hostMappings[k] = v
+                val key = k.trim().lowercase()
+                if (!hostMappings.containsKey(key)) {
+                    hostMappings[key] = v
+                    mitmMeta["host|$key"] = makeMeta("host", key, src.id, src.name, ruleOrder++)
+                }
             }
+            val legacyChain = parsed.generalOptions["legacy-chain"]
+                ?.let { it.equals("true", ignoreCase = true) || it == "1" } ?: false
             parsed.scripts.forEach { rule ->
-                var src = rule.source
-                if (src.isBlank() && rule.scriptPath.isNotBlank()) {
+                var body = rule.source
+                if (body.isBlank() && rule.scriptPath.isNotBlank()) {
                     val cache = scriptCacheFile(context, rule.scriptPath)
                     if (cache.exists() && cache.length() > 0) {
-                        src = runCatching { cache.readText() }.getOrDefault("")
+                        body = runCatching { cache.readText() }.getOrDefault("")
                     }
                 }
-                if (src.isBlank()) {
+                if (body.isBlank()) {
                     scriptIssues.add("${rule.name}: 脚本正文未缓存，不会执行")
                 } else {
-                    scripts[scriptKey(rule)] = rule.copy(source = src)
+                    val key = scriptKey(rule)
+                    if (!scripts.containsKey(key)) {
+                        val meta = makeMeta("script", key, src.id, src.name, ruleOrder++)
+                        mitmMeta["script|$key"] = meta
+                        scripts[key] = rule.copy(
+                            source = body,
+                            meta = meta,
+                            legacyChain = rule.legacyChain || legacyChain,
+                        )
+                    }
                 }
             }
             parsed.scriptIssues.forEach { scriptIssues.add(it) }
             ignored += parsed.ignored
         }
+        // S6：模块 General 里只影响壳行为的键在写盘前映射一次。
+        val generalEffects = com.namu.dns.core.config.ModuleGeneral.parse(generalOptions)
+        mitmSkips.addAll(generalEffects.skipHosts)
         // block 与 allow 必须写入同一个过滤文件：FilterEngine 按文件顺序处理 @@ 例外。
         writeAtomic(moduleBlockFile(context), (blocks + allows).joinToString("\n"))
         writeAtomic(
@@ -466,8 +638,17 @@ object ConfigStore {
                 put("wsRewrites", JSONArray(wsRewrites.toList()))
                 put("hostMappings", JSONObject(hostMappings as Map<*, *>))
                 put("scripts", JSONArray(scripts.values.map { it.toJsonObject() }))
+                put("dnsRuleMeta", JSONArray(dnsMeta.values.map { it.toJson() }))
+                put("ruleMeta", JSONArray(mitmMeta.values.map { it.toJson() }))
                 put("scriptIssues", JSONArray(scriptIssues.toList()))
                 put("ruleSetIssues", JSONArray(ruleSetIssues.toList()))
+                put("generalEffects", JSONObject().apply {
+                    put("skipHosts", JSONArray(generalEffects.skipHosts))
+                    put("ssidTriggers", JSONArray(generalEffects.ssidTriggers))
+                    put("testUrl", generalEffects.testUrl)
+                    put("testTimeout", generalEffects.testTimeout)
+                    put("forceCloseConnections", generalEffects.forceCloseConnections)
+                })
                 put("ignoredRules", ignored)
             }.toString(),
         )

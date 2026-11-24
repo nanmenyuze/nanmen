@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 门形品牌标：与应用内首页标识同一形状。108dp 视口，图形落在 72dp 安全区内。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- 顶部独立短横杠 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M48,36.6 H60 A2.4,2.4 0 0 1 60,41.4 H48 A2.4,2.4 0 0 1 48,36.6 Z" />
+    <!-- 平顶拱门：小圆角、粗腿、底部开口 -->
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="7.87"
+        android:strokeLineCap="butt"
+        android:strokeLineJoin="miter"
+        android:fillColor="#00000000"
+        android:pathData="M34.93,71.4 V50.83 Q34.93,49.33 36.43,49.33 H71.57 Q73.07,49.33 73.07,50.83 V71.4" />
+</vector>

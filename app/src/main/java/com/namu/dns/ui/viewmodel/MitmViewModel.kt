@@ -38,12 +38,11 @@ class MitmViewModel(
     private val exportDirFallback: () -> String = { "" },
     private val caFingerprintCheck: () -> String? = { null },
     private val systemCertCheck: (systemName: String) -> Boolean = { _ -> false },
-    private val installCaAction: suspend (pemPath: String, systemName: String) -> RootCaManager.Result =
-        { _, _ -> RootCaManager.Result(false, "一键安装未接入") },
-    private val removeCaAction: suspend () -> RootCaManager.Result =
-        { RootCaManager.Result(false, "移除系统 CA 未接入") },
     private val trustSnapshotCheck: suspend (systemName: String) -> RootCaManager.TrustSnapshot =
         { RootCaManager.TrustSnapshot() },
+    private val publishExport: suspend (MitmManager.ExportResult) -> String = { "" },
+    private val readInjectionLog: suspend () -> String = { "" },
+    private val publishLog: suspend (String) -> String = { "" },
 ) : ViewModel() {
 
     private val _busy = MutableStateFlow(false)
@@ -77,7 +76,8 @@ class MitmViewModel(
             val snapshot = withContext(Dispatchers.IO) {
                 if (systemName.isBlank()) {
                     RootCaManager.TrustSnapshot(
-                        systemCertInstalled = systemCertCheck(systemName),
+                        visibleInSelf = systemCertCheck(systemName),
+                        detail = "证书尚未生成或导出，无法核验系统区",
                     )
                 } else {
                     runCatching { trustSnapshotCheck(systemName) }
@@ -87,7 +87,7 @@ class MitmViewModel(
             _caExists.value = exists
             _caFingerprint.value = fingerprint
             _trust.value = snapshot
-            _systemCertInstalled.value = snapshot.systemCertInstalled
+            _systemCertInstalled.value = snapshot.visibleInSelf
         }
     }
 
@@ -149,41 +149,70 @@ class MitmViewModel(
         )
     }
 
-    /** 生成 KernelSU/Magisk 系统信任模块（开机早期挂载、重启不丢）。 */
+    /** 导出由 Magisk 管理的系统 CA 模块。 */
     fun generateTrustModule() = withExport { r ->
         val result = generateModule(r.pemPath, r.systemName)
         if (result.ok) {
             _systemCertInstalled.value = systemCertCheck(r.systemName)
             messages.show(
-                "系统信任模块已导出：${result.path}。用 KernelSU/Magisk「从存储安装」该模块后重启，" +
-                    "所有 App 即信任此 CA（重启不丢）。",
+                "模块已导出到 ${result.path}。请在 Magisk 中从存储安装，然后完整重启。",
             )
         } else {
             messages.show("模块生成失败：${result.error}")
         }
     }
 
-    /** 有 Root 时直接写模块并立即注入 Zygote；无 Root 自动退回导出 zip。 */
-    fun installSystemCa() = withExport { r ->
-        val result = installCaAction(r.pemPath, r.systemName)
-        refreshTrust(r.systemName)
-        messages.show(result.message.ifBlank { if (result.ok) "系统 CA 已安装" else "安装失败" })
-    }
-
-    /** 精确 umount 我们自己的 staging 层，再删模块与状态。 */
-    fun removeSystemCa() {
+    /** 同时导出开机日志和 App 此刻看到的证书状态。 */
+    fun exportInjectionLog() {
         if (_busy.value) return
         viewModelScope.launch {
             _busy.value = true
             try {
-                val result = removeCaAction()
-                refreshTrust(lastSystemName)
-                messages.show(result.message.ifBlank { if (result.ok) "已移除系统 CA" else "移除失败" })
+                val systemName = lastSystemName
+                val (log, snapshot) = withContext(Dispatchers.IO) {
+                    val log = runCatching { readInjectionLog() }.getOrDefault("")
+                    val snapshot = if (systemName.isBlank()) {
+                        RootCaManager.TrustSnapshot(detail = "当前未取得 CA 文件名")
+                    } else {
+                        runCatching { trustSnapshotCheck(systemName) }.getOrElse {
+                            RootCaManager.TrustSnapshot(detail = "实时核验异常：${it.javaClass.simpleName}")
+                        }
+                    }
+                    log to snapshot
+                }
+                val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
+                    .format(java.util.Date())
+                val report = buildString {
+                    appendLine("南门DNS 注入日志 $stamp")
+                    appendLine()
+                    appendLine(log.ifBlank { "未读到开机注入日志" })
+                    appendLine()
+                    appendLine("=== 当前 App 核验 ===")
+                    appendLine("cert=$systemName")
+                    appendLine("root=${snapshot.root.kind}, available=${snapshot.root.available}")
+                    appendLine("current_boot=${snapshot.bootId}")
+                    appendLine("target=${snapshot.target}")
+                    appendLine("module_cert_matches=${snapshot.moduleCertMatches}")
+                    appendLine("resolved_state=${RootCaManager.resolveTrustState(_caExists.value, snapshot)}")
+                    appendLine("zygote_count=${snapshot.zygoteChecks.size}")
+                    for (check in snapshot.zygoteChecks) {
+                        appendLine("${check.process}: ids=${check.directoryIds.joinToString(",")}, " +
+                            "mount_matches=${check.ownsTarget}, cert_readable=${check.certificateReadable}, " +
+                            "cert_matches=${check.certificateMatches}")
+                    }
+                    if (snapshot.detail.isNotBlank()) appendLine("detail=${snapshot.detail}")
+                }
+                val path = runCatching { publishLog(report) }.getOrDefault("")
+                messages.show(
+                    if (path.isBlank()) "日志导出失败，请稍后重试"
+                    else "日志已导出到 $path，可直接打开或分享",
+                )
             } finally {
                 _busy.value = false
             }
         }
     }
+
 
     private suspend fun refreshTrust(systemName: String) {
         if (systemName.isBlank()) return
@@ -192,12 +221,17 @@ class MitmViewModel(
                 .getOrElse { RootCaManager.TrustSnapshot(detail = it.message.orEmpty()) }
         }
         _trust.value = snapshot
-        _systemCertInstalled.value = snapshot.systemCertInstalled
+        _systemCertInstalled.value = snapshot.visibleInSelf
     }
 
     fun exportOnly() = withExport { r ->
-        val dir = File(r.derPath).parent ?: exportDirFallback()
-        messages.show("已导出到 $dir：namu-ca.pem / namu-ca.crt（DER）")
+        val publicPath = publishExport(r)
+        if (publicPath.isNotBlank()) {
+            messages.show("已导出到 $publicPath：namu-ca.pem（PEM）/ namu-ca.crt（DER）")
+        } else {
+            val dir = File(r.derPath).parent ?: exportDirFallback()
+            messages.show("已导出到 $dir：namu-ca.pem / namu-ca.crt（DER）")
+        }
     }
 
     private fun withExport(after: suspend (MitmManager.ExportResult) -> Unit) {
@@ -234,9 +268,10 @@ class MitmViewModel(
                     exportDirFallback = { MitmManager.exportDir(app).absolutePath },
                     caFingerprintCheck = { MitmManager.caFingerprint(app) },
                     systemCertCheck = { name -> MitmManager.systemCertInstalled(app, name) },
-                    installCaAction = { pem, name -> RootCaManager.install(app, pem, name) },
-                    removeCaAction = { RootCaManager.remove(app) },
                     trustSnapshotCheck = { name -> RootCaManager.inspect(app, name) },
+                    publishExport = { r -> Actions.exportCertificateFiles(app, r) },
+                    readInjectionLog = { RootCaManager.diagnosticLog() },
+                    publishLog = { text -> Actions.exportText(app, "namu_mitm_inject_log.txt", text) },
                 )
             }
         }

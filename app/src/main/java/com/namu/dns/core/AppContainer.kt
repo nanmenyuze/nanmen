@@ -18,7 +18,10 @@ import com.namu.dns.core.repository.DefaultConfigRepository
 import com.namu.dns.core.repository.DefaultLogRepository
 import com.namu.dns.core.repository.DefaultNodeRepository
 import com.namu.dns.core.repository.DefaultRuleRepository
+import com.namu.dns.core.repository.DefaultHitRepository
+import com.namu.dns.core.repository.ProfileMigration
 import com.namu.dns.core.repository.DefaultStatsRepository
+import com.namu.dns.core.repository.HitRepository
 import com.namu.dns.core.repository.LogRepository
 import com.namu.dns.core.repository.NodeRepository
 import com.namu.dns.core.repository.RuleRepository
@@ -49,6 +52,7 @@ class AppContainer(val context: Context) {
     val runtime: RuntimeRepository = DefaultRuntimeRepository()
     val messages: MessageRepository = DefaultMessageRepository()
     val stats: StatsRepository = DefaultStatsRepository(runtime)
+    val hits: HitRepository = DefaultHitRepository(runtime)
     val logs: LogRepository = DefaultLogRepository(runtime)
 
     init {
@@ -56,9 +60,12 @@ class AppContainer(val context: Context) {
         // 异步把当前配置写回 active .conf；若顺序反了，旧扁平文件可能先被整体覆盖。
         val migration = ConfigFileStore.migrateLegacy(context, settings.current())
         MigrationReportStore.record(context, migration)
+        // S2：把 2.9 的设备全局组选择无损复制进每份 Profile；失败不阻断启动。
+        val profileMigration = runCatching { ProfileMigration.apply(context, settings.current()) }.getOrNull()
         // 迁移/恢复完成后，重新把 active .conf 套回内存，避免继续使用迁移前的 DataStore 快照。
-        if (migration.migrated > 0 || migration.restored > 0 || migration.recovered > 0) {
-            val active = ConfigFileStore.activeName(context)
+        val profileChanged = profileMigration?.changedCount?.let { it > 0 } == true
+        if (migration.migrated > 0 || migration.restored > 0 || migration.recovered > 0 || profileChanged) {
+            val active = settings.activeConfigName()
             ConfigFileStore.loadInto(context, active, settings.current())?.let { settings.set(it) }
         }
         DnsDefaultsMigration.apply(context, settings)
@@ -69,6 +76,7 @@ class AppContainer(val context: Context) {
     fun refreshRuntime() {
         ioScope.launch {
             stats.poll()
+            hits.poll()
             logs.poll()
         }
     }

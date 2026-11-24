@@ -2,6 +2,8 @@ package com.namu.dns.ui
 
 import com.namu.dns.core.LocalDockClearance
 
+import com.namu.dns.core.config.DirectFilterScope
+import com.namu.dns.core.config.RoutingMode
 import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.clickable
@@ -336,13 +338,36 @@ private fun formatConfigTime(ts: Long): String {
 }
 
 @Composable
-fun ConfigDetailScreen(onRestart: () -> Unit, onOpenModules: () -> Unit, onOpenMitm: () -> Unit) {
+fun ConfigDetailScreen(
+    onRestart: () -> Unit,
+    onOpenModules: () -> Unit,
+    onOpenMitm: () -> Unit,
+    onManageProfiles: () -> Unit,
+) {
     val container = LocalAppContainer.current
     val settings = container.settings
     val cfg by settings.config.collectAsStateWithLifecycle()
     val runtime = container.runtime
     val messages = container.messages
     val scope = rememberCoroutineScope()
+    val routingMode = RoutingMode.fromConfig(cfg.mode)
+    val filterScope = DirectFilterScope.fromConfig(cfg.mode, cfg.dnsOnlyFullRoute)
+    var showRoutingMode by remember { mutableStateOf(false) }
+    var showFilterScope by remember { mutableStateOf(false) }
+
+    fun applyRouting(mode: String, fullRoute: Boolean) {
+        val current = settings.current()
+        if (current.mode == mode && current.dnsOnlyFullRoute == fullRoute) return
+        settings.update {
+            it.copy(
+                mode = mode,
+                dnsOnlyFullRoute = fullRoute,
+                finalPolicy = if (mode == DirectFilterScope.Connections.mode && it.mode != mode) "direct" else it.finalPolicy,
+            )
+        }
+        if (runtime.current().connected) onRestart()
+    }
+
     var showDns by remember { mutableStateOf(false) }
     var showBlockMode by remember { mutableStateOf(false) }
     var showFinalPolicy by remember { mutableStateOf(false) }
@@ -369,8 +394,25 @@ fun ConfigDetailScreen(onRestart: () -> Unit, onOpenModules: () -> Unit, onOpenM
                 subtitle = "配置文件 · 切换后整体替换 DNS、规则与模块",
                 value = "使用中",
                 valueColor = NamuColors.Green,
-                showDivider = false,
+                chevron = true,
+                onClick = onManageProfiles,
             )
+            SettingsRow(
+                title = "运行模式",
+                value = routingMode.title,
+                chevron = true,
+                showDivider = routingMode == RoutingMode.Direct,
+                onClick = { showRoutingMode = true },
+            )
+            if (routingMode == RoutingMode.Direct) {
+                SettingsRow(
+                    title = "过滤范围",
+                    value = filterScope.title,
+                    chevron = true,
+                    showDivider = false,
+                    onClick = { showFilterScope = true },
+                )
+            }
         }
 
         SectionHeader("通用")
@@ -441,8 +483,8 @@ fun ConfigDetailScreen(onRestart: () -> Unit, onOpenModules: () -> Unit, onOpenM
                 settings.update { current -> current.copy(autoUpdateRules = it) }
             }
             SwitchRow(
-                title = "拦截广告域名",
-                subtitle = "在 DNS 层返回 NXDOMAIN 或 0.0.0.0，不请求上游",
+                title = "订阅广告规则",
+                subtitle = "仅控制订阅规则文件，自定义规则的拦截不受影响",
                 checked = cfg.blockEnabled,
             ) {
                 settings.update { current -> current.copy(blockEnabled = it) }
@@ -485,15 +527,6 @@ fun ConfigDetailScreen(onRestart: () -> Unit, onOpenModules: () -> Unit, onOpenM
                 chevron = true,
                 onClick = { showHostMap = true },
             )
-            SwitchRow(
-                title = "DNS-only 全量接管",
-                subtitle = "只对 DNS-only 生效：接管全部流量，硬编码 DNS 与 DoT 853 才进内核；" +
-                    "关闭后只接管本机 DNS 地址，冷门 DNS 和 DoH 可绕过",
-                checked = cfg.dnsOnlyFullRoute,
-            ) {
-                settings.update { current -> current.copy(dnsOnlyFullRoute = it) }
-                if (runtime.current().connected) onRestart()
-            }
             SwitchRow(
                 title = "QUIC 假活自动回落",
                 subtitle = "蜂窝网络下 UDP 假活（发得出去、收不到回包）时，判定该目标 QUIC 不可用，" +
@@ -752,6 +785,38 @@ fun ConfigDetailScreen(onRestart: () -> Unit, onOpenModules: () -> Unit, onOpenM
                 showDns = false
                 if (runtime.current().connected) onRestart()
             },
+        )
+    }
+    if (showRoutingMode) {
+        ChoiceDialog(
+            title = "运行模式",
+            message = "选择当前配置如何处理流量",
+            options = RoutingMode.entries.map { it.key to it.title },
+            selected = routingMode.key,
+            onSelect = { key ->
+                showRoutingMode = false
+                val selected = RoutingMode.entries.first { it.key == key }
+                val current = settings.current()
+                applyRouting(selected.modeFor(current.mode), current.dnsOnlyFullRoute)
+            },
+            onDismiss = { showRoutingMode = false },
+        )
+    }
+    if (showFilterScope) {
+        ChoiceDialog(
+            title = "过滤范围",
+            message = "轻量模式只接管系统 DNS。全量接管会让其他连接也经过 VPN，自带 DoH 的应用仍可能绕过 DNS 过滤。",
+            options = DirectFilterScope.entries.map { it.name to it.title },
+            selected = filterScope.name,
+            onSelect = { key ->
+                showFilterScope = false
+                val selected = DirectFilterScope.valueOf(key)
+                val current = settings.current()
+                // 连接层过滤始终全量接管，保留原有 DNS-only 开关供切回时使用。
+                val fullRoute = if (selected == DirectFilterScope.Connections) current.dnsOnlyFullRoute else selected.fullRoute
+                applyRouting(selected.mode, fullRoute)
+            },
+            onDismiss = { showFilterScope = false },
         )
     }
     if (showBlockMode) {

@@ -7,6 +7,8 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import com.namu.dns.Actions
 import com.namu.dns.AppConfig
 import com.namu.dns.core.AppContainer
+import com.namu.dns.core.repository.HitRepository
+import com.namu.dns.core.repository.HitsUiState
 import com.namu.dns.core.repository.NodeRepository
 import com.namu.dns.core.repository.SettingsRepository
 import com.namu.dns.core.repository.StatsRepository
@@ -26,6 +28,8 @@ data class HomeUiState(
     val config: AppConfig = AppConfig(),
     val runtime: RuntimeState = RuntimeState(),
     val stats: StatsUiState = StatsUiState(),
+    /** U1：首页状态卡、最近 3 条与快捷指标都从 D2/D4 的同一个出口读。 */
+    val hits: HitsUiState = HitsUiState(),
 )
 
 /** 连通性测试状态放到 ViewModel，切到服务器/数据页再回来不会丢。 */
@@ -40,20 +44,24 @@ class HomeViewModel(
     private val stats: StatsRepository,
     private val nodes: NodeRepository,
     private val messages: MessageRepository,
+    private val hits: HitRepository? = null,
     private val ping: suspend (String, Int, String) -> Long? = { host, port, method ->
         Actions.ping(host, port, method)
     },
 ) : ViewModel() {
+    private val emptyHits = MutableStateFlow(HitsUiState())
+
     val state: StateFlow<HomeUiState> = combine(
         settings.config,
         runtime.state,
         stats.state,
-    ) { config, runtime, stats ->
-        HomeUiState(config, runtime, stats)
+        hits?.state ?: emptyHits,
+    ) { config, runtime, stats, hitState ->
+        HomeUiState(config, runtime, stats, hitState)
     }.stateIn(
         viewModelScope,
         SharingStarted.WhileSubscribed(5_000),
-        HomeUiState(settings.current(), runtime.current(), stats.current()),
+        HomeUiState(settings.current(), runtime.current(), stats.current(), hits?.current() ?: HitsUiState()),
     )
 
     private val _testState = MutableStateFlow(HomeTestState())
@@ -102,6 +110,12 @@ class HomeViewModel(
 
     fun showMessage(message: String) = messages.show(message)
 
+    fun setHitsWindow(hours: Int) = hits?.setWindow(hours)
+
+    fun retryHits() = hits?.poll()
+
+    fun clearHits() = hits?.clear()
+
     companion object {
         fun factory(container: AppContainer) = viewModelFactory {
             initializer {
@@ -111,6 +125,7 @@ class HomeViewModel(
                     stats = container.stats,
                     nodes = container.nodes,
                     messages = container.messages,
+                    hits = container.hits,
                 )
             }
         }

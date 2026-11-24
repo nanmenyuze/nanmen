@@ -1,10 +1,15 @@
 package com.namu.dns.ui
 
-import com.namu.dns.core.LocalDockClearance
-
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -15,41 +20,88 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.Apps
+import androidx.compose.material.icons.outlined.ArrowDownward
+import androidx.compose.material.icons.outlined.ArrowUpward
+import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.Security
+import androidx.compose.material.icons.outlined.Sync
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInParent
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.namu.dns.Actions
 import com.namu.dns.ConfigStore
-import com.namu.dns.core.LocalAppContainer
 import com.namu.dns.ModuleSource
+import com.namu.dns.core.LocalAppContainer
+import com.namu.dns.core.LocalDockClearance
+import com.namu.dns.core.config.ModuleOrder
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ModulesScreen(onRestart: () -> Unit) {
+fun ModulesScreen(
+    onRestart: () -> Unit,
+    onOpenMitm: (() -> Unit)? = null,
+) {
     var showAdd by remember { mutableStateOf(false) }
+    var showLibrary by remember { mutableStateOf(false) }
     var syncing by remember { mutableStateOf(false) }
+    var syncingId by remember { mutableStateOf<String?>(null) }
+    var actionTarget by remember { mutableStateOf<ModuleSource?>(null) }
+    var detailTarget by remember { mutableStateOf<ModuleSource?>(null) }
+    var appTarget by remember { mutableStateOf<ModuleSource?>(null) }
     var deleteTarget by remember { mutableStateOf<ModuleSource?>(null) }
     val scope = rememberCoroutineScope()
     val container = LocalAppContainer.current
@@ -59,7 +111,81 @@ fun ModulesScreen(onRestart: () -> Unit) {
     val messages = container.messages
     val modules = cfg.moduleSources
     val enabled = modules.count { it.enabled }
+    val hitState by container.hits.state.collectAsStateWithLifecycle()
+    val todayBySource = remember(hitState.snapshot.sources) {
+        hitState.snapshot.sources.associate { it.sourceId to it.hitsToday }
+    }
+    val ordered = remember(modules) {
+        modules.sortedWith(
+            compareBy<ModuleSource> { if (it.order >= 0) it.order else Int.MAX_VALUE }
+                .thenBy { modules.indexOf(it) },
+        )
+    }
     val ctx = LocalContext.current
+    val haptic = LocalHapticFeedback.current
+    val scrollState = rememberScrollState()
+    val density = LocalDensity.current
+    val autoScrollEdge = with(density) { 88.dp.toPx() }
+    val centers = remember { mutableStateMapOf<String, Float>() }
+    val rootCenters = remember { mutableStateMapOf<String, Float>() }
+    val heights = remember { mutableStateMapOf<String, Float>() }
+    var viewportTop by remember { mutableFloatStateOf(0f) }
+    var viewportBottom by remember { mutableFloatStateOf(0f) }
+    var draggingId by remember { mutableStateOf<String?>(null) }
+    var dragOffsetY by remember { mutableFloatStateOf(0f) }
+    var dragTargetIndex by remember { mutableStateOf(-1) }
+    var autoScrollDirection by remember { mutableStateOf(0) }
+
+    fun updateDragTarget() {
+        val id = draggingId ?: return
+        val from = ordered.indexOfFirst { it.id == id }
+        val center = centers[id] ?: return
+        if (from < 0 || ordered.any { centers[it.id] == null }) return
+        dragTargetIndex = ModuleOrder.dragTarget(
+            centers = ordered.map { centers.getValue(it.id) },
+            from = from,
+            draggedCenter = center + dragOffsetY,
+        )
+    }
+
+    fun updateAutoScroll() {
+        val id = draggingId ?: return
+        val center = (rootCenters[id] ?: return) + dragOffsetY
+        autoScrollDirection = when {
+            center < viewportTop + autoScrollEdge -> -1
+            center > viewportBottom - autoScrollEdge -> 1
+            else -> 0
+        }
+    }
+
+    fun finishDrag(save: Boolean) {
+        val id = draggingId ?: return
+        val from = ordered.indexOfFirst { it.id == id }
+        val to = dragTargetIndex
+        draggingId = null
+        autoScrollDirection = 0
+        dragOffsetY = 0f
+        dragTargetIndex = -1
+        if (save && from >= 0 && to >= 0 && from != to) {
+            haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+            scope.launch { Actions.reorderModule(id, to) }
+        }
+    }
+
+    LaunchedEffect(draggingId, autoScrollDirection) {
+        if (draggingId == null || autoScrollDirection == 0) return@LaunchedEffect
+        while (true) {
+            val consumed = scrollState.scrollBy(autoScrollDirection * 16f)
+            if (consumed == 0f) {
+                autoScrollDirection = 0
+                break
+            }
+            dragOffsetY += consumed
+            updateDragTarget()
+            delay(16)
+        }
+    }
+
     // 规则集展开结果：缓存未命中、格式不识别、整集被跳过时都在这里提示，避免静默失效。
     val ruleSetIssues = remember(modules) {
         runCatching {
@@ -75,43 +201,74 @@ fun ModulesScreen(onRestart: () -> Unit) {
     }
 
     Column(
-        Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
+        Modifier
+            .fillMaxSize()
+            .background(NamuColors.Bg)
+            .onGloballyPositioned {
+                viewportTop = it.positionInRoot().y
+                viewportBottom = viewportTop + it.size.height
+            }
+            .verticalScroll(scrollState),
     ) {
-        SectionHeader("模块")
-        GroupCard {
-            SettingsRow(
-                title = "导入模块...",
-                subtitle = "支持从本地文件或 URL 导入，可分别启用与同步",
-                chevron = true,
-                onClick = { showAdd = true },
-            )
-            SettingsRow(
-                title = "同步全部",
-                subtitle = if (modules.isEmpty()) "还没有导入模块" else "重新拉取 $enabled 个启用模块",
-                value = if (syncing) "同步中…" else null,
-                chevron = true,
-                showDivider = false,
-                onClick = {
-                    if (!syncing && modules.isNotEmpty()) scope.launch {
-                        syncing = true
-                        try {
-                            val result = Actions.syncModules()
-                            messages.show(if (result.errors.isEmpty()) {
-                                "已同步 ${result.updated} 个模块"
-                            } else {
-                                "同步 ${result.updated} 个，失败 ${result.errors.size} 个：${result.errors.first()}"
-                            })
-                        } catch (e: Exception) {
-                            messages.show(e.message ?: "同步模块失败")
-                        } finally {
-                            syncing = false
+        SectionHeader(
+            "模块库 · ${container.config.activeName()}",
+            trailing = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box {
+                        TextAction("模块库") { showLibrary = true }
+                        DropdownMenu(
+                            expanded = showLibrary,
+                            onDismissRequest = { showLibrary = false },
+                        ) {
+                            DropdownMenuItem(
+                                text = { Text("导入本地文件或 URL") },
+                                onClick = {
+                                    showLibrary = false
+                                    showAdd = true
+                                },
+                            )
+                            DropdownMenuItem(
+                                text = { Text(if (syncing) "同步中…" else "同步全部") },
+                                enabled = !syncing && enabled > 0,
+                                onClick = {
+                                    showLibrary = false
+                                    syncing = true
+                                    scope.launch {
+                                        try {
+                                            val result = Actions.syncModules()
+                                            messages.show(if (result.errors.isEmpty()) {
+                                                "已同步 ${result.updated} 个模块"
+                                            } else {
+                                                "同步 ${result.updated} 个，失败 ${result.errors.size} 个：${result.errors.first()}"
+                                            })
+                                        } catch (e: Exception) {
+                                            messages.show(e.message ?: "同步模块失败")
+                                        } finally {
+                                            syncing = false
+                                        }
+                                    }
+                                },
+                            )
                         }
                     }
-                },
+                }
+            },
+        )
+        val appBound = modules.count { it.app.isNotBlank() }
+        GroupCard {
+            SettingsRow(
+                title = "按 App 分流",
+                subtitle = if (appBound > 0) "已绑定 $appBound 个应用" else "尚未绑定应用",
+                value = "${modules.size} 个模块",
+                showDivider = true,
+            )
+            SettingsRow(
+                title = "自定义规则",
+                subtitle = "模块之外的手写规则，优先级高于模块",
+                value = "${cfg.rules.size} 条",
+                showDivider = false,
             )
         }
-
-        SectionHeader("已安装")
         if (ruleSetIssues.isNotEmpty() || ignoredRules > 0) {
             GroupCard {
                 Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)) {
@@ -158,47 +315,124 @@ fun ModulesScreen(onRestart: () -> Unit) {
                             .padding(horizontal = 14.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Icon(Icons.Rounded.Add, null, tint = androidx.compose.ui.graphics.Color.White, modifier = Modifier.height(16.dp))
+                        Icon(Icons.Outlined.Add, null, tint = androidx.compose.ui.graphics.Color.White, modifier = Modifier.height(16.dp))
                         Text(" 导入模块 URL", fontSize = 13.sp, color = androidx.compose.ui.graphics.Color.White)
                     }
                 }
             }
         } else {
             GroupCard {
-                modules.forEachIndexed { index, module ->
+                ordered.forEachIndexed { index, module ->
+                    val totalRules = module.blockRules + module.routeRules + module.allowRules + module.mitmRules
+                    val todayHits = todayBySource[module.id] ?: 0L
                     val subtitle = buildString {
-                        append(module.app.ifBlank { "按 App 分组" })
-                        append(" · ${module.blockRules} 条阻断")
-                        if (module.routeRules > 0) append("，${module.routeRules} 条分流")
-                        if (module.allowRules > 0) append("，${module.allowRules} 条例外")
-                        if (module.mitmRules > 0) append("，${module.mitmRules} 条 MITM")
-                        if (module.ignored > 0) append("，${module.ignored} 条不支持")
+                        append(if (module.url.isNotBlank()) "URL" else "本地")
+                        append(" · $totalRules 条规则")
+                        append(" · ")
+                        append(if (module.updatedAt > 0) "更新 ${formatAgo(module.updatedAt)}" else "尚未更新")
+                        append(" · 今日命中 $todayHits")
+                        if (module.app.isNotBlank()) append(" · ${module.app}")
+                        if (module.ignored > 0) append(" · ${module.ignored} 条不支持")
                         if (module.stale) append(" · 上次更新失败，继续使用旧缓存")
                         if (module.error.isNotBlank()) append("\n${module.error}")
                     }
-                    SettingsRow(
-                        title = module.name.ifBlank { "未命名模块" },
+                    val isDragging = draggingId == module.id
+                    val from = ordered.indexOfFirst { it.id == draggingId }
+                    val target = dragTargetIndex
+                    val draggedHeight = draggingId?.let { heights[it] } ?: 0f
+                    val displacement = if (draggingId == null || isDragging || from < 0 || target < 0) {
+                        0f
+                    } else when {
+                        target > from && index in (from + 1)..target -> -draggedHeight
+                        target < from && index in target until from -> draggedHeight
+                        else -> 0f
+                    }
+                    ModuleRow(
+                        module = module,
                         subtitle = subtitle,
-                        showDivider = index != modules.lastIndex,
-                        rightContent = {
-                            IosSwitch(
-                                checked = module.enabled,
-                                onCheckedChange = { enabledNow ->
-                                    scope.launch { Actions.setModuleEnabled(module.id, enabledNow) }
-                                },
-                            )
-                            MiniTextAction("删除", color = NamuColors.Red) { deleteTarget = module }
+                        showDivider = index != ordered.lastIndex,
+                        isDragging = isDragging,
+                        dragOffsetY = if (isDragging) dragOffsetY else 0f,
+                        displacementY = displacement,
+                        onMeasure = { coordinates ->
+                            centers[module.id] = coordinates.positionInParent().y + coordinates.size.height / 2f
+                            rootCenters[module.id] = coordinates.positionInRoot().y + coordinates.size.height / 2f
+                            heights[module.id] = coordinates.size.height.toFloat()
                         },
+                        onClick = { if (draggingId == null) actionTarget = module },
+                        onCheckedChange = { enabledNow ->
+                            scope.launch { Actions.setModuleEnabled(module.id, enabledNow) }
+                        },
+                        onDragStart = {
+                            if (draggingId == null) {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                draggingId = module.id
+                                dragOffsetY = 0f
+                                dragTargetIndex = index
+                                autoScrollDirection = 0
+                            }
+                        },
+                        onDrag = { amountY ->
+                            if (draggingId == module.id) {
+                                dragOffsetY += amountY
+                                updateDragTarget()
+                                updateAutoScroll()
+                            }
+                        },
+                        onDragEnd = { finishDrag(save = true) },
+                        onDragCancel = { finishDrag(save = false) },
                     )
                 }
             }
+            FooterText("单击模块打开功能面板；长按卡片约 0.4 秒后拖动排序，松手保存。")
+        }
+
+        if (onOpenMitm != null) {
+            SectionHeader("证书与 HTTPS 过滤")
+            GroupCard {
+                SettingsRow(
+                    title = "MITM 管理",
+                    subtitle = "HTTPS 内容级过滤 · 域名与应用例外 · CA 模块",
+                    value = "${cfg.mitm.hostnames.size + cfg.mitm.skipHostnames.size} 条名单",
+                    icon = Icons.Outlined.Security,
+                    chevron = true,
+                    showDivider = false,
+                    onClick = onOpenMitm,
+                )
+            }
+        }
+
+        SectionHeader("全局判定")
+        GroupCard {
+            SettingsRow(
+                title = "未命中时",
+                subtitle = "所有模块都没命中时，按下面的归属规则处理",
+                value = if (cfg.finalPolicy == "direct") "直连" else "走代理",
+                chevron = true,
+                onClick = {
+                    settings.update {
+                        it.copy(finalPolicy = if (it.finalPolicy == "direct") "proxy" else "direct")
+                    }
+                },
+            )
+            SettingsRow(
+                title = "国内域名直连",
+                subtitle = "未命中时按域名归属判断，国内域名不经过代理",
+                rightContent = {
+                    IosSwitch(
+                        checked = cfg.cnDirect,
+                        onCheckedChange = { on -> settings.update { it.copy(cnDirect = on) } },
+                    )
+                },
+                showDivider = false,
+            )
         }
 
         FooterText(
             "模块按小火箭 .sgmodule 解析：[Rule] 支持 DOMAIN / DOMAIN-SUFFIX / DOMAIN-REGEX / " +
                 "IP-CIDR / IP-CIDR6 / PORT；AdBlock 支持 ||domain^ 后缀、|domain| 精确和 @@ 例外。" +
                 "带 $ 选项、通配路径与 PROCESS-NAME 的规则会跳过，并在导入预览按原因列出。" +
-                "[MITM] 域名与 [URL Rewrite] / [Header Rewrite] / Loon [Rewrite] / [Script] 会在「设置 → MITM 去广告」启用并安装 CA 证书后生效；" +
+                "[MITM] 域名与 [URL Rewrite] / [Header Rewrite] / Loon [Rewrite] / [Script] 会在「MITM 管理」启用并安装 CA 证书后生效；" +
                 "脚本运行在 QuickJS 沙箱内，支持 \$request/\$response/\$done/\$httpClient/\$persistentStore/\$argument/\$environment/\$utils；" +
                 "\$notification 已接系统通知（需通知权限），require 提供 crypto/base64/util 内置模块；" +
                 "setTimeout/setInterval 按 Loon 语义只执行一次，Promise/async 已驱动微任务，binary-body-mode/Uint8Array 已支持，本地文件读取仍不开放，导入预览会逐条标出；" +
@@ -213,6 +447,69 @@ fun ModulesScreen(onRestart: () -> Unit) {
             onDone = {
                 showAdd = false
                 if (runtime.current().connected) onRestart()
+            },
+        )
+    }
+    actionTarget?.let { target ->
+        val current = ordered.firstOrNull { it.id == target.id } ?: target
+        val index = ordered.indexOfFirst { it.id == current.id }
+        ModuleActionSheet(
+            module = current,
+            index = index,
+            lastIndex = ordered.lastIndex,
+            syncing = syncingId == current.id,
+            onDismiss = { actionTarget = null },
+            onDetail = {
+                actionTarget = null
+                detailTarget = current
+            },
+            onEditApp = {
+                actionTarget = null
+                appTarget = current
+            },
+            onSync = {
+                actionTarget = null
+                if (syncingId == null) {
+                    syncingId = current.id
+                    scope.launch {
+                        try {
+                            val result = Actions.syncModules(current.id)
+                            messages.show(if (result.errors.isEmpty()) {
+                                "已同步「${current.name.ifBlank { "未命名模块" }}」"
+                            } else {
+                                result.errors.first()
+                            })
+                        } catch (e: Exception) {
+                            messages.show(e.message ?: "同步模块失败")
+                        } finally {
+                            syncingId = null
+                        }
+                    }
+                }
+            },
+            onMove = { destination ->
+                actionTarget = null
+                scope.launch { Actions.reorderModule(current.id, destination) }
+            },
+            onDelete = {
+                actionTarget = null
+                deleteTarget = current
+            },
+        )
+    }
+    detailTarget?.let { target ->
+        ModuleDetailSheet(target, onDismiss = { detailTarget = null })
+    }
+    appTarget?.let { target ->
+        ModuleAppSheet(
+            module = target,
+            onDismiss = { appTarget = null },
+            onSave = { app ->
+                scope.launch {
+                    Actions.setModuleApp(target.id, app)
+                    appTarget = null
+                    messages.show(if (app.isBlank()) "已清除应用归属" else "已保存应用归属")
+                }
             },
         )
     }
@@ -232,6 +529,343 @@ fun ModulesScreen(onRestart: () -> Unit) {
                 }
             },
         ) {}
+    }
+}
+
+@Composable
+private fun ModuleRow(
+    module: ModuleSource,
+    subtitle: String,
+    showDivider: Boolean,
+    isDragging: Boolean,
+    dragOffsetY: Float,
+    displacementY: Float,
+    onMeasure: (LayoutCoordinates) -> Unit,
+    onClick: () -> Unit,
+    onCheckedChange: (Boolean) -> Unit,
+    onDragStart: () -> Unit,
+    onDrag: (Float) -> Unit,
+    onDragEnd: () -> Unit,
+    onDragCancel: () -> Unit,
+) {
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val displaced by animateFloatAsState(
+        targetValue = if (isDragging) 0f else displacementY,
+        animationSpec = spring(dampingRatio = 0.78f, stiffness = 430f),
+        label = "module-make-room",
+    )
+    val scale by animateFloatAsState(
+        targetValue = if (isDragging) 1.025f else 1f,
+        animationSpec = spring(dampingRatio = 0.72f, stiffness = 520f),
+        label = "module-lift",
+    )
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .onGloballyPositioned(onMeasure)
+            .zIndex(if (isDragging) 2f else 0f)
+            .graphicsLayer {
+                translationY = if (isDragging) dragOffsetY else displaced
+                scaleX = scale
+                scaleY = scale
+            }
+            .then(
+                if (isDragging) {
+                    Modifier
+                        .shadow(16.dp, RoundedCornerShape(14.dp))
+                        .clip(RoundedCornerShape(14.dp))
+                        .background(NamuColors.Card)
+                } else {
+                    Modifier.background(if (pressed) NamuColors.FillPressed else Color.Transparent)
+                },
+            ),
+    ) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .heightIn(min = 64.dp)
+                .padding(start = 16.dp, end = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(
+                Modifier
+                    .weight(1f)
+                    .pointerInput(module.id) {
+                        detectDragGesturesAfterLongPress(
+                            onDragStart = { onDragStart() },
+                            onDrag = { change, dragAmount ->
+                                change.consume()
+                                onDrag(dragAmount.y)
+                            },
+                            onDragEnd = onDragEnd,
+                            onDragCancel = onDragCancel,
+                        )
+                    }
+                    .clickable(
+                        interactionSource = interaction,
+                        indication = null,
+                        onClick = onClick,
+                    )
+                    .padding(vertical = 12.dp),
+            ) {
+                Text(
+                    module.name.ifBlank { "未命名模块" },
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = NamuColors.TextMain,
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    subtitle,
+                    fontSize = 12.sp,
+                    color = if (module.error.isNotBlank()) NamuColors.Orange else NamuColors.TextSub,
+                    lineHeight = 16.sp,
+                )
+            }
+            Spacer(Modifier.width(8.dp))
+            // 手势只挂在左侧内容区，开关的点击和长按都不会触发卡片功能面板或拖拽。
+            IosSwitch(checked = module.enabled, onCheckedChange = onCheckedChange)
+        }
+        if (showDivider) RowDivider()
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ModuleActionSheet(
+    module: ModuleSource,
+    index: Int,
+    lastIndex: Int,
+    syncing: Boolean,
+    onDismiss: () -> Unit,
+    onDetail: () -> Unit,
+    onEditApp: () -> Unit,
+    onSync: () -> Unit,
+    onMove: (Int) -> Unit,
+    onDelete: () -> Unit,
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = NamuColors.Bg) {
+        Column(Modifier.fillMaxWidth().padding(bottom = 26.dp)) {
+            Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp)) {
+                Text(
+                    module.name.ifBlank { "未命名模块" },
+                    fontSize = 22.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = NamuColors.TextMain,
+                )
+                Text(
+                    if (module.enabled) "模块已启用 · 选择要执行的操作" else "模块已停用 · 仍可同步和编辑归属",
+                    fontSize = 12.sp,
+                    color = NamuColors.TextSub,
+                    modifier = Modifier.padding(top = 3.dp, bottom = 12.dp),
+                )
+            }
+            GroupCard {
+                ModuleActionRow(
+                    icon = Icons.Outlined.Description,
+                    title = "查看规则与详情",
+                    subtitle = "查看本地缓存正文、规则数量和更新状态",
+                    chevron = true,
+                    onClick = onDetail,
+                )
+                ModuleActionRow(
+                    icon = Icons.Outlined.Apps,
+                    title = "应用归属管理",
+                    subtitle = "编辑 #!app 分组元数据，不是 UID 隔离",
+                    value = module.app.ifBlank { "未设置" },
+                    chevron = true,
+                    onClick = onEditApp,
+                )
+                ModuleActionRow(
+                    icon = Icons.Outlined.Sync,
+                    title = if (syncing) "正在同步当前模块" else "立即同步当前模块",
+                    subtitle = if (module.url.startsWith("https://")) "从远程更新，保留现有启用状态" else "仅远程 HTTPS 模块可同步",
+                    loading = syncing,
+                    enabled = !syncing && module.url.startsWith("https://"),
+                    onClick = onSync,
+                )
+                ModuleActionRow(
+                    icon = Icons.Outlined.ArrowUpward,
+                    title = "上移",
+                    subtitle = if (index > 0) "无需拖拽的排序方式" else "已经是第一个模块",
+                    enabled = index > 0,
+                    onClick = { onMove(index - 1) },
+                )
+                ModuleActionRow(
+                    icon = Icons.Outlined.ArrowDownward,
+                    title = "下移",
+                    subtitle = if (index in 0 until lastIndex) "无需拖拽的排序方式" else "已经是最后一个模块",
+                    enabled = index in 0 until lastIndex,
+                    showDivider = false,
+                    onClick = { onMove(index + 1) },
+                )
+            }
+            Spacer(Modifier.height(12.dp))
+            GroupCard {
+                ModuleActionRow(
+                    icon = Icons.Outlined.Delete,
+                    title = "删除模块",
+                    subtitle = "删除前仍会再次确认",
+                    destructive = true,
+                    showDivider = false,
+                    onClick = onDelete,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ModuleActionRow(
+    icon: ImageVector,
+    title: String,
+    subtitle: String? = null,
+    value: String? = null,
+    enabled: Boolean = true,
+    loading: Boolean = false,
+    chevron: Boolean = false,
+    destructive: Boolean = false,
+    showDivider: Boolean = true,
+    onClick: () -> Unit,
+) {
+    val contentColor = if (destructive) NamuColors.Red else NamuColors.TextMain
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .alpha(if (enabled) 1f else 0.42f)
+            .clickable(enabled = enabled && !loading, onClick = onClick),
+    ) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .heightIn(min = 58.dp)
+                .padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            NamuIcon(icon, null, tint = if (destructive) NamuColors.Red else NamuColors.Brand)
+            Spacer(Modifier.width(13.dp))
+            Column(Modifier.weight(1f)) {
+                Text(title, fontSize = 16.sp, color = contentColor)
+                if (subtitle != null) {
+                    Text(
+                        subtitle,
+                        fontSize = 11.sp,
+                        color = NamuColors.TextSub,
+                        lineHeight = 15.sp,
+                        modifier = Modifier.padding(top = 2.dp),
+                    )
+                }
+            }
+            if (loading) {
+                CircularProgressIndicator(Modifier.size(19.dp), strokeWidth = 2.dp, color = NamuColors.Brand)
+            } else if (value != null) {
+                Text(value, fontSize = 12.sp, color = NamuColors.TextSub, maxLines = 1)
+            }
+            if (chevron) {
+                Spacer(Modifier.width(8.dp))
+                Chevron()
+            }
+        }
+        if (showDivider) RowDivider(startInset = 49.dp)
+    }
+}
+
+@Suppress("ProduceStateDoesNotAssignValue")
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ModuleDetailSheet(module: ModuleSource, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val cached by produceState<String?>(initialValue = null, module.id, module.updatedAt) {
+        value = withContext(Dispatchers.IO) {
+            runCatching {
+                val file = ConfigStore.moduleFile(context, module.id)
+                if (!file.exists() || file.length() == 0L) {
+                    "暂无本地缓存正文。远程模块可先执行“立即同步当前模块”。"
+                } else {
+                    val text = file.readText()
+                    if (text.length > 20_000) text.take(20_000) + "\n\n… 正文过长，仅显示前 20,000 个字符" else text
+                }
+            }.getOrElse { "读取模块缓存失败：${it.message ?: "未知错误"}" }
+        }
+    }
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = NamuColors.Bg) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(bottom = 26.dp)) {
+            Text(
+                module.name.ifBlank { "未命名模块" },
+                fontSize = 22.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = NamuColors.TextMain,
+            )
+            Text(
+                "阻断 ${module.blockRules} · 分流 ${module.routeRules} · 例外 ${module.allowRules} · MITM ${module.mitmRules}" +
+                    "\n来源：${module.url.ifBlank { "本地模块" }}" +
+                    "\n更新：${if (module.updatedAt > 0) formatAgo(module.updatedAt) else "尚未更新"}",
+                fontSize = 12.sp,
+                color = NamuColors.TextSub,
+                lineHeight = 17.sp,
+                modifier = Modifier.padding(top = 5.dp, bottom = 12.dp),
+            )
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 480.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(NamuColors.Fill)
+                    .verticalScroll(rememberScrollState())
+                    .padding(14.dp),
+            ) {
+                val text = cached
+                if (text == null) {
+                    CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp, color = NamuColors.Brand)
+                } else {
+                    SelectionContainer {
+                        Text(
+                            text,
+                            fontSize = 11.sp,
+                            lineHeight = 16.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = NamuColors.TextMain,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ModuleAppSheet(
+    module: ModuleSource,
+    onDismiss: () -> Unit,
+    onSave: (String) -> Unit,
+) {
+    var app by remember(module.id) { mutableStateOf(module.app) }
+    ModalBottomSheet(onDismissRequest = onDismiss, containerColor = NamuColors.Bg) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 20.dp).padding(bottom = 26.dp)) {
+            Text(
+                "应用归属",
+                fontSize = 22.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = NamuColors.TextMain,
+            )
+            Text(
+                module.name.ifBlank { "未命名模块" },
+                fontSize = 13.sp,
+                color = NamuColors.TextSub,
+                modifier = Modifier.padding(top = 3.dp, bottom = 14.dp),
+            )
+            NamuTextField(app, { app = it }, "例如：酷安、B站或 com.example.app", singleLine = true)
+            Text(
+                "这里编辑的是模块的 #!app 分组元数据，用于整理和识别规则归属；不会把模块变成系统级按 UID 隔离。远程模块若自带 #!app，下次同步可能以远程值为准。留空保存可清除归属。",
+                fontSize = 12.sp,
+                color = NamuColors.TextSub,
+                lineHeight = 17.sp,
+                modifier = Modifier.padding(vertical = 12.dp),
+            )
+            IosButton("保存归属", onClick = { onSave(app) })
+        }
     }
 }
 
@@ -528,6 +1162,9 @@ private fun AddModuleDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
 
 /** 单条脚本的可用性判断：正文缺失=不可用；用了未提供的宿主 API=部分可用。 */
 private fun scriptCapability(rule: com.namu.dns.core.config.ScriptConfig): Pair<String, String> {
+    // 禁用优先于可用性判断：它本来就不执行，不该显示成"不可用"让人去修正文。
+    if (!rule.enabled) return "已禁用" to "Loon enable=false，条目不执行"
+    if (rule.enableParam.isNotBlank()) return "跟随开关" to "启用状态由参数 ${rule.enableParam} 决定"
     if (rule.source.isBlank()) return "不可用" to "脚本正文未缓存"
     val gaps = mutableListOf<String>()
     val low = rule.source

@@ -1,9 +1,30 @@
 use crate::config::Config;
 use crate::logging;
+use crate::hits::RuleMeta;
 use ipnet::IpNet;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterDecision {
+    Important,
+    Allow,
+    Block,
+    None,
+}
+
+#[derive(Debug, Clone)]
+pub struct FilterMatch {
+    pub decision: FilterDecision,
+    pub meta: RuleMeta,
+}
+
+impl FilterMatch {
+    pub fn is_block(&self) -> bool {
+        matches!(self.decision, FilterDecision::Important | FilterDecision::Block)
+    }
+}
 
 /// 域名集合：精确匹配 + 后缀匹配（`||example.com^`、`.example.com`）
 #[derive(Default, Clone)]
@@ -26,19 +47,24 @@ impl DomainSet {
         }
     }
     pub fn contains(&self, domain: &str) -> bool {
+        self.lookup(domain).is_some()
+    }
+
+    /// 返回实际命中的域名键（精确项或后缀项），供归因表反查身份。
+    pub fn lookup(&self, domain: &str) -> Option<&String> {
         // 精确集合只匹配完整域名；只有后缀集合才向父域回溯。
         // 原来把 exact 也放进回溯循环，会让 example.com 误伤 a.example.com。
-        if self.exact.contains(domain) {
-            return true;
+        if let Some(d) = self.exact.get(domain) {
+            return Some(d);
         }
         let mut s = domain;
         loop {
-            if self.suffix.contains(s) {
-                return true;
+            if let Some(d) = self.suffix.get(s) {
+                return Some(d);
             }
             match s.find('.') {
                 Some(i) => s = &s[i + 1..],
-                None => return false,
+                None => return None,
             }
         }
     }
@@ -71,6 +97,15 @@ pub struct FilterEngine {
     /// 构造失败时存 None，回退逐条 contains——绝不能用空模式兜底（会匹配一切域名）。
     keywords_ac: once_cell::sync::OnceCell<Option<aho_corasick::AhoCorasick>>,
     regexes: Vec<Regex>,
+    /// D0：按实际命中键反查规则身份。
+    block_meta: HashMap<String, RuleMeta>,
+    important_meta: HashMap<String, RuleMeta>,
+    allow_meta: HashMap<String, RuleMeta>,
+    keyword_meta: Vec<RuleMeta>,
+    regex_meta: Vec<RuleMeta>,
+    /// 原始规则行 → 身份；模块聚合文件里的行靠它找回模块名。
+    line_meta: HashMap<String, RuleMeta>,
+    current_meta: Option<RuleMeta>,
     pub lines: usize,
     pub skipped: usize,
     pub skipped_cosmetic: usize,
@@ -82,6 +117,54 @@ pub struct FilterEngine {
 impl FilterEngine {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_line_meta(&mut self, meta: Vec<RuleMeta>) {
+        self.line_meta.clear();
+        for m in meta {
+            if m.section == "dns" && !m.key.trim().is_empty() {
+                self.line_meta.insert(m.key.trim().to_string(), m);
+            }
+        }
+    }
+
+    fn meta_for(&self, raw: &str) -> RuleMeta {
+        self.current_meta
+            .clone()
+            .or_else(|| self.line_meta.get(raw.trim()).cloned())
+            .unwrap_or_else(|| {
+                RuleMeta::config_fallback("dns", raw.trim(), self.lines as i64)
+            })
+    }
+
+    fn block_exact(&mut self, host: &str, meta: RuleMeta) {
+        self.block.insert_exact(host);
+        self.block_meta.insert(normalize_domain(host), meta);
+    }
+
+    fn block_suffix(&mut self, host: &str, meta: RuleMeta) {
+        self.block.insert_suffix(host);
+        self.block_meta.insert(normalize_domain(host), meta);
+    }
+
+    fn important_exact(&mut self, host: &str, meta: RuleMeta) {
+        self.important.insert_exact(host);
+        self.important_meta.insert(normalize_domain(host), meta);
+    }
+
+    fn important_suffix(&mut self, host: &str, meta: RuleMeta) {
+        self.important.insert_suffix(host);
+        self.important_meta.insert(normalize_domain(host), meta);
+    }
+
+    fn allow_exact(&mut self, host: &str, meta: RuleMeta) {
+        self.allow.insert_exact(host);
+        self.allow_meta.insert(normalize_domain(host), meta);
+    }
+
+    fn allow_suffix(&mut self, host: &str, meta: RuleMeta) {
+        self.allow.insert_suffix(host);
+        self.allow_meta.insert(normalize_domain(host), meta);
     }
 
     pub fn load_file(&mut self, path: &str) {
@@ -139,10 +222,11 @@ impl FilterEngine {
             for key in ["domain", "domain_suffix"] {
                 if let Some(arr) = obj.get(key).and_then(|a| a.as_array()) {
                     for d in arr.iter().filter_map(|d| d.as_str()) {
+                        let meta = self.meta_for(&format!("singbox:{}:{}", key, d));
                         if key == "domain" {
-                            self.block.insert_exact(d);
+                            self.block_exact(d, meta);
                         } else {
-                            self.block.insert_suffix(d);
+                            self.block_suffix(d, meta);
                         }
                         added += 1;
                     }
@@ -152,7 +236,9 @@ impl FilterEngine {
                 for k in arr.iter().filter_map(|d| d.as_str()) {
                     let k = k.trim().to_ascii_lowercase();
                     if !k.is_empty() {
-                        self.keywords.push(k);
+                        self.keywords.push(k.clone());
+                        let meta = self.meta_for(&format!("singbox:domain_keyword:{}", k));
+                        self.keyword_meta.push(meta);
                         added += 1;
                     }
                 }
@@ -162,6 +248,8 @@ impl FilterEngine {
                     match Regex::new(r) {
                         Ok(re) => {
                             self.regexes.push(re);
+                            let meta = self.meta_for(&format!("singbox:domain_regex:{}", r));
+                            self.regex_meta.push(meta);
                             added += 1;
                         }
                         Err(_) => {
@@ -200,6 +288,7 @@ impl FilterEngine {
         {
             return;
         }
+        let meta = self.meta_for(raw);
         // 元素隐藏/脚本注入等规则不是 DNS 层能表达的，直接跳过，绝不能被截成主域名。
         if line.contains("##")
             || line.contains("#@#")
@@ -218,9 +307,9 @@ impl FilterEngine {
                 let mods = &line[i + 1..];
                 let important = mods.split(',').any(|m| m.trim() == "important");
                 if line.starts_with("@@") {
-                    self.add_allow(&line[..i]);
+                    self.add_allow(&line[..i], &meta);
                 } else if important {
-                    self.add_important(&line[..i]);
+                    self.add_important(&line[..i], &meta);
                 } else {
                     self.skipped += 1;
                     self.skipped_conditional += 1;
@@ -234,7 +323,7 @@ impl FilterEngine {
             return;
         }
         if let Some(rest) = line.strip_prefix("@@") {
-            self.add_allow(rest);
+            self.add_allow(rest, &meta);
             return;
         }
         // hosts 格式
@@ -243,7 +332,8 @@ impl FilterEngine {
             if (first == "0.0.0.0" || first == "127.0.0.1" || first == "::1")
                 && valid_host(&strip_adblock(second))
             {
-                self.block.insert_exact(&strip_adblock(second));
+                let host = strip_adblock(second);
+                self.block_exact(&host, meta);
                 self.lines += 1;
                 return;
             }
@@ -263,7 +353,7 @@ impl FilterEngine {
         if let Some(rest) = line.strip_prefix("||") {
             let host = rest.trim_end_matches('^').trim_end_matches('|').trim();
             if valid_host(host) {
-                self.block.insert_suffix(host);
+                self.block_suffix(host, meta);
                 self.lines += 1;
             } else {
                 self.skip_invalid(host);
@@ -273,7 +363,7 @@ impl FilterEngine {
         if line.starts_with('|') {
             let host = line.trim_matches('|').trim_end_matches('^').trim();
             if valid_host(host) {
-                self.block.insert_exact(host);
+                self.block_exact(host, meta);
                 self.lines += 1;
             } else {
                 self.skip_invalid(host);
@@ -282,7 +372,7 @@ impl FilterEngine {
         }
         let host = strip_adblock(line);
         if valid_host(&host) {
-            self.block.insert_exact(&host);
+            self.block_exact(&host, meta);
             self.lines += 1;
         } else if host.contains('.') {
             self.skip_invalid(&host);
@@ -303,7 +393,7 @@ impl FilterEngine {
     }
 
     /// $important 拦截：即使被 @@ 例外也仍然拦截（AdGuard Home 优先级语义）。
-    fn add_important(&mut self, rest: &str) {
+    fn add_important(&mut self, rest: &str, meta: &RuleMeta) {
         let rest = rest.trim();
         let host = if let Some(r) = rest.strip_prefix("||") {
             r.trim_end_matches('^').trim_end_matches('|')
@@ -313,9 +403,9 @@ impl FilterEngine {
         let host = host.trim();
         if valid_host(host) {
             if rest.starts_with("||") {
-                self.important.insert_suffix(host);
+                self.important_suffix(host, meta.clone());
             } else {
-                self.important.insert_exact(host);
+                self.important_exact(host, meta.clone());
             }
         } else {
             self.skipped += 1;
@@ -335,14 +425,14 @@ impl FilterEngine {
     ///
     /// 优先级用 `important`：手写的 REJECT 是明确指令，应该压过订阅广告源里
     /// 的 `@@` 例外，否则会出现「规则明明写了却拦不住」的困惑。
-    pub fn add_route_block(&mut self, kind: &str, value: &str) -> bool {
+    pub fn add_route_block(&mut self, kind: &str, value: &str, meta: Option<&RuleMeta>) -> bool {
         let k = kind.trim().to_ascii_uppercase();
         let v = value.trim();
         match k.as_str() {
             "DOMAIN" => {
                 let d = normalize_domain(v);
                 if valid_host(&d) {
-                    self.important.insert_exact(&d);
+                    self.important_exact(&d, meta.cloned().unwrap_or_else(|| RuleMeta::config_fallback("route", kind, self.lines as i64)));
                     self.lines += 1;
                     true
                 } else {
@@ -352,7 +442,7 @@ impl FilterEngine {
             "DOMAIN-SUFFIX" => {
                 let d = v.trim_start_matches('.').to_ascii_lowercase();
                 if valid_host(&d) {
-                    self.important.insert_suffix(&d);
+                    self.important_suffix(&d, meta.cloned().unwrap_or_else(|| RuleMeta::config_fallback("route", kind, self.lines as i64)));
                     self.lines += 1;
                     true
                 } else {
@@ -365,6 +455,7 @@ impl FilterEngine {
                     false
                 } else {
                     self.keywords.push(kw);
+                    self.keyword_meta.push(meta.cloned().unwrap_or_else(|| RuleMeta::config_fallback("route", kind, self.lines as i64)));
                     // OnceCell 可能已在之前的判定里初始化，重置它让新关键词进入自动机。
                     self.keywords_ac = once_cell::sync::OnceCell::new();
                     self.lines += 1;
@@ -374,6 +465,7 @@ impl FilterEngine {
             "DOMAIN-REGEX" => match Regex::new(v) {
                 Ok(re) => {
                     self.regexes.push(re);
+                    self.regex_meta.push(meta.cloned().unwrap_or_else(|| RuleMeta::config_fallback("route", kind, self.lines as i64)));
                     self.lines += 1;
                     true
                 }
@@ -385,6 +477,7 @@ impl FilterEngine {
             "DOMAIN-WILDCARD" => match wildcard_regex(v) {
                 Ok(re) => {
                     self.regexes.push(re);
+                    self.regex_meta.push(meta.cloned().unwrap_or_else(|| RuleMeta::config_fallback("route", kind, self.lines as i64)));
                     self.lines += 1;
                     true
                 }
@@ -394,7 +487,7 @@ impl FilterEngine {
         }
     }
 
-    fn add_allow(&mut self, rest: &str) {
+    fn add_allow(&mut self, rest: &str, meta: &RuleMeta) {
         let rest = rest.trim().trim_start_matches("@@");
         let host = if let Some(r) = rest.strip_prefix("||") {
             r.trim_end_matches('^').trim_end_matches('|')
@@ -406,11 +499,9 @@ impl FilterEngine {
         let host = host.trim();
         if valid_host(host) {
             if rest.starts_with("||") {
-                self.allow.insert_suffix(host);
-            } else if rest.starts_with('|') {
-                self.allow.insert_exact(host);
+                self.allow_suffix(host, meta.clone());
             } else {
-                self.allow.insert_exact(host);
+                self.allow_exact(host, meta.clone());
             }
         } else {
             self.skip_invalid(host);
@@ -418,18 +509,46 @@ impl FilterEngine {
     }
 
     pub fn is_blocked(&self, domain: &str) -> bool {
+        self.match_detail(domain).is_block()
+    }
+
+    /// D0：返回实际生效的规则（important > allow > block > keyword/regex）。
+    /// allow 与无命中都计入「不计数」，由调用方区分展示。
+    pub fn match_detail(&self, domain: &str) -> FilterMatch {
         let domain = normalize_domain(domain);
+        let none = FilterMatch {
+            decision: FilterDecision::None,
+            meta: RuleMeta::config_fallback("dns", "", -1),
+        };
         if domain.is_empty() {
-            return false;
+            return none;
         }
-        if self.important.contains(&domain) {
-            return true;
+        if let Some(key) = self.important.lookup(&domain) {
+            let meta = self.important_meta.get(key).cloned().unwrap_or_else(|| {
+                RuleMeta::config_fallback("dns", key, -1)
+            });
+            return FilterMatch {
+                decision: FilterDecision::Important,
+                meta,
+            };
         }
-        if self.allow.contains(&domain) {
-            return false;
+        if let Some(key) = self.allow.lookup(&domain) {
+            let meta = self.allow_meta.get(key).cloned().unwrap_or_else(|| {
+                RuleMeta::config_fallback("dns", key, -1)
+            });
+            return FilterMatch {
+                decision: FilterDecision::Allow,
+                meta,
+            };
         }
-        if self.block.contains(&domain) {
-            return true;
+        if let Some(key) = self.block.lookup(&domain) {
+            let meta = self.block_meta.get(key).cloned().unwrap_or_else(|| {
+                RuleMeta::config_fallback("dns", key, -1)
+            });
+            return FilterMatch {
+                decision: FilterDecision::Block,
+                meta,
+            };
         }
         if !self.keywords.is_empty() {
             let ac = self.keywords_ac.get_or_init(|| {
@@ -447,18 +566,38 @@ impl FilterEngine {
                     }
                 }
             });
-            let hit = match ac {
-                Some(ac) => ac.is_match(domain.as_bytes()),
-                None => self.keywords.iter().any(|k| domain.contains(k.as_str())),
+            let idx = match ac {
+                Some(ac) => ac.find(domain.as_bytes()).map(|_| {
+                    self.keywords
+                        .iter()
+                        .position(|k| domain.contains(k.as_str()))
+                        .unwrap_or(0)
+                }),
+                None => self
+                    .keywords
+                    .iter()
+                    .position(|k| domain.contains(k.as_str())),
             };
-            if hit {
-                return true;
+            if let Some(i) = idx {
+                let meta = self.keyword_meta.get(i).cloned().unwrap_or_else(|| {
+                    RuleMeta::config_fallback("dns", &self.keywords[i], i as i64)
+                });
+                return FilterMatch {
+                    decision: FilterDecision::Block,
+                    meta,
+                };
             }
         }
-        if self.regexes.iter().any(|r| r.is_match(&domain)) {
-            return true;
+        if let Some(i) = self.regexes.iter().position(|r| r.is_match(&domain)) {
+            let meta = self.regex_meta.get(i).cloned().unwrap_or_else(|| {
+                RuleMeta::config_fallback("dns", self.regexes[i].as_str(), i as i64)
+            });
+            return FilterMatch {
+                decision: FilterDecision::Block,
+                meta,
+            };
         }
-        false
+        none
     }
 
     pub fn rule_count(&self) -> usize {
@@ -589,6 +728,7 @@ struct RouteRule {
     value: String,
     action: Action,
     source: Option<String>,
+    meta: Option<crate::hits::RuleMeta>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -719,6 +859,7 @@ impl RuleEngine {
                 value,
                 action,
                 source: rc.source.clone(),
+                meta: rc.meta.clone(),
             });
         }
         let final_action = classify_action(&cfg.final_policy, &group_names, &node_names);
@@ -733,6 +874,7 @@ impl RuleEngine {
                 value: String::new(),
                 action: final_action.clone(),
                 source: None,
+                meta: None,
             });
         }
 
@@ -805,6 +947,16 @@ impl RuleEngine {
 
     /// 带 App 归属的连接判定。UID 规则只在 `input.uid` 有值时才参与匹配。
     pub fn decide_input(&self, input: &MatchInput<'_>) -> (Action, String) {
+        let (a, d, _) = self.decide_input_attributed(input);
+        (a, d)
+    }
+
+    /// D0：同一套判定，额外返回首条生效规则的稳定身份。
+    /// CN 直连 / final_policy / 无规则 都返回 None（bypass 不计命中）。
+    pub fn decide_input_attributed(
+        &self,
+        input: &MatchInput<'_>,
+    ) -> (Action, String, Option<crate::hits::RuleIdentity>) {
         let dom = input.domain.map(normalize_domain);
         // 顺序：自定义规则 -> 国内直连 -> 最终策略。FINAL 不能提前命中。
         for (idx, r) in self.rules.iter().enumerate() {
@@ -864,7 +1016,22 @@ impl RuleEngine {
                         self.decision_label(&r.action)
                     ),
                 };
-                return (r.action.clone(), detail);
+                let identity = r
+                    .meta
+                    .as_ref()
+                    .map(|m| m.identity())
+                    .unwrap_or_else(|| crate::hits::RuleIdentity {
+                        rule_id: crate::hits::short_rule_id(
+                            "config",
+                            "route",
+                            &format!("{}|{}|{}", kind_name(&r.kind), r.value, idx),
+                        ),
+                        source_type: "route".into(),
+                        source_id: "config".into(),
+                        source_name: r.source.clone().unwrap_or_else(|| "当前配置".into()),
+                        order: idx as i64,
+                    });
+                return (r.action.clone(), detail, Some(identity));
             }
         }
         if self.cn_direct {
@@ -873,6 +1040,7 @@ impl RuleEngine {
                     return (
                         Action::Direct,
                         format!("国内直连：域名 {} 命中 CN 域名库", d),
+                        None,
                     );
                 }
             }
@@ -881,6 +1049,7 @@ impl RuleEngine {
                     return (
                         Action::Direct,
                         format!("国内直连：IP {} 命中 CN IP 库", input.ip),
+                        None,
                     );
                 }
             }
@@ -891,6 +1060,7 @@ impl RuleEngine {
                 return (
                     r.action.clone(),
                     format!("未命中任何规则，走最终策略：{}\n来源：final_policy", label),
+                    None,
                 );
             }
         }
@@ -898,6 +1068,7 @@ impl RuleEngine {
         (
             self.final_action.clone(),
             format!("未命中任何规则，走最终策略：{}", label),
+            None,
         )
     }
 
@@ -1022,12 +1193,13 @@ fn action_is_block(action: &str) -> bool {
 
 pub fn build_filter(cfg: &Config) -> FilterEngine {
     let mut filter = FilterEngine::new();
+    filter.set_line_meta(cfg.rule_meta.clone());
     // 分流里的 REJECT 域名规则先并入 DNS 过滤，且**不受 block_enabled 影响**：
     // 它是分流语义（用户明确要求拦截），不是广告过滤。DNS-only 模式下连接层
     // 对所有非 DNS 连接直接直连，route 层没有机会拦截，只有 DNS 层能兜住。
     let mut route_blocked = 0usize;
     for rc in &cfg.rules {
-        if action_is_block(&rc.action) && filter.add_route_block(&rc.kind, &rc.value) {
+        if action_is_block(&rc.action) && filter.add_route_block(&rc.kind, &rc.value, rc.meta.as_ref()) {
             route_blocked += 1;
         }
     }
@@ -1129,12 +1301,14 @@ mod tests {
                 value: "10100".into(),
                 action: "BLOCK".into(),
                 source: None,
+                meta: None,
             },
             crate::config::RuleConf {
                 kind: "DOMAIN-SUFFIX".into(),
                 value: "ads.bilibili.com".into(),
                 action: "BLOCK".into(),
                 source: None,
+                meta: None,
             },
         ];
         cfg
@@ -1213,7 +1387,8 @@ mod tests {
             value: "com.bilibili.app".into(),
             action: "BLOCK".into(),
             source: None,
-        }];
+                meta: None,
+            }];
         let engine = RuleEngine::from_config(&cfg);
         // 包名误写成 UID 时该条规则必须被丢弃，否则会匹配不到任何连接却让人以为生效
         assert_eq!(engine.rule_count, 1, "只剩自动补的 FINAL");
@@ -1231,12 +1406,14 @@ mod tests {
                 value: "via-proxy.example".into(),
                 action: "proxy".into(),
                 source: None,
+                meta: None,
             },
             crate::config::RuleConf {
                 kind: "DOMAIN-SUFFIX".into(),
                 value: "blocked.example".into(),
                 action: "block".into(),
                 source: None,
+                meta: None,
             },
         ];
         let engine = RuleEngine::from_config(&cfg);
@@ -1306,36 +1483,42 @@ mod tests {
                 value: "ad.example.com".into(),
                 action: "block".into(),
                 source: None,
+                meta: None,
             },
             crate::config::RuleConf {
                 kind: "DOMAIN-SUFFIX".into(),
                 value: "tracker.example".into(),
                 action: "BLOCK".into(),
                 source: None,
+                meta: None,
             },
             crate::config::RuleConf {
                 kind: "DOMAIN-KEYWORD".into(),
                 value: "adserv".into(),
                 action: "reject".into(),
                 source: None,
+                meta: None,
             },
             crate::config::RuleConf {
                 kind: "DOMAIN-REGEX".into(),
                 value: "^ads\\d+\\.foo\\.com$".into(),
                 action: "block".into(),
                 source: None,
+                meta: None,
             },
             crate::config::RuleConf {
                 kind: "DOMAIN-WILDCARD".into(),
                 value: "*.banner.example".into(),
                 action: "block".into(),
                 source: None,
+                meta: None,
             },
             crate::config::RuleConf {
                 kind: "DOMAIN".into(),
                 value: "allow.example.com".into(),
                 action: "direct".into(),
                 source: None,
+                meta: None,
             },
         ];
         let f = build_filter(&cfg);
@@ -1364,7 +1547,8 @@ mod tests {
             value: "tracker.example".into(),
             action: "block".into(),
             source: None,
-        }];
+                meta: None,
+            }];
         let f = build_filter(&cfg);
         // 分流拦截是用户明确指令，不能被广告过滤总开关一起关掉。
         assert!(f.is_blocked("x.tracker.example"));
@@ -1378,7 +1562,8 @@ mod tests {
             value: "([".into(),
             action: "block".into(),
             source: None,
-        }];
+                meta: None,
+            }];
         let f = build_filter(&cfg);
         // 非法正则不能让内核 panic 或误匹配任何域名
         assert!(!f.is_blocked("anything.example"));
@@ -1392,7 +1577,8 @@ mod tests {
             value: "com.bilibili.app".into(),
             action: "BLOCK".into(),
             source: None,
-        }];
+                meta: None,
+            }];
         let engine = RuleEngine::from_config(&cfg);
         // 包名类规则由壳层展开成 UID 后下发；内核直接收到时应拒绝而不是误匹配
         assert_eq!(engine.rule_count, 1, "只剩自动补的 FINAL");

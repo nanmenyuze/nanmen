@@ -87,7 +87,7 @@ data class ParsedModule(
 object ModuleParser {
     private val supportedRouteTypes = setOf(
         "DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DOMAIN-REGEX", "DOMAIN-WILDCARD",
-        "IP-CIDR", "IP-CIDR6", "GEOIP", "PORT", "PROTOCOL",
+        "IP-CIDR", "IP-CIDR6", "GEOIP", "PORT", "PROTOCOL", "UID",
     )
 
     fun parse(rawText: String): ParsedModule {
@@ -555,6 +555,8 @@ object ModuleParser {
         "always-real-ip", "hijack-dns", "ipv6", "prefer-ipv6", "force-close-connections",
         "proxy-test-url", "internet-test-url", "test-timeout", "allow-wifi-access", "wifi-assist",
         "dns-cache", "dns-cache-size", "geoip-maxmind", "skip-cert-verify",
+        // S6：SSID 触发只解析名单；是否启用由本地 opt-in 决定。
+        "ssid-trigger", "ssid-trigger-names",
     )
 
     /**
@@ -670,6 +672,7 @@ object ModuleParser {
             "GEOIP" -> v.equals("CN", ignoreCase = true)
             "PORT" -> v.toIntOrNull()?.let { it in 1..65535 } == true
             "PROTOCOL" -> v.equals("TCP", ignoreCase = true) || v.equals("UDP", ignoreCase = true)
+            "UID" -> v.toLongOrNull()?.let { it in 0..4_294_967_295L } == true
             "IP-CIDR" -> validCidr(v, ipv6 = false)
             "IP-CIDR6" -> validCidr(v, ipv6 = true)
             else -> false
@@ -963,6 +966,7 @@ object ModuleParser {
         var timeoutMs = 5000
         var tag = ""
         var enabled = true
+        var enableParam = ""
         for (opt in splitTopLevel(withRaw)) {
             val i = opt.indexOf('=')
             if (i <= 0) continue
@@ -976,10 +980,15 @@ object ModuleParser {
                     timeoutMs = if (n in 1..60) n * 1000 else n.coerceAtLeast(50)
                 }
                 "tag", "name" -> tag = value
-                "enable", "enabled" -> enabled = value.lowercase() !in setOf("0", "false", "no", "off")
+                "enable", "enabled" -> {
+                    // Loon 只认 enable；`${name}` 交给插件开关在运行期决定，
+                    // 不能在这里烘焙成 bool，否则用户拨动开关不会生效。
+                    val ref = Regex("""^\$\{([^}]+)}$""").find(value.trim())
+                    if (ref != null) enableParam = ref.groupValues[1].trim()
+                    else enabled = value.lowercase() !in setOf("0", "false", "no", "off")
+                }
             }
         }
-        if (!enabled) return null to null
         if (!scriptPath.startsWith("http://") && !scriptPath.startsWith("https://")) {
             return null to "script-path 只支持 http/https: $scriptPath"
         }
@@ -997,6 +1006,8 @@ object ModuleParser {
             requiresBody = requiresBody || binaryBody,
             binaryBodyMode = binaryBody,
             scriptPath = scriptPath,
+            enabled = enabled,
+            enableParam = enableParam,
         ) to null
     }
 
@@ -1094,6 +1105,7 @@ object ModuleParser {
         var timeoutMs = 5000
         var argumentText = ""
         var enabled = true
+        var enableParam = ""
         var binaryBody = false
         // Loon 允许 `名称 = type=...` 的具名写法；名称和等号是两个 token，
         // 不能把名称当成 URL 正则，也不能让独立的 `=` 覆盖 pattern。
@@ -1118,7 +1130,12 @@ object ModuleParser {
                         timeoutMs = if (n in 1..60) n * 1000 else n.coerceAtLeast(50)
                     }
                     "argument", "arguments" -> argumentText = value
-                    "enable" -> enabled = value.lowercase() !in setOf("0", "false", "no", "off")
+                    "enable" -> {
+                        // Loon 只认 enable；`${name}` 留给运行期按开关求值。
+                        val ref = Regex("""^\$\{([^}]+)}$""").find(value.trim())
+                        if (ref != null) enableParam = ref.groupValues[1].trim()
+                        else enabled = value.lowercase() !in setOf("0", "false", "no", "off")
+                    }
                     "binary-body-mode", "binarybodymode" -> binaryBody =
                         value.lowercase() in setOf("1", "true", "yes", "on")
                 }
@@ -1138,7 +1155,7 @@ object ModuleParser {
             phase.contains("response") -> "response"
             else -> ""
         }
-        if (!enabled) return null to null
+        // 禁用不等于解析失败：条目照常产出并标 disabled，界面可见、内核不跑。
         if (phase == "cron" && pattern.isBlank()) pattern = ".*"
         if (phase.isBlank()) return null to "缺少 request/response 阶段: ${line.take(80)}"
         if (pattern.isBlank()) return null to "缺少 URL 匹配正则: ${line.take(80)}"
@@ -1160,6 +1177,8 @@ object ModuleParser {
             binaryBodyMode = binaryBody,
             scriptPath = scriptPath,
             argumentText = argumentText,
+            enabled = enabled,
+            enableParam = enableParam,
         ) to null
     }
 

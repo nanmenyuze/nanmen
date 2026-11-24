@@ -461,7 +461,7 @@ private fun liveTime(ts: Long): String =
  * A1：恢复成功后只做 CA 复用/核对，不在 restore 内部碰 Root。
  * - 未启用 MITM：完全不生成 CA。
  * - 同机恢复且指纹未变、证书区/模块已匹配：静默返回，不打扰。
- * - 指纹变了，或系统库和模块都没有这张证书：才调用一键安装/更新。
+ * - 指纹变了，或系统库和模块都没有这张证书：才提示用 Magisk 更新。
  */
 private suspend fun ensureCaAfterRestore(ctx: android.content.Context, beforeFingerprint: String?): String {
     if (!App.container.settings.current().mitm.enabled) return ""
@@ -471,10 +471,5 @@ private suspend fun ensureCaAfterRestore(ctx: android.content.Context, beforeFin
     val regenerated = beforeFingerprint == null || afterFingerprint == null || beforeFingerprint != afterFingerprint
     val trust = RootCaManager.inspect(ctx, exported.systemName)
     if (!RootCaManager.caNeedsRefresh(regenerated, trust)) return ""
-    val updated = RootCaManager.install(ctx, exported.pemPath, exported.systemName)
-    return if (updated.ok) {
-        "；CA 已联动更新并注入系统信任"
-    } else {
-        "；CA 需要更新：${updated.message}"
-    }
+    return "；CA 需要更新，请在证书页导出模块，在 Magisk 中安装后完整重启"
 }

@@ -8,7 +8,7 @@ use nanmen_core::engine::Action;
 use nanmen_core::mitm::http1::{self, Buffered};
 use nanmen_core::mitm::{MitmConfig, MitmRuleConf, MitmState};
 use nanmen_core::netstack::Ctx;
-use nanmen_core::script::ScriptRuleConf;
+use nanmen_core::script::{ScriptMessage, ScriptPhase, ScriptRuleConf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::io::AsyncWriteExt;
@@ -28,6 +28,7 @@ fn rule(pattern: &str, action: &str, body_pattern: &str, replacement: &str) -> M
         replacement: replacement.into(),
         header_field: String::new(),
         source: None,
+        raw: String::new(),
     }
 }
 
@@ -1852,4 +1853,104 @@ async fn h2_idle_client_preface_is_reclaimed_quietly() {
     )
     .await;
     assert!(res.is_ok(), "空闲连接应安静回收，实际: {:?}", res.err());
+}
+
+/// 并发配额耗尽时，旧实现会 try_acquire 失败即原样透传并标 skipped，
+/// 等于把模块本该改写的正文吃掉。这里锁定：不得静默跳过，必须排队，
+/// 排不上就明确报错且正文保持原样。
+#[tokio::test]
+async fn script_slot_exhaustion_fails_loudly_instead_of_silent_bypass() {
+    let cfg = MitmConfig {
+        enabled: true,
+        hostnames: vec!["slot.test.local".into()],
+        scripts: vec![ScriptRuleConf {
+            name: "slot".into(),
+            phase: "request".into(),
+            pattern: r"^https://slot\.test\.local/x$".into(),
+            source: "$done({body:\"rewritten\"});".into(),
+            requires_body: true,
+            timeout_ms: 50,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut state = MitmState::build(&cfg);
+    // 配额归零，模拟并发打满
+    state.script_slots = Arc::new(tokio::sync::Semaphore::new(0));
+    let state = Arc::new(state);
+
+    let msg = ScriptMessage {
+        url: "https://slot.test.local/x".into(),
+        method: "GET".into(),
+        status: 200,
+        headers: Vec::new(),
+        body: "orig".into(),
+        body_bytes: None,
+    };
+    let r = state
+        .run_scripts(ScriptPhase::Request, "https://slot.test.local/x", &msg)
+        .await;
+
+    assert!(!r.skipped, "配额不足不得静默跳过: {:?}", r.errors);
+    assert_eq!(r.matched, 1, "命中的脚本数必须体现在结果里");
+    assert!(
+        r.errors.iter().any(|e| e.contains("排队超时")),
+        "排不上时应明确报排队失败: {:?}",
+        r.errors
+    );
+    assert_eq!(r.message.body, "orig", "未执行时正文必须原样透传");
+}
+
+/// 配额被占满但随后释放：必须排队等到许可并照常执行，
+/// 模块应得的结果不能因内部限流而丢失。
+#[tokio::test]
+async fn script_slot_waits_then_applies_rewrite() {
+    let cfg = MitmConfig {
+        enabled: true,
+        hostnames: vec!["slot.test.local".into()],
+        scripts: vec![ScriptRuleConf {
+            name: "slot".into(),
+            phase: "request".into(),
+            pattern: r"^https://slot\.test\.local/x$".into(),
+            source: "$done({body:\"rewritten\"});".into(),
+            requires_body: true,
+            timeout_ms: 300,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let state = Arc::new(MitmState::build(&cfg));
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        held.push(
+            state
+                .script_slots
+                .clone()
+                .try_acquire_owned()
+                .expect("4 个许可应能全部占用"),
+        );
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        drop(held);
+    });
+
+    let msg = ScriptMessage {
+        url: "https://slot.test.local/x".into(),
+        method: "GET".into(),
+        status: 200,
+        headers: Vec::new(),
+        body: "orig".into(),
+        body_bytes: None,
+    };
+    let r = state
+        .run_scripts(ScriptPhase::Request, "https://slot.test.local/x", &msg)
+        .await;
+
+    assert!(!r.skipped, "排队成功不得标记跳过");
+    assert!(r.errors.is_empty(), "排队后应正常执行: {:?}", r.errors);
+    assert_eq!(
+        r.message.body, "rewritten",
+        "模块应得的改写结果不能被并发状况吃掉"
+    );
 }

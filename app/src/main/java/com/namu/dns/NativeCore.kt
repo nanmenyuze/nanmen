@@ -18,6 +18,13 @@ object NativeCore {
     @JvmStatic external fun nativeSetUidMap(tableJson: String): Int
     @JvmStatic external fun nativeStop()
     @JvmStatic external fun nativeStats(): String
+    /** D1-D3 命中摘要快照；`since` 为 ring 增量游标，首次传 0。 */
+    @JvmStatic external fun nativeHits(since: Long): String
+    /** 历史文件损坏后重建（保留可读部分，失败时返回 false）。 */
+    @JvmStatic external fun nativeSetHitHistoryEnabled(enabled: Boolean): Boolean
+    @JvmStatic external fun nativeHitsRepair(): Boolean
+    /** 清空内存与持久化命中摘要。 */
+    @JvmStatic external fun nativeClearHits()
 
     /** 活跃连接增量快照；`since` 是上次的游标，首次传 0。 */
     @JvmStatic external fun nativeConnections(since: Long): String

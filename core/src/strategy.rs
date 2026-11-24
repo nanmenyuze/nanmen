@@ -1723,12 +1723,14 @@ mod tests {
                 value: "a.example".into(),
                 action: "组A".into(),
                 source: Some("测试".into()),
+                meta: None,
             },
             RuleConf {
                 kind: "DOMAIN".into(),
                 value: "b.example".into(),
                 action: "组B".into(),
                 source: Some("测试".into()),
+                meta: None,
             },
         ];
         let engine = RuleEngine::from_config(&cfg);

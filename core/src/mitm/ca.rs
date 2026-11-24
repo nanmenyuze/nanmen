@@ -11,7 +11,8 @@ use rcgen::{
 };
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use std::collections::{HashMap, VecDeque};
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -25,6 +26,7 @@ const CERT_MARK: &str = "-----BEGIN CERTIFICATE-----";
 const CERT_END: &str = "-----END CERTIFICATE-----";
 const KEY_MARK: &str = "-----BEGIN PRIVATE KEY-----";
 const KEY_END: &str = "-----END PRIVATE KEY-----";
+static NEXT_CA_TEMP: AtomicUsize = AtomicUsize::new(0);
 
 fn io_err(msg: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::Other, msg.to_string())
@@ -32,8 +34,42 @@ fn io_err(msg: impl std::fmt::Display) -> io::Error {
 
 fn pem_section(pem: &str, begin: &str, end: &str) -> Option<String> {
     let s = pem.find(begin)?;
-    let e = pem.find(end)? + end.len();
+    let body = s + begin.len();
+    let e = body + pem[body..].find(end)? + end.len();
     Some(pem[s..e].to_string())
+}
+
+fn publish_ca(path: &Path, pem: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let (temp, mut file) = loop {
+        let id = NEXT_CA_TEMP.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(".namu-ca-{}-{id}.tmp", std::process::id()));
+        match options.open(&temp) {
+            Ok(file) => break (temp, file),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let result = (|| {
+        file.write_all(pem)?;
+        file.sync_all()?;
+        drop(file);
+        // 原子发布且不覆盖：另一个进程已生成 CA 时，调用者改为读取赢家的证书。
+        fs::hard_link(&temp, path)
+    })();
+    let _ = fs::remove_file(temp);
+    result
 }
 
 fn pem_to_der(pem: &str) -> io::Result<Vec<u8>> {
@@ -122,30 +158,44 @@ impl MitmCa {
         if path.trim().is_empty() {
             return Err(io_err("未配置 CA 文件路径"));
         }
-        if Path::new(path).exists() {
-            let pem = std::fs::read_to_string(path)?;
-            let cert_pem = pem_section(&pem, CERT_MARK, CERT_END)
-                .ok_or_else(|| io_err("CA 文件缺少证书段"))?;
-            let key_pem =
-                pem_section(&pem, KEY_MARK, KEY_END).ok_or_else(|| io_err("CA 文件缺少私钥段"))?;
-            let key = KeyPair::from_pem(&key_pem)
-                .map_err(|e| io_err(format!("CA 私钥解析失败: {}", e)))?;
-            let params = CertificateParams::from_ca_cert_pem(&cert_pem)
-                .map_err(|e| io_err(format!("CA 证书解析失败: {}", e)))?;
-            let issuer = params
-                .self_signed(&key)
-                .map_err(|e| io_err(format!("CA 重建失败: {}", e)))?;
-            let ca_der = CertificateDer::from(pem_to_der(&cert_pem)?);
-            return Ok(Self {
-                key,
-                issuer,
-                ca_der,
-                cache: Mutex::new(LeafCache::new()),
-                inflight: Mutex::new(HashMap::new()),
-                pending_waiters: AtomicUsize::new(0),
-                stats: RwLock::new(None),
-            });
+        match fs::read_to_string(path) {
+            Ok(pem) => return Self::load_pem(&pem),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
+        Self::generate(Path::new(path))
+    }
+
+    fn load_pem(pem: &str) -> io::Result<Self> {
+        let cert_pem = pem_section(pem, CERT_MARK, CERT_END)
+            .ok_or_else(|| io_err("CA 文件缺少证书段"))?;
+        let key_pem =
+            pem_section(pem, KEY_MARK, KEY_END).ok_or_else(|| io_err("CA 文件缺少私钥段"))?;
+        let key = KeyPair::from_pem(&key_pem)
+            .map_err(|e| io_err(format!("CA 私钥解析失败: {}", e)))?;
+        let ca_der = CertificateDer::from(pem_to_der(&cert_pem)?);
+        let (_, parsed) = x509_parser::parse_x509_certificate(ca_der.as_ref())
+            .map_err(|e| io_err(format!("CA 证书解析失败: {}", e)))?;
+        if parsed.public_key().raw != key.public_key_der().as_slice() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "CA 证书与私钥不匹配"));
+        }
+        let params = CertificateParams::from_ca_cert_pem(&cert_pem)
+            .map_err(|e| io_err(format!("CA 证书解析失败: {}", e)))?;
+        let issuer = params
+            .self_signed(&key)
+            .map_err(|e| io_err(format!("CA 重建失败: {}", e)))?;
+        Ok(Self {
+            key,
+            issuer,
+            ca_der,
+            cache: Mutex::new(LeafCache::new()),
+            inflight: Mutex::new(HashMap::new()),
+            pending_waiters: AtomicUsize::new(0),
+            stats: RwLock::new(None),
+        })
+    }
+
+    fn generate(path: &Path) -> io::Result<Self> {
         let key = KeyPair::generate().map_err(|e| io_err(format!("生成 CA 私钥失败: {}", e)))?;
         let mut params = CertificateParams::default();
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -166,17 +216,13 @@ impl MitmCa {
             .self_signed(&key)
             .map_err(|e| io_err(format!("自签 CA 失败: {}", e)))?;
         let ca_der = cert.der().clone();
-        if let Some(parent) = Path::new(path).parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let mut blob = cert.pem();
         blob.push_str(&key.serialize_pem());
-        // 私钥文件权限收紧（Android 应用私有目录本身已隔离，这里再兜底一层）
-        std::fs::write(path, blob)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        if let Err(e) = publish_ca(path, blob.as_bytes()) {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                return Self::load_pem(&fs::read_to_string(path)?);
+            }
+            return Err(e);
         }
         Ok(Self {
             key,
@@ -442,6 +488,50 @@ mod tests {
         let _c1 = ca1.server_config("a.example.com").unwrap();
         let _c2 = ca2.server_config("a.example.com").unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn mismatched_disk_ca_is_rejected_without_overwriting() {
+        let path = tmp_path("mixed-ca.pem");
+        let key_a = KeyPair::generate().unwrap();
+        let cert_a = CertificateParams::default().self_signed(&key_a).unwrap();
+        let key_b = KeyPair::generate().unwrap();
+        let pem = cert_a.pem() + &key_b.serialize_pem();
+        fs::write(&path, &pem).unwrap();
+        let err = MitmCa::load_or_generate(&path)
+            .err()
+            .expect("must reject mixed CA");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read_to_string(&path).unwrap(), pem);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn concurrent_first_generation_publishes_one_ca() {
+        let path = tmp_path("concurrent-ca.pem");
+        let _ = fs::remove_file(&path);
+        let start = Arc::new(std::sync::Barrier::new(6));
+        let workers: Vec<_> = (0..6)
+            .map(|_| {
+                let start = Arc::clone(&start);
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    MitmCa::load_or_generate(&path).unwrap().ca_der().to_vec()
+                })
+            })
+            .collect();
+        let results: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+        let saved = MitmCa::load_or_generate(&path).unwrap();
+        for der in results {
+            assert_eq!(der, saved.ca_der());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

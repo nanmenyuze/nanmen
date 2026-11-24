@@ -1,14 +1,9 @@
 package com.namu.dns.core
 
-import androidx.compose.animation.animateColorAsState
-import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.foundation.border
-import androidx.compose.foundation.selection.selectable
-import androidx.compose.foundation.selection.selectableGroup
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.ui.semantics.Role
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -17,7 +12,6 @@ import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
@@ -25,21 +19,13 @@ import androidx.compose.foundation.layout.calculateStartPadding
 import androidx.compose.foundation.layout.calculateEndPadding
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.widthIn
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.QrCodeScanner
 import androidx.compose.material3.Icon
@@ -55,27 +41,19 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.drawWithContent
-import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.drawscope.translate
-import androidx.compose.ui.graphics.layer.GraphicsLayer
 import androidx.compose.ui.graphics.layer.drawLayer
 import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.hapticfeedback.HapticFeedbackType
-import androidx.compose.ui.platform.LocalHapticFeedback
-import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavDestination
 import androidx.navigation.NavHostController
@@ -85,13 +63,13 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.toRoute
-import com.namu.dns.App
 import com.namu.dns.UiPrefs
 import com.namu.dns.ui.OnboardingScreen
 import com.namu.dns.ui.ConfigDetailScreen
 import com.namu.dns.ui.ConfigScreen
 import com.namu.dns.ui.DataScreen
 import com.namu.dns.ui.DnsLogsScreen
+import com.namu.dns.ui.FirstRunVpnGuide
 import com.namu.dns.ui.HomeScreen
 import com.namu.dns.ui.LogsScreen
 import com.namu.dns.ui.MitmScreen
@@ -100,6 +78,7 @@ import com.namu.dns.ui.NamuColors
 import com.namu.dns.ui.NodesScreen
 import com.namu.dns.ui.ScanScreen
 import com.namu.dns.ui.SettingsScreen
+import com.namu.dns.ui.PrimaryTopBar
 import com.namu.dns.ui.ShadowTopBar
 
 internal val LocalDockClearance = compositionLocalOf { 0.dp }
@@ -120,6 +99,18 @@ fun NamuAppShell(
             return@CompositionLocalProvider
         }
         val container = vm.container
+        val runtimeState by container.runtime.state.collectAsStateWithLifecycle()
+        // U4：首次 VPN 全屏引导只出现一次；授权/稍后都记为已读，之后用首页空态入口再次启动。
+        if (!UiPrefs.vpnGuideDone && !runtimeState.connected) {
+            FirstRunVpnGuide(
+                onStart = {
+                    UiPrefs.setVpnGuideDone(true)
+                    onToggle()
+                },
+                onLater = { UiPrefs.setVpnGuideDone(true) },
+            )
+            return@CompositionLocalProvider
+        }
         val navController = rememberNavController()
         // B1 通知「切换节点」入口：带 open_nodes extra 打开时直达节点页。
         LaunchedEffect(openNodes) {
@@ -131,7 +122,8 @@ fun NamuAppShell(
         val snackbar = remember { SnackbarHostState() }
         val entry by navController.currentBackStackEntryAsState()
         val destination = entry?.destination
-        val currentTab = MainTab.entries.firstOrNull { destination.matches(it.route::class) }
+        val tabs = MainTab.entries
+        val currentTab = tabs.firstOrNull { destination.matches(it.route::class) }
         val isDetail = destination != null && currentTab == null
 
         // 规则更新/自动测速已交给 WorkManager（RuleUpdateWorker / NodeTestWorker），
@@ -145,28 +137,27 @@ fun NamuAppShell(
         Scaffold(
             containerColor = NamuColors.Bg,
             topBar = {
-                ShadowTopBar(
-                    title = titleFor(destination, entry),
-                    left = {
-                        NavIcon(
-                            icon = if (isDetail) Icons.AutoMirrored.Rounded.ArrowBack else Icons.Rounded.QrCodeScanner,
-                            desc = if (isDetail) "返回" else "导入服务器",
-                        ) {
+                if (currentTab != null) {
+                    PrimaryTopBar(titleFor(destination, entry))
+                } else {
+                    ShadowTopBar(
+                        title = titleFor(destination, entry),
+                        left = {
                             if (isDetail) {
-                                navController.popBackStack()
-                            } else {
-                                navController.navigate(ScanRoute)
+                                NavIcon(Icons.AutoMirrored.Rounded.ArrowBack, "返回") {
+                                    navController.popBackStack()
+                                }
                             }
-                        }
-                    },
-                    right = {
-                        if (destination.matches(HomeRoute::class)) {
-                            NavIcon(Icons.Rounded.Add, "添加服务器") {
-                                navController.navigate(NodesRoute)
+                        },
+                        right = {
+                            if (destination.matches(NodesRoute::class)) {
+                                NavIcon(Icons.Rounded.QrCodeScanner, "扫码导入节点") {
+                                    navController.navigate(ScanRoute)
+                                }
                             }
-                        }
-                    },
-                )
+                        },
+                    )
+                }
             },
             snackbarHost = {
                 SnackbarHost(snackbar) { data ->
@@ -188,7 +179,8 @@ fun NamuAppShell(
             },
             bottomBar = {
                 if (currentTab != null) {
-                    MainTabBar(
+                    GlassDock(
+                        tabs = tabs,
                         selected = currentTab,
                         pageLayer = pageLayer,
                         pageOrigin = { pageOrigin },
@@ -246,19 +238,39 @@ fun NamuNavHost(
         navController = navController,
         startDestination = HomeRoute,
         modifier = modifier,
-        enterTransition = { fadeIn(tween(170)) },
+        enterTransition = {
+            fadeIn(tween(180)) + slideInVertically(tween(220)) { it / 48 }
+        },
         exitTransition = { fadeOut(tween(120)) },
+        popEnterTransition = { fadeIn(tween(170)) },
+        popExitTransition = {
+            fadeOut(tween(140)) + slideOutVertically(tween(180)) { it / 60 }
+        },
     ) {
         composable<HomeRoute> {
             HomeScreen(
                 onToggle = onToggle,
                 onOpenNodes = { navController.navigate(NodesRoute) },
                 onRestart = onRestart,
+                onOpenData = { navController.navigate(DataRoute) },
+                onOpenConfig = { navController.navigate(ConfigDetailRoute) },
+                onOpenModules = {
+                    navController.navigate(ModulesRoute) {
+                        popUpTo(navController.graph.findStartDestination().id) { saveState = true }
+                        launchSingleTop = true
+                        restoreState = true
+                    }
+                },
+                onOpenMitm = { navController.navigate(MitmRoute) },
             )
         }
         composable<ConfigRoute> {
             StrategyScreen(
-                onOpenDetail = { navController.navigate(ConfigDetailRoute) },
+                onOpenDetail = {
+                    if (!navController.popBackStack<ConfigDetailRoute>(inclusive = false)) {
+                        navController.navigate(ConfigDetailRoute)
+                    }
+                },
                 onRestart = onRestart,
             )
         }
@@ -266,8 +278,8 @@ fun NamuNavHost(
             DataScreen(
                 onOpenLogs = { navController.navigate(LogsRoute(LogKind.Runtime)) },
                 onOpenDnsLogs = { navController.navigate(LogsRoute(LogKind.Dns)) },
-                onOpenNodes = { navController.navigate(NodesRoute) },
                 onRestart = onRestart,
+                onStartVpn = onToggle,
             )
         }
         composable<SettingsRoute> {
@@ -277,7 +289,12 @@ fun NamuNavHost(
                 onOpenMitm = { navController.navigate(MitmRoute) },
             )
         }
-        composable<NodesRoute> { NodesScreen(onRestart = onRestart) }
+        composable<NodesRoute> {
+            NodesScreen(
+                onRestart = onRestart,
+                onBack = { navController.popBackStack() },
+            )
+        }
         composable<LogsRoute> { logsEntry ->
             when (logsEntry.toRoute<LogsRoute>().kind) {
                 LogKind.Runtime -> LogsScreen()
@@ -288,35 +305,38 @@ fun NamuNavHost(
             ConfigDetailScreen(
                 onRestart = onRestart,
                 onOpenModules = { navController.navigate(ModulesRoute) },
+                onManageProfiles = { navController.navigate(ConfigRoute) },
                 onOpenMitm = { navController.navigate(MitmRoute) },
             )
         }
-        composable<ModulesRoute> { ModulesScreen(onRestart = onRestart) }
+        composable<ModulesRoute> {
+            ModulesScreen(
+                onRestart = onRestart,
+                onOpenMitm = { navController.navigate(MitmRoute) },
+            )
+        }
         composable<MitmRoute> { MitmScreen() }
         composable<ScanRoute> {
             ScanScreen(onDone = {
-                navController.navigate(NodesRoute) {
-                    popUpTo(ScanRoute) { inclusive = true }
-                    launchSingleTop = true
-                }
+                navController.popBackStack()
             })
         }
     }
 }
 
 private fun titleFor(destination: NavDestination?, entry: androidx.navigation.NavBackStackEntry?): String = when {
-    destination.matches(HomeRoute::class) -> "南门DNS"
-    destination.matches(ConfigRoute::class) -> MainTab.Config.label
-    destination.matches(DataRoute::class) -> "数据"
-    destination.matches(SettingsRoute::class) -> "设置"
-    destination.matches(NodesRoute::class) -> "服务器"
+    destination.matches(HomeRoute::class) -> "南门 DNS"
+    destination.matches(ConfigRoute::class) -> "规则"
+    destination.matches(DataRoute::class) -> "维护"
+    destination.matches(ModulesRoute::class) -> "模块"
+    destination.matches(SettingsRoute::class) -> "我的"
+    destination.matches(NodesRoute::class) -> "代理节点"
     destination.matches(LogsRoute::class) ->
         if (entry?.toRoute<LogsRoute>()?.kind == LogKind.Dns) "DNS 查询" else "运行日志"
-    destination.matches(ConfigDetailRoute::class) -> "基础配置"
-    destination.matches(ModulesRoute::class) -> "模块"
-    destination.matches(MitmRoute::class) -> "MITM 去广告"
+    destination.matches(ConfigDetailRoute::class) -> "当前配置"
+    destination.matches(MitmRoute::class) -> "MITM 管理"
     destination.matches(ScanRoute::class) -> "扫码导入"
-    else -> "南门DNS"
+    else -> "南门 DNS"
 }
 
 @Composable
@@ -347,58 +367,6 @@ private fun StrategyScreen(onOpenDetail: () -> Unit, onRestart: () -> Unit) {
 }
 
 @Composable
-private fun MainTabBar(
-    selected: MainTab,
-    pageLayer: GraphicsLayer,
-    pageOrigin: () -> Offset,
-    onSelect: (MainTab) -> Unit,
-) {
-    var dockOrigin by remember { mutableStateOf(Offset.Zero) }
-    val shape = RoundedCornerShape(32.dp)
-    Box(
-        Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 20.dp, vertical = 10.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        BoxWithConstraints(
-            Modifier.widthIn(max = 360.dp).fillMaxWidth()
-                .shadow(3.dp, shape).clip(shape)
-                .onGloballyPositioned { dockOrigin = it.positionInRoot() }
-                .border(0.5.dp, NamuColors.Separator, shape),
-        ) {
-            // 仅此背景层应用 RenderEffect，导航文字和指示器单独绘制。
-            Spacer(Modifier.matchParentSize().blur(12.dp).drawBehind {
-                val offset = pageOrigin() - dockOrigin
-                translate(offset.x, offset.y) { drawLayer(pageLayer) }
-            })
-            Spacer(Modifier.matchParentSize().background(NamuColors.Card.copy(alpha = 0.64f)))
-            val cellWidth = maxWidth / MainTab.entries.size
-            val indicatorX by animateDpAsState(
-                targetValue = cellWidth * selected.ordinal,
-                animationSpec = tween(220),
-                label = "dock-indicator",
-            )
-            Row(Modifier.fillMaxWidth().selectableGroup().padding(vertical = 4.dp)) {
-                MainTab.entries.forEach { item ->
-                    TabButton(
-                        selected = item == selected,
-                        iconRes = item.iconRes,
-                        label = item.label,
-                        modifier = Modifier.weight(1f),
-                    ) { onSelect(item) }
-                }
-            }
-            Box(
-                Modifier.align(Alignment.BottomStart)
-                    .offset(x = indicatorX + (cellWidth - 12.dp) / 2)
-                    .padding(bottom = 3.dp)
-                    .size(12.dp, 2.dp)
-                    .background(NamuColors.Accent, shape),
-            )
-        }
-    }
-}
-
-@Composable
 private fun NavIcon(
     icon: ImageVector,
     desc: String,
@@ -417,50 +385,6 @@ private fun NavIcon(
             contentDescription = desc,
             tint = NamuColors.TextMain,
             modifier = Modifier.size(23.dp),
-        )
-    }
-}
-
-@Composable
-private fun TabButton(
-    selected: Boolean,
-    iconRes: Int,
-    label: String,
-    modifier: Modifier = Modifier,
-    onClick: () -> Unit,
-) {
-    val interaction = remember { MutableInteractionSource() }
-    val haptic = LocalHapticFeedback.current
-    Column(
-        modifier
-            .heightIn(min = 48.dp)
-            .selectable(selected = selected, role = Role.Tab, interactionSource = interaction, indication = null) {
-                if (!selected) {
-                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                    onClick()
-                }
-            }
-            .padding(vertical = 4.dp),
-        verticalArrangement = androidx.compose.foundation.layout.Arrangement.Center,
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        val tint by animateColorAsState(
-            if (selected) NamuColors.Accent else NamuColors.TextSub,
-            tween(180),
-            label = "tab-tint",
-        )
-        Icon(
-            painter = painterResource(iconRes),
-            contentDescription = null,
-            tint = tint,
-            modifier = Modifier.size(20.dp),
-        )
-        Spacer(Modifier.height(3.dp))
-        Text(
-            label,
-            fontSize = 12.sp,
-            fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal,
-            color = tint,
         )
     }
 }

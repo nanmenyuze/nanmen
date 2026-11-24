@@ -164,6 +164,40 @@ data class RuleSetRef(
     val action: String,
 )
 
+/** D0 归因身份：内核与壳层共用的稳定规则标识，不下发到 UI 以外的位置。 */
+@Serializable
+data class RuleMeta(
+    val section: String = "",
+    val key: String = "",
+    val ruleId: String = "",
+    val sourceType: String = "",
+    val sourceId: String = "",
+    val sourceName: String = "",
+    val order: Long = 0,
+) {
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("section", section)
+        put("key", key)
+        put("ruleId", ruleId)
+        put("sourceType", sourceType)
+        put("sourceId", sourceId)
+        put("sourceName", sourceName)
+        put("order", order)
+    }
+
+    companion object {
+        fun fromJson(o: JSONObject) = RuleMeta(
+            section = o.optString("section"),
+            key = o.optString("key"),
+            ruleId = o.optString("ruleId"),
+            sourceType = o.optString("sourceType"),
+            sourceId = o.optString("sourceId"),
+            sourceName = o.optString("sourceName"),
+            order = o.optLong("order", 0),
+        )
+    }
+}
+
 @Serializable
 data class RuleItem(
     val type: String,
@@ -172,6 +206,8 @@ data class RuleItem(
     val source: String = "",
     /** B3 单条启用开关：禁用规则不下发内核（壳层过滤），旧 JSON 缺省启用。 */
     val enabled: Boolean = true,
+    /** D0 归因身份；模块规则在重建时生成，手写配置在 nativeJson 时补默认身份。 */
+    @kotlinx.serialization.Transient val meta: RuleMeta? = null,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("type", type)
@@ -179,6 +215,7 @@ data class RuleItem(
         put("action", action)
         if (source.isNotBlank()) put("source", source)
         if (!enabled) put("enabled", false)
+        meta?.let { put("meta", it.toJson()) }
     }
 
     companion object {
@@ -188,6 +225,7 @@ data class RuleItem(
             o.optString("action", "proxy"),
             o.optString("source", ""),
             o.optBoolean("enabled", true),
+            if (o.has("meta") && !o.isNull("meta")) RuleMeta.fromJson(o.getJSONObject("meta")) else null,
         )
     }
 }
@@ -589,6 +627,8 @@ data class ModuleSource(
     /** 上次拉取失败但本地旧缓存仍可用。 */
     val stale: Boolean = false,
     val cacheBytes: Long = 0L,
+    /** S3：Profile 内模块顺序；-1 表示旧数据，按列表下标兜底。 */
+    val order: Int = -1,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id)
@@ -609,6 +649,7 @@ data class ModuleSource(
         put("lastModified", lastModified)
         put("stale", stale)
         put("cacheBytes", cacheBytes)
+        if (order >= 0) put("order", order)
     }
 
     companion object {
@@ -631,6 +672,7 @@ data class ModuleSource(
             lastModified = o.optString("lastModified", ""),
             stale = o.optBoolean("stale", false),
             cacheBytes = o.optLong("cacheBytes", 0L),
+            order = o.optInt("order", -1),
         )
     }
 }
@@ -732,6 +774,21 @@ data class AppConfig(
     var autoConnect: Boolean = false,
     /** tcp / tls：首页测速和自动选节点共用。 */
     var pingMethod: String = "tcp",
+    /** D2 轻量命中摘要开关：默认开；关闭后不再写盘，内存快照仍可用于本会话诊断。 */
+    var hitHistoryEnabled: Boolean = true,
+    /** S6：SSID 触发默认关；开启前必须由用户显式同意定位权限（opt-in）。 */
+    var ssidTriggerEnabled: Boolean = false,
+    var ssidTriggerNames: List<String> = emptyList(),
+    /** 只有用户主动勾选后才申请定位权限并读取当前 SSID。 */
+    var ssidLocationOptIn: Boolean = false,
+    /**
+     * 第 13 节 L3：最近一次移除系统 CA 的结果。仅用于区分「已卸载」与
+     * 「从未安装」；残留异常时同时列出失败 namespace 供重试。
+     */
+    var caLastRemovalAt: Long = 0L,
+    var caLastRemovalCleared: Int = 0,
+    var caLastRemovalFailed: Int = 0,
+    var caLastRemovalFailedNs: String = "",
     var subscriptionInfo: SubscriptionInfo? = null,
     var rules: List<RuleItem> = defaultRules(),
     var proxyGroups: List<ProxyGroup> = emptyList(),
@@ -786,6 +843,14 @@ data class AppConfig(
         put("themeMode", themeMode)
         put("autoConnect", autoConnect)
         put("pingMethod", pingMethod)
+        put("hitHistoryEnabled", hitHistoryEnabled)
+        put("ssidTriggerEnabled", ssidTriggerEnabled)
+        put("ssidTriggerNames", JSONArray().apply { ssidTriggerNames.forEach { put(it) } })
+        put("ssidLocationOptIn", ssidLocationOptIn)
+        put("caLastRemovalAt", caLastRemovalAt)
+        put("caLastRemovalCleared", caLastRemovalCleared)
+        put("caLastRemovalFailed", caLastRemovalFailed)
+        put("caLastRemovalFailedNs", caLastRemovalFailedNs)
         subscriptionInfo?.let { put("subscriptionInfo", it.toJson()) }
         put("nodes", JSONArray().apply { nodes.forEach { put(it.toJson()) } })
         put("rules", JSONArray().apply { rules.forEach { put(it.toJson()) } })
@@ -815,6 +880,8 @@ data class AppConfig(
             "customAds", "autoUpdateRules", "financeProtect", "rulesUpdatedAt", "allowDnsFallback", "blockWhenNoNode",
             "fakeIp", "blockAaaa", "sniff", "autoSelectNode", "autoClearLogs",
             "autoDisablePrivateDns", "themeMode", "autoConnect", "pingMethod", "subscriptionInfo",
+            "hitHistoryEnabled", "ssidTriggerEnabled", "ssidTriggerNames", "ssidLocationOptIn",
+            "caLastRemovalAt", "caLastRemovalCleared", "caLastRemovalFailed", "caLastRemovalFailedNs",
             "rules", "proxyGroups", "groupSelections", "mitm", "mtu", "bbr", "quicFallback",
             "dnsOnlyFullRoute",
         )
@@ -925,6 +992,16 @@ data class AppConfig(
                     },
                     autoConnect = o.optBoolean("autoConnect", false),
                     pingMethod = o.optString("pingMethod", "tcp").let { if (it == "tls") "tls" else "tcp" },
+                    hitHistoryEnabled = o.optBoolean("hitHistoryEnabled", true),
+                    ssidTriggerEnabled = o.optBoolean("ssidTriggerEnabled", false),
+                    ssidTriggerNames = o.optJSONArray("ssidTriggerNames")?.let { a ->
+                        (0 until a.length()).mapNotNull { i -> a.optString(i, "").trim().takeIf { it.isNotBlank() } }
+                    } ?: emptyList(),
+                    ssidLocationOptIn = o.optBoolean("ssidLocationOptIn", false),
+                    caLastRemovalAt = o.optLong("caLastRemovalAt", 0L),
+                    caLastRemovalCleared = o.optInt("caLastRemovalCleared", 0),
+                    caLastRemovalFailed = o.optInt("caLastRemovalFailed", 0),
+                    caLastRemovalFailedNs = o.optString("caLastRemovalFailedNs", ""),
                     subscriptionInfo = o.optJSONObject("subscriptionInfo")?.let { SubscriptionInfo.fromJson(it) },
                     // 缺 rules 键（旧配置/外部导入）时回退默认私网直连规则，而不是空表。
                     rules = if (o.has("rules")) rules else defaultRules(),

@@ -391,6 +391,8 @@ struct HostMap {
     exact: HashMap<String, HostEntry>,
     /// (去掉 `*.` 的域名, 值)；按最长后缀匹配。
     wildcard: Vec<(String, HostEntry)>,
+    /// D0：normalized key → 归因身份（exact 与 wildcard 共用一张表）。
+    meta: HashMap<String, crate::hits::RuleMeta>,
     /// 解析期拒绝的条目，启动/热重载时写日志，不静默失效。
     rejected: Vec<String>,
 }
@@ -402,6 +404,12 @@ impl HostMap {
         fallback: Option<&UpstreamKind>,
     ) -> Self {
         let mut map = HostMap::default();
+        for m in &cfg.host_meta {
+            if !m.key.trim().is_empty() {
+                map.meta
+                    .insert(m.key.trim().trim_end_matches('.').to_ascii_lowercase(), m.clone());
+            }
+        }
         let mut allowed: HashSet<&'static str> = HashSet::new();
         allowed.insert(upstream_protocol(primary));
         if let Some(f) = fallback {
@@ -440,13 +448,13 @@ impl HostMap {
         map
     }
 
-    fn lookup(&self, host: &str) -> Option<&HostEntry> {
+    fn lookup(&self, host: &str) -> Option<(&HostEntry, Option<&crate::hits::RuleMeta>)> {
         let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
         if h.is_empty() {
             return None;
         }
         if let Some(e) = self.exact.get(&h) {
-            return Some(e);
+            return Some((e, self.meta.get(&h)));
         }
         self.wildcard.iter().find_map(|(base, entry)| {
             // *.example.com 只匹配子域，不匹配 apex；避免把用户没写的根域一起覆盖。
@@ -454,7 +462,7 @@ impl HostMap {
                 && h.ends_with(base)
                 && h.as_bytes().get(h.len() - base.len() - 1) == Some(&b'.')
             {
-                Some(entry)
+                Some((entry, self.meta.get(base)))
             } else {
                 None
             }
@@ -714,16 +722,20 @@ impl DnsEngine {
         }
     }
 
-    fn host_entry(&self, qname: &str) -> Option<HostEntry> {
+    fn host_entry(&self, qname: &str) -> Option<(HostEntry, Option<crate::hits::RuleMeta>)> {
         self.hosts
             .read()
-            .map(|h| h.lookup(qname).cloned())
-            .unwrap_or_else(|p| p.into_inner().lookup(qname).cloned())
+            .map(|h| h.lookup(qname).map(|(e, m)| (e.clone(), m.cloned())))
+            .unwrap_or_else(|p| {
+                p.into_inner()
+                    .lookup(qname)
+                    .map(|(e, m)| (e.clone(), m.cloned()))
+            })
     }
 
     fn host_server(&self, qname: &str) -> Option<UpstreamKind> {
         match self.host_entry(qname) {
-            Some(HostEntry::Server(kind)) => Some(kind),
+            Some((HostEntry::Server(kind), _)) => Some(kind),
             _ => None,
         }
     }
@@ -873,7 +885,7 @@ impl DnsEngine {
         let mut name = Name::from_ascii(&key).ok()?;
         // 直连真实解析也要遵守 [Host]：IP 直接返回，别名换 qname 查上游，
         // server 由 query_upstream 里的域名级上游选择接管。
-        if let Some(entry) = self.host_entry(&key) {
+        if let Some((entry, _meta)) = self.host_entry(&key) {
             match entry {
                 HostEntry::Ip(ips) => {
                     let usable: Vec<IpAddr> = ips
@@ -998,6 +1010,7 @@ impl DnsEngine {
         let started = Instant::now();
         if count_query {
             self.stats.dns_queries.fetch_add(1, Ordering::Relaxed);
+            self.stats.hits.record_query(false);
         }
 
         // 缓存与并发合并必须区分 qclass、DO、CD：带 DO 的查询要求 DNSSEC 记录，
@@ -1023,8 +1036,13 @@ impl DnsEngine {
             .read()
             .map(|f| f.clone())
             .unwrap_or_else(|p| p.into_inner().clone());
-        if self.block_enabled && filter.is_blocked(&qname) {
+        let filter_match = filter.match_detail(&qname);
+        if self.block_enabled && filter_match.is_block() {
             self.stats.dns_blocked.fetch_add(1, Ordering::Relaxed);
+            self.stats.hits.record_blocked();
+            self.stats
+                .hits
+                .record_hit(&filter_match.meta.identity(), &qname, "block");
             // 本地拦截应答缓存：规则命中的热门广告域在 TTL 内直接复用应答，
             // 不再每次构造报文/查规则；换规则时 swap_filter 会清空。
             let cached = self
@@ -1075,7 +1093,12 @@ impl DnsEngine {
         // - server 只记录为本次 query_upstream 的主上游，链路其余部分不动。
         // AAAA 关闭时，IP/别名同样返回空 NOERROR，不能因为 Host 绕过 AAAA 过滤。
         if qclass == DNSClass::IN {
-            if let Some(entry) = self.host_entry(&qname) {
+            if let Some((entry, meta)) = self.host_entry(&qname) {
+                if let Some(meta) = meta {
+                    self.stats
+                        .hits
+                        .record_hit(&meta.identity(), &qname, "rewrite");
+                }
                 match entry {
                     HostEntry::Ip(ips) => {
                         let resp = self.host_ip_response(&req, qtype, &qname, &ips);
@@ -1162,6 +1185,8 @@ impl DnsEngine {
 
         self.stats.dns_cache_lookups.fetch_add(1, Ordering::Relaxed);
         let cached = self.cache.lock().ok().and_then(|mut c| c.get(&key, id));
+        let cache_hit_now = cached.as_ref().map(|(_, stale)| !*stale).unwrap_or(false);
+        self.stats.hits.record_cache_lookup(cache_hit_now);
         if let Some((cached, stale)) = cached {
             if !stale {
                 self.stats.dns_cached.fetch_add(1, Ordering::Relaxed);
@@ -1237,7 +1262,7 @@ impl DnsEngine {
                             engine.stats.dns_rebind.fetch_add(1, Ordering::Relaxed);
                             logging::warn("dns", format!("rebind 防护拦截 {}", qname2));
                             Some((engine.blocked_response(&req2, qtype), "rebind"))
-                        } else if let Some(target) = blocked_cname_target(&r, &filter, qtype) {
+                        } else if let Some((target, meta)) = blocked_cname_target(&r, &filter, qtype) {
                             // CNAME 伪装：查询名是第一方正常域名，广告域名藏在应答链里。
                             // 只查 qname 会整条放过去，这里对链上目标再过一遍规则。
                             engine
@@ -1245,6 +1270,11 @@ impl DnsEngine {
                                 .dns_cname_blocked
                                 .fetch_add(1, Ordering::Relaxed);
                             engine.stats.dns_blocked.fetch_add(1, Ordering::Relaxed);
+                            engine.stats.hits.record_blocked();
+                            engine
+                                .stats
+                                .hits
+                                .record_hit(&meta.identity(), &target, "block");
                             logging::info(
                                 "dns",
                                 format!("CNAME 伪装拦截 {} -> {}", qname2, target),
@@ -1459,13 +1489,18 @@ impl DnsEngine {
                     // 后台刷新也必须过同一套 rebind 检查，否则坏应答会绕过防护进缓存。
                     engine.stats.dns_rebind.fetch_add(1, Ordering::Relaxed);
                     logging::warn("dns", format!("rebind 防护拦截(刷新) {}", qname2));
-                } else if let Some(target) = blocked_cname_target(&r, &filter, qt) {
+                } else if let Some((target, meta)) = blocked_cname_target(&r, &filter, qt) {
                     // 刷新路径同样要查 CNAME，否则坏应答会先进缓存、绕过首次查询的检查。
                     engine
                         .stats
                         .dns_cname_blocked
                         .fetch_add(1, Ordering::Relaxed);
                     engine.stats.dns_blocked.fetch_add(1, Ordering::Relaxed);
+                    engine.stats.hits.record_blocked();
+                    engine
+                        .stats
+                        .hits
+                        .record_hit(&meta.identity(), &target, "block");
                     logging::info(
                         "dns",
                         format!("CNAME 伪装拦截(刷新) {} -> {}", qname2, target),
@@ -2078,7 +2113,11 @@ pub fn fit_udp_response(req: &[u8], resp: Vec<u8>) -> Vec<u8> {
 ///
 /// 只对 A/AAAA 查询生效：其他类型（MX/TXT/SRV）没有「连接目标」语义，
 /// 拦截它们只会造成误伤。
-fn blocked_cname_target(bytes: &[u8], filter: &FilterEngine, qtype: RecordType) -> Option<String> {
+fn blocked_cname_target(
+    bytes: &[u8],
+    filter: &FilterEngine,
+    qtype: RecordType,
+) -> Option<(String, crate::hits::RuleMeta)> {
     if qtype != RecordType::A && qtype != RecordType::AAAA {
         return None;
     }
@@ -2091,8 +2130,9 @@ fn blocked_cname_target(bytes: &[u8], filter: &FilterEngine, qtype: RecordType) 
         if target.is_empty() {
             continue;
         }
-        if filter.is_blocked(&target) {
-            return Some(target);
+        let m = filter.match_detail(&target);
+        if m.is_block() {
+            return Some((target, m.meta));
         }
     }
     None
@@ -2506,14 +2546,14 @@ mod tests {
             .insert("bad.example".into(), "server:system".into());
         let primary = UpstreamKind::Udp("223.5.5.5".into(), 53);
         let map = HostMap::from_config(&cfg, &primary, None);
-        assert!(matches!(map.lookup("ip.example"), Some(HostEntry::Ip(v)) if v.len() == 2));
+        assert!(matches!(map.lookup("ip.example"), Some((HostEntry::Ip(v), _)) if v.len() == 2));
         assert!(
-            matches!(map.lookup("a.wild.example"), Some(HostEntry::Alias(v)) if v == "alias.example")
+            matches!(map.lookup("a.wild.example"), Some((HostEntry::Alias(v), _)) if v == "alias.example")
         );
         assert!(map.lookup("wild.example").is_none(), "*. 不匹配 apex");
         assert!(matches!(
             map.lookup("server.example"),
-            Some(HostEntry::Server(_))
+            Some((HostEntry::Server(_), _))
         ));
         assert!(map.lookup("bad.example").is_none());
         assert!(map.rejected.iter().any(|s| s.contains("server:system")));
@@ -2538,7 +2578,7 @@ mod tests {
         let map = HostMap::from_config(&cfg, &doh, None);
         assert!(matches!(
             map.lookup("doh.example"),
-            Some(HostEntry::Server(UpstreamKind::Doh(..)))
+            Some((HostEntry::Server(UpstreamKind::Doh(..)), _))
         ));
         assert!(map.lookup("udp.example").is_none());
         assert!(map.rejected.iter().any(|s| s.contains("没有 udp 客户端")));
@@ -2686,7 +2726,7 @@ mod tests {
         ));
         let bytes = resp.to_vec().unwrap();
         assert_eq!(
-            blocked_cname_target(&bytes, &filter, RecordType::A).as_deref(),
+            blocked_cname_target(&bytes, &filter, RecordType::A).map(|(t, _)| t).as_deref(),
             Some("adserver.example"),
             "查询名正常、CNAME 目标命中规则时必须拦截"
         );

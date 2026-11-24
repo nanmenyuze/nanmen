@@ -7,6 +7,7 @@ pub mod dns;
 pub mod dns_log;
 pub mod engine;
 pub mod finance;
+pub mod hits;
 pub mod logging;
 pub mod mitm;
 pub mod netstack;
@@ -58,6 +59,7 @@ fn stop_engine() {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .save_state();
+        engine.stats.hits.persist();
         // 冻结统计时点：停止后 nativeStats 仍返回本次会话的汇总，uptime 不再增长。
         engine
             .stats
@@ -148,6 +150,10 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStart<'local>(
             }
         }
         let stats: Arc<Stats> = Arc::new(Stats::new());
+        stats
+            .hits
+            .set_history_path(cfg.hit_history_file.clone());
+        stats.hits.set_persist_enabled(cfg.hit_history_enabled);
         crate::outbound::set_tuning(cfg.bbr, stats.clone());
         stats
             .filter_rules
@@ -287,6 +293,7 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStart<'local>(
                     .read()
                     .unwrap_or_else(|p| p.into_inner())
                     .save_state();
+                ctx_flush.stats.hits.flush_if_dirty();
             }
         });
 
@@ -358,6 +365,69 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStats<'local>(
         }
     };
     to_jstring(&mut env, json)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeHits<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    since: jlong,
+) -> jstring {
+    let json = {
+        let guard = match ENGINE.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let stats = match guard.as_ref() {
+            Some(engine) => engine.stats.clone(),
+            None => ENGINE_STATS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone(),
+        };
+        stats.hits.snapshot_json(since)
+    };
+    to_jstring(&mut env, json)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeHitsRepair<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jboolean {
+    let stats = ENGINE_STATS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    if stats.hits.repair() {
+        1
+    } else {
+        0
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeSetHitHistoryEnabled<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    enabled: jboolean,
+) -> jboolean {
+    let on = enabled != 0;
+    let mut stats = ENGINE_STATS.lock().unwrap_or_else(|p| p.into_inner());
+    stats.hits.set_persist_enabled(on);
+    on as jboolean
+}
+
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeClearHits<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) {
+    ENGINE_STATS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .hits
+        .clear();
 }
 
 #[no_mangle]
@@ -955,8 +1025,13 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeVersion<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
-    to_jstring(&mut env, "1.13.22".into())
+    to_jstring(&mut env, "1.13.25".into())
 }
+
+/// 给发布产物做独立校验用：即使 JNI 入口被裁剪，`llvm-strings` 仍能在
+/// libnanmen_core.so 里读到 `nanmen_core-1.13.25`，不必只信清单文件。
+#[no_mangle]
+pub static NAMU_CORE_VERSION: [u8; 19] = *b"nanmen_core-1.13.25";
 
 #[cfg(test)]
 mod rule_test_transport_tests {

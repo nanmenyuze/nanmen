@@ -7,6 +7,8 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import com.namu.dns.Actions
 import com.namu.dns.AppConfig
 import com.namu.dns.core.AppContainer
+import com.namu.dns.core.repository.HitRepository
+import com.namu.dns.core.repository.HitsUiState
 import com.namu.dns.core.repository.LogRepository
 import com.namu.dns.core.repository.LogsUiState
 import com.namu.dns.core.repository.NodeRepository
@@ -26,12 +28,14 @@ data class DataUiState(
     val runtime: RuntimeState = RuntimeState(),
     val stats: StatsUiState = StatsUiState(),
     val logs: LogsUiState = LogsUiState(),
+    val hits: HitsUiState = HitsUiState(),
 )
 
 class DataViewModel(
     private val settings: SettingsRepository,
     private val runtime: RuntimeRepository,
     private val stats: StatsRepository,
+    private val hits: HitRepository,
     private val logs: LogRepository,
     private val nodes: NodeRepository,
     private val messages: MessageRepository,
@@ -40,17 +44,29 @@ class DataViewModel(
         settings.config,
         runtime.state,
         stats.state,
+        hits.state,
         logs.state,
-    ) { config, runtime, stats, logs ->
-        DataUiState(config, runtime, stats, logs)
+    ) { config, runtime, stats, hitState, logs ->
+        DataUiState(config, runtime, stats, logs, hitState)
     }.stateIn(
         viewModelScope,
         SharingStarted.WhileSubscribed(5_000),
-        DataUiState(settings.current(), runtime.current(), stats.current(), logs.current()),
+        DataUiState(settings.current(), runtime.current(), stats.current(), logs.current(), hits.current()),
     )
 
     fun setAutoClearLogs(enabled: Boolean) {
         settings.update { it.copy(autoClearLogs = enabled) }
+    }
+
+    fun setHitWindow(hours: Int) = hits.setWindow(hours)
+
+    fun clearHits() = hits.clear()
+
+    fun repairHits() = hits.repair()
+
+    fun setHitHistoryEnabled(enabled: Boolean) {
+        settings.update { it.copy(hitHistoryEnabled = enabled) }
+        hits.setEnabled(enabled)
     }
 
     fun clearAllNodes() {
@@ -82,6 +98,7 @@ class DataViewModel(
                     settings = container.settings,
                     runtime = container.runtime,
                     stats = container.stats,
+                    hits = container.hits,
                     logs = container.logs,
                     nodes = container.nodes,
                     messages = container.messages,

@@ -35,6 +35,8 @@ data class ConfigFile(
     @SerialName("proxyGroups") val proxyGroups: List<ProxyGroup> = emptyList(),
     val ruleSources: List<RuleSource> = emptyList(),
     val modules: List<ModuleSource> = emptyList(),
+    /** S1：组选择归 Profile；null = 旧文件缺字段，读取时回落到设备全局值。 */
+    val groupSelections: Map<String, String>? = null,
     val customAds: List<String> = emptyList(),
     val mitm: MitmConfig = MitmConfig(),
     @Transient val unknownRoot: JsonObject = JsonObject(emptyMap()),
@@ -64,22 +66,23 @@ data class ConfigFile(
         proxyGroups = proxyGroups,
         ruleSources = ruleSources,
         moduleSources = modules,
+        groupSelections = groupSelections ?: base.groupSelections,
         customAds = customAds,
         mitm = mitm,
         configUnknown = if (unknownRoot.isEmpty()) "" else unknownRoot.toString(),
     )
 
     companion object {
-        const val CURRENT_VERSION = 3
+        const val CURRENT_VERSION = 4
         const val SOURCE_NATIVE = "native-json"
         const val SOURCE_CLASH = "clash-yaml"
         const val SOURCE_LOON = "loon-conf"
         const val SOURCE_SHADOWROCKET = "shadowrocket-conf"
 
         private val KNOWN_ROOT_KEYS = setOf(
-            "version", "general", "rules", "proxyGroups", "ruleSources", "modules", "customAds", "mitm",
+            "version", "general", "rules", "proxyGroups", "ruleSources", "modules", "groupSelections", "customAds", "mitm",
             // 设备侧字段不属于配置文件；即使外部文件带进来，也不能写回 .conf。
-            "nodes", "selected", "groupSelections", "subscription", "configUnknown",
+            "nodes", "selected", "subscription", "configUnknown",
         )
 
         /** 判断磁盘文件是否已经是带 general 分区的新格式（不要求 version 已是最新）。 */
@@ -96,6 +99,7 @@ data class ConfigFile(
             proxyGroups = cfg.proxyGroups,
             ruleSources = cfg.ruleSources,
             modules = cfg.moduleSources,
+            groupSelections = cfg.groupSelections,
             customAds = cfg.customAds,
             mitm = cfg.mitm,
             unknownRoot = parseUnknown(cfg.configUnknown),
@@ -128,7 +132,8 @@ data class ConfigFile(
         fun fromLegacyJson(text: String, fallback: AppConfig): ConfigFile {
             val merged = fallback.toJson()
             val old = JSONObject(text)
-            val deviceOnly = setOf("nodes", "selected", "groupSelections", "subscription")
+            // S1 起 groupSelections 属于 Profile；旧扁平文件里的同名键要保留给这份 Profile。
+            val deviceOnly = setOf("nodes", "selected", "subscription")
             old.keys().forEach { key ->
                 if (key !in deviceOnly) merged.put(key, old.get(key))
             }
@@ -184,6 +189,7 @@ data class GeneralConfig(
     val allowDnsFallback: Boolean = true,
     val blockWhenNoNode: Boolean = true,
     val fakeIp: Boolean = false,
+    val dnsOnlyFullRoute: Boolean? = null,
     val blockAaaa: Boolean = false,
     val sniff: Boolean = true,
     val autoSelectNode: Boolean = false,
@@ -192,6 +198,9 @@ data class GeneralConfig(
     val themeMode: String = "system",
     val autoConnect: Boolean = false,
     val pingMethod: String = "tcp",
+    val ssidTriggerEnabled: Boolean = false,
+    val ssidTriggerNames: List<String> = emptyList(),
+    val ssidLocationOptIn: Boolean = false,
     val subscriptionInfo: SubscriptionInfo? = null,
 ) {
     fun applyTo(base: AppConfig): AppConfig = base.copy(
@@ -220,6 +229,7 @@ data class GeneralConfig(
         allowDnsFallback = allowDnsFallback,
         blockWhenNoNode = blockWhenNoNode,
         fakeIp = fakeIp,
+        dnsOnlyFullRoute = dnsOnlyFullRoute ?: base.dnsOnlyFullRoute,
         blockAaaa = blockAaaa,
         sniff = sniff,
         autoSelectNode = autoSelectNode,
@@ -228,6 +238,9 @@ data class GeneralConfig(
         themeMode = themeMode,
         autoConnect = autoConnect,
         pingMethod = pingMethod,
+        ssidTriggerEnabled = ssidTriggerEnabled,
+        ssidTriggerNames = ssidTriggerNames,
+        ssidLocationOptIn = ssidLocationOptIn,
         subscriptionInfo = subscriptionInfo,
     )
 
@@ -258,6 +271,7 @@ data class GeneralConfig(
             allowDnsFallback = cfg.allowDnsFallback,
             blockWhenNoNode = cfg.blockWhenNoNode,
             fakeIp = cfg.fakeIp,
+            dnsOnlyFullRoute = cfg.dnsOnlyFullRoute,
             blockAaaa = cfg.blockAaaa,
             sniff = cfg.sniff,
             autoSelectNode = cfg.autoSelectNode,
@@ -266,6 +280,9 @@ data class GeneralConfig(
             themeMode = cfg.themeMode,
             autoConnect = cfg.autoConnect,
             pingMethod = cfg.pingMethod,
+            ssidTriggerEnabled = cfg.ssidTriggerEnabled,
+            ssidTriggerNames = cfg.ssidTriggerNames,
+            ssidLocationOptIn = cfg.ssidLocationOptIn,
             subscriptionInfo = cfg.subscriptionInfo,
         )
     }

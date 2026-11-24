@@ -244,6 +244,7 @@ mod tests {
             body: Some(regex::bytes::Regex::new(pattern).unwrap()),
             replacement: replacement.to_string(),
             header_field: String::new(),
+            identity: None,
         }
     }
 

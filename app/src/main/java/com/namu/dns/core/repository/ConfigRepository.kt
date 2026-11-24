@@ -4,6 +4,7 @@ import com.namu.dns.AppConfig
 import com.namu.dns.ConfigFileStore
 import com.namu.dns.core.config.ConfigFile
 import com.namu.dns.core.config.ConfigSourceRegistry
+import com.namu.dns.core.config.GroupValidator
 
 data class ConfigEntry(
     val name: String,
@@ -58,6 +59,8 @@ class DefaultConfigRepository(
     override fun switchTo(name: String): Boolean {
         val n = ConfigFileStore.sanitize(name)
         val loaded = files.load(n, settings.current()) ?: return false
+        // S1：切换前校验组引用，孤立组/串组不允许进入运行时；warning 不阻断。
+        if (!GroupValidator.validate(n, loaded).ok) return false
         // 先改 active 名，再写内存配置：persist 会用新 active 名刷新 .conf，
         // 顺序反了会把旧配置文件覆盖成新配置内容。
         settings.setActiveConfigName(n)
@@ -82,6 +85,8 @@ class DefaultConfigRepository(
         val parsed = result.config ?: return false
         val next = parsed.toAppConfig(current)
         if (result.nodes.isEmpty()) {
+            // S1：纯配置文件导入先按当前设备节点校验组引用。
+            if (!GroupValidator.validate(n, next).ok) return false
             return files.save(n, next)
         }
         // Loon/小火箭配置把节点内联在文件里；节点仍属于设备侧，不写进 .conf。
@@ -91,6 +96,8 @@ class DefaultConfigRepository(
             nodes = result.nodes,
             selected = if (next.selected != null && result.nodes.any { it.name == next.selected }) next.selected else first,
         )
+        // S1：节点内联的文件必须用合并后的节点表校验，否则组引用会被误判缺失。
+        if (!GroupValidator.validate(n, merged).ok) return false
         if (!files.save(n, merged)) return false
         settings.setActiveConfigName(n)
         settings.set(merged)

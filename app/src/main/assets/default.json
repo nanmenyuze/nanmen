@@ -1,5 +1,6 @@
 {
   "mode": "dns_only",
+  "dnsOnlyFullRoute": false,
   "dnsUpstream": "system",
   "dnsFallback": "system",
   "allowDnsFallback": true,

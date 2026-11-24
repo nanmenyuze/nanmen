@@ -8,6 +8,7 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import com.namu.dns.core.config.MitmConfig
+import com.namu.dns.core.config.ModuleOrder
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -30,9 +31,18 @@ object Actions {
         fileName: String,
         content: String,
         mimeType: String = "text/plain",
+    ): String = exportBytes(context, fileName, content.toByteArray(), mimeType)
+
+    /** 二进制导出统一走公共下载目录；29+ 用 MediaStore，无需存储权限。 */
+    suspend fun exportBytes(
+        context: android.content.Context,
+        fileName: String,
+        bytes: ByteArray,
+        mimeType: String = "application/octet-stream",
     ): String =
         withContext(Dispatchers.IO) {
             if (android.os.Build.VERSION.SDK_INT >= 29) {
+                deleteExistingDownload(context, fileName)
                 val values = android.content.ContentValues().apply {
                     put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, fileName)
                     put(android.provider.MediaStore.MediaColumns.MIME_TYPE, mimeType)
@@ -43,15 +53,54 @@ object Actions {
                     android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI,
                     values,
                 ) ?: throw RuntimeException("无法创建导出文件")
-                resolver.openOutputStream(uri)?.use { it.write(content.toByteArray()) }
+                resolver.openOutputStream(uri)?.use { it.write(bytes) }
                     ?: throw RuntimeException("写入导出文件失败")
                 "下载/NamuDNS/$fileName"
             } else {
-                val dir = File(context.getExternalFilesDir(null), "logs").apply { mkdirs() }
-                val f = File(dir, fileName).also { it.writeText(content) }
-                f.absolutePath
+                val base = context.getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS)
+                    ?: context.filesDir
+                val dir = File(base, "NamuDNS").apply { mkdirs() }
+                File(dir, fileName).also { it.writeBytes(bytes) }
+                "应用外部目录/NamuDNS/$fileName"
             }
         }
+
+    /** MITM 的 PEM/DER 也落公共下载目录，和模块 zip 使用同一出口径。 */
+    suspend fun exportCertificateFiles(
+        context: android.content.Context,
+        exported: MitmManager.ExportResult,
+    ): String = withContext(Dispatchers.IO) {
+        runCatching {
+            val pem = File(exported.pemPath).readText()
+            val der = File(exported.derPath).readBytes()
+            val p1 = exportBytes(context, "namu-ca.pem", pem.toByteArray(), "application/x-pem-file")
+            val p2 = exportBytes(context, "namu-ca.crt", der, "application/x-x509-ca-cert")
+            "$p1；$p2"
+        }.getOrDefault("")
+    }
+
+    private fun deleteExistingDownload(context: android.content.Context, fileName: String) {
+        runCatching {
+            val collection = android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI
+            val projection = arrayOf(android.provider.MediaStore.MediaColumns._ID)
+            context.contentResolver.query(
+                collection,
+                projection,
+                "${android.provider.MediaStore.MediaColumns.DISPLAY_NAME}=?",
+                arrayOf(fileName),
+                null,
+            )?.use { c ->
+                val idCol = c.getColumnIndexOrThrow(android.provider.MediaStore.MediaColumns._ID)
+                while (c.moveToNext()) {
+                    context.contentResolver.delete(
+                        android.content.ContentUris.withAppendedId(collection, c.getLong(idCol)),
+                        null,
+                        null,
+                    )
+                }
+            }
+        }
+    }
 
     data class NodeDiagnostic(
         val line: Int,
@@ -801,16 +850,17 @@ object Actions {
         else mergeModuleSyncState(cur, synced)
     }
 
-    /** 重新拉取所有启用模块；单个失败保留上一份文件。 */
     /**
-     * 拉取启用模块：HTTPS → 条件请求 → 校验 → 原子落盘。
-     * 失败/解析失败/类型不合法时保留上一份 good 文件，只标 stale，不清空。
+     * 拉取模块：未传 moduleId 时只处理全部启用模块；传入时只同步指定模块（含停用模块）。
+     * HTTPS → 条件请求 → 校验 → 原子落盘；失败时保留上一份 good 文件，只标 stale，不清空。
      */
-    suspend fun syncModules(): ModuleSyncResult = withContext(Dispatchers.IO) {
+    suspend fun syncModules(moduleId: String? = null): ModuleSyncResult = withContext(Dispatchers.IO) {
         var updated = 0
         val errors = mutableListOf<String>()
         val results = mutableMapOf<String, ModuleSource>()
-        settings.current().moduleSources.filter { it.enabled }.forEach { src ->
+        settings.current().moduleSources.filter { src ->
+            if (moduleId == null) src.enabled else src.id == moduleId
+        }.forEach { src ->
             if (!src.url.startsWith("https://")) {
                 results[src.id] = src.copy(
                     error = "远程模块只允许 HTTPS，已保留旧缓存",
@@ -905,6 +955,42 @@ object Actions {
         settings.set(next)
         ConfigStore.rebuildModules(App.context, next)
         if (runtime.current().connected) NamuVpnService.reload(App.context)
+    }
+
+    /** U2：只改 Profile 内模块顺序，重建规则后热重载，identity 不变。 */
+    suspend fun moveModule(from: Int, to: Int) = withContext(Dispatchers.Main) {
+        val current = settings.current()
+        val next = current.copy(moduleSources = ModuleOrder.move(current.moduleSources, from, to))
+        settings.set(next)
+        ConfigStore.rebuildModules(App.context, next)
+        if (runtime.current().connected) NamuVpnService.reload(App.context)
+    }
+
+    /** 长按拖拽松手后一次落盘，避免拖动过程中反复重建规则。 */
+    suspend fun reorderModule(id: String, to: Int) = withContext(Dispatchers.Main) {
+        val current = settings.current()
+        val ordered = current.moduleSources.sortedWith(
+            compareBy<ModuleSource> { if (it.order >= 0) it.order else Int.MAX_VALUE }
+                .thenBy { current.moduleSources.indexOf(it) },
+        )
+        val from = ordered.indexOfFirst { it.id == id }
+        if (from >= 0) {
+            val next = current.copy(moduleSources = ModuleOrder.move(ordered, from, to))
+            settings.set(next)
+            ConfigStore.rebuildModules(App.context, next)
+            if (runtime.current().connected) NamuVpnService.reload(App.context)
+        }
+    }
+
+    /** 编辑模块的 #!app 分组元数据；这不是系统级 UID 隔离开关。 */
+    suspend fun setModuleApp(id: String, app: String) = withContext(Dispatchers.Main) {
+        val current = settings.current()
+        val next = current.copy(
+            moduleSources = current.moduleSources.map {
+                if (it.id == id) it.copy(app = app.trim()) else it
+            },
+        )
+        settings.set(next)
     }
 
     suspend fun deleteModule(id: String) = withContext(Dispatchers.Main) {

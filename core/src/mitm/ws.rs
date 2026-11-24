@@ -32,6 +32,8 @@ pub enum WsAction {
 pub struct WsRule {
     pub url: Regex,
     pub action: WsAction,
+    /// 原始规则行；D0 归因按它反查模块身份。
+    pub raw: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -108,6 +110,7 @@ impl WsRules {
                         Ok(url) => rules.push(WsRule {
                             url,
                             action: WsAction::Block,
+                            raw: line.to_string(),
                         }),
                         Err(_) => unsupported += 1,
                     }
@@ -141,6 +144,7 @@ impl WsRules {
                     rules.push(WsRule {
                         url,
                         action: WsAction::TextReplace { re, replacement },
+                        raw: line.to_string(),
                     });
                 }
                 _ => unsupported += 1,

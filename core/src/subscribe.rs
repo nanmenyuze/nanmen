@@ -608,6 +608,7 @@ fn parse_clash(value: &serde_yaml::Value) -> ParseResult {
                         value: parts[..parts.len() - 1].join(","),
                         action,
                         source: Some("订阅".into()),
+                        meta: None,
                     });
                 }
             }

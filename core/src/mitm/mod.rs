@@ -44,6 +44,8 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 /// 其余流在额度不足时直接原样流式转发，避免多流叠加把 PSS 推高。
 pub const REWRITE_BUFFER_COPIES: usize = 3;
 pub const MAX_CONCURRENT_REWRITE_STREAMS: usize = 2;
+/// 脚本配额排队的额外余量：在单脚本超时之上再等这么久才判排队失败。
+const SCRIPT_SLOT_QUEUE_GRACE_MS: u64 = 250;
 /// 正文直通硬上限：超过 2 MiB 的响应绝不进改写缓冲，哪怕 body_limit 配得更大。
 pub const BODY_PASSTHROUGH_LIMIT: usize = 2 * 1024 * 1024;
 
@@ -136,7 +138,8 @@ pub struct MitmState {
     pub engine: Arc<MitmEngine>,
     pub ca: Option<Arc<MitmCa>>,
     pub rewrite_budget: Arc<RewriteBudget>,
-    /// 限制并发脚本数：拿不到许可直接跳过脚本，不让隧道排队。
+    /// 限制并发脚本数：拿不到许可时排队等待（有上限），不跳过脚本。
+    /// 并发是内部实现细节，不能改变模块应得的改写结果。
     pub script_slots: Arc<tokio::sync::Semaphore>,
     /// WebSocket 帧改写独立并发闸，不与 h2 短正文改写共享预算。
     pub ws_slots: Arc<tokio::sync::Semaphore>,
@@ -152,7 +155,9 @@ impl MitmState {
     }
 
     pub fn build_with_stats(cfg: &MitmConfig, stats: Option<Arc<crate::stats::Stats>>) -> Self {
-        let engine = Arc::new(MitmEngine::from_config(cfg));
+        let mut engine_built = MitmEngine::from_config(cfg);
+        engine_built.stats = stats.clone();
+        let engine = Arc::new(engine_built);
         let ca = if cfg.enabled && !cfg.ca_file.trim().is_empty() && !engine.hosts.is_empty() {
             match MitmCa::load_or_generate(&cfg.ca_file) {
                 Ok(c) => {
@@ -262,7 +267,7 @@ impl MitmState {
         url: &str,
         message: &ScriptMessage,
     ) -> ScriptBatchResult {
-        let hits: Vec<_> = self
+        let mut hits: Vec<_> = self
             .engine
             .scripts
             .hits_with_message(url, phase, message)
@@ -279,14 +284,54 @@ impl MitmState {
                 ..Default::default()
             };
         }
-        let Ok(_permit) = self.script_slots.clone().try_acquire_owned() else {
-            self.script_pool.note_skipped();
-            return ScriptBatchResult {
-                message: message.clone(),
-                skipped: true,
-                errors: vec!["脚本并发已满，本次跳过（不影响隧道）".into()],
-                ..Default::default()
-            };
+        // Loon 语义：每阶段至多执行首条最终条件为 true 的脚本。
+        // 只有模块显式打开 legacy-chain 时才沿用 2.8 的多脚本链式执行。
+        hits = crate::script::select_phase_hits(hits);
+        if let Some(rule) = hits.first() {
+            if let Some(identity) = rule.meta.as_ref().map(|m| m.identity()) {
+                if let Some(stats) = self.engine.stats.as_ref() {
+                    let host = url::Url::parse(url)
+                        .ok()
+                        .and_then(|u| u.host_str().map(|h| h.to_string()))
+                        .unwrap_or_else(|| url.to_string());
+                    stats.hits.record_hit(&identity, &host, "rewrite");
+                }
+            }
+        }
+        // 配额满时排队等待，不再静默透传：内部排队/限流是实现细节，
+        // 不能改变模块应得的结果。排队上限跟随本次命中的脚本超时，
+        // 超时后明确失败（既不改写，也不假装成功）。
+        let queue_timeout_ms = hits
+            .iter()
+            .map(|r| r.timeout_ms.max(50).min(crate::script::MAX_TIMEOUT_MS))
+            .max()
+            .unwrap_or(0)
+            + SCRIPT_SLOT_QUEUE_GRACE_MS;
+        let _permit = match tokio::time::timeout(
+            std::time::Duration::from_millis(queue_timeout_ms),
+            self.script_slots.clone().acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                self.script_pool.note_failed();
+                return ScriptBatchResult {
+                    message: message.clone(),
+                    matched: hits.len(),
+                    errors: vec!["脚本配额已关闭，本次改写未执行".into()],
+                    ..Default::default()
+                };
+            }
+            Err(_) => {
+                self.script_pool.note_failed();
+                return ScriptBatchResult {
+                    message: message.clone(),
+                    matched: hits.len(),
+                    errors: vec![format!("脚本排队超时（{queue_timeout_ms}ms），本次改写未执行")],
+                    ..Default::default()
+                };
+            }
         };
         let base = message.clone();
         let body_limit = self.engine.body_limit;
@@ -336,6 +381,12 @@ impl MitmState {
                     continue;
                 }
                 current = r.message;
+                if r.aborted {
+                    out.aborted = true;
+                    out.message = current.clone();
+                    out.matched = idx + 1;
+                    return out;
+                }
                 if phase == ScriptPhase::Request && r.short_circuit_response {
                     out.short_circuit = true;
                     out.message = current.clone();
@@ -398,6 +449,22 @@ fn parse_rewrite_url(url: &str) -> Option<(String, String, u16)> {
         u.path().to_string()
     };
     Some((host, path, port))
+}
+
+/// D5 Rewrite↔Script disable 表：
+/// - 请求阶段终止响应（reject/mock）→ 禁请求脚本 + 禁响应脚本；
+/// - 请求体改写/mock → 禁请求脚本；
+/// - 响应体改写 → 禁响应脚本；
+/// - 仅改头 → 不禁。
+pub fn script_disable_flags(
+    terminal: bool,
+    request_mock: bool,
+    request_body_rewrite: bool,
+    response_body_rewrite: bool,
+) -> (bool, bool) {
+    let request = terminal || request_mock || request_body_rewrite;
+    let response = terminal || request_mock || response_body_rewrite;
+    (request, response)
 }
 
 /// 只对请求阶段执行 URL/头/mock 动作；响应动作收集起来等上游响应回来再应用。
@@ -1011,20 +1078,28 @@ pub async fn handle<S>(
             });
         }
         let script_url = format!("https://{}{}", plan.host, req.path);
-        let request_scripts = state
-            .engine
-            .scripts
-            .has_phase(&script_url, ScriptPhase::Request);
+        let (script_disabled_req, script_disabled_resp) = script_disable_flags(
+            plan.terminal.is_some(),
+            plan.request_mock.is_some(),
+            !plan.request_body_ops.is_empty(),
+            !plan.response_body_ops.is_empty() || !body_rules.is_empty(),
+        );
+        let request_scripts = !script_disabled_req
+            && state
+                .engine
+                .scripts
+                .has_phase(&script_url, ScriptPhase::Request);
         let script_needs_body =
             request_scripts && state.engine.scripts.needs_request_body(&script_url);
         trace.reqs.fetch_add(1, Ordering::Relaxed);
         ctx.stats.mitm_reqs.fetch_add(1, Ordering::Relaxed);
         host_stats::record(&host, host_stats::Metric::Request);
         // 与 h2 路径一致：响应阶段规则/脚本也算命中，避免把响应体改写误报为无规则。
-        let response_scripts = state
-            .engine
-            .scripts
-            .has_phase(&script_url, ScriptPhase::Response);
+        let response_scripts = !script_disabled_resp
+            && state
+                .engine
+                .scripts
+                .has_phase(&script_url, ScriptPhase::Response);
         let matched = !hits.is_empty()
             || !loon_hits.is_empty()
             || request_scripts
@@ -1154,6 +1229,18 @@ pub async fn handle<S>(
                             batch.errors.join("; ")
                         ),
                     );
+                }
+                if batch.aborted {
+                    logging::info(
+                        "mitm",
+                        format!(
+                            "#{} MITM {} {} -> 脚本 $done() 放弃请求并断开",
+                            conn_id,
+                            host,
+                            http1::redact_path(&req.path)
+                        ),
+                    );
+                    break;
                 }
                 if batch.short_circuit {
                     let keep_alive = req.keep_alive
@@ -1305,6 +1392,26 @@ where
     } else {
         ws::WsPlan::default()
     };
+    if ws_plan.active {
+        let probe = format!("https://{}{}", host, req.path);
+        if let Some(rule) = state
+            .engine
+            .ws_rules
+            .rules
+            .iter()
+            .find(|r| r.url.is_match(probe.as_bytes()))
+        {
+            if let Some(identity) = state.engine.identity_for("ws", &rule.raw) {
+                if let Some(stats) = state.engine.stats.as_ref() {
+                    stats.hits.record_hit(
+                        &identity,
+                        host,
+                        if ws_plan.block { "block" } else { "rewrite" },
+                    );
+                }
+            }
+        }
+    }
     let expect_continue = http1::get_header(&req.headers, "expect")
         .map(|v| v.eq_ignore_ascii_case("100-continue"))
         .unwrap_or(false);
@@ -1875,7 +1982,7 @@ mod tls_abort_tests {
 
 #[cfg(test)]
 mod body_bypass_tests {
-    use super::{body_bypass_reason, BodyBypass, BODY_PASSTHROUGH_LIMIT};
+    use super::{body_bypass_reason, script_disable_flags, BodyBypass, BODY_PASSTHROUGH_LIMIT};
 
     #[test]
     fn small_text_is_buffered() {
@@ -1930,4 +2037,13 @@ mod body_bypass_tests {
             Some(BodyBypass::TooLarge)
         );
     }
+    #[test]
+    fn script_disable_table_matches_contract() {
+        assert_eq!(script_disable_flags(true, false, false, false), (true, true));
+        assert_eq!(script_disable_flags(false, true, false, false), (true, true));
+        assert_eq!(script_disable_flags(false, false, true, false), (true, false));
+        assert_eq!(script_disable_flags(false, false, false, true), (false, true));
+        assert_eq!(script_disable_flags(false, false, false, false), (false, false));
+    }
+
 }

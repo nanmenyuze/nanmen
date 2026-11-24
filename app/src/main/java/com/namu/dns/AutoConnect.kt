@@ -13,6 +13,7 @@ import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import com.namu.dns.core.config.SsidTrigger
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -55,7 +56,9 @@ object AutoConnect {
     }
 
     private fun schedule(context: Context, delayMs: Long) {
-        if (!runCatching { App.container.settings.current().autoConnect }.getOrDefault(false)) return
+        val cfg = runCatching { App.container.settings.current() }.getOrNull() ?: return
+        // S6 运行时接线：自动连接或 SSID 触发任一开启都要监听网络变化。
+        if (!cfg.autoConnect && !cfg.ssidTriggerEnabled) return
         pending?.cancel()
         pending = scope.launch {
             delay(delayMs)
@@ -67,9 +70,16 @@ object AutoConnect {
     fun attempt(context: Context) {
         val app = context.applicationContext
         val cfg = runCatching { App.container.settings.current() }.getOrNull() ?: return
-        if (!cfg.autoConnect) return
+        if (!cfg.autoConnect && !cfg.ssidTriggerEnabled) return
         if (NamuVpnService.isRunning()) return
         if (runCatching { App.container.runtime.current().starting }.getOrDefault(false)) return
+        if (!cfg.autoConnect) {
+            // SSID 触发：名单取 Profile + 模块 [General] 合并结果，本地 opt-in 与
+            // 双权限仍由 SsidTrigger.state 校验；不命中就保持原状态，不弹通知。
+            val names = runCatching { ConfigStore.effectiveSsidTriggers(app, cfg) }
+                .getOrDefault(cfg.ssidTriggerNames)
+            if (!SsidTrigger.active(app, cfg, names)) return
+        }
         val now = SystemClock.elapsedRealtime()
         if (now - lastAttemptAt < MIN_ATTEMPT_GAP_MS) return
         lastAttemptAt = now

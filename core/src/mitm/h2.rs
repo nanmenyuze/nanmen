@@ -524,20 +524,28 @@ async fn handle_stream(
         });
     }
     let script_url = format!("https://{}{}", plan.host, rh.path);
-    let request_scripts = state
-        .engine
-        .scripts
-        .has_phase(&script_url, ScriptPhase::Request);
+    let (script_disabled_req, script_disabled_resp) = super::script_disable_flags(
+        plan.terminal.is_some(),
+        plan.request_mock.is_some(),
+        !plan.request_body_ops.is_empty(),
+        !plan.response_body_ops.is_empty() || !hits.iter().any(|r| r.action == RewriteAction::Body),
+    );
+    let request_scripts = !script_disabled_req
+        && state
+            .engine
+            .scripts
+            .has_phase(&script_url, ScriptPhase::Request);
     let script_needs_body = request_scripts && state.engine.scripts.needs_request_body(&script_url);
     trace.reqs.fetch_add(1, Ordering::Relaxed);
     ctx.stats.mitm_reqs.fetch_add(1, Ordering::Relaxed);
     super::host_stats::record(host, super::host_stats::Metric::Request);
     // 响应阶段的规则/脚本同样算命中：B 站首页这类改写全在响应体阶段，
     // 只看请求阶段会把「改写成功」误报成「无规则」，诊断口径必须两阶段一起算。
-    let response_scripts = state
-        .engine
-        .scripts
-        .has_phase(&script_url, ScriptPhase::Response);
+    let response_scripts = !script_disabled_resp
+        && state
+            .engine
+            .scripts
+            .has_phase(&script_url, ScriptPhase::Response);
     let matched = !hits.is_empty()
         || !loon_hits.is_empty()
         || request_scripts
@@ -695,6 +703,14 @@ async fn handle_stream(
                         batch.errors.join("; ")
                     ),
                 );
+            }
+            if batch.aborted {
+                logging::info(
+                    "mitm",
+                    format!("#{} MITM {} {} 请求脚本 $done() 放弃请求，h2 流断开", conn_id, host, http1_redact(&path_for_log)),
+                );
+                ctx.stats.mitm_rewritten.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
             }
             if batch.short_circuit {
                 send_script_h2(responder, &batch.message, is_head).await?;
@@ -1038,7 +1054,10 @@ async fn copy_response(
         .engine
         .scripts
         .has_binary_phase(&script_url, ScriptPhase::Response);
-    let response_scripts = (binary_response_scripts || !grpc_body)
+    let response_body_rewrite =
+        !body_rules.is_empty() || (!grpc_body && !response_body_ops.is_empty());
+    let response_scripts = !response_body_rewrite
+        && (binary_response_scripts || !grpc_body)
         && state
             .engine
             .scripts
@@ -1221,6 +1240,13 @@ async fn copy_response(
                     batch.errors.join("; ")
                 ),
             );
+        }
+        if batch.aborted {
+            logging::info(
+                "mitm",
+                format!("#{} MITM {} {} 响应脚本 $done() 放弃响应，h2 流断开", conn_id, host, http1_redact(path)),
+            );
+            return Ok(());
         }
         if batch.matched > 0 && batch.message.body_len() <= limit {
             let body_bytes = batch.message.body_bytes().to_vec();

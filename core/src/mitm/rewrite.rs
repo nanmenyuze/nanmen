@@ -45,6 +45,9 @@ pub struct MitmRuleConf {
     pub header_field: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// 模块原始行；D0 用它反查 rule_meta。手写配置缺省时按 pattern 查。
+    #[serde(default)]
+    pub raw: String,
 }
 
 /// MITM 配置块（config.rs 的 `mitm` 字段），默认关闭。
@@ -82,6 +85,9 @@ pub struct MitmConfig {
     /// 请求/响应脚本；正文由外壳下载后写入，内核用 QuickJS 执行。
     #[serde(default)]
     pub scripts: Vec<ScriptRuleConf>,
+    /// D0 各段规则身份：section = url/header/loon/body/ws/script；key = 原始行或脚本键。
+    #[serde(default)]
+    pub rule_meta: Vec<crate::hits::RuleMeta>,
     /// `$persistentStore` 落盘路径；空 = 仅在进程内保存。
     #[serde(default)]
     pub script_store_file: String,
@@ -134,6 +140,7 @@ impl Default for MitmConfig {
             body_rewrites: Vec::new(),
             websocket_rewrites: Vec::new(),
             scripts: Vec::new(),
+            rule_meta: Vec::new(),
             script_store_file: String::new(),
             mock_base_dir: String::new(),
             notification_file: String::new(),
@@ -223,6 +230,8 @@ pub struct RewriteRule {
     pub body: Option<regex::bytes::Regex>,
     pub replacement: String,
     pub header_field: String,
+    /// D0：编译期从 rule_meta 解析出的稳定身份。
+    pub identity: Option<crate::hits::RuleIdentity>,
 }
 
 /// hostname 匹配器：精确集合 + 后缀列表。
@@ -300,6 +309,10 @@ impl HostMatcher {
 
 pub struct MitmEngine {
     pub enabled: bool,
+    /// D1：MITM 命中计数/ring；None 时只执行不计数（测试/预览）。
+    pub stats: Option<std::sync::Arc<crate::stats::Stats>>,
+    /// section|key → 身份，供 URL/Header/Body/WS/Script 命中反查。
+    pub rule_meta: HashMap<String, crate::hits::RuleMeta>,
     pub hosts: HostMatcher,
     pub skip: HostMatcher,
     pub rules: Vec<RewriteRule>,
@@ -327,6 +340,12 @@ pub struct MitmEngine {
 
 impl MitmEngine {
     pub fn from_config(cfg: &MitmConfig) -> Self {
+        let rule_meta = cfg
+            .rule_meta
+            .iter()
+            .filter(|m| !m.key.trim().is_empty())
+            .map(|m| (format!("{}|{}", m.section, m.key), m.clone()))
+            .collect::<HashMap<_, _>>();
         let mut rules = Vec::new();
         let mut skipped = 0usize;
         // 兼容 1.33 壳层的原始规则行：拼成模块文本后复用同一套 Surge 解析器。
@@ -382,12 +401,18 @@ impl MitmEngine {
                 skipped += 1;
                 continue;
             }
+            let section = if action == RewriteAction::Header { "header" } else { "url" };
+            let identity = rule_meta
+                .get(&format!("{}|{}", section, if r.raw.is_empty() { r.pattern.trim() } else { r.raw.trim() }))
+                .or_else(|| rule_meta.get(&format!("{}|{}", section, r.pattern.trim())))
+                .map(|m| m.identity());
             rules.push(RewriteRule {
                 url,
                 action,
                 body,
                 replacement: r.replacement.clone(),
                 header_field: r.header_field.trim().to_string(),
+                identity,
             });
         }
         let mut loon_lines = cfg.loon_rewrites.clone();
@@ -400,6 +425,8 @@ impl MitmEngine {
         let scripts = ScriptEngine::from_config(&cfg.scripts, &cfg.script_store_file);
         Self {
             enabled: cfg.enabled,
+            stats: None,
+            rule_meta,
             hosts: HostMatcher::new(&cfg.hostnames),
             skip: HostMatcher::new(&cfg.skip),
             rules,
@@ -513,15 +540,51 @@ impl MitmEngine {
 
     /// 命中该 URL 的全部规则（reject 优先判断，body 可叠加）。
     pub fn rules_for(&self, url: &str) -> Vec<&RewriteRule> {
-        self.rules.iter().filter(|r| r.url.is_match(url)).collect()
+        let hits: Vec<&RewriteRule> =
+            self.rules.iter().filter(|r| r.url.is_match(url)).collect();
+        self.record_first(url, "url", hits.iter().filter_map(|r| r.identity.clone()), "rewrite");
+        hits
     }
 
     /// 命中该 URL 的 Loon 规则；按声明顺序执行，不把 Surge 规则混进来。
     pub fn loon_rules_for(&self, url: &str) -> Vec<&LoonRule> {
-        self.loon_rules
+        let hits: Vec<&LoonRule> = self
+            .loon_rules
             .iter()
             .filter(|r| r.url.is_match(url))
-            .collect()
+            .collect();
+        let identities = hits.iter().filter_map(|r| {
+            self.rule_meta
+                .get(&format!("loon|{}", r.raw))
+                .map(|m| m.identity())
+        });
+        self.record_first(url, "loon", identities, "rewrite");
+        hits
+    }
+
+    pub fn identity_for(&self, section: &str, key: &str) -> Option<crate::hits::RuleIdentity> {
+        self.rule_meta
+            .get(&format!("{section}|{key}"))
+            .map(|m| m.identity())
+    }
+
+    fn record_first<'a>(
+        &self,
+        url: &str,
+        section: &str,
+        identities: impl Iterator<Item = crate::hits::RuleIdentity>,
+        action: &str,
+    ) {
+        let Some(stats) = &self.stats else { return };
+        let Some(first) = identities.min_by_key(|m| m.order) else {
+            return;
+        };
+        let host = url::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()))
+            .unwrap_or_else(|| url.to_string());
+        stats.hits.record_hit(&first, &host, action);
+        let _ = section;
     }
 }
 
@@ -789,6 +852,7 @@ pub fn parse_surge_module(text: &str) -> SurgeMitm {
                                 replacement: String::new(),
                                 header_field: String::new(),
                                 source: None,
+                                raw: line.to_string(),
                             });
                         }
                         RewriteAction::Body => {
@@ -809,6 +873,7 @@ pub fn parse_surge_module(text: &str) -> SurgeMitm {
                                 replacement: rep,
                                 header_field: String::new(),
                                 source: None,
+                                raw: line.to_string(),
                             });
                         }
                         RewriteAction::Header => {
@@ -821,6 +886,7 @@ pub fn parse_surge_module(text: &str) -> SurgeMitm {
                                     replacement: t[2].clone(),
                                     header_field: t[1].clone(),
                                     source: None,
+                                    raw: line.to_string(),
                                 });
                             } else {
                                 ignored += 1;
@@ -848,6 +914,7 @@ pub fn parse_surge_module(text: &str) -> SurgeMitm {
                         replacement: t[3].clone(),
                         header_field: t[2].clone(),
                         source: None,
+                        raw: line.to_string(),
                     });
                 } else {
                     ignored += 1;
@@ -878,6 +945,7 @@ mod tests {
             replacement: String::new(),
             header_field: String::new(),
             source: None,
+            raw: String::new(),
         }
     }
 

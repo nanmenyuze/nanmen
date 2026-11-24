@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+fn default_hit_history_enabled() -> bool { true }
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default = "default_mode")]
@@ -23,6 +25,15 @@ pub struct Config {
     pub group_selections: BTreeMap<String, String>,
     #[serde(default)]
     pub ads_files: Vec<String>,
+    /// D3 历史桶落盘路径；空 = 仅内存。
+    #[serde(default)]
+    pub hit_history_file: Option<String>,
+    /// D2：命中摘要开关；关闭后内存仍可诊断，但不落盘。
+    #[serde(default = "default_hit_history_enabled")]
+    pub hit_history_enabled: bool,
+    /// D0 规则身份表：DNS/分流/Host 由顶层下发；MITM 各段在 mitm.rule_meta。
+    #[serde(default)]
+    pub rule_meta: Vec<crate::hits::RuleMeta>,
     #[serde(default)]
     pub cn_domains_file: Option<String>,
     #[serde(default)]
@@ -91,6 +102,9 @@ impl Default for Config {
             proxy_groups: Vec::new(),
             group_selections: BTreeMap::new(),
             ads_files: Vec::new(),
+            hit_history_file: None,
+            hit_history_enabled: true,
+            rule_meta: Vec::new(),
             cn_domains_file: None,
             cn_ip_file: None,
             block_enabled: true,
@@ -207,6 +221,9 @@ pub struct DnsConfig {
     /// 外壳合并模块与当前配置后下发；空 = 不覆盖任何域名。
     #[serde(default)]
     pub hosts: std::collections::BTreeMap<String, String>,
+    /// [Host] 条目的归因身份；key 为 hostnames 表里的原始 key（小写）。
+    #[serde(default)]
+    pub host_meta: Vec<crate::hits::RuleMeta>,
     #[serde(default = "default_cache_ttl")]
     pub cache_ttl: u32,
     #[serde(default = "default_cache_size")]
@@ -276,6 +293,7 @@ impl Default for DnsConfig {
             bootstrap: String::new(),
             headers: Default::default(),
             hosts: Default::default(),
+            host_meta: Vec::new(),
             cache_ttl: default_cache_ttl(),
             cache_size: default_cache_size(),
             query_log: true,
@@ -354,6 +372,9 @@ pub struct RuleConf {
     /// 规则来源（配置 / 模块名），用于「规则诊断」展示；旧配置缺省为空。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// D0 稳定身份；旧配置缺省时由 source/规则序号兜底。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<crate::hits::RuleMeta>,
 }
 
 #[derive(Debug, Clone)]

@@ -7,6 +7,8 @@ pub static STATS_TCP: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
 
 #[derive(Default)]
 pub struct Stats {
+    /// D1–D3：per-source 命中、最近命中 ring 与小时历史。
+    pub hits: crate::hits::HitStore,
     pub started_at: AtomicI64,
     /// 停止时点（0 = 仍在运行）：停止后 uptime 冻结，不再随墙钟增长。
     pub stopped_at: AtomicI64,

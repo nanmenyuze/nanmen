@@ -58,9 +58,9 @@ enum class MainTab(
     val route: Any,
 ) {
     Home("首页", R.drawable.ic_tab_home, HomeRoute),
-    Config("策略", R.drawable.ic_tab_rules, ConfigRoute),
-    Data("数据", R.drawable.ic_tab_logs, DataRoute),
-    Settings("设置", R.drawable.ic_tab_settings, SettingsRoute),
+    Modules("模块", R.drawable.ic_tab_rules, ModulesRoute),
+    Data("维护", R.drawable.ic_tab_logs, DataRoute),
+    Settings("我的", R.drawable.ic_tab_settings, SettingsRoute),
 }
 
 /** Navigation 的类型安全匹配；destination 为 null 时视为不在任何已知路由。 */

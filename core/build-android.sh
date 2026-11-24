@@ -53,6 +53,13 @@ cp target/armv7-linux-androideabi/release/libnanmen_core.so "$ROOT/app/src/main/
 # 产物与「源码内容哈希」一起落盘：不能依赖 mtime，zip 解压/git 检出都会重置时间。
 # Gradle 打包前用同样的算法重算哈希比对，避免再出现「壳更新了、.so 还是旧的」。
 VER="$(sed -n 's/.*to_jstring(\&mut env, "\([0-9.]*\)".*/\1/p' "$ROOT/core/src/lib.rs" | head -1)"
+# .so 必须自带可 grep 的版本串，评审可独立验证产物，不必只信清单/源码。
+for SO in "$ROOT/app/src/main/jniLibs/arm64-v8a/libnanmen_core.so" "$ROOT/app/src/main/jniLibs/armeabi-v7a/libnanmen_core.so"; do
+  grep -aFq "nanmen_core-$VER" "$SO" || {
+    echo "ERROR: $SO 缺少版本标记 nanmen_core-$VER" >&2
+    exit 1
+  }
+done
 SRC_HASH="$(find "$ROOT/core/src" -type f -name '*.rs' -print | LC_ALL=C sort | xargs cat | sha256sum | cut -d' ' -f1)"
 # Cargo 清单/锁定文件也纳入哈希，依赖或构建配置被改也必须重编。
 CARGO_HASH="$(for f in .cargo/config.toml Cargo.lock Cargo.toml; do

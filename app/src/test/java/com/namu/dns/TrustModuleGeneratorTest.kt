@@ -1,6 +1,7 @@
 package com.namu.dns
 
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
@@ -34,13 +35,12 @@ class TrustModuleGeneratorTest {
         val m = build()
         assertTrue(m.containsKey("module.prop"))
         assertTrue(m.containsKey("customize.sh"))
-        assertTrue(m.containsKey("post-fs-data.sh"))
         assertTrue(m.containsKey("service.sh"))
-        assertTrue(m.containsKey("uninstall.sh"))
         assertTrue(m.containsKey("inject.sh"))
         assertTrue(m.containsKey("bind.sh"))
-        assertTrue(m.containsKey("unmount.sh"))
-        assertTrue(m.containsKey("remove.sh"))
+        listOf("post-fs-data.sh", "uninstall.sh", "cleanup-all.sh", "unmount.sh", "remove.sh").forEach {
+            assertFalse("unexpected hook: $it", m.containsKey(it))
+        }
         assertTrue(m.containsKey("certs/d756baa7.0"))
         assertTrue(m.containsKey("README.md"))
     }
@@ -67,10 +67,9 @@ class TrustModuleGeneratorTest {
     @Test
     fun `scripts use certificate name and staging bind`() {
         val m = build(name = "abcdef01.0")
-        val post = String(m["post-fs-data.sh"]!!)
-        assertTrue(post.contains("inject.sh"))
-        assertTrue(post.contains("--boot"))
-
+        val service = String(m["service.sh"]!!)
+        assertTrue(service.contains("inject.sh"))
+        assertTrue(service.contains("--late"))
         val inject = String(m["inject.sh"]!!)
         assertTrue(inject.contains("NAME=abcdef01.0"))
         assertTrue(inject.contains("/apex/com.android.conscrypt/cacerts"))
@@ -81,10 +80,40 @@ class TrustModuleGeneratorTest {
         assertTrue(inject.contains("STATUS.tmp"))
         assertFalse(inject.contains("mount -t tmpfs"))
 
-        val remove = String(m["remove.sh"]!!)
-        assertTrue(remove.contains("/data/local/tmp/namu_ca_unmount.sh"))
-        assertTrue(String(m["unmount.sh"]!!).contains("umount"))
+        assertTrue(inject.contains("/proc/sys/kernel/random/boot_id"))
+        assertFalse(inject.contains("umount"))
+        assertFalse(inject.contains("rm -rf \"\$STAGING\""))
+        assertFalse(String(m["bind.sh"]!!).contains("umount"))
         assertTrue(String(m["module.prop"]!!).contains("id=namu_mitm_ca"))
+    }
+
+    @Test
+    fun `read only preflight refuses a missing changed or extra system certificate`() {
+        val dir = kotlin.io.path.createTempDirectory("namu-ca-preflight").toFile()
+        try {
+            val source = dir.resolve("system").apply { mkdir() }
+            val stage = dir.resolve("stage").apply { mkdir() }
+            val script = dir.resolve("bind.sh").apply { writeBytes(build().getValue("bind.sh")) }
+            val original = source.resolve("01234567.0").apply { writeText("stock CA") }
+            val copy = stage.resolve(original.name).apply { writeText(original.readText()) }
+            stage.resolve("d756baa7.0").writeText(fakePem)
+            fun verify(mode: String = "--verify"): Int = ProcessBuilder(
+                "sh", script.absolutePath, stage.absolutePath, source.absolutePath, "d756baa7.0", mode,
+            ).start().waitFor()
+
+            assertEquals(0, verify())
+            assertEquals(2, verify("--unmount"))
+            copy.writeText("different CA")
+            assertEquals(9, verify())
+            copy.delete()
+            assertEquals(9, verify())
+            copy.writeText(original.readText())
+            stage.resolve("12345678.0").writeText("unrelated CA")
+            assertEquals(9, verify())
+            assertEquals("stock CA", original.readText())
+        } finally {
+            dir.deleteRecursively()
+        }
     }
 
     @Test
@@ -104,6 +133,36 @@ class TrustModuleGeneratorTest {
             }
         } finally {
             tmp.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `pruning leaves current mounted and unrecognized state alone`() {
+        val dir = kotlin.io.path.createTempDirectory("namu-ca-prune").toFile()
+        try {
+            val state = dir.resolve("state").apply { mkdir() }
+            val proc = dir.resolve("proc").apply { mkdir() }
+            val current = "aaaaaaaa-1234-1234-1234-000000000001"
+            val mounted = "aaaaaaaa-1234-1234-1234-000000000002"
+            val old = "aaaaaaaa-1234-1234-1234-000000000003"
+            val script = dir.resolve("prune.sh").apply { writeBytes(build().getValue("prune.sh")) }
+            proc.resolve("1").apply { mkdir() }.resolve("mountinfo").writeText(
+                "1 0 0:1 /adb/namu_mitm_ca/cacerts_staging.$mounted /apex/conscrypt/cacerts rw - ext4 /dev/block/vda rw\n",
+            )
+            for (id in listOf(current, mounted, old, "test")) {
+                state.resolve("cacerts_staging.$id").apply { mkdir() }
+                    .resolve("d756baa7.0").writeText(fakePem)
+                state.resolve("inject_lock.$id").mkdir()
+            }
+            assertEquals(0, ProcessBuilder("sh", script.path, state.path, current, proc.path).start().waitFor())
+            assertTrue(state.resolve("cacerts_staging.$current/d756baa7.0").isFile)
+            assertTrue(state.resolve("cacerts_staging.$mounted/d756baa7.0").isFile)
+            assertTrue(state.resolve("cacerts_staging.test/d756baa7.0").isFile)
+            assertTrue(state.resolve("inject_lock.$current").isDirectory)
+            assertFalse(state.resolve("cacerts_staging.$old").exists())
+            assertFalse(state.resolve("inject_lock.$old").exists())
+        } finally {
+            dir.deleteRecursively()
         }
     }
 

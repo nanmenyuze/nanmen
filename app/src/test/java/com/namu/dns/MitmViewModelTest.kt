@@ -2,14 +2,14 @@ package com.namu.dns
 
 import com.namu.dns.core.runtime.DefaultMessageRepository
 import com.namu.dns.ui.viewmodel.MitmViewModel
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
+import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -31,9 +31,8 @@ class MitmViewModelTest {
         private val moduleResult: TrustModuleGenerator.Result =
             TrustModuleGenerator.Result(ok = true, path = "下载/NamuDNS/namu_mitm_ca_module.zip"),
         private val systemCertResult: Boolean = false,
-        private val installResult: RootCaManager.Result = RootCaManager.Result(true, "已注入"),
-        private val removeResult: RootCaManager.Result = RootCaManager.Result(true, "已移除"),
         private val snapshot: RootCaManager.TrustSnapshot = RootCaManager.TrustSnapshot(),
+        publishLog: suspend (String) -> String = { "" },
     ) {
         var ca = caExists
         var exports = 0
@@ -41,8 +40,6 @@ class MitmViewModelTest {
         val hostCalls = mutableListOf<List<String>>()
         val skipCalls = mutableListOf<List<String>>()
         var modulePem = ""
-        var installCalls = 0
-        var removeCalls = 0
         val messages = DefaultMessageRepository()
         val vm = MitmViewModel(
             messages = messages,
@@ -55,19 +52,11 @@ class MitmViewModelTest {
             applySkip = { skipCalls.add(it) },
             applyApps = { _, _ -> },
             exportDirFallback = { "/data/export" },
-            installCaAction = { _, _ -> installCalls++; installResult },
-            removeCaAction = { removeCalls++; removeResult },
             trustSnapshotCheck = { snapshot },
+            publishLog = publishLog,
         )
         fun lastMessage(): String = messages.messages.replayCache.lastOrNull() ?: ""
 
-        /** refreshTrust 会切到 Dispatchers.IO；测试里等它把消息发出来。 */
-        fun awaitMessage(fragment: String): String = runBlocking {
-            withTimeout(2_000) {
-                while (!lastMessage().contains(fragment)) delay(10)
-                lastMessage()
-            }
-        }
     }
 
     @Test
@@ -110,8 +99,9 @@ class MitmViewModelTest {
     fun `generate module success shows path and guidance`() {
         val h = Harness()
         h.vm.generateTrustModule()
-        assertTrue(h.lastMessage().contains("系统信任模块已导出"))
-        assertTrue(h.lastMessage().contains("KernelSU"))
+        assertTrue(h.lastMessage().contains("模块已导出"))
+        assertTrue(h.lastMessage().contains("Magisk"))
+        assertTrue(h.lastMessage().contains("完整重启"))
         assertEquals("/data/ca.pem", h.modulePem)
         assertFalse(h.vm.busy.value)
     }
@@ -155,30 +145,40 @@ class MitmViewModelTest {
     }
 
     @Test
+    fun `export logs includes current Zygote results when boot log is missing`() = runBlocking<Unit> {
+        val published = CompletableDeferred<String>()
+        val h = Harness(
+            snapshot = RootCaManager.TrustSnapshot(
+                root = RootCaManager.RootInfo(true, RootCaManager.RootKind.KERNELSU),
+                moduleInstalled = true,
+                moduleCertMatches = true,
+                bootId = "current-boot",
+                zygoteChecks = listOf(RootCaManager.ZygoteCheck(
+                    process = "zygote:123",
+                    directoryIds = listOf("1:2", "1:3"),
+                    ownsTarget = false,
+                    certificateReadable = false,
+                    certificateMatches = false,
+                )),
+            ),
+            publishLog = { published.complete(it); "Downloads/log.txt" },
+        )
+        h.vm.exportOnly()
+        h.vm.exportInjectionLog()
+        val report = withTimeout(5_000) { published.await() }
+        assertTrue(report.contains("未读到开机注入日志"))
+        assertTrue(report.contains("cert=d756baa7.0"))
+        assertTrue(report.contains("current_boot=current-boot"))
+        assertTrue(report.contains("resolved_state=INSTALLED_PENDING"))
+        assertTrue(report.contains("zygote:123: ids=1:2,1:3, mount_matches=false"))
+    }
+
+    @Test
     fun `save hostnames and skip delegate`() {
         val h = Harness()
         h.vm.saveHostnames(listOf("*.a.com"))
         h.vm.saveSkip(listOf("*.bank.com"))
         assertEquals(listOf(listOf("*.a.com")), h.hostCalls)
         assertEquals(listOf(listOf("*.bank.com")), h.skipCalls)
-    }
-
-    @Test
-    fun `install system ca delegates and refreshes trust`() {
-        val h = Harness(snapshot = RootCaManager.TrustSnapshot(moduleInstalled = true, systemCertInstalled = true))
-        h.vm.installSystemCa()
-        assertEquals(1, h.installCalls)
-        assertTrue(h.awaitMessage("已注入").contains("已注入"))
-        assertTrue(h.vm.systemCertInstalled.value)
-        assertFalse(h.vm.busy.value)
-    }
-
-    @Test
-    fun `remove system ca delegates and reports`() {
-        val h = Harness(removeResult = RootCaManager.Result(true, "已卸载并清理"))
-        h.vm.removeSystemCa()
-        assertEquals(1, h.removeCalls)
-        assertTrue(h.lastMessage().contains("已卸载并清理"))
-        assertFalse(h.vm.busy.value)
     }
 }
