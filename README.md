@@ -11,7 +11,7 @@
 
 > 当前版本：`3.0` / `versionCode 111` / 内核 `1.13.25`。APK 与源码包均可在 Release 页面直接下载。
 
-# 南门DNS 2.9.2（G2 出口）
+## 2.9.2（G2 出口）
 
 > 内核 crate / JNI：`nanmen_core` / `libnanmen_core.so`；许可证：**GPL-3.0-only**（见 `LICENSE`、`NOTICE`、`THIRD_PARTY_NOTICES.md`）。
 
