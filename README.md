@@ -1,13 +1,13 @@
-# 南门DNS 3.0.2 正式版（内核 1.13.28，versionCode 113）
+# 南门DNS 3.0.3 正式版（内核 1.13.28，versionCode 114）
 
-> 2026-11-25 3.0.2 正式版：在 3.0 基础上全量覆盖「首页 / 模块 / 设置」三栏壳层，并改用玻璃底栏与快速编辑页，应用版本改为 `3.0.2` / `versionCode 113`，内核升级 `nanmen_core 1.13.28`，修复 CA 并发发布与证书导出错误信息，修好软重启下 CA 模块证书目录复用与挂载核验，同时覆盖 APEX 与 `/system/etc/security/cacerts` 两套系统证书路径，在 `post-fs-data` 阶段完成早期注入，证书冲突日志补充 `mount_roots`、`conflict_sources` 与逐进程 `mountinfo`；HTTP/2 改写响应按客户端 `Accept-Encoding` 正确回压 gzip；MITM 启用后自动把 HTTPS 连接纳入 TUN 路由。本版包含 r10 壳层与 UI 骨架、证书生成/发布原子化、启动配置重载修复，以及此前 2.9.5 的证书状态、MITM 页、mountinfo 与迁移修复。
+> 2026-11-25 3.0.3 正式版：在 3.0 基础上全量覆盖「首页 / 模块 / 设置」三栏壳层，并改用玻璃底栏与快速编辑页，应用版本改为 `3.0.3` / `versionCode 114`，内核升级 `nanmen_core 1.13.28`，修复 CA 并发发布与证书导出错误信息，修好软重启下 CA 模块证书目录复用与挂载核验，同时覆盖 APEX 与 `/system/etc/security/cacerts` 两套系统证书路径，在 `post-fs-data` 阶段完成早期注入，证书冲突日志补充 `mount_roots`、`conflict_sources` 与逐进程 `mountinfo`；HTTP/2 改写响应按客户端 `Accept-Encoding` 正确回压 gzip；MITM 启用后自动把 HTTPS 连接纳入 TUN 路由。本版包含 r10 壳层与 UI 骨架、证书生成/发布原子化、启动配置重载修复，以及此前 2.9.5 的证书状态、MITM 页、mountinfo 与迁移修复。
 > 验收：Rust 356/356、Kotlin 227/227、lint 0 error / 28 warning；双 ABI `.so` 均含 `nanmen_core-1.13.28` 标记；APK v3 签名通过。
 
 ## 下载
 
-- [南门DNS 3.0.2 正式版 APK](https://github.com/nanmenyuze/nanmen/releases/download/v3.0.2/NanmenDNS-3.0.2-official.apk)
-- [完整源码包](https://github.com/nanmenyuze/nanmen/releases/download/v3.0.2/NanmenDNS-3.0.2-source.zip)
-- [Release 说明](https://github.com/nanmenyuze/nanmen/releases/tag/v3.0.2)
+- [南门DNS 3.0.3 正式版 APK](https://github.com/nanmenyuze/nanmen/releases/download/v3.0.3/NanmenDNS-3.0.3-official.apk)
+- [完整源码包](https://github.com/nanmenyuze/nanmen/releases/download/v3.0.3/NanmenDNS-3.0.3-source.zip)
+- [Release 说明](https://github.com/nanmenyuze/nanmen/releases/tag/v3.0.3)
 
 # 南门DNS 2.9.2（G2 出口）
 
