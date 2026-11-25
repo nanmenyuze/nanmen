@@ -14,7 +14,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AccountTree
 import androidx.compose.material.icons.outlined.Description
-import androidx.compose.material.icons.outlined.Dns
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.LibraryBooks
@@ -24,6 +23,7 @@ import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.Rule
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Speed
+import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.SwapVert
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.runtime.Composable
@@ -34,6 +34,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -56,6 +57,12 @@ import com.namu.dns.core.config.SsidTrigger
 import com.namu.dns.ui.viewmodel.SettingsViewModel
 import kotlinx.coroutines.launch
 import org.json.JSONObject
+
+private val settingsBlue = Color(0xFF3B82F6)
+private val settingsOrange = Color(0xFFF59E0B)
+private val settingsPurple = Color(0xFFA855F7)
+private val settingsGreen = Color(0xFF22C58B)
+private val settingsGray = Color(0xFF6B7280)
 
 @Composable
 fun SettingsScreen(
@@ -80,7 +87,8 @@ fun SettingsScreen(
         GroupCard {
             SettingsRow(
                 title = "DNS 与连接处理",
-                icon = Icons.Outlined.Dns,
+                icon = Icons.Outlined.Tune,
+                iconBackground = settingsBlue,
                 chevron = true,
                 showDivider = false,
                 onClick = onOpenGeneral,
@@ -93,6 +101,7 @@ fun SettingsScreen(
                 title = "规则",
                 value = "${cfg.rules.size} 条",
                 icon = Icons.Outlined.Rule,
+                iconBackground = settingsOrange,
                 chevron = true,
                 onClick = onOpenRules,
             )
@@ -100,6 +109,7 @@ fun SettingsScreen(
                 title = "策略组",
                 value = "${cfg.proxyGroups.size} 个",
                 icon = Icons.Outlined.AccountTree,
+                iconBackground = settingsPurple,
                 chevron = true,
                 showDivider = false,
                 onClick = { showGroups = true },
@@ -112,12 +122,14 @@ fun SettingsScreen(
                 title = "快速编辑",
                 value = container.config.activeName(),
                 icon = Icons.Outlined.Edit,
+                iconBackground = settingsOrange,
                 chevron = true,
                 onClick = onOpenQuickEdit,
             )
             SettingsRow(
                 title = "所有配置文件",
                 icon = Icons.Outlined.Folder,
+                iconBackground = settingsBlue,
                 chevron = true,
                 showDivider = false,
                 onClick = onOpenConfig,
@@ -130,6 +142,7 @@ fun SettingsScreen(
                 title = "MITM 管理",
                 value = if (cfg.mitm.enabled) "已开启" else "已关闭",
                 icon = Icons.Outlined.Security,
+                iconBackground = settingsGreen,
                 chevron = true,
                 showDivider = false,
                 onClick = onOpenMitm,
@@ -140,6 +153,8 @@ fun SettingsScreen(
         GroupCard {
             SettingsRow(
                 title = "自动连接",
+                icon = Icons.Outlined.Sync,
+                iconBackground = settingsOrange,
                 rightContent = {
                     IosSwitch(
                         checked = cfg.autoConnect,
@@ -155,6 +170,7 @@ fun SettingsScreen(
                     else -> "跟随系统"
                 },
                 icon = Icons.Outlined.Palette,
+                iconBackground = settingsPurple,
                 chevron = true,
                 showDivider = false,
                 onClick = { showTheme = true },
@@ -166,6 +182,7 @@ fun SettingsScreen(
             SettingsRow(
                 title = "高级设置",
                 icon = Icons.Outlined.Tune,
+                iconBackground = settingsGray,
                 chevron = true,
                 showDivider = false,
                 onClick = onOpenAdvanced,

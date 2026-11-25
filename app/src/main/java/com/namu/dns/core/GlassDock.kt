@@ -25,6 +25,10 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Home
+import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.Widgets
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -41,6 +45,7 @@ import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
@@ -53,6 +58,7 @@ import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.drawscope.translate
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.layer.GraphicsLayer
 import androidx.compose.ui.graphics.layer.drawLayer
 import androidx.compose.ui.graphics.rememberGraphicsLayer
@@ -63,7 +69,6 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalLayoutDirection
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.LayoutDirection
@@ -124,7 +129,8 @@ internal fun GlassDock(
         contentAlignment = Alignment.Center,
     ) {
         Box(
-            Modifier.widthIn(max = 360.dp).fillMaxWidth()
+            Modifier.widthIn(max = 340.dp).fillMaxWidth()
+                .shadow(8.dp, shape)
                 .onGloballyPositioned { dockOrigin = it.positionInRoot() }
                 .pointerInput(tabs, rtl) {
                     awaitEachGesture {
@@ -166,17 +172,21 @@ internal fun GlassDock(
                     )
                 },
         ) {
-            Spacer(Modifier.matchParentSize().clip(shape).blur(5.dp).drawBehind {
+            Spacer(Modifier.matchParentSize().clip(shape).blur(2.5.dp).drawBehind {
                 val offset = pageOrigin() - dockOrigin
                 translate(offset.x, offset.y) { drawLayer(pageLayer) }
             })
             Spacer(
                 Modifier.matchParentSize()
                     .background(
-                        if (NamuColors.isDark) surface.copy(alpha = .24f) else Color.White.copy(alpha = .40f),
+                        if (NamuColors.isDark) surface.copy(alpha = .24f) else Color.White.copy(alpha = .48f),
                         shape,
                     )
-                    .border(.5.dp, rim.copy(alpha = .45f), shape),
+                    .border(
+                        .5.dp,
+                        if (NamuColors.isDark) rim.copy(alpha = .35f) else Color.White.copy(alpha = .72f),
+                        shape,
+                    ),
             )
 
             Row(
@@ -194,13 +204,17 @@ internal fun GlassDock(
                     val lens = Path().apply { addRoundRect(RoundRect(Rect(topLeft, lensSize), radius)) }
                     drawRoundRect(
                         brush = Brush.verticalGradient(
-                            listOf(surface.copy(alpha = .40f), surface.copy(alpha = .14f)),
+                            if (NamuColors.isDark) {
+                                listOf(surface.copy(alpha = .40f), surface.copy(alpha = .14f))
+                            } else {
+                                listOf(Color(0xFFD7DCE5).copy(alpha = .52f), Color(0xFFD7DCE5).copy(alpha = .22f))
+                            },
                             startY = topLeft.y, endY = topLeft.y + lensSize.height,
                         ),
                         topLeft = topLeft, size = lensSize, cornerRadius = radius,
                     )
                     drawLine(
-                        color = accent.copy(alpha = .14f),
+                        color = accent.copy(alpha = .18f),
                         start = Offset(topLeft.x + radius.x, topLeft.y + lensSize.height - 1.dp.toPx()),
                         end = Offset(topLeft.x + lensSize.width - radius.x, topLeft.y + lensSize.height - 1.dp.toPx()),
                         strokeWidth = 1.5.dp.toPx(),
@@ -220,7 +234,11 @@ internal fun GlassDock(
                     TabButton(
                         selected = item == selected,
                         highlighted = if (dragging) index == fingerSlot.roundToInt() else item == selected,
-                        iconRes = item.iconRes,
+                        icon = when (item) {
+                            MainTab.Home -> Icons.Outlined.Home
+                            MainTab.Modules -> Icons.Outlined.Widgets
+                            MainTab.Settings -> Icons.Outlined.Settings
+                        },
                         label = item.label,
                         modifier = Modifier.weight(1f),
                     ) { currentSelect(item) }
@@ -234,7 +252,7 @@ internal fun GlassDock(
 private fun TabButton(
     selected: Boolean,
     highlighted: Boolean,
-    iconRes: Int,
+    icon: ImageVector,
     label: String,
     modifier: Modifier = Modifier,
     onClick: () -> Unit,
@@ -260,10 +278,10 @@ private fun TabButton(
             label = "tab-tint",
         )
         Icon(
-            painter = painterResource(iconRes),
+            imageVector = icon,
             contentDescription = null,
             tint = tint,
-            modifier = Modifier.size(20.dp),
+            modifier = Modifier.size(22.dp),
         )
         Spacer(Modifier.height(3.dp))
         Text(

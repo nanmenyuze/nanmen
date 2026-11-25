@@ -225,15 +225,15 @@ fun SectionHeader(text: String, trailing: @Composable (() -> Unit)? = null) {
     Row(
         Modifier
             .fillMaxWidth()
-            .padding(start = 20.dp, end = 16.dp, top = 20.dp, bottom = 7.dp),
+            .padding(start = 20.dp, end = 16.dp, top = 18.dp, bottom = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
             text.uppercase(),
-            fontSize = 12.sp,
-            fontWeight = FontWeight.Medium,
-            color = NamuColors.TextSub,
-            letterSpacing = 0.5.sp,
+            fontSize = 16.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = NamuColors.TextMain,
+            letterSpacing = 0.2.sp,
             modifier = Modifier.weight(1f),
         )
         trailing?.invoke()
@@ -253,8 +253,8 @@ fun PrimaryTopBar(title: String, subtitle: String = "") {
             modifier = Modifier.semantics { heading() },
             fontSize = 30.sp,
             lineHeight = 37.sp,
-            fontWeight = FontWeight.SemiBold,
-            fontFamily = FontFamily.Serif,
+            fontWeight = FontWeight.Bold,
+            fontFamily = FontFamily.SansSerif,
             color = NamuColors.TextMain,
         )
         if (subtitle.isNotEmpty()) {
@@ -305,8 +305,8 @@ fun GroupCard(glow: Boolean = false, content: @Composable ColumnScope.() -> Unit
     Column(
         Modifier
             .fillMaxWidth()
-            .padding(horizontal = 12.dp)
-            .shadow(0.5.dp, RoundedCornerShape(NamuTokens.RadiusCard))
+            .padding(horizontal = 16.dp)
+            .shadow(1.dp, RoundedCornerShape(NamuTokens.RadiusCard))
             .clip(RoundedCornerShape(NamuTokens.RadiusCard))
             .background(NamuColors.Card)
             .then(
@@ -338,6 +338,7 @@ fun SettingsRow(
     showDivider: Boolean = true,
     icon: ImageVector? = null,
     iconTint: Color = NamuColors.Brand,
+    iconBackground: Color? = null,
     rightContent: (@Composable RowScope.() -> Unit)? = null,
     onClick: (() -> Unit)? = null,
 ) {
@@ -368,12 +369,21 @@ fun SettingsRow(
         Row(
             Modifier
                 .fillMaxWidth()
-                .heightIn(min = 48.dp)
+                .heightIn(min = if (iconBackground == null) 48.dp else 56.dp)
                 .padding(horizontal = 16.dp, vertical = 9.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             if (icon != null) {
-                Icon(icon, contentDescription = null, tint = iconTint, modifier = Modifier.size(NamuTokens.IconSize))
+                if (iconBackground != null) {
+                    Box(
+                        Modifier.size(36.dp).clip(RoundedCornerShape(11.dp)).background(iconBackground),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(icon, contentDescription = null, tint = Color.White, modifier = Modifier.size(20.dp))
+                    }
+                } else {
+                    Icon(icon, contentDescription = null, tint = iconTint, modifier = Modifier.size(NamuTokens.IconSize))
+                }
                 Spacer(Modifier.width(13.dp))
             }
             Column(Modifier.weight(1f)) {
@@ -402,7 +412,7 @@ fun SettingsRow(
                 }
             }
         }
-        if (showDivider) RowDivider(if (icon != null) 56.dp else 16.dp)
+        if (showDivider) RowDivider(if (iconBackground != null) 65.dp else if (icon != null) 56.dp else 16.dp)
     }
 }
 

@@ -1,5 +1,6 @@
 package com.namu.dns.ui
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -30,9 +31,9 @@ import androidx.compose.material.icons.outlined.ArrowUpward
 import androidx.compose.material.icons.outlined.Dns
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Info
-import androidx.compose.material.icons.outlined.Insights
 import androidx.compose.material.icons.outlined.Router
 import androidx.compose.material.icons.outlined.Shield
+import androidx.compose.material.icons.outlined.TrendingUp
 import androidx.compose.material.icons.outlined.Wifi
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -47,8 +48,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
@@ -199,7 +205,7 @@ fun HomeScreen(
                     HomeShortcutCard(
                         title = "拦截命中",
                         subtitle = hitSummary,
-                        icon = Icons.Outlined.Insights,
+                        icon = Icons.Outlined.TrendingUp,
                         modifier = Modifier.weight(1f),
                         onClick = onOpenData,
                     )
@@ -325,6 +331,7 @@ private fun WorkbenchStatusCard(
     val shape = RoundedCornerShape(24.dp)
     Column(
         Modifier.fillMaxWidth().padding(horizontal = 16.dp)
+            .shadow(6.dp, shape)
             .clip(shape)
             .background(
                 Brush.linearGradient(
@@ -335,7 +342,6 @@ private fun WorkbenchStatusCard(
                     ),
                 ),
             )
-            .border(1.dp, NamuColors.Separator, shape)
             .padding(start = 18.dp, end = 18.dp, top = 16.dp, bottom = 16.dp),
     ) {
         Row(
@@ -355,25 +361,81 @@ private fun WorkbenchStatusCard(
             }
             IosSwitch(checked = checked, onCheckedChange = { onToggle() }, enabled = enabled)
         }
-        Text(
-            uptime ?: "—",
-            modifier = Modifier.padding(top = 10.dp),
-            style = NamuTokens.Type.Display.copy(fontSize = 38.sp, lineHeight = 44.sp, fontFeatureSettings = "tnum"),
-            color = if (uptime != null) NamuColors.TextMain else NamuColors.TextTertiary,
-            maxLines = 1,
-        )
-        Text("运行时长", style = NamuTokens.Type.Caption, color = NamuColors.TextSub)
-        if (samples.isNotEmpty()) {
-            SpeedSparkline(
-                samples = samples,
-                modifier = Modifier.fillMaxWidth().padding(top = 14.dp).height(58.dp),
-            )
+        Row(
+            Modifier.fillMaxWidth().padding(top = 12.dp),
+            verticalAlignment = Alignment.Bottom,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("运行时长", style = NamuTokens.Type.Caption, color = NamuColors.TextSub)
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    uptime ?: "—",
+                    style = NamuTokens.Type.Display.copy(
+                        fontSize = 34.sp,
+                        lineHeight = 40.sp,
+                        fontFeatureSettings = "tnum",
+                    ),
+                    color = if (uptime != null) NamuColors.TextMain else NamuColors.TextTertiary,
+                    maxLines = 1,
+                )
+            }
+            if (samples.isNotEmpty()) {
+                HomeSpeedSparkline(
+                    samples = samples.map { it.down },
+                    modifier = Modifier.weight(1.08f).height(56.dp)
+                        .padding(start = 16.dp, bottom = 3.dp),
+                )
+            }
         }
         Spacer(Modifier.height(16.dp))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             NetworkRateTile("上传", upload, Icons.Outlined.ArrowUpward, Modifier.weight(1f))
             NetworkRateTile("下载", download, Icons.Outlined.ArrowDownward, Modifier.weight(1f))
         }
+    }
+}
+
+@Composable
+private fun HomeSpeedSparkline(samples: List<Long>, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        if (samples.isEmpty()) return@Canvas
+        val maxValue = maxOf(samples.maxOrNull() ?: 0L, 1024L).toDouble()
+        val top = 3.dp.toPx()
+        val bottom = size.height - 2.dp.toPx()
+        val drawHeight = (bottom - top).coerceAtLeast(1f)
+        val points = samples.mapIndexed { index, value ->
+            val x = if (samples.size == 1) size.width else size.width * index / (samples.size - 1)
+            val y = bottom - (value.toDouble() / maxValue).coerceIn(0.0, 1.0).toFloat() * drawHeight
+            Offset(x, y)
+        }
+        val line = Path().apply {
+            moveTo(points.first().x, points.first().y)
+            for (index in 1 until points.size) {
+                val previous = points[index - 1]
+                val current = points[index]
+                val middleX = (previous.x + current.x) / 2f
+                cubicTo(middleX, previous.y, middleX, current.y, current.x, current.y)
+            }
+        }
+        val fill = Path().apply {
+            addPath(line)
+            lineTo(size.width, bottom)
+            lineTo(0f, bottom)
+            close()
+        }
+        drawPath(
+            path = fill,
+            brush = Brush.verticalGradient(
+                listOf(NamuColors.Blue.copy(alpha = .18f), NamuColors.Blue.copy(alpha = 0f)),
+                startY = top,
+                endY = bottom,
+            ),
+        )
+        drawPath(
+            path = line,
+            color = NamuColors.Blue,
+            style = Stroke(width = 1.8.dp.toPx(), cap = StrokeCap.Round),
+        )
     }
 }
 
@@ -388,7 +450,8 @@ private fun HomeRoutingPicker(mode: RoutingMode, enabled: Boolean, onModeChange:
             contentAlignment = Alignment.Center,
         ) {
             Row(
-                Modifier.clip(RoundedCornerShape(50)).background(NamuColors.Brand.copy(alpha = 0.09f))
+                Modifier.clip(RoundedCornerShape(50)).background(NamuColors.Card)
+                    .border(1.dp, NamuColors.Separator.copy(alpha = .7f), RoundedCornerShape(50))
                     .padding(start = 12.dp, end = 8.dp, top = 6.dp, bottom = 6.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -414,8 +477,8 @@ private fun HomeRoutingPicker(mode: RoutingMode, enabled: Boolean, onModeChange:
 private fun NetworkRateTile(label: String, rate: String, icon: ImageVector, modifier: Modifier) {
     val shape = RoundedCornerShape(12.dp)
     Column(
-        modifier.clip(shape).background(NamuColors.Card.copy(alpha = 0.72f))
-            .border(1.dp, NamuColors.Separator.copy(alpha = 0.7f), shape)
+        modifier.clip(shape)
+            .background(if (NamuColors.isDark) Color(0xFF262A31) else Color(0xFFF4F5F7))
             .padding(horizontal = 12.dp, vertical = 9.dp),
         verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
@@ -446,9 +509,9 @@ private fun HomeShortcutCard(
     val shape = RoundedCornerShape(16.dp)
     Column(
         modifier.fillMaxHeight().heightIn(min = 102.dp)
+            .shadow(4.dp, shape)
             .clip(shape)
             .background(NamuColors.Card)
-            .border(1.dp, NamuColors.Separator, shape)
             .then(if (onClick != null) Modifier.clickable(role = Role.Button, onClick = onClick) else Modifier)
             .padding(horizontal = 14.dp, vertical = 13.dp),
         verticalArrangement = Arrangement.spacedBy(9.dp),
