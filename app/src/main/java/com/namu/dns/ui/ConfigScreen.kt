@@ -1,8 +1,13 @@
 package com.namu.dns.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -13,10 +18,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Info
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -28,6 +31,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -36,19 +40,25 @@ import com.namu.dns.ConfigFileStore
 import com.namu.dns.ConfigStore
 import com.namu.dns.NamuVpnService
 import com.namu.dns.RuleItem
+import com.namu.dns.RuleLineParser
 import com.namu.dns.core.ConfigSection
 import com.namu.dns.core.LocalAppContainer
 import com.namu.dns.core.config.DirectFilterScope
 import com.namu.dns.core.config.ProxyGroupValidation
 import com.namu.dns.core.config.RoutingMode
 import com.namu.dns.core.repository.SettingsRepository
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Composable
-fun ConfigScreen(onOpenDetail: () -> Unit) {
+fun ConfigScreen(onOpenQuickEdit: () -> Unit) {
     var showCreate by remember { mutableStateOf(false) }
-    var showImport by remember { mutableStateOf(false) }
+    var showImportLocal by remember { mutableStateOf(false) }
+    var showImportUrl by remember { mutableStateOf(false) }
+    var addMenu by remember { mutableStateOf(false) }
     var infoFile by remember { mutableStateOf<ConfigFileStore.FileInfo?>(null) }
+    var deleteFile by remember { mutableStateOf<ConfigFileStore.FileInfo?>(null) }
     var revision by remember { mutableStateOf(0) }
     val container = LocalAppContainer.current
     val settings = container.settings
@@ -85,34 +95,46 @@ fun ConfigScreen(onOpenDetail: () -> Unit) {
                 } catch (e: Exception) {
                     messages.show("规则同步失败：${e.message ?: "网络错误"}")
                 } finally {
-                    if (openDetail) onOpenDetail()
+                    if (openDetail) onOpenQuickEdit()
                 }
             }
         } else if (openDetail) {
-            onOpenDetail()
+            onOpenQuickEdit()
         }
     }
 
     Column(
         Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
     ) {
-        SectionHeader("当前配置")
-        GroupCard {
-            SettingsRow(
-                title = "编辑当前配置",
-                value = activeName,
-                chevron = true,
-                showDivider = false,
-                onClick = onOpenDetail,
-            )
-        }
-
         SectionHeader(
-            text = "本地配置",
+            text = "配置文件",
             trailing = {
-                Row {
-                    TextAction("新建") { showCreate = true }
-                    TextAction("导入文件") { showImport = true }
+                Box {
+                    TextAction("＋") { addMenu = true }
+                    DropdownMenu(
+                        expanded = addMenu,
+                        onDismissRequest = { addMenu = false },
+                        modifier = Modifier.width(128.dp),
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("新建配置", fontSize = 14.sp) },
+                            modifier = Modifier.height(34.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp),
+                            onClick = { addMenu = false; showCreate = true },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("本地导入", fontSize = 14.sp) },
+                            modifier = Modifier.height(34.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp),
+                            onClick = { addMenu = false; showImportLocal = true },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("URL 导入", fontSize = 14.sp) },
+                            modifier = Modifier.height(34.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp),
+                            onClick = { addMenu = false; showImportUrl = true },
+                        )
+                    }
                 }
             },
         )
@@ -124,7 +146,6 @@ fun ConfigScreen(onOpenDetail: () -> Unit) {
                     ConfigFileRow(
                         info = f,
                         showDivider = index != files.lastIndex,
-                        onActivate = { activate(f.name) },
                         onInfo = { infoFile = f },
                     )
                 }
@@ -149,13 +170,18 @@ fun ConfigScreen(onOpenDetail: () -> Unit) {
             onDismiss = { showCreate = false },
         )
     }
-    if (showImport) {
+    if (showImportLocal || showImportUrl) {
         ConfigImportDialog(
+            urlMode = showImportUrl,
             onDone = { info ->
-                showImport = false
+                showImportLocal = false
+                showImportUrl = false
                 activate(info.name, openDetail = true)
             },
-            onDismiss = { showImport = false },
+            onDismiss = {
+                showImportLocal = false
+                showImportUrl = false
+            },
         )
     }
     infoFile?.let { f ->
@@ -165,15 +191,13 @@ fun ConfigScreen(onOpenDetail: () -> Unit) {
                 infoFile = null
                 activate(f.name)
             },
+            onEdit = {
+                infoFile = null
+                if (f.name == activeName) onOpenQuickEdit() else activate(f.name, openDetail = true)
+            },
             onDelete = {
                 infoFile = null
-                val ok = container.config.delete(f.name)
-                if (!ok) {
-                    messages.show("默认配置不能删除")
-                } else {
-                    revision++
-                    messages.show("已删除 ${f.name}")
-                }
+                deleteFile = f
             },
             onRestore = {
                 infoFile = null
@@ -191,20 +215,36 @@ fun ConfigScreen(onOpenDetail: () -> Unit) {
             onDismiss = { infoFile = null },
         )
     }
+    deleteFile?.let { f ->
+        NamuDialog(
+            title = "删除配置？",
+            message = f.name,
+            confirmText = "删除",
+            onDismiss = { deleteFile = null },
+            onConfirm = {
+                deleteFile = null
+                if (container.config.delete(f.name)) {
+                    revision++
+                    messages.show("已删除 ${f.name}")
+                } else {
+                    messages.show("默认配置不能删除")
+                }
+            },
+        )
+    }
 }
 
 @Composable
 private fun ConfigFileRow(
     info: ConfigFileStore.FileInfo,
     showDivider: Boolean,
-    onActivate: () -> Unit,
     onInfo: () -> Unit,
 ) {
     Row(
         Modifier
             .fillMaxWidth()
-            .clickable(enabled = !info.active, onClick = onActivate)
-            .padding(start = 16.dp, end = 12.dp, top = 10.dp, bottom = 10.dp),
+            .clickable(onClick = onInfo)
+            .padding(horizontal = 16.dp, vertical = 13.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(Modifier.weight(1f)) {
@@ -213,18 +253,7 @@ private fun ConfigFileRow(
                 Text("默认配置", fontSize = 12.sp, color = NamuColors.TextSub)
             }
         }
-        if (info.active) {
-            CheckMark()
-            Spacer(Modifier.width(10.dp))
-        }
-        IconButton(onClick = onInfo, modifier = Modifier.size(48.dp)) {
-            Icon(
-                Icons.Rounded.Info,
-                contentDescription = "管理 ${info.name}",
-                tint = NamuColors.TextSub,
-                modifier = Modifier.size(20.dp),
-            )
-        }
+        if (info.active) CheckMark()
     }
     if (showDivider) RowDivider()
 }
@@ -486,6 +515,9 @@ private fun ConfigRulesScreen(onRestart: () -> Unit) {
     var showBlockMode by remember { mutableStateOf(false) }
     var showFinalPolicy by remember { mutableStateOf(false) }
     var showAddRule by remember { mutableStateOf(false) }
+    var ruleAddMenu by remember { mutableStateOf(false) }
+    var showRuleImportLocal by remember { mutableStateOf(false) }
+    var showRuleImportUrl by remember { mutableStateOf(false) }
     var ruleQuery by remember { mutableStateOf("") }
     var showCustomAds by remember { mutableStateOf(false) }
     var updatingIp by remember { mutableStateOf(false) }
@@ -585,7 +617,38 @@ private fun ConfigRulesScreen(onRestart: () -> Unit) {
             )
         }
 
-        SectionHeader("自定义规则", trailing = { TextAction("添加") { showAddRule = true } })
+        SectionHeader(
+            "自定义规则",
+            trailing = {
+                Box {
+                    TextAction("＋") { ruleAddMenu = true }
+                    DropdownMenu(
+                        expanded = ruleAddMenu,
+                        onDismissRequest = { ruleAddMenu = false },
+                        modifier = Modifier.width(128.dp),
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("添加规则", fontSize = 14.sp) },
+                            modifier = Modifier.height(34.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp),
+                            onClick = { ruleAddMenu = false; showAddRule = true },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("本地导入", fontSize = 14.sp) },
+                            modifier = Modifier.height(34.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp),
+                            onClick = { ruleAddMenu = false; showRuleImportLocal = true },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("URL 导入", fontSize = 14.sp) },
+                            modifier = Modifier.height(34.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp),
+                            onClick = { ruleAddMenu = false; showRuleImportUrl = true },
+                        )
+                    }
+                }
+            },
+        )
         if (cfg.rules.isNotEmpty()) {
             NamuTextField(
                 value = ruleQuery,
@@ -687,6 +750,26 @@ private fun ConfigRulesScreen(onRestart: () -> Unit) {
             onAdd = { item ->
                 settings.update { current -> current.copy(rules = current.rules + item) }
                 showAddRule = false
+                if (runtime.current().connected) onRestart()
+            },
+        )
+    }
+    if (showRuleImportLocal || showRuleImportUrl) {
+        RuleImportDialog(
+            urlMode = showRuleImportUrl,
+            onDismiss = {
+                showRuleImportLocal = false
+                showRuleImportUrl = false
+            },
+            onImport = { imported: List<RuleItem> ->
+                val existing = settings.current().rules.map { Triple(it.type, it.value, it.action) }.toSet()
+                val additions = imported
+                    .filter { Triple(it.type, it.value, it.action) !in existing }
+                    .distinctBy { Triple(it.type, it.value, it.action) }
+                settings.update { current -> current.copy(rules = current.rules + additions) }
+                showRuleImportLocal = false
+                showRuleImportUrl = false
+                messages.show("已导入 ${additions.size} 条规则")
                 if (runtime.current().connected) onRestart()
             },
         )
@@ -811,6 +894,107 @@ private fun ConfigSourcesScreen(onRestart: () -> Unit) {
                 if (runtime.current().connected) onRestart()
             },
         )
+    }
+}
+
+@Composable
+private fun RuleImportDialog(
+    urlMode: Boolean,
+    onImport: (List<RuleItem>) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var url by remember { mutableStateOf("") }
+    var text by remember { mutableStateOf("") }
+    var error by remember { mutableStateOf<String?>(null) }
+    var reading by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            reading = true
+            error = null
+            try {
+                text = withContext(Dispatchers.IO) {
+                    val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                        ?: throw RuntimeException("无法读取该文件")
+                    if (bytes.size > 2 * 1024 * 1024) throw RuntimeException("规则文件超过 2MB")
+                    bytes.toString(Charsets.UTF_8).removePrefix("\uFEFF")
+                }
+            } catch (e: Exception) {
+                error = e.message ?: "读取规则文件失败"
+            } finally {
+                reading = false
+            }
+        }
+    }
+    val parsed = remember(text) {
+        val rules = mutableListOf<RuleItem>()
+        var invalid = 0
+        text.lineSequence().forEach { raw ->
+            val line = raw.trim()
+            if (line.isEmpty() || line.startsWith("#") || line.startsWith("//") || line.startsWith(";")) {
+                return@forEach
+            }
+            val item = RuleLineParser.split(line)?.let { parsedLine ->
+                val action = when (val value = parsedLine.action.trim().uppercase()) {
+                    "DIRECT" -> "direct"
+                    "PROXY" -> "proxy"
+                    "REJECT", "REJECT-DROP", "REJECT-TINYGIF", "REJECT-NO-DROP", "BLOCK" -> "block"
+                    else -> parsedLine.action.trim().takeIf { value.isNotEmpty() }
+                }
+                action?.let { RuleItem(parsedLine.type, parsedLine.value, it) }
+            }
+            if (item == null) invalid++ else rules += item
+        }
+        rules.distinctBy { Triple(it.type, it.value, it.action) } to invalid
+    }
+
+    NamuDialog(
+        title = if (urlMode) "URL 导入规则" else "本地导入规则",
+        confirmText = "导入",
+        loading = reading,
+        confirmEnabled = parsed.first.isNotEmpty() && parsed.second == 0,
+        onConfirm = { onImport(parsed.first) },
+        onDismiss = onDismiss,
+    ) {
+        if (urlMode) {
+            NamuTextField(url, { url = it; error = null }, "https://example.com/rules.list", maxLines = 3)
+            Spacer(Modifier.height(8.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+                MiniTextAction("下载") {
+                    scope.launch {
+                        reading = true
+                        error = null
+                        try {
+                            text = Actions.fetchText(url.trim(), maxBytes = 2 * 1024 * 1024).removePrefix("\uFEFF")
+                        } catch (e: Exception) {
+                            error = e.message ?: "下载失败"
+                        } finally {
+                            reading = false
+                        }
+                    }
+                }
+            }
+        } else {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+                MiniTextAction("选择规则文件") {
+                    error = null
+                    filePicker.launch(arrayOf("*/*"))
+                }
+            }
+        }
+        if (text.isNotBlank()) {
+            Text(
+                if (parsed.second == 0) "可导入 ${parsed.first.size} 条规则" else "${parsed.second} 行无法解析",
+                fontSize = 13.sp,
+                color = if (parsed.second == 0) NamuColors.Green else NamuColors.Red,
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+            )
+        }
+        error?.let {
+            Text(it, fontSize = 12.sp, color = NamuColors.Red, modifier = Modifier.fillMaxWidth().padding(top = 8.dp))
+        }
     }
 }
 

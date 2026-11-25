@@ -76,6 +76,7 @@ import com.namu.dns.ui.NodesScreen
 import com.namu.dns.ui.ScanScreen
 import com.namu.dns.ui.SettingsScreen
 import com.namu.dns.ui.PrimaryTopBar
+import com.namu.dns.ui.QuickEditScreen
 import com.namu.dns.ui.ShadowTopBar
 
 internal val LocalDockClearance = compositionLocalOf { 0.dp }
@@ -134,7 +135,9 @@ fun NamuAppShell(
         Scaffold(
             containerColor = NamuColors.Bg,
             topBar = {
-                if (currentTab != null) {
+                if (destination.matches(HomeRoute::class) || destination.matches(QuickEditRoute::class)) {
+                    Unit
+                } else if (currentTab != null) {
                     PrimaryTopBar(titleFor(destination, entry))
                 } else {
                     ShadowTopBar(
@@ -245,11 +248,13 @@ fun NamuNavHost(
                 onRestart = onRestart,
                 onOpenData = { navController.navigate(DataRoute) },
                 onOpenDnsLogs = { navController.navigate(LogsRoute(LogKind.Dns)) },
+                onOpenQuickEdit = { navController.navigate(QuickEditRoute) },
+                onOpenMitm = { navController.navigate(MitmRoute) },
             )
         }
         composable<ConfigRoute> {
             ConfigScreen(
-                onOpenDetail = { navController.navigate(ConfigDetailRoute) },
+                onOpenQuickEdit = { navController.navigate(QuickEditRoute) },
             )
         }
         composable<DataRoute> {
@@ -261,6 +266,9 @@ fun NamuNavHost(
         }
         composable<SettingsRoute> {
             SettingsScreen(
+                onOpenGeneral = { navController.navigate(ConfigSectionRoute(ConfigSection.General)) },
+                onOpenRules = { navController.navigate(ConfigSectionRoute(ConfigSection.Rules)) },
+                onOpenQuickEdit = { navController.navigate(QuickEditRoute) },
                 onOpenConfig = { navController.navigate(ConfigRoute) },
                 onOpenMitm = { navController.navigate(MitmRoute) },
                 onOpenAdvanced = { navController.navigate(AdvancedSettingsRoute) },
@@ -286,6 +294,9 @@ fun NamuNavHost(
         }
         composable<ConfigDetailRoute> {
             ConfigDetailScreen(onOpenSection = { navController.navigate(ConfigSectionRoute(it)) })
+        }
+        composable<QuickEditRoute> {
+            QuickEditScreen(onBack = { navController.popBackStack() }, onRestart = onRestart)
         }
         composable<ConfigSectionRoute> { sectionEntry ->
             ConfigSectionScreen(sectionEntry.toRoute<ConfigSectionRoute>().section, onRestart)
@@ -319,6 +330,7 @@ private fun titleFor(destination: NavDestination?, entry: androidx.navigation.Na
     destination.matches(LogsRoute::class) ->
         if (entry?.toRoute<LogsRoute>()?.kind == LogKind.Dns) "DNS 查询" else "运行日志"
     destination.matches(ConfigDetailRoute::class) -> "编辑当前配置"
+    destination.matches(QuickEditRoute::class) -> "快速编辑"
     destination.matches(ConfigSectionRoute::class) -> entry?.toRoute<ConfigSectionRoute>()?.section?.title ?: "配置"
     destination.matches(MitmRoute::class) -> "MITM 管理"
     destination.matches(ScanRoute::class) -> "扫码导入"

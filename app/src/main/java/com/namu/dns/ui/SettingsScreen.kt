@@ -12,10 +12,16 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.AccountTree
 import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.Dns
+import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.LibraryBooks
 import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.Lan
+import androidx.compose.material.icons.outlined.Palette
+import androidx.compose.material.icons.outlined.Rule
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Speed
 import androidx.compose.material.icons.outlined.SwapVert
@@ -53,6 +59,9 @@ import org.json.JSONObject
 
 @Composable
 fun SettingsScreen(
+    onOpenGeneral: () -> Unit,
+    onOpenRules: () -> Unit,
+    onOpenQuickEdit: () -> Unit,
     onOpenConfig: () -> Unit,
     onOpenMitm: () -> Unit,
     onOpenAdvanced: () -> Unit,
@@ -62,33 +71,75 @@ fun SettingsScreen(
     val state by vm.state.collectAsStateWithLifecycle()
     val cfg = state.config
     var showTheme by remember { mutableStateOf(false) }
+    var showGroups by remember { mutableStateOf(false) }
 
     Column(
         Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
     ) {
+        SectionHeader("通用")
         GroupCard {
             SettingsRow(
-                title = "配置文件",
-                value = container.config.activeName(),
-                icon = Icons.Outlined.Description,
+                title = "DNS 与连接处理",
+                icon = Icons.Outlined.Dns,
                 chevron = true,
-                onClick = onOpenConfig,
+                showDivider = false,
+                onClick = onOpenGeneral,
+            )
+        }
+
+        SectionHeader("规则")
+        GroupCard {
+            SettingsRow(
+                title = "规则",
+                value = "${cfg.rules.size} 条",
+                icon = Icons.Outlined.Rule,
+                chevron = true,
+                onClick = onOpenRules,
             )
             SettingsRow(
+                title = "策略组",
+                value = "${cfg.proxyGroups.size} 个",
+                icon = Icons.Outlined.AccountTree,
+                chevron = true,
+                showDivider = false,
+                onClick = { showGroups = true },
+            )
+        }
+
+        SectionHeader("文件")
+        GroupCard {
+            SettingsRow(
+                title = "快速编辑",
+                value = container.config.activeName(),
+                icon = Icons.Outlined.Edit,
+                chevron = true,
+                onClick = onOpenQuickEdit,
+            )
+            SettingsRow(
+                title = "所有配置文件",
+                icon = Icons.Outlined.Folder,
+                chevron = true,
+                showDivider = false,
+                onClick = onOpenConfig,
+            )
+        }
+
+        SectionHeader("MITM")
+        GroupCard {
+            SettingsRow(
                 title = "MITM 管理",
-                subtitle = "证书与 HTTPS 过滤",
-                value = if (cfg.mitm.enabled) "已开启" else null,
+                value = if (cfg.mitm.enabled) "已开启" else "已关闭",
                 icon = Icons.Outlined.Security,
                 chevron = true,
                 showDivider = false,
                 onClick = onOpenMitm,
             )
         }
-        Spacer(Modifier.height(12.dp))
+
+        SectionHeader("偏好")
         GroupCard {
             SettingsRow(
                 title = "自动连接",
-                subtitle = "开机或默认网络恢复时，在未连接状态下自动启动 VPN",
                 rightContent = {
                     IosSwitch(
                         checked = cfg.autoConnect,
@@ -103,17 +154,17 @@ fun SettingsScreen(
                     "dark" -> "深色"
                     else -> "跟随系统"
                 },
-                icon = Icons.Outlined.Tune,
+                icon = Icons.Outlined.Palette,
                 chevron = true,
                 showDivider = false,
                 onClick = { showTheme = true },
             )
         }
-        Spacer(Modifier.height(12.dp))
+
+        SectionHeader("其他")
         GroupCard {
             SettingsRow(
                 title = "高级设置",
-                subtitle = "网络、脚本和诊断",
                 icon = Icons.Outlined.Tune,
                 chevron = true,
                 showDivider = false,
@@ -125,7 +176,6 @@ fun SettingsScreen(
     if (showTheme) {
         ChoiceDialog(
             title = "外观",
-            message = "选择浅色、深色，或跟随系统深色模式",
             options = listOf(
                 "system" to "跟随系统",
                 "light" to "浅色",
@@ -139,7 +189,14 @@ fun SettingsScreen(
             onDismiss = { showTheme = false },
         )
     }
-
+    if (showGroups) {
+        ProxyGroupsDialog(
+            groups = cfg.proxyGroups,
+            nodes = cfg.nodes.map { it.name },
+            selections = cfg.groupSelections,
+            onDismiss = { showGroups = false },
+        )
+    }
 }
 
 @Composable

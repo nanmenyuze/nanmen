@@ -590,9 +590,16 @@ fun EmptyState(
 }
 
 @Composable
-fun TextAction(text: String, color: Color = NamuColors.Blue, modifier: Modifier = Modifier, onClick: () -> Unit) {
+fun TextAction(
+    text: String,
+    color: Color = NamuColors.Blue,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    onClick: () -> Unit,
+) {
     TextButton(
         onClick = onClick,
+        enabled = enabled,
         modifier = modifier.heightIn(min = 48.dp),
         contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp),
     ) {

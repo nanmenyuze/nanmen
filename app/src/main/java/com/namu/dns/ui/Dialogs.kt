@@ -867,7 +867,7 @@ fun DnsDialog(current: String, onDismiss: () -> Unit, onSelect: (String) -> Unit
 @Composable
 fun ChoiceDialog(
     title: String,
-    message: String,
+    message: String = "",
     options: List<Pair<String, String>>,
     selected: String,
     onSelect: (String) -> Unit,
@@ -991,10 +991,12 @@ private fun configUnusableCount(preview: com.namu.dns.core.config.ConfigSourcePr
 
 @Composable
 fun ConfigImportDialog(
+    urlMode: Boolean = false,
     onDone: (ConfigFileStore.FileInfo) -> Unit,
     onDismiss: () -> Unit,
 ) {
     var name by remember { mutableStateOf("导入.conf") }
+    var url by remember { mutableStateOf("") }
     var text by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     var reading by remember { mutableStateOf(false) }
@@ -1033,8 +1035,8 @@ fun ConfigImportDialog(
     }
 
     NamuDialog(
-        title = "导入配置文件",
-        message = "选择本地配置文件后确认导入。",
+        title = if (urlMode) "URL 导入" else "导入配置文件",
+        message = "",
         confirmText = if (preview?.canImport == true) "导入" else "仅预览",
         loading = reading,
         confirmEnabled = name.isNotBlank() && text.isNotBlank() && preview?.canImport == true,
@@ -1058,10 +1060,32 @@ fun ConfigImportDialog(
     ) {
         NamuTextField(name, { name = it }, "文件名", singleLine = true)
         Spacer(Modifier.height(8.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
-            MiniTextAction("从本地文件导入") {
-                error = null
-                filePicker.launch(arrayOf("*/*"))
+        if (urlMode) {
+            NamuTextField(url, { url = it; error = null }, "https://example.com/config.conf", maxLines = 3)
+            Spacer(Modifier.height(8.dp))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+                MiniTextAction("下载") {
+                    scope.launch {
+                        reading = true
+                        error = null
+                        try {
+                            val content = Actions.fetchText(url.trim(), maxBytes = 2 * 1024 * 1024)
+                            text = content.removePrefix("\uFEFF")
+                            name = url.substringAfterLast('/').substringBefore('?').ifBlank { "导入.conf" }
+                        } catch (e: Exception) {
+                            error = e.message ?: "下载失败"
+                        } finally {
+                            reading = false
+                        }
+                    }
+                }
+            }
+        } else {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+                MiniTextAction("选择文件") {
+                    error = null
+                    filePicker.launch(arrayOf("*/*"))
+                }
             }
         }
         preview?.let { p ->
@@ -1084,6 +1108,7 @@ fun ConfigImportDialog(
 fun ConfigFileInfoDialog(
     info: ConfigFileStore.FileInfo,
     onActivate: () -> Unit,
+    onEdit: () -> Unit,
     onDelete: () -> Unit,
     onRestore: () -> Unit = {},
     onDismiss: () -> Unit,
@@ -1112,6 +1137,8 @@ fun ConfigFileInfoDialog(
                 DialogAction("回退到上一版", NamuColors.Orange) { onRestore() }
                 Box(Modifier.fillMaxWidth().height(0.5.dp).background(NamuColors.Separator))
             }
+            DialogAction("编辑配置", NamuColors.Blue) { onEdit() }
+            Box(Modifier.fillMaxWidth().height(0.5.dp).background(NamuColors.Separator))
             DialogAction("复制配置内容", NamuColors.Blue) {
                 val text = ConfigFileStore.exportText(context, info.name)
                 if (text.isNullOrBlank()) {

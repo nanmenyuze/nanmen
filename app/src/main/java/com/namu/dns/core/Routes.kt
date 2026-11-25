@@ -44,6 +44,9 @@ data class LogsRoute(val kind: LogKind = LogKind.Runtime)
 @Serializable
 data object ConfigDetailRoute
 
+@Serializable
+data object QuickEditRoute
+
 @Keep
 @Serializable
 enum class ConfigSection(val title: String) {

@@ -50,7 +50,6 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.ClipOp
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.graphics.drawscope.scale
 import androidx.compose.ui.graphics.drawscope.translate
@@ -171,7 +170,14 @@ internal fun GlassDock(
                 val offset = pageOrigin() - dockOrigin
                 translate(offset.x, offset.y) { drawLayer(pageLayer) }
             })
-            Spacer(Modifier.matchParentSize().background(surface.copy(alpha = .24f), shape).border(.5.dp, rim, shape))
+            Spacer(
+                Modifier.matchParentSize()
+                    .background(
+                        if (NamuColors.isDark) surface.copy(alpha = .24f) else Color.White.copy(alpha = .40f),
+                        shape,
+                    )
+                    .border(.5.dp, rim.copy(alpha = .45f), shape),
+            )
 
             Row(
                 Modifier.fillMaxWidth().selectableGroup().drawWithContent {
@@ -188,15 +194,16 @@ internal fun GlassDock(
                     val lens = Path().apply { addRoundRect(RoundRect(Rect(topLeft, lensSize), radius)) }
                     drawRoundRect(
                         brush = Brush.verticalGradient(
-                            listOf(surface.copy(alpha = .55f), accent.copy(alpha = .10f)),
+                            listOf(surface.copy(alpha = .40f), surface.copy(alpha = .14f)),
                             startY = topLeft.y, endY = topLeft.y + lensSize.height,
                         ),
                         topLeft = topLeft, size = lensSize, cornerRadius = radius,
                     )
-                    drawRoundRect(
-                        color = rim.copy(alpha = .80f),
-                        topLeft = topLeft, size = lensSize, cornerRadius = radius,
-                        style = Stroke(.75.dp.toPx()),
+                    drawLine(
+                        color = accent.copy(alpha = .14f),
+                        start = Offset(topLeft.x + radius.x, topLeft.y + lensSize.height - 1.dp.toPx()),
+                        end = Offset(topLeft.x + lensSize.width - radius.x, topLeft.y + lensSize.height - 1.dp.toPx()),
+                        strokeWidth = 1.5.dp.toPx(),
                     )
                     if (raised > .01f) {
                         clipPath(lens, ClipOp.Difference) { drawLayer(labelsLayer) }

@@ -16,21 +16,23 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.outlined.ArrowDownward
 import androidx.compose.material.icons.outlined.ArrowUpward
 import androidx.compose.material.icons.outlined.Dns
+import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Insights
 import androidx.compose.material.icons.outlined.Router
+import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.Wifi
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -39,14 +41,15 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
-import androidx.compose.runtime.setValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
@@ -55,6 +58,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.namu.dns.MitmManager
 import com.namu.dns.NetworkStatus
 import com.namu.dns.PrivateDnsController
 import com.namu.dns.core.LocalAppContainer
@@ -62,8 +66,11 @@ import com.namu.dns.core.LocalDockClearance
 import com.namu.dns.core.config.RoutingMode
 import com.namu.dns.core.repository.ShellPhase
 import com.namu.dns.ui.viewmodel.HomeViewModel
+import java.io.File
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Suppress("ProduceStateDoesNotAssignValue")
 @Composable
@@ -73,6 +80,8 @@ fun HomeScreen(
     onRestart: () -> Unit,
     onOpenDnsLogs: () -> Unit,
     onOpenData: () -> Unit,
+    onOpenQuickEdit: () -> Unit,
+    onOpenMitm: () -> Unit,
 ) {
     val container = LocalAppContainer.current
     val vm: HomeViewModel = viewModel(factory = HomeViewModel.factory(container))
@@ -106,6 +115,26 @@ fun HomeScreen(
             value = NetworkStatus.current(context)
         }
     }
+    val certificateStatus by produceState("读取中", context, cfg.mitm.enabled) {
+        value = withContext(Dispatchers.IO) {
+            val caExists = MitmManager.caFile(context).exists()
+            val der = MitmManager.caDer(context)
+            val trusted = der != null && listOf(
+                File("/apex/com.android.conscrypt/cacerts"),
+                File("/system/etc/security/cacerts"),
+            ).any { dir ->
+                dir.listFiles()?.any { file ->
+                    file.isFile && file.name.endsWith(".0") &&
+                        MitmManager.systemCertDerMatches(file, der)
+                } == true
+            }
+            when {
+                trusted -> "已就绪"
+                caExists -> "未信任"
+                else -> "未生成"
+            }
+        }
+    }
 
     val status = when {
         stopping -> "正在停止"
@@ -120,32 +149,50 @@ fun HomeScreen(
         Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Column(Modifier.widthIn(max = 560.dp).fillMaxWidth().padding(top = 4.dp)) {
+        Column(Modifier.widthIn(max = 560.dp).fillMaxWidth()) {
+            Row(
+                Modifier.fillMaxWidth().statusBarsPadding()
+                    .padding(start = 20.dp, end = 16.dp, top = 16.dp, bottom = 12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text(
+                    "南门 DNS",
+                    fontSize = 28.sp,
+                    lineHeight = 34.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = if (NamuColors.isDark) Color(0xFFFFA45E) else Color(0xFFEF7D22),
+                )
+                HomeRoutingPicker(
+                    mode = mode,
+                    enabled = !starting && !stopping,
+                    onModeChange = { selected ->
+                        val current = container.settings.current()
+                        if (container.settings.applyRouting(selected.modeFor(current.mode), current.dnsOnlyFullRoute) &&
+                            container.runtime.current().connected
+                        ) onRestart()
+                    },
+                )
+            }
+
             val sessionActive = connected && state.stats.sessionActive
             WorkbenchStatusCard(
                 status = status,
-                mode = mode,
-                modeEnabled = !starting && !stopping,
                 connected = connected && !stopping,
-                onModeChange = { selected ->
-                    val current = container.settings.current()
-                    if (container.settings.applyRouting(selected.modeFor(current.mode), current.dnsOnlyFullRoute) &&
-                        container.runtime.current().connected
-                    ) onRestart()
-                },
                 uptime = if (sessionActive) {
                     val seconds = stats.uptime / 1000
                     "%02d:%02d:%02d".format(seconds / 3600, seconds / 60 % 60, seconds % 60)
                 } else null,
                 upload = if (sessionActive) "${formatBytes(state.stats.upRate)}/s" else "—",
                 download = if (sessionActive) "${formatBytes(state.stats.downRate)}/s" else "—",
+                samples = state.stats.speedSamples,
                 checked = connected || starting,
                 enabled = !stopping,
                 onToggle = onToggle,
             )
 
             Column(
-                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -172,9 +219,26 @@ fun HomeScreen(
                 Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     HomeShortcutCard(
                         title = "DNS 记录",
+                        subtitle = if (stats.dnsQueries > 0) "${stats.dnsQueries} 次查询" else "暂无查询",
                         icon = Icons.Outlined.Dns,
                         modifier = Modifier.weight(1f),
                         onClick = onOpenDnsLogs,
+                    )
+                    HomeShortcutCard(
+                        title = "配置文件",
+                        subtitle = container.config.activeName(),
+                        icon = Icons.Outlined.Description,
+                        modifier = Modifier.weight(1f),
+                        onClick = onOpenQuickEdit,
+                    )
+                }
+                Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    HomeShortcutCard(
+                        title = "证书状态",
+                        subtitle = certificateStatus,
+                        icon = Icons.Outlined.Shield,
+                        modifier = Modifier.weight(1f),
+                        onClick = onOpenMitm,
                     )
                     HomeShortcutCard(
                         title = "当前网络",
@@ -195,7 +259,7 @@ fun HomeScreen(
                         showDivider = false,
                         onClick = {
                             scope.launch {
-                                val ok = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                val ok = withContext(Dispatchers.IO) {
                                     PrivateDnsController.disable(context.applicationContext)
                                 }
                                 if (ok) {
@@ -249,15 +313,13 @@ private val homeAccent: Color
 @Composable
 private fun WorkbenchStatusCard(
     status: String,
-    mode: RoutingMode,
-    modeEnabled: Boolean,
     connected: Boolean,
     uptime: String?,
     upload: String,
     download: String,
+    samples: List<com.namu.dns.core.stats.SpeedSample>,
     checked: Boolean,
     enabled: Boolean,
-    onModeChange: (RoutingMode) -> Unit,
     onToggle: () -> Unit,
 ) {
     val shape = RoundedCornerShape(24.dp)
@@ -266,35 +328,47 @@ private fun WorkbenchStatusCard(
             .clip(shape)
             .background(
                 Brush.linearGradient(
-                    listOf(NamuColors.Card, NamuColors.Card, if (NamuColors.isDark) Color(0xFF202938) else Color(0xFFF3F7FF)),
+                    listOf(
+                        NamuColors.Card,
+                        NamuColors.Card,
+                        if (NamuColors.isDark) Color(0xFF202938) else Color(0xFFF3F7FF),
+                    ),
                 ),
             )
             .border(1.dp, NamuColors.Separator, shape)
-            .padding(start = 18.dp, end = 18.dp, top = 12.dp, bottom = 16.dp),
+            .padding(start = 18.dp, end = 18.dp, top = 16.dp, bottom = 16.dp),
     ) {
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-            HomeRoutingPicker(mode, modeEnabled, onModeChange)
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier.size(8.dp).background(
+                        if (connected) NamuColors.Green else NamuColors.TextTertiary,
+                        CircleShape,
+                    ),
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(status, style = NamuTokens.Type.Title, color = NamuColors.TextMain)
+            }
             IosSwitch(checked = checked, onCheckedChange = { onToggle() }, enabled = enabled)
-        }
-        Spacer(Modifier.height(10.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(
-                Modifier.size(7.dp).background(
-                    if (connected) NamuColors.Green else NamuColors.TextTertiary,
-                    CircleShape,
-                ),
-            )
-            Spacer(Modifier.width(8.dp))
-            Text(status, style = NamuTokens.Type.Title, color = NamuColors.TextMain)
         }
         Text(
             uptime ?: "—",
-            modifier = Modifier.padding(top = 2.dp),
+            modifier = Modifier.padding(top = 10.dp),
             style = NamuTokens.Type.Display.copy(fontSize = 38.sp, lineHeight = 44.sp, fontFeatureSettings = "tnum"),
             color = if (uptime != null) NamuColors.TextMain else NamuColors.TextTertiary,
             maxLines = 1,
         )
         Text("运行时长", style = NamuTokens.Type.Caption, color = NamuColors.TextSub)
+        if (samples.isNotEmpty()) {
+            SpeedSparkline(
+                samples = samples,
+                modifier = Modifier.fillMaxWidth().padding(top = 14.dp).height(58.dp),
+            )
+        }
         Spacer(Modifier.height(16.dp))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             NetworkRateTile("上传", upload, Icons.Outlined.ArrowUpward, Modifier.weight(1f))
@@ -308,10 +382,10 @@ private fun HomeRoutingPicker(mode: RoutingMode, enabled: Boolean, onModeChange:
     var expanded by remember { mutableStateOf(false) }
     Box {
         Box(
-            Modifier.heightIn(min = 48.dp)
+            Modifier.heightIn(min = 44.dp)
                 .clip(RoundedCornerShape(12.dp))
                 .clickable(enabled = enabled, onClickLabel = "切换流量模式", role = Role.Button) { expanded = true },
-            contentAlignment = Alignment.CenterStart,
+            contentAlignment = Alignment.Center,
         ) {
             Row(
                 Modifier.clip(RoundedCornerShape(50)).background(NamuColors.Brand.copy(alpha = 0.09f))
@@ -325,9 +399,7 @@ private fun HomeRoutingPicker(mode: RoutingMode, enabled: Boolean, onModeChange:
         DropdownMenu(expanded = expanded && enabled, onDismissRequest = { expanded = false }) {
             RoutingMode.entries.forEach { option ->
                 DropdownMenuItem(
-                    text = {
-                        Text(option.homeLabel, color = if (option == mode) homeAccent else NamuColors.TextMain)
-                    },
+                    text = { Text(option.homeLabel, color = if (option == mode) homeAccent else NamuColors.TextMain) },
                     onClick = {
                         expanded = false
                         onModeChange(option)
@@ -342,13 +414,13 @@ private fun HomeRoutingPicker(mode: RoutingMode, enabled: Boolean, onModeChange:
 private fun NetworkRateTile(label: String, rate: String, icon: ImageVector, modifier: Modifier) {
     val shape = RoundedCornerShape(12.dp)
     Column(
-        modifier.clip(shape).background(NamuColors.Card)
-            .border(1.dp, NamuColors.Separator, shape)
+        modifier.clip(shape).background(NamuColors.Card.copy(alpha = 0.72f))
+            .border(1.dp, NamuColors.Separator.copy(alpha = 0.7f), shape)
             .padding(horizontal = 12.dp, vertical = 9.dp),
         verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            NamuIcon(icon, tint = homeAccent, size = 14.dp)
+            NamuIcon(icon, tint = NamuColors.TextSub, size = 14.dp)
             Spacer(Modifier.width(4.dp))
             Text(label, style = NamuTokens.Type.Caption, color = NamuColors.TextSub)
         }
@@ -373,28 +445,15 @@ private fun HomeShortcutCard(
 ) {
     val shape = RoundedCornerShape(16.dp)
     Column(
-        modifier.fillMaxHeight().heightIn(min = 106.dp)
+        modifier.fillMaxHeight().heightIn(min = 102.dp)
             .clip(shape)
             .background(NamuColors.Card)
             .border(1.dp, NamuColors.Separator, shape)
             .then(if (onClick != null) Modifier.clickable(role = Role.Button, onClick = onClick) else Modifier)
-            .padding(horizontal = 13.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
+            .padding(horizontal = 14.dp, vertical = 13.dp),
+        verticalArrangement = Arrangement.spacedBy(9.dp),
     ) {
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Box(
-                Modifier.size(32.dp).clip(RoundedCornerShape(10.dp))
-                    .background(NamuColors.Brand.copy(alpha = 0.09f)),
-                contentAlignment = Alignment.Center,
-            ) {
-                NamuIcon(icon, tint = homeAccent, size = 18.dp)
-            }
-            if (onClick != null) Chevron()
-        }
+        NamuIcon(icon, tint = NamuColors.TextSub, size = 23.dp)
         Column {
             Text(title, style = NamuTokens.Type.Body, fontWeight = FontWeight.SemiBold, color = NamuColors.TextMain)
             if (subtitle != null) {
