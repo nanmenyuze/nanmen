@@ -629,6 +629,8 @@ data class ModuleSource(
     val cacheBytes: Long = 0L,
     /** S3：Profile 内模块顺序；-1 表示旧数据，按列表下标兜底。 */
     val order: Int = -1,
+    /** null 表示旧记录，可从已缓存的模块原文读取。空字符串表示模块未声明图标。 */
+    val iconUrl: String? = null,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id)
@@ -650,6 +652,7 @@ data class ModuleSource(
         put("stale", stale)
         put("cacheBytes", cacheBytes)
         if (order >= 0) put("order", order)
+        iconUrl?.let { put("iconUrl", it) }
     }
 
     companion object {
@@ -673,6 +676,7 @@ data class ModuleSource(
             stale = o.optBoolean("stale", false),
             cacheBytes = o.optLong("cacheBytes", 0L),
             order = o.optInt("order", -1),
+            iconUrl = if (o.isNull("iconUrl")) null else o.optString("iconUrl"),
         )
     }
 }

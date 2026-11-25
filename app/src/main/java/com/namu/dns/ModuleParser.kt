@@ -8,7 +8,7 @@ import org.json.JSONObject
  * 解析小火箭 .sgmodule 的规则子集，以及简单的 JSON 模块。
  *
  * 支持：
- *  - #!name= / #!desc= / #!app= 元数据
+ *  - #!name= / #!desc= / #!app= / #!icon= 元数据
  *  - [Rule] 中的 DOMAIN / DOMAIN-SUFFIX / DOMAIN-KEYWORD / DOMAIN-REGEX /
  *    IP-CIDR / IP-CIDR6 / PORT
  *    REJECT/BLOCK 会转成 DNS 阻断或内核规则，DIRECT/PROXY 会转成分流规则
@@ -82,6 +82,7 @@ data class ParsedModule(
     val sectionStatus: List<ModuleSectionStatus> = emptyList(),
     /** 全局依赖缺口，例如脚本引擎、Host 映射、参数替换。 */
     val dependencies: List<String> = emptyList(),
+    val iconUrl: String = "",
 )
 
 object ModuleParser {
@@ -89,6 +90,12 @@ object ModuleParser {
         "DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DOMAIN-REGEX", "DOMAIN-WILDCARD",
         "IP-CIDR", "IP-CIDR6", "GEOIP", "PORT", "PROTOCOL", "UID",
     )
+
+    fun readIconUrl(lines: Sequence<String>): String =
+        lines.map { it.removePrefix("\uFEFF").trim() }
+            .takeWhile { !it.startsWith("[") }
+            .firstOrNull { it.substringBefore('=').trim() == "#!icon" && '=' in it }
+            ?.substringAfter('=')?.trim().orEmpty()
 
     fun parse(rawText: String): ParsedModule {
         val text = rawText.removePrefix("\uFEFF")
@@ -439,6 +446,7 @@ object ModuleParser {
             scriptIssues = scriptIssues.toList(),
             sectionStatus = statuses,
             dependencies = dependencies,
+            iconUrl = readIconUrl(text.lineSequence()),
         )
     }
 

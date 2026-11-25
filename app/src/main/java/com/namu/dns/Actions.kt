@@ -780,6 +780,7 @@ object Actions {
             name = displayName.trim().ifBlank { parsed.name.ifBlank { target.removePrefix("local://").substringAfter("://").substringBefore('/').ifBlank { "模块" } } },
             url = target,
             app = parsed.app,
+            iconUrl = parsed.iconUrl,
             enabled = existing?.enabled ?: true,
             updatedAt = System.currentTimeMillis(),
             blockRules = parsed.blockLines.size,
@@ -826,6 +827,7 @@ object Actions {
         current.copy(
             name = synced.name,
             app = synced.app,
+            iconUrl = synced.iconUrl,
             updatedAt = synced.updatedAt,
             blockRules = synced.blockRules,
             routeRules = synced.routeRules,
@@ -906,6 +908,7 @@ object Actions {
                 results[src.id] = src.copy(
                     name = src.name.ifBlank { parsed.name },
                     app = parsed.app.ifBlank { src.app },
+                    iconUrl = parsed.iconUrl,
                     updatedAt = now,
                     lastAttemptAt = now,
                     blockRules = parsed.blockLines.size,

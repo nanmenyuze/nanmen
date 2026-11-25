@@ -4,6 +4,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -50,13 +51,39 @@ class ActionsRegressionTest {
             blockRules = 7,
             etag = "\"x\"",
             cacheBytes = 12,
+            iconUrl = "https://example.com/icon.png",
         )
         val merged = Actions.mergeModuleSyncState(current, synced)
         assertFalse(merged.enabled)
         assertEquals(60, merged.intervalSeconds)
         assertEquals(current.url, merged.url)
         assertEquals(7, merged.blockRules)
+        assertEquals(synced.iconUrl, merged.iconUrl)
         assertEquals("\"x\"", merged.etag)
+    }
+
+    @Test
+    fun `module icon is read from header without affecting rules`() {
+        val url = "https://example.com/icon.png?v=2"
+        val text = "#!icon = $url\n[Rule]\nDOMAIN,ads.example.com,REJECT"
+        assertEquals(url, ModuleParser.parse(text).iconUrl)
+        assertEquals(url, ModuleParser.readIconUrl(("\uFEFF" + text).lineSequence()))
+        assertEquals(
+            ModuleParser.parse(text.substringAfter('\n')).blockLines,
+            ModuleParser.parse(text).blockLines,
+        )
+        assertEquals("", ModuleParser.parse("[Rule]\n#!icon=$url").iconUrl)
+        assertEquals(url, ModuleParser.parse("#!icon=$url").iconUrl)
+    }
+
+    @Test
+    fun `module icon round trip distinguishes missing and empty values`() {
+        val old = ModuleSource.fromJson(JSONObject("""{"id":"m1","name":"模块","url":"local://m1"}"""))
+        assertNull(old.iconUrl)
+        val icon = old.copy(iconUrl = "https://example.com/icon.png")
+        assertEquals(icon, ModuleSource.fromJson(icon.toJson()))
+        val noIcon = old.copy(iconUrl = "")
+        assertEquals(noIcon, ModuleSource.fromJson(noIcon.toJson()))
     }
 
     @Test
