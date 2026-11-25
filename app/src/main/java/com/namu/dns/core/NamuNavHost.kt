@@ -135,7 +135,10 @@ fun NamuAppShell(
         Scaffold(
             containerColor = NamuColors.Bg,
             topBar = {
-                if (destination.matches(HomeRoute::class) || destination.matches(QuickEditRoute::class)) {
+                if (destination.matches(HomeRoute::class) ||
+                    destination.matches(ModulesRoute::class) ||
+                    destination.matches(QuickEditRoute::class)
+                ) {
                     Unit
                 } else if (currentTab != null) {
                     PrimaryTopBar(titleFor(destination, entry))
