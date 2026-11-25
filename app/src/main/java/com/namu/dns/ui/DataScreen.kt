@@ -48,7 +48,6 @@ import android.content.Intent
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.namu.dns.Diagnostics
-import com.namu.dns.NamuVpnService
 import com.namu.dns.NetworkStatus
 import com.namu.dns.PrivateDnsController
 import com.namu.dns.core.LocalAppContainer
@@ -64,6 +63,7 @@ fun DataScreen(
     onOpenDnsLogs: () -> Unit,
     onRestart: () -> Unit,
     onStartVpn: () -> Unit = {},
+    onOpenMitmDetails: () -> Unit = {},
 ) {
     val container = LocalAppContainer.current
     val vm: DataViewModel = viewModel(factory = DataViewModel.factory(container))
@@ -233,6 +233,7 @@ fun DataScreen(
                     color = NamuColors.TextSub,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
                 )
+                SettingsRow("运行详情", chevron = true, showDivider = false, onClick = onOpenMitmDetails)
             }
         }
 
@@ -261,25 +262,6 @@ fun DataScreen(
 
         SectionHeader("诊断")
         GroupCard {
-            SettingsRow(
-                title = "同步规则源",
-                subtitle = if (cfg.rulesUrl.isBlank()) {
-                    "当前配置没有设置 rulesUrl"
-                } else {
-                    "下载 ${cfg.rulesUrl.substringAfterLast('/').take(32)} 并重载内核"
-                },
-                chevron = true,
-                onClick = {
-                    if (cfg.rulesUrl.isBlank()) {
-                        vm.showMessage("当前配置没有 rulesUrl")
-                    } else {
-                        scope.launch {
-                            val n = vm.syncRules()
-                            if (n != null && runtime.connected) NamuVpnService.reload(ctx)
-                        }
-                    }
-                },
-            )
             SettingsRow(
                 title = "导出诊断报告",
                 subtitle = "日志、内核版本、运行时长、请求数、缓存命中率、DNS 延迟分布和内存统计",
@@ -409,14 +391,14 @@ private fun HitWindowSelector(selected: Int, onSelect: (Int) -> Unit) {
     Row(
         Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp)
             .heightIn(min = 48.dp)
-            .background(NamuColors.Fill, RoundedCornerShape(12.dp))
+            .background(NamuColors.Fill, RoundedCornerShape(NamuTokens.RadiusControl))
             .padding(3.dp),
     ) {
         listOf(24 to "24 小时", 168 to "7 天").forEach { (hours, label) ->
             val active = selected == hours
             Box(
                 Modifier.weight(1f).heightIn(min = 42.dp)
-                    .clip(RoundedCornerShape(9.dp))
+                    .clip(RoundedCornerShape(NamuTokens.RadiusControl))
                     .background(if (active) NamuColors.Card else androidx.compose.ui.graphics.Color.Transparent)
                     .clickable { onSelect(hours) },
                 contentAlignment = Alignment.Center,
@@ -441,7 +423,7 @@ private fun HitAnalytics(
     onClear: () -> Unit,
 ) {
     when (state.phase) {
-        ShellPhase.LOADING -> NamuLoadingPanel("正在读取命中历史…")
+        ShellPhase.LOADING -> NamuLoadingPanel(label = "正在读取命中历史…")
         ShellPhase.EMPTY -> NamuEmptyPanel(
             title = if (state.needsVpnGuide) "先启动 VPN" else "本窗口暂无查询",
             body = if (state.needsVpnGuide) {

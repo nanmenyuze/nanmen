@@ -35,8 +35,8 @@ import com.namu.dns.core.repository.ShellPhase
 /** U4 四态：loading 用静态骨架，避免额外循环动效。 */
 @Composable
 fun NamuLoadingPanel(
-    label: String = "正在读取…",
     modifier: Modifier = Modifier,
+    label: String = "正在读取…",
 ) {
     Column(
         modifier.fillMaxWidth().padding(NamuTokens.Space20),
@@ -59,10 +59,10 @@ fun NamuLoadingPanel(
 fun NamuEmptyPanel(
     title: String,
     body: String,
+    modifier: Modifier = Modifier,
     action: String? = null,
     onAction: (() -> Unit)? = null,
     icon: ImageVector = Icons.Outlined.Inbox,
-    modifier: Modifier = Modifier,
 ) {
     Column(
         modifier.fillMaxWidth().padding(horizontal = NamuTokens.Space24, vertical = 28.dp),
@@ -86,8 +86,8 @@ fun NamuEmptyPanel(
 @Composable
 fun NamuErrorPanel(
     message: String,
-    onRetry: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
+    onRetry: (() -> Unit)? = null,
 ) {
     Column(
         modifier.fillMaxWidth().padding(horizontal = NamuTokens.Space24, vertical = 28.dp),
@@ -154,7 +154,7 @@ fun NamuStatePanel(
             onAction = if (needsVpnGuide) onStartVpn else null,
             icon = if (needsVpnGuide) Icons.Outlined.WifiTethering else Icons.Outlined.Inbox,
         )
-        ShellPhase.ERROR -> NamuErrorPanel(message, onRetry)
+        ShellPhase.ERROR -> NamuErrorPanel(message, onRetry = onRetry)
         ShellPhase.SUCCESS -> Unit
     }
 }

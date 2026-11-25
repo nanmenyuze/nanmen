@@ -23,6 +23,7 @@ pub enum RejectKind {
     TinyGif,
     JsonObject,
     JsonArray,
+    Mp4,
 }
 
 #[derive(Debug, Clone)]
@@ -409,6 +410,7 @@ fn rejects(action: &str) -> Option<RejectKind> {
         "reject-img" | "reject-tinygif" => Some(RejectKind::TinyGif),
         "reject-dict" => Some(RejectKind::JsonObject),
         "reject-array" => Some(RejectKind::JsonArray),
+        "reject-video" => Some(RejectKind::Mp4),
         _ => None,
     }
 }
@@ -648,7 +650,21 @@ fn build_old_rule(
         });
     }
     if let Some(kind) = rejects(&action) {
-        return req(LoonAction::Reject(kind));
+        let cond = if params.first().map(String::as_str) == Some("user-agent-regex") {
+            Some(LoonCond::HeaderRegex {
+                name: "User-Agent".into(),
+                re: Regex::new(params.get(1)?).ok()?,
+            })
+        } else {
+            None
+        };
+        return Some(vec![LoonRule {
+            phase: LoonPhase::Request,
+            url: url.clone(),
+            cond,
+            action: LoonAction::Reject(kind),
+            raw: line.into(),
+        }]);
     }
     if action == "mock-request-body" {
         return req(LoonAction::RequestMock(parse_mock(params, false)?));
@@ -1743,17 +1759,6 @@ fn set_json(
     false
 }
 
-fn get_json<'a>(value: &'a serde_json::Value, path: &[PathSeg]) -> Option<&'a serde_json::Value> {
-    let mut cur = value;
-    for seg in path {
-        match seg {
-            PathSeg::Key(k) => cur = cur.as_object()?.get(k)?,
-            PathSeg::Index(n) => cur = cur.as_array()?.get(*n)?,
-        }
-    }
-    Some(cur)
-}
-
 fn del_json(value: &mut serde_json::Value, path: &[PathSeg]) -> bool {
     if path.is_empty() {
         return false;
@@ -2216,5 +2221,19 @@ mod tests {
         let (out, changed) = apply_body_ops(b"not json", &refs, 1 << 20).unwrap();
         assert_eq!(out, b"not json");
         assert!(!changed);
+    }
+
+    #[test]
+    fn user_agent_condition_and_video_reject_are_executable() {
+        let lines = vec![
+            r#"^.*$ reject-video user-agent-regex "(?i)^AdBot.*$""#.to_string(),
+        ];
+        let set = parse_loon_rewrites(&lines);
+        assert_eq!(set.unsupported.len(), 0, "{:?}", set.unsupported);
+        assert_eq!(set.rules.len(), 1);
+        let headers = vec![("User-Agent".to_string(), "AdBot/1.0".to_string())];
+        assert!(set.rules[0].applies("https://example.com/ad", &headers));
+        assert!(!set.rules[0].applies("https://example.com/ad", &[]));
+        assert!(matches!(set.rules[0].action, LoonAction::Reject(RejectKind::Mp4)));
     }
 }

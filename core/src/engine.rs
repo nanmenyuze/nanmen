@@ -727,6 +727,8 @@ struct RouteRule {
     kind: RuleKind,
     value: String,
     action: Action,
+    extended_match: bool,
+    pre_match: bool,
     source: Option<String>,
     meta: Option<crate::hits::RuleMeta>,
 }
@@ -742,6 +744,7 @@ pub struct RuleEngine {
     final_action: Action,
     cn_direct: bool,
     cn_domains: DomainSet,
+    skip_proxy: DomainSet,
     cn_ips: Vec<(u32, u32)>,
     pub rule_count: usize,
     /// 配置里是否存在 UID 规则。用于「没 root 时提醒规则不生效」的统计与界面提示。
@@ -793,7 +796,7 @@ impl RuleEngine {
                     Ok(net) => RuleKind::IpCidr(net),
                     Err(_) => continue,
                 },
-                "PORT" => match rc.value.parse::<u16>() {
+                "PORT" | "DST-PORT" => match rc.value.parse::<u16>() {
                     Ok(p) => RuleKind::Port(p),
                     Err(_) => continue,
                 },
@@ -848,16 +851,22 @@ impl RuleEngine {
                 RuleKind::Protocol(_) => rc.value.trim().to_ascii_uppercase(),
                 _ => rc.value.clone(),
             };
-            let action = classify_action(&rc.action, &group_names, &node_names);
+            let action_name = rc.action.split(',').next().unwrap_or("").trim();
+            let extended_match = rc.action.split(',').any(|v| v.trim().eq_ignore_ascii_case("extended-matching"));
+            let pre_match = rc.action.split(',').any(|v| v.trim().eq_ignore_ascii_case("pre-matching"));
+            let action = classify_action(action_name, &group_names, &node_names);
             let action = if filter_only {
                 proxy_to_direct(action)
             } else {
                 action
             };
+            let pre_match = pre_match && matches!(action, Action::Block);
             rules.push(RouteRule {
                 kind,
                 value,
                 action,
+                extended_match,
+                pre_match,
                 source: rc.source.clone(),
                 meta: rc.meta.clone(),
             });
@@ -873,6 +882,8 @@ impl RuleEngine {
                 kind: RuleKind::Final,
                 value: String::new(),
                 action: final_action.clone(),
+                extended_match: false,
+                pre_match: false,
                 source: None,
                 meta: None,
             });
@@ -898,6 +909,11 @@ impl RuleEngine {
             }
         }
 
+        let mut skip_proxy = DomainSet::default();
+        for domain in &cfg.skip_proxy {
+            skip_proxy.insert_suffix(domain);
+        }
+
         // GEOIP 规则即使关闭 cn_direct 也需要 CN IP 库；两者用途不同。
         let cn_ips = cfg
             .cn_ip_file
@@ -912,6 +928,7 @@ impl RuleEngine {
             final_action,
             cn_direct: cfg.cn_direct,
             cn_domains,
+            skip_proxy,
             cn_ips,
             rule_count,
             has_uid,
@@ -957,9 +974,41 @@ impl RuleEngine {
         &self,
         input: &MatchInput<'_>,
     ) -> (Action, String, Option<crate::hits::RuleIdentity>) {
+        self.decide_input_attributed_with_sniff(input, false)
+    }
+
+    /// `sniffed_domain` 表示域名来自 TLS SNI / HTTP Host；仅扩展匹配规则消费该来源。
+    pub fn decide_input_attributed_with_sniff(
+        &self,
+        input: &MatchInput<'_>,
+        sniffed_domain: bool,
+    ) -> (Action, String, Option<crate::hits::RuleIdentity>) {
+        self.decide_input_attributed_with_sources(input, sniffed_domain, None)
+    }
+
+    /// 同时保留 DNS 反查域名与嗅探域名；普通规则消费前者，扩展规则还可消费后者。
+    pub fn decide_input_attributed_with_sources(
+        &self,
+        input: &MatchInput<'_>,
+        sniffed_domain: bool,
+        base_domain: Option<&str>,
+    ) -> (Action, String, Option<crate::hits::RuleIdentity>) {
         let dom = input.domain.map(normalize_domain);
-        // 顺序：自定义规则 -> 国内直连 -> 最终策略。FINAL 不能提前命中。
-        for (idx, r) in self.rules.iter().enumerate() {
+        let base_dom = base_domain.map(normalize_domain);
+        if let Some(domain) = &dom {
+            if self.skip_proxy.contains(domain) {
+                return (Action::Direct, format!("跳过代理：域名 {} 命中直连列表", domain), None);
+            }
+        }
+        if let Some(domain) = &base_dom {
+            if self.skip_proxy.contains(domain) {
+                return (Action::Direct, format!("跳过代理：域名 {} 命中直连列表", domain), None);
+            }
+        }
+        // 预匹配拦截规则先于普通顺序规则，其余规则保持配置顺序。
+        for (idx, r) in self.rules.iter().enumerate()
+            .filter(|(_, r)| r.pre_match && matches!(r.action, Action::Block))
+            .chain(self.rules.iter().enumerate().filter(|(_, r)| !(r.pre_match && matches!(r.action, Action::Block)))) {
             if matches!(r.kind, RuleKind::Final) {
                 continue;
             }
@@ -997,6 +1046,27 @@ impl RuleEngine {
                 // 归属未知时 UID 规则不命中：不能把 None 当成 0（0 是 root）去比。
                 RuleKind::Uid(u) => input.uid.map(|v| v == *u).unwrap_or(false),
                 RuleKind::Final => false,
+            };
+            let domain_rule = matches!(
+                &r.kind,
+                RuleKind::Domain | RuleKind::DomainSuffix | RuleKind::DomainKeyword |
+                    RuleKind::DomainRegex(_) | RuleKind::DomainWildcard(_)
+            );
+            let matched = if sniffed_domain && domain_rule {
+                let base_match = match &r.kind {
+                    RuleKind::Domain => base_dom.as_ref().map(|d| d == &r.value).unwrap_or(false),
+                    RuleKind::DomainSuffix => base_dom.as_ref().map(|d| {
+                        let suffix = r.value.as_str();
+                        !suffix.is_empty() && (d == suffix || (d.len() > suffix.len()
+                            && d.ends_with(suffix) && d.as_bytes()[d.len() - suffix.len() - 1] == b'.'))
+                    }).unwrap_or(false),
+                    RuleKind::DomainKeyword => base_dom.as_ref().map(|d| !r.value.is_empty() && d.contains(r.value.as_str())).unwrap_or(false),
+                    RuleKind::DomainRegex(re) | RuleKind::DomainWildcard(re) => base_dom.as_ref().map(|d| re.is_match(d)).unwrap_or(false),
+                    _ => false,
+                };
+                (r.extended_match && matched) || base_match
+            } else {
+                matched
             };
             if matched {
                 let detail = match &r.source {
@@ -1582,5 +1652,44 @@ mod tests {
         let engine = RuleEngine::from_config(&cfg);
         // 包名类规则由壳层展开成 UID 后下发；内核直接收到时应拒绝而不是误匹配
         assert_eq!(engine.rule_count, 1, "只剩自动补的 FINAL");
+    }
+
+    fn flagged_rule(value: &str, action: &str) -> crate::config::RuleConf {
+        crate::config::RuleConf {
+            kind: "DOMAIN-SUFFIX".into(), value: value.into(), action: action.into(), source: None, meta: None,
+        }
+    }
+
+    fn flagged_input<'a>(domain: &'a str) -> MatchInput<'a> {
+        MatchInput { domain: Some(domain), ip: "203.0.113.9".parse().unwrap(), port: 443, kind: ConnKind::Tcp, uid: None }
+    }
+
+    #[test]
+    fn extended_matching_consumes_sniffed_domain_only_when_enabled() {
+        let mut cfg = Config::default();
+        cfg.rules = vec![flagged_rule("example.com", "direct"), flagged_rule("example.com", "block,extended-matching")];
+        let engine = RuleEngine::from_config(&cfg);
+        assert!(matches!(engine.decide_input(&flagged_input("a.example.com")).0, Action::Direct));
+        assert!(matches!(engine.decide_input_attributed_with_sniff(&flagged_input("a.example.com"), true).0, Action::Block));
+        assert!(matches!(engine.decide_input_attributed_with_sources(&flagged_input("a.example.com"), true, Some("example.com")).0, Action::Direct));
+    }
+
+    #[test]
+    fn pre_matching_block_precedes_normal_rule_order() {
+        let mut cfg = Config::default();
+        cfg.rules = vec![flagged_rule("example.com", "direct"), flagged_rule("example.com", "block,pre-matching")];
+        let engine = RuleEngine::from_config(&cfg);
+        let (action, detail) = engine.decide_input(&flagged_input("a.example.com"));
+        assert!(matches!(action, Action::Block));
+        assert!(detail.contains("第 2 条规则"));
+    }
+
+    #[test]
+    fn skip_proxy_bypasses_block_rules() {
+        let mut cfg = Config::default();
+        cfg.skip_proxy = vec!["example.com".into()];
+        cfg.rules = vec![flagged_rule("example.com", "block")];
+        let engine = RuleEngine::from_config(&cfg);
+        assert!(matches!(engine.decide_input(&flagged_input("a.example.com")).0, Action::Direct));
     }
 }

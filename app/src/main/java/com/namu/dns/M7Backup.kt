@@ -29,6 +29,7 @@ object M7Backup {
         val scriptFiles: Map<String, String> = emptyMap(),
         /** 模块规则集缓存；key 为 files 下的 ruleset_*.txt。 */
         val ruleSetFiles: Map<String, String> = emptyMap(),
+        val profileNodes: Map<String, List<NodeInfo>> = emptyMap(),
     )
 
     data class RestoreResult(
@@ -58,6 +59,9 @@ object M7Backup {
                 files.forEach { (name, text) -> put(name, text) }
             })
             // 本地导入的模块正文不在 .conf 里；只备模块清单会让新机恢复后「有模块但没规则」。
+            put("profileNodes", JSONObject().apply {
+                files.keys.forEach { name -> ConfigFileStore.exportImportedNodes(context, name)?.let { put(name, it) } }
+            })
             put("moduleFiles", readFiles(File(context.filesDir, "modules"), MODULE_FILE_RE))
             put("scriptFiles", readFiles(File(context.filesDir, "scripts"), SCRIPT_FILE_RE))
             put("ruleSetFiles", readFiles(context.filesDir, RULESET_FILE_RE))
@@ -124,6 +128,14 @@ object M7Backup {
                 files[ConfigFileStore.sanitize(name)] = text
             }
         }
+        val profileNodes = linkedMapOf<String, List<NodeInfo>>()
+        root.optJSONObject("profileNodes")?.let { all ->
+            all.keys().forEach { name ->
+                require(name in files) { "备用节点没有对应配置 $name" }
+                val nodes = all.getJSONArray(name)
+                profileNodes[name] = List(nodes.length()) { NodeInfo.fromJson(nodes.getJSONObject(it)) }
+            }
+        }
         val requestedActive = root.optString("activeConfig", ConfigFileStore.DEFAULT_NAME)
         return BackupInfo(
             appVersion = root.optString("appVersion", "?"),
@@ -134,6 +146,7 @@ object M7Backup {
             moduleFiles = readFiles(root, "moduleFiles", MODULE_FILE_RE),
             scriptFiles = readFiles(root, "scriptFiles", SCRIPT_FILE_RE),
             ruleSetFiles = readFiles(root, "ruleSetFiles", RULESET_FILE_RE),
+            profileNodes = profileNodes,
         )
     }
 
@@ -152,6 +165,9 @@ object M7Backup {
         // 校验完再落盘，避免第二份文件失败时前半包已覆盖。
         info.files.forEach { (name, text) ->
             check(ConfigFileStore.writeRaw(context, name, text)) { "写入 $name 失败" }
+            val profileNodes = info.profileNodes[name].orEmpty()
+            if (profileNodes.isEmpty()) ConfigFileStore.clearImportedNodes(context, name)
+            else check(ConfigFileStore.saveImportedNodes(context, name, profileNodes)) { "写入 $name 的备用节点失败" }
         }
         // 模块正文与依赖先恢复；rebuildModules 只读这些文件，不联网。
         var restoredAssets = 0

@@ -13,6 +13,7 @@ object NetworkStatus {
         val vpnUp: Boolean,
     )
 
+    @Suppress("DEPRECATION")
     fun current(context: Context): Snapshot {
         val cm = context.getSystemService(ConnectivityManager::class.java)
         val active = cm?.activeNetwork

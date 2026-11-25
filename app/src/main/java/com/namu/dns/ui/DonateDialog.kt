@@ -97,7 +97,7 @@ fun DonateDialog(onDismiss: () -> Unit) {
         Box(
             Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(10.dp))
+                .clip(RoundedCornerShape(NamuTokens.RadiusControl))
                 .background(NamuColors.Fill)
                 .clickable {
                     if (!openAlipay(context)) showFallbackQr = true
@@ -138,7 +138,7 @@ fun DonateDialog(onDismiss: () -> Unit) {
                     Box(
                         Modifier
                             .size(150.dp)
-                            .clip(RoundedCornerShape(10.dp))
+                            .clip(RoundedCornerShape(NamuTokens.RadiusControl))
                             .background(NamuColors.Fill),
                         contentAlignment = Alignment.Center,
                     ) {
@@ -164,7 +164,7 @@ fun DonateDialog(onDismiss: () -> Unit) {
             Box(
                 Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(10.dp))
+                    .clip(RoundedCornerShape(NamuTokens.RadiusControl))
                     .background(NamuColors.Fill)
                     .clickable {
                         runCatching {

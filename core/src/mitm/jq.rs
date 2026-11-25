@@ -350,7 +350,6 @@ enum Step {
     Key(String),
     Index(i64),
     Iterate,
-    Slice(Option<i64>, Option<i64>),
 }
 
 #[derive(Debug, Clone)]
@@ -400,13 +399,6 @@ impl Parser {
             Err(format!("期望 {tok:?}"))
         }
     }
-    fn ident(&mut self) -> Option<String> {
-        match self.eat() {
-            Some(Tok::Ident(s)) => Some(s),
-            _ => None,
-        }
-    }
-
     fn parse(mut self) -> Result<Expr, String> {
         let e = self.parse_assign()?;
         if self.i != self.t.len() {
@@ -894,7 +886,7 @@ fn get_path<'a>(mut v: &'a Value, path: &[Step]) -> Option<&'a Value> {
                 let idx = if *n < 0 { arr.len() as i64 + *n } else { *n };
                 v = arr.get(idx as usize)?;
             }
-            Step::Iterate | Step::Slice(_, _) => return None,
+            Step::Iterate => return None,
         }
     }
     Some(v)
@@ -941,7 +933,7 @@ fn set_path(v: &mut Value, path: &[Step], new: Value) -> bool {
                 }
                 cur = &mut arr[idx as usize];
             }
-            Step::Iterate | Step::Slice(_, _) => return false,
+            Step::Iterate => return false,
         }
     }
     false
@@ -981,7 +973,7 @@ fn del_path(v: &mut Value, path: &[Step]) -> bool {
                 }
                 cur = &mut arr[idx as usize];
             }
-            Step::Iterate | Step::Slice(_, _) => return false,
+            Step::Iterate => return false,
         }
     }
     false

@@ -86,6 +86,7 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
     val haptic = LocalHapticFeedback.current
     var showSub by remember { mutableStateOf(false) }
     var showAddNode by remember { mutableStateOf(false) }
+    var showPingMethod by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
     var refreshing by remember { mutableStateOf(false) }
     var selectionMode by remember { mutableStateOf(false) }
@@ -208,8 +209,14 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
                 item { SubscriptionCard(info) }
             }
             item {
-                SectionHeader("自动选择")
+                SectionHeader("测速与自动选择")
                 GroupCard {
+                    SettingsRow(
+                        title = "延迟测试方法",
+                        value = pingMethodLabel(cfg.pingMethod),
+                        chevron = true,
+                        onClick = { showPingMethod = true },
+                    )
                     SwitchRow(
                         title = "自动选择最快节点",
                         subtitle = "WorkManager 每 15 分钟测速，按 ${pingMethodLabel(cfg.pingMethod)} 延迟选择；也可手动点测速",
@@ -251,7 +258,7 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
                         Modifier
                             .fillMaxWidth()
                             .padding(horizontal = 12.dp, vertical = 4.dp)
-                            .clip(RoundedCornerShape(12.dp))
+                            .clip(RoundedCornerShape(NamuTokens.RadiusControl))
                             .background(NamuColors.Card)
                             .padding(horizontal = 14.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -329,6 +336,24 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
         }
     }
 
+    if (showPingMethod) {
+        ChoiceDialog(
+            title = "延迟测试方法",
+            message = "TCP 握手兼容所有节点；TLS 握手只适合 TLS 节点，能额外发现端口可连但握手失败的情况。自动选节点也使用这里的方法。",
+            options = listOf(
+                "tcp" to "TCP 握手（推荐）",
+                "tls" to "TLS 握手",
+            ),
+            selected = cfg.pingMethod,
+            onSelect = { method ->
+                if (method == "tcp" || method == "tls") {
+                    settings.update { current -> current.copy(pingMethod = method) }
+                }
+                showPingMethod = false
+            },
+            onDismiss = { showPingMethod = false },
+        )
+    }
     if (showSub) {
         SubscriptionDialog(
             onDismiss = { showSub = false },
@@ -507,7 +532,7 @@ private fun NodeRow(
             Box(
                 Modifier
                     .size(38.dp)
-                    .clip(RoundedCornerShape(9.dp))
+                    .clip(RoundedCornerShape(NamuTokens.RadiusControl))
                     .background(color.copy(alpha = 0.12f)),
                 contentAlignment = Alignment.Center,
             ) {
@@ -553,7 +578,7 @@ private fun NodeRow(
                     Modifier
                         .heightIn(min = 48.dp)
                         .widthIn(min = 48.dp)
-                        .clip(RoundedCornerShape(8.dp))
+                        .clip(RoundedCornerShape(NamuTokens.RadiusControl))
                         .background(NamuColors.Blue.copy(alpha = 0.10f))
                         .clickable { onTest() },
                     contentAlignment = Alignment.Center,

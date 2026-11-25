@@ -1,5 +1,6 @@
 package com.namu.dns.ui
 
+import androidx.compose.runtime.mutableIntStateOf
 import com.namu.dns.core.LocalDockClearance
 
 import androidx.compose.foundation.background
@@ -16,13 +17,13 @@ import androidx.compose.material.icons.outlined.AccountTree
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Folder
-import androidx.compose.material.icons.outlined.LibraryBooks
+import androidx.compose.material.icons.automirrored.outlined.LibraryBooks
 import androidx.compose.material.icons.outlined.BugReport
+import androidx.compose.material.icons.outlined.Insights
 import androidx.compose.material.icons.outlined.Lan
 import androidx.compose.material.icons.outlined.Palette
-import androidx.compose.material.icons.outlined.Rule
+import androidx.compose.material.icons.automirrored.outlined.Rule
 import androidx.compose.material.icons.outlined.Security
-import androidx.compose.material.icons.outlined.Speed
 import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.SwapVert
 import androidx.compose.material.icons.outlined.Tune
@@ -59,77 +60,34 @@ import kotlinx.coroutines.launch
 import org.json.JSONObject
 
 private val settingsBlue = Color(0xFF3B82F6)
-private val settingsOrange = Color(0xFFF59E0B)
 private val settingsPurple = Color(0xFFA855F7)
 private val settingsGreen = Color(0xFF22C58B)
 private val settingsGray = Color(0xFF6B7280)
 
 @Composable
 fun SettingsScreen(
-    onOpenGeneral: () -> Unit,
-    onOpenRules: () -> Unit,
-    onOpenQuickEdit: () -> Unit,
     onOpenConfig: () -> Unit,
     onOpenMitm: () -> Unit,
+    onOpenDiagnostics: () -> Unit,
     onOpenAdvanced: () -> Unit,
 ) {
     val container = LocalAppContainer.current
+    val activeProfile by container.settings.activeProfile.collectAsStateWithLifecycle()
     val vm: SettingsViewModel = viewModel(factory = SettingsViewModel.factory(container))
     val state by vm.state.collectAsStateWithLifecycle()
     val cfg = state.config
     var showTheme by remember { mutableStateOf(false) }
-    var showGroups by remember { mutableStateOf(false) }
 
     Column(
         Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
     ) {
-        SectionHeader("通用")
+        MainPageTopBar("设置")
+        SectionHeader("配置")
         GroupCard {
             SettingsRow(
-                title = "DNS 与连接处理",
-                icon = Icons.Outlined.Tune,
-                iconBackground = settingsBlue,
-                chevron = true,
-                showDivider = false,
-                onClick = onOpenGeneral,
-            )
-        }
-
-        SectionHeader("规则")
-        GroupCard {
-            SettingsRow(
-                title = "规则",
-                value = "${cfg.rules.size} 条",
-                icon = Icons.Outlined.Rule,
-                iconBackground = settingsOrange,
-                chevron = true,
-                onClick = onOpenRules,
-            )
-            SettingsRow(
-                title = "策略组",
-                value = "${cfg.proxyGroups.size} 个",
-                icon = Icons.Outlined.AccountTree,
-                iconBackground = settingsPurple,
-                chevron = true,
-                showDivider = false,
-                onClick = { showGroups = true },
-            )
-        }
-
-        SectionHeader("文件")
-        GroupCard {
-            SettingsRow(
-                title = "快速编辑",
-                value = container.config.activeName(),
-                icon = Icons.Outlined.Edit,
-                iconBackground = settingsOrange,
-                chevron = true,
-                onClick = onOpenQuickEdit,
-            )
-            SettingsRow(
-                title = "所有配置文件",
+                title = "配置管理",
+                value = activeProfile,
                 icon = Icons.Outlined.Folder,
-                iconBackground = settingsBlue,
                 chevron = true,
                 showDivider = false,
                 onClick = onOpenConfig,
@@ -139,8 +97,7 @@ fun SettingsScreen(
         SectionHeader("MITM")
         GroupCard {
             SettingsRow(
-                title = "MITM 管理",
-                value = if (cfg.mitm.enabled) "已开启" else "已关闭",
+                title = "MITM 证书",
                 icon = Icons.Outlined.Security,
                 iconBackground = settingsGreen,
                 chevron = true,
@@ -151,17 +108,6 @@ fun SettingsScreen(
 
         SectionHeader("偏好")
         GroupCard {
-            SettingsRow(
-                title = "自动连接",
-                icon = Icons.Outlined.Sync,
-                iconBackground = settingsOrange,
-                rightContent = {
-                    IosSwitch(
-                        checked = cfg.autoConnect,
-                        onCheckedChange = { vm.setAutoConnect(it) },
-                    )
-                },
-            )
             SettingsRow(
                 title = "外观",
                 value = when (cfg.themeMode) {
@@ -179,6 +125,13 @@ fun SettingsScreen(
 
         SectionHeader("其他")
         GroupCard {
+            SettingsRow(
+                title = "运行数据与诊断",
+                icon = Icons.Outlined.Insights,
+                iconBackground = settingsBlue,
+                chevron = true,
+                onClick = onOpenDiagnostics,
+            )
             SettingsRow(
                 title = "高级设置",
                 icon = Icons.Outlined.Tune,
@@ -206,14 +159,7 @@ fun SettingsScreen(
             onDismiss = { showTheme = false },
         )
     }
-    if (showGroups) {
-        ProxyGroupsDialog(
-            groups = cfg.proxyGroups,
-            nodes = cfg.nodes.map { it.name },
-            selections = cfg.groupSelections,
-            onDismiss = { showGroups = false },
-        )
-    }
+
 }
 
 @Composable
@@ -222,7 +168,6 @@ fun AdvancedSettingsScreen(onOpenLogs: () -> Unit, onRestart: () -> Unit) {
     val vm: SettingsViewModel = viewModel(factory = SettingsViewModel.factory(container))
     val state by vm.state.collectAsStateWithLifecycle()
     val cfg = state.config
-    var showPingMethod by remember { mutableStateOf(false) }
     var showDonate by remember { mutableStateOf(false) }
     var showBackup by remember { mutableStateOf(false) }
     var showMigration by remember { mutableStateOf(false) }
@@ -230,7 +175,7 @@ fun AdvancedSettingsScreen(onOpenLogs: () -> Unit, onRestart: () -> Unit) {
     var showSsidNames by remember { mutableStateOf(false) }
     var showGeneral by remember { mutableStateOf(false) }
     var showScriptArgs by remember { mutableStateOf(false) }
-    var permissionEpoch by remember { mutableStateOf(0) }
+    var permissionEpoch by remember { mutableIntStateOf(0) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -265,7 +210,7 @@ fun AdvancedSettingsScreen(onOpenLogs: () -> Unit, onRestart: () -> Unit) {
             SettingsRow(
                 title = "[General]",
                 subtitle = if (moduleGeneral.raw.isEmpty()) "模块通用项：未声明" else "模块通用项：${moduleGeneral.raw.size} 个键，只映射壳行为",
-                icon = Icons.Outlined.LibraryBooks,
+                icon = Icons.AutoMirrored.Outlined.LibraryBooks,
                 chevron = true,
                 onClick = { showGeneral = true },
             )
@@ -276,6 +221,17 @@ fun AdvancedSettingsScreen(onOpenLogs: () -> Unit, onRestart: () -> Unit) {
                 onClick = {
                     if (scriptCount == 0) vm.showMessage("当前没有可编辑的脚本参数")
                     else showScriptArgs = true
+                },
+            )
+            SettingsRow(
+                title = "自动连接",
+                subtitle = "开机或默认网络恢复后自动连接；设备级开关，与 SSID 触发各自独立",
+                icon = Icons.Outlined.Sync,
+                rightContent = {
+                    IosSwitch(
+                        checked = cfg.autoConnect,
+                        onCheckedChange = { vm.setAutoConnect(it) },
+                    )
                 },
             )
             SettingsRow(
@@ -332,13 +288,6 @@ fun AdvancedSettingsScreen(onOpenLogs: () -> Unit, onRestart: () -> Unit) {
 
         SectionHeader("应用与网络")
         GroupCard {
-            SettingsRow(
-                title = "延迟测试方法",
-                value = pingMethodLabel(cfg.pingMethod),
-                icon = Icons.Outlined.Speed,
-                chevron = true,
-                onClick = { showPingMethod = true },
-            )
             SettingsRow(
                 title = "金融连接保护",
                 subtitle = "支付、银行、账号安全连接不走 MITM；银行类 App 整包跳过，微信支付宝按域名排除",
@@ -444,22 +393,6 @@ fun AdvancedSettingsScreen(onOpenLogs: () -> Unit, onRestart: () -> Unit) {
         Spacer(Modifier.height(LocalDockClearance.current + 30.dp))
     }
 
-    if (showPingMethod) {
-        ChoiceDialog(
-            title = "延迟测试方法",
-            message = "TCP 握手兼容所有节点；TLS 握手只适合 TLS 节点，能额外发现端口可连但握手失败的情况。自动选节点也使用这里的方法。",
-            options = listOf(
-                "tcp" to "TCP 握手（推荐）",
-                "tls" to "TLS 握手",
-            ),
-            selected = cfg.pingMethod,
-            onSelect = {
-                vm.setPingMethod(it)
-                showPingMethod = false
-            },
-            onDismiss = { showPingMethod = false },
-        )
-    }
     if (showDonate) {
         DonateDialog(onDismiss = { showDonate = false })
     }

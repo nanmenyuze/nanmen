@@ -65,17 +65,19 @@ import com.namu.dns.ui.ConfigDetailScreen
 import com.namu.dns.ui.ConfigScreen
 import com.namu.dns.ui.ConfigSectionScreen
 import com.namu.dns.ui.DataScreen
+import com.namu.dns.ui.DiagnosticsScreen
 import com.namu.dns.ui.DnsLogsScreen
 import com.namu.dns.ui.FirstRunVpnGuide
 import com.namu.dns.ui.HomeScreen
 import com.namu.dns.ui.LogsScreen
 import com.namu.dns.ui.MitmScreen
+import com.namu.dns.ui.ModuleDetailScreen
 import com.namu.dns.ui.ModulesScreen
 import com.namu.dns.ui.NamuColors
+import com.namu.dns.ui.NamuTokens
 import com.namu.dns.ui.NodesScreen
 import com.namu.dns.ui.ScanScreen
 import com.namu.dns.ui.SettingsScreen
-import com.namu.dns.ui.PrimaryTopBar
 import com.namu.dns.ui.QuickEditScreen
 import com.namu.dns.ui.ShadowTopBar
 
@@ -137,11 +139,10 @@ fun NamuAppShell(
             topBar = {
                 if (destination.matches(HomeRoute::class) ||
                     destination.matches(ModulesRoute::class) ||
+                    destination.matches(SettingsRoute::class) ||
                     destination.matches(QuickEditRoute::class)
                 ) {
                     Unit
-                } else if (currentTab != null) {
-                    PrimaryTopBar(titleFor(destination, entry))
                 } else {
                     ShadowTopBar(
                         title = titleFor(destination, entry),
@@ -168,7 +169,7 @@ fun NamuAppShell(
                         Modifier.fillMaxWidth().padding(horizontal = 28.dp, vertical = 8.dp),
                         contentAlignment = Alignment.Center,
                     ) {
-                        Surface(shape = RoundedCornerShape(18.dp), color = Color(0xEE1C1C1E)) {
+                        Surface(shape = RoundedCornerShape(NamuTokens.RadiusCard), color = Color(0xEE1C1C1E)) {
                             Text(
                                 data.visuals.message,
                                 color = Color.White,
@@ -231,6 +232,7 @@ fun NamuNavHost(
     onRestart: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val container = LocalAppContainer.current
     NavHost(
         navController = navController,
         startDestination = HomeRoute,
@@ -251,13 +253,13 @@ fun NamuNavHost(
                 onRestart = onRestart,
                 onOpenData = { navController.navigate(DataRoute) },
                 onOpenDnsLogs = { navController.navigate(LogsRoute(LogKind.Dns)) },
-                onOpenQuickEdit = { navController.navigate(QuickEditRoute) },
+                onOpenQuickEdit = { navController.navigate(ConfigDetailRoute(container.config.activeName())) },
                 onOpenMitm = { navController.navigate(MitmRoute) },
             )
         }
         composable<ConfigRoute> {
             ConfigScreen(
-                onOpenQuickEdit = { navController.navigate(QuickEditRoute) },
+                onOpenPanel = { navController.navigate(ConfigDetailRoute(it)) },
             )
         }
         composable<DataRoute> {
@@ -265,16 +267,23 @@ fun NamuNavHost(
                 onOpenDnsLogs = { navController.navigate(LogsRoute(LogKind.Dns)) },
                 onRestart = onRestart,
                 onStartVpn = onToggle,
+                onOpenMitmDetails = { navController.navigate(MitmRuntimeRoute) },
             )
         }
         composable<SettingsRoute> {
             SettingsScreen(
-                onOpenGeneral = { navController.navigate(ConfigSectionRoute(ConfigSection.General)) },
-                onOpenRules = { navController.navigate(ConfigSectionRoute(ConfigSection.Rules)) },
-                onOpenQuickEdit = { navController.navigate(QuickEditRoute) },
                 onOpenConfig = { navController.navigate(ConfigRoute) },
                 onOpenMitm = { navController.navigate(MitmRoute) },
+                onOpenDiagnostics = { navController.navigate(DiagnosticsRoute) },
                 onOpenAdvanced = { navController.navigate(AdvancedSettingsRoute) },
+            )
+        }
+        composable<DiagnosticsRoute> {
+            DiagnosticsScreen(
+                onOpenDnsAnalytics = { navController.navigate(DataRoute) },
+                onOpenDnsLogs = { navController.navigate(LogsRoute(LogKind.Dns)) },
+                onOpenRuntimeLogs = { navController.navigate(LogsRoute(LogKind.Runtime)) },
+                onOpenMitmDetails = { navController.navigate(MitmRuntimeRoute) },
             )
         }
         composable<AdvancedSettingsRoute> {
@@ -295,21 +304,38 @@ fun NamuNavHost(
                 LogKind.Dns -> DnsLogsScreen()
             }
         }
-        composable<ConfigDetailRoute> {
-            ConfigDetailScreen(onOpenSection = { navController.navigate(ConfigSectionRoute(it)) })
+        composable<ConfigDetailRoute> { entry ->
+            val name = entry.toRoute<ConfigDetailRoute>().name
+            ConfigDetailScreen(
+                name = name,
+                onOpenSection = { navController.navigate(ConfigSectionRoute(it, name)) },
+                onOpenRaw = { navController.navigate(QuickEditRoute(name)) },
+                onDeleted = { navController.popBackStack() },
+            )
         }
-        composable<QuickEditRoute> {
-            QuickEditScreen(onBack = { navController.popBackStack() }, onRestart = onRestart)
+        composable<QuickEditRoute> { entry ->
+            QuickEditScreen(name = entry.toRoute<QuickEditRoute>().name, onBack = { navController.popBackStack() })
         }
-        composable<ConfigSectionRoute> { sectionEntry ->
-            ConfigSectionScreen(sectionEntry.toRoute<ConfigSectionRoute>().section, onRestart)
+        composable<ConfigSectionRoute> { entry ->
+            val route = entry.toRoute<ConfigSectionRoute>()
+            ConfigSectionScreen(route.section, route.name, onOpenCertificate = { navController.navigate(MitmRoute) })
         }
-        composable<ModulesRoute> { ModulesScreen(onRestart = onRestart) }
-        composable<MitmRoute> { MitmScreen() }
+        composable<ModulesRoute> {
+            ModulesScreen(
+                onRestart = onRestart,
+                onOpenDetail = { navController.navigate(ModuleDetailRoute(it)) },
+            )
+        }
+        composable<ModuleDetailRoute> { detailEntry ->
+            ModuleDetailScreen(
+                moduleId = detailEntry.toRoute<ModuleDetailRoute>().moduleId,
+                onBack = { navController.popBackStack() },
+            )
+        }
+        composable<MitmRoute> { MitmScreen(certificateOnly = true) }
+        composable<MitmRuntimeRoute> { MitmScreen(certificateOnly = false) }
         composable<ScanRoute> {
-            ScanScreen(onDone = {
-                navController.popBackStack()
-            })
+            ScanScreen(onDone = { navController.popBackStack() })
         }
     }
 }
@@ -325,17 +351,21 @@ private fun NavHostController.openMainTab(tab: MainTab) {
 private fun titleFor(destination: NavDestination?, entry: androidx.navigation.NavBackStackEntry?): String = when {
     destination.matches(HomeRoute::class) -> "南门 DNS"
     destination.matches(ConfigRoute::class) -> "配置文件"
-    destination.matches(DataRoute::class) -> "数据"
+    destination.matches(DataRoute::class) -> "DNS 与拦截"
     destination.matches(ModulesRoute::class) -> "模块"
+    destination.matches(ModuleDetailRoute::class) -> "模块详情"
     destination.matches(SettingsRoute::class) -> "设置"
     destination.matches(AdvancedSettingsRoute::class) -> "高级设置"
+    destination.matches(DiagnosticsRoute::class) -> "运行数据与诊断"
     destination.matches(NodesRoute::class) -> "节点与订阅"
     destination.matches(LogsRoute::class) ->
         if (entry?.toRoute<LogsRoute>()?.kind == LogKind.Dns) "DNS 查询" else "运行日志"
-    destination.matches(ConfigDetailRoute::class) -> "编辑当前配置"
+    destination.matches(ConfigDetailRoute::class) -> entry?.toRoute<ConfigDetailRoute>()?.name ?: "配置"
     destination.matches(QuickEditRoute::class) -> "快速编辑"
-    destination.matches(ConfigSectionRoute::class) -> entry?.toRoute<ConfigSectionRoute>()?.section?.title ?: "配置"
+    destination.matches(ConfigSectionRoute::class) -> entry?.toRoute<ConfigSectionRoute>()
+        ?.let { "${it.section.title} · ${it.name}" } ?: "配置"
     destination.matches(MitmRoute::class) -> "MITM 管理"
+    destination.matches(MitmRuntimeRoute::class) -> "MITM 运行详情"
     destination.matches(ScanRoute::class) -> "扫码导入"
     else -> "南门 DNS"
 }
@@ -350,7 +380,7 @@ private fun NavIcon(
     Box(
         Modifier
             .size(48.dp)
-            .clip(RoundedCornerShape(8.dp))
+            .clip(RoundedCornerShape(NamuTokens.RadiusControl))
             .clickable(interactionSource = interaction, indication = null) { onClick() },
         contentAlignment = Alignment.Center,
     ) {

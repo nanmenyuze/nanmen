@@ -27,6 +27,10 @@ data object SettingsRoute
 @Serializable
 data object AdvancedSettingsRoute
 
+/** 设置 → 运行数据与诊断：DNS 拦截、流量连接、MITM 统计与日志导出的总览二级页。 */
+@Serializable
+data object DiagnosticsRoute
+
 @Serializable
 data object NodesRoute
 
@@ -42,28 +46,40 @@ enum class LogKind {
 data class LogsRoute(val kind: LogKind = LogKind.Runtime)
 
 @Serializable
-data object ConfigDetailRoute
+data class ConfigDetailRoute(val name: String)
 
 @Serializable
-data object QuickEditRoute
+data class QuickEditRoute(val name: String)
 
 @Keep
 @Serializable
 enum class ConfigSection(val title: String) {
     General("通用"),
     Rules("规则"),
-    Sources("配置来源"),
+    Sources("规则来源"),
+    Hosts("Hosts"),
+    UrlRewrite("URL 重写"),
+    HeaderRewrite("头部重写"),
+    BodyRewrite("正文重写"),
+    Https("HTTPS 解密"),
+    Advanced("高级设置"),
 }
 
 @Serializable
-data class ConfigSectionRoute(val section: ConfigSection)
+data class ConfigSectionRoute(val section: ConfigSection, val name: String)
 
 @Serializable
 data object ModulesRoute
 
+@Serializable
+data class ModuleDetailRoute(val moduleId: String)
+
 /** MITM 去广告：证书安装、域名/跳过列表、规则与运行数据。 */
 @Serializable
 data object MitmRoute
+
+@Serializable
+data object MitmRuntimeRoute
 
 /** 扫码导入的占位路由；当前入口仍复用「节点」页的导入/订阅流程。 */
 @Serializable

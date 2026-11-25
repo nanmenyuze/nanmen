@@ -17,7 +17,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
@@ -33,10 +32,8 @@ import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Router
 import androidx.compose.material.icons.outlined.Shield
-import androidx.compose.material.icons.outlined.TrendingUp
+import androidx.compose.material.icons.automirrored.outlined.TrendingUp
 import androidx.compose.material.icons.outlined.Wifi
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -90,6 +87,7 @@ fun HomeScreen(
     onOpenMitm: () -> Unit,
 ) {
     val container = LocalAppContainer.current
+    val activeProfile by container.settings.activeProfile.collectAsStateWithLifecycle()
     val vm: HomeViewModel = viewModel(factory = HomeViewModel.factory(container))
     val state by vm.state.collectAsStateWithLifecycle()
     val cfg = state.config
@@ -156,19 +154,10 @@ fun HomeScreen(
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Column(Modifier.widthIn(max = 560.dp).fillMaxWidth()) {
-            Row(
-                Modifier.fillMaxWidth().statusBarsPadding()
-                    .padding(start = 20.dp, end = 16.dp, top = 16.dp, bottom = 12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
+            MainPageTopBar(
+                title = "南门 DNS",
+                titleColor = if (NamuColors.isDark) Color(0xFFFFA45E) else Color(0xFFEF7D22),
             ) {
-                Text(
-                    "南门 DNS",
-                    fontSize = 28.sp,
-                    lineHeight = 34.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = if (NamuColors.isDark) Color(0xFFFFA45E) else Color(0xFFEF7D22),
-                )
                 HomeRoutingPicker(
                     mode = mode,
                     enabled = !starting && !stopping,
@@ -205,7 +194,7 @@ fun HomeScreen(
                     HomeShortcutCard(
                         title = "拦截命中",
                         subtitle = hitSummary,
-                        icon = Icons.Outlined.TrendingUp,
+                        icon = Icons.AutoMirrored.Outlined.TrendingUp,
                         modifier = Modifier.weight(1f),
                         onClick = onOpenData,
                     )
@@ -231,8 +220,8 @@ fun HomeScreen(
                         onClick = onOpenDnsLogs,
                     )
                     HomeShortcutCard(
-                        title = "配置文件",
-                        subtitle = container.config.activeName(),
+                        title = "当前配置",
+                        subtitle = activeProfile,
                         icon = Icons.Outlined.Description,
                         modifier = Modifier.weight(1f),
                         onClick = onOpenQuickEdit,
@@ -309,7 +298,7 @@ fun HomeScreen(
 private val RoutingMode.homeLabel: String
     get() = when (this) {
         RoutingMode.Direct -> "仅过滤"
-        RoutingMode.Rules -> "自动分流"
+        RoutingMode.Rules -> "规则分流"
         RoutingMode.Proxy -> "全局代理"
     }
 
@@ -328,7 +317,7 @@ private fun WorkbenchStatusCard(
     enabled: Boolean,
     onToggle: () -> Unit,
 ) {
-    val shape = RoundedCornerShape(24.dp)
+    val shape = RoundedCornerShape(NamuTokens.RadiusDialog)
     Column(
         Modifier.fillMaxWidth().padding(horizontal = 16.dp)
             .shadow(6.dp, shape)
@@ -445,7 +434,7 @@ private fun HomeRoutingPicker(mode: RoutingMode, enabled: Boolean, onModeChange:
     Box {
         Box(
             Modifier.heightIn(min = 44.dp)
-                .clip(RoundedCornerShape(12.dp))
+                .clip(RoundedCornerShape(NamuTokens.RadiusControl))
                 .clickable(enabled = enabled, onClickLabel = "切换流量模式", role = Role.Button) { expanded = true },
             contentAlignment = Alignment.Center,
         ) {
@@ -459,15 +448,43 @@ private fun HomeRoutingPicker(mode: RoutingMode, enabled: Boolean, onModeChange:
                 NamuIcon(Icons.Filled.ArrowDropDown, tint = homeAccent, size = 18.dp)
             }
         }
-        DropdownMenu(expanded = expanded && enabled, onDismissRequest = { expanded = false }) {
-            RoutingMode.entries.forEach { option ->
-                DropdownMenuItem(
-                    text = { Text(option.homeLabel, color = if (option == mode) homeAccent else NamuColors.TextMain) },
-                    onClick = {
-                        expanded = false
-                        onModeChange(option)
-                    },
-                )
+    }
+    if (expanded && enabled) {
+        NamuDialog(
+            title = "流量模式",
+            confirmText = "取消",
+            showDismiss = false,
+            onConfirm = { expanded = false },
+            onDismiss = { expanded = false },
+        ) {
+            Column(
+                Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(NamuTokens.RadiusRow))
+                    .background(NamuColors.Fill),
+            ) {
+                RoutingMode.entries.forEachIndexed { index, option ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                expanded = false
+                                onModeChange(option)
+                            }
+                            .padding(horizontal = 16.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            option.homeLabel,
+                            modifier = Modifier.weight(1f),
+                            fontSize = 16.sp,
+                            fontWeight = if (option == mode) FontWeight.SemiBold else FontWeight.Normal,
+                            color = if (option == mode) homeAccent else NamuColors.TextMain,
+                        )
+                        if (option == mode) CheckMark(color = homeAccent)
+                    }
+                    if (index != RoutingMode.entries.lastIndex) RowDivider()
+                }
             }
         }
     }
@@ -475,7 +492,7 @@ private fun HomeRoutingPicker(mode: RoutingMode, enabled: Boolean, onModeChange:
 
 @Composable
 private fun NetworkRateTile(label: String, rate: String, icon: ImageVector, modifier: Modifier) {
-    val shape = RoundedCornerShape(12.dp)
+    val shape = RoundedCornerShape(NamuTokens.RadiusControl)
     Column(
         modifier.clip(shape)
             .background(if (NamuColors.isDark) Color(0xFF262A31) else Color(0xFFF4F5F7))
@@ -506,7 +523,7 @@ private fun HomeShortcutCard(
     subtitle: String? = null,
     onClick: (() -> Unit)? = null,
 ) {
-    val shape = RoundedCornerShape(16.dp)
+    val shape = RoundedCornerShape(NamuTokens.RadiusCard)
     Column(
         modifier.fillMaxHeight().heightIn(min = 102.dp)
             .shadow(4.dp, shape)
@@ -522,7 +539,7 @@ private fun HomeShortcutCard(
             if (subtitle != null) {
                 Text(
                     subtitle,
-                    style = NamuTokens.Type.Caption,
+                    style = NamuTokens.Type.Caption.copy(fontFeatureSettings = "tnum"),
                     color = NamuColors.TextSub,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,

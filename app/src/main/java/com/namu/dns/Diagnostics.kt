@@ -26,6 +26,7 @@ object Diagnostics {
         Actions.exportText(context, "namu_diag_$ts.txt", build(context))
     }
 
+    @Suppress("DEPRECATION")
     fun build(context: Context): String {
         val sb = StringBuilder()
         val now = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
@@ -85,7 +86,7 @@ object Diagnostics {
                 },
         )
         runCatching {
-            val f = ConfigStore.rulesFile(context)
+            val f = ConfigStore.rulesFile(context, cfg.rulesUrl)
             sb.appendLine(
                 "规则文件：${f.name}，${if (f.exists()) formatBytes(f.length()) else "不存在"}，" +
                     "${if (f.exists()) countLines(f) else 0} 行",

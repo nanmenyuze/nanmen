@@ -1,5 +1,6 @@
 package com.namu.dns.ui
 
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.fadeIn
@@ -43,6 +44,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Shapes
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.Text
@@ -102,9 +104,11 @@ object NamuTokens {
     val Space24 = 24.dp
     val Space32 = 32.dp
 
-    val RadiusCard = 16.dp
-    val RadiusRow = 14.dp
-    val RadiusControl = 12.dp
+    val RadiusCard = 24.dp
+    val RadiusRow = 18.dp
+    val RadiusControl = 16.dp
+    val RadiusMenu = 22.dp
+    val RadiusDialog = 28.dp
 
     /** 20dp / 2px 线性图标；新页面统一走 NamuIcon。 */
     val IconSize = 20.dp
@@ -186,6 +190,13 @@ fun NamuTheme(
                 error = NamuColors.Red,
             )
         },
+        shapes = Shapes(
+            extraSmall = RoundedCornerShape(12.dp),
+            small = RoundedCornerShape(NamuTokens.RadiusControl),
+            medium = RoundedCornerShape(NamuTokens.RadiusMenu),
+            large = RoundedCornerShape(NamuTokens.RadiusCard),
+            extraLarge = RoundedCornerShape(NamuTokens.RadiusDialog),
+        ),
         content = content,
     )
 }
@@ -268,6 +279,38 @@ fun PrimaryTopBar(title: String, subtitle: String = "") {
     }
 }
 
+/** 首页、模块、设置共用的大标题顶栏：状态栏留白、标题基线和操作区高度完全一致。 */
+@Composable
+fun MainPageTopBar(
+    title: String,
+    titleColor: Color = NamuColors.TextMain,
+    trailing: @Composable (() -> Unit)? = null,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .background(NamuColors.Bg)
+            .statusBarsPadding()
+            .padding(start = 22.dp, end = 16.dp, top = 12.dp, bottom = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(Modifier.weight(1f).height(44.dp), contentAlignment = Alignment.CenterStart) {
+            Text(
+                title,
+                fontSize = 30.sp,
+                lineHeight = 37.sp,
+                fontWeight = FontWeight.Bold,
+                fontFamily = FontFamily.SansSerif,
+                color = titleColor,
+                maxLines = 1,
+            )
+        }
+        Box(Modifier.height(44.dp), contentAlignment = Alignment.Center) {
+            trailing?.invoke()
+        }
+    }
+}
+
 /** iOS / Shadowrocket 风格的蓝色顶部导航栏。 */
 @Composable
 fun ShadowTopBar(
@@ -306,7 +349,7 @@ fun GroupCard(glow: Boolean = false, content: @Composable ColumnScope.() -> Unit
         Modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp)
-            .shadow(1.dp, RoundedCornerShape(NamuTokens.RadiusCard))
+            .shadow(2.dp, RoundedCornerShape(NamuTokens.RadiusCard))
             .clip(RoundedCornerShape(NamuTokens.RadiusCard))
             .background(NamuColors.Card)
             .then(
@@ -472,7 +515,7 @@ fun IosSwitch(checked: Boolean, onCheckedChange: (Boolean) -> Unit, enabled: Boo
         ) {
             Box(
                 Modifier
-                    .offset(x = 20.dp * progress)
+                    .offset { IntOffset((20.dp * progress).roundToPx(), 0) }
                     .size(27.dp)
                     .shadow(1.5.dp, CircleShape)
                     .clip(CircleShape)
@@ -516,13 +559,13 @@ fun IosButton(
     Button(
         onClick = onClick,
         enabled = enabled && !loading,
-        shape = RoundedCornerShape(12.dp),
+        shape = RoundedCornerShape(NamuTokens.RadiusControl),
         colors = ButtonDefaults.buttonColors(
             containerColor = NamuColors.Brand,
             disabledContainerColor = NamuColors.Brand.copy(alpha = 0.4f),
             contentColor = Color.White,
         ),
-        modifier = modifier.fillMaxWidth().height(50.dp),
+        modifier = modifier.fillMaxWidth().height(52.dp),
     ) {
         if (loading) {
             CircularProgressIndicator(Modifier.size(18.dp), color = Color.White, strokeWidth = 2.dp)

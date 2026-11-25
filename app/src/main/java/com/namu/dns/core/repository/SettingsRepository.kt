@@ -9,11 +9,16 @@ import kotlinx.coroutines.flow.StateFlow
  */
 interface SettingsRepository {
     val config: StateFlow<AppConfig>
+    val activeProfile: StateFlow<String>
 
     fun current(): AppConfig
     fun set(config: AppConfig)
     fun update(transform: (AppConfig) -> AppConfig): AppConfig
     fun save()
+    fun applySavedProfile(name: String, config: AppConfig) {
+        setActiveConfigName(name)
+        set(config)
+    }
 
     fun assetStamp(): Int
     fun setAssetStamp(stamp: Int)

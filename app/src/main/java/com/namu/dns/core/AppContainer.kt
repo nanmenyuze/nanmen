@@ -46,6 +46,12 @@ class AppContainer(val context: Context) {
             ConfigStore.rebuildModules(context, cfg)
             if (NamuVpnService.isRunning()) NamuVpnService.reload(context)
         },
+        onSwitched = { oldName, oldConfig, next ->
+            ConfigStore.rebuildModules(context, next)
+            if (NamuVpnService.isRunning()) {
+                NamuVpnService.reloadProfile(context, settings.activeConfigName(), oldName, oldConfig)
+            }
+        },
     )
     val nodes: NodeRepository = DefaultNodeRepository(settings)
     val rules: RuleRepository = DefaultRuleRepository(settings)

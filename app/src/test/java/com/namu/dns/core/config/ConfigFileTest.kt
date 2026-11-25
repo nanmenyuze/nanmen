@@ -92,11 +92,17 @@ class ConfigFileTest {
         assertEquals("示例模块", decoded.modules.single().name)
         assertEquals(30, decoded.general.blockTtl)
         assertTrue(decoded.general.fakeIp)
-        assertEquals("dark", decoded.general.themeMode)
-        assertEquals(true, decoded.general.autoConnect)
-        assertEquals("tls", decoded.general.pingMethod)
+        val exportedGeneral = org.json.JSONObject(file.toJson()).getJSONObject("general")
+        assertFalse(exportedGeneral.has("themeMode"))
+        assertFalse(exportedGeneral.has("autoConnect"))
+        assertFalse(exportedGeneral.has("pingMethod"))
+        assertFalse(exportedGeneral.has("autoDisablePrivateDns"))
         assertEquals(300L, decoded.general.subscriptionInfo?.remaining)
-        assertEquals("dark", decoded.toAppConfig(decoded.toAppConfig(sampleConfig())).themeMode)
+        val applied = decoded.toAppConfig(sampleConfig())
+        assertEquals("dark", applied.themeMode)
+        assertTrue(applied.autoConnect)
+        assertEquals("tls", applied.pingMethod)
+        assertTrue(applied.autoDisablePrivateDns)
     }
 
     @Test

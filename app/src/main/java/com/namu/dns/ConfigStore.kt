@@ -47,6 +47,10 @@ object ConfigStore {
         fileIo.execute { runCatching { task() } }
     }
 
+    /** 等待已入队的配置写入，然后读取或写入指定方案。 */
+    fun <T> runProfileFileIo(task: () -> T): T =
+        fileIo.submit(java.util.concurrent.Callable { task() }).get()
+
     fun baseConfigFile(context: Context): File = File(context.filesDir, "default.json")
 
     fun ensureAssets(context: Context, settings: com.namu.dns.core.repository.SettingsRepository) {
@@ -107,8 +111,22 @@ object ConfigStore {
         val cfg = settings.current()
         // 模块文件变化后重建合并规则；启动时也保证聚合文件存在。
         if (cfg.moduleSources.isNotEmpty()) rebuildModules(context, cfg)
+        val profileCacheMigration = File(dir, "profile_rule_cache_migrated")
+        if (!profileCacheMigration.exists()) {
+            runCatching {
+                if (cfg.rulesUrl.isNotBlank() && downloaded.length() > 0L && !rulesFile(context, cfg.rulesUrl, settings.activeConfigName()).exists()) {
+                    downloaded.copyTo(rulesFile(context, cfg.rulesUrl, settings.activeConfigName()), overwrite = false)
+                }
+                cfg.ruleSources.forEach { source ->
+                    val legacy = ruleSourceFile(context, source.id)
+                    val target = ruleSourceFile(context, source, settings.activeConfigName())
+                    if (legacy.length() > 0L && !target.exists()) legacy.copyTo(target)
+                }
+                profileCacheMigration.writeText("1")
+            }
+        }
         cfg.ruleSources.forEach { src ->
-            val target = ruleSourceFile(context, src.id)
+            val target = ruleSourceFile(context, src, settings.activeConfigName())
             val backup = File(target.parentFile, target.name + ".bak")
             if (!target.exists() || target.length() == 0L) {
                 if (backup.exists() && backup.length() > 0) {
@@ -135,16 +153,16 @@ object ConfigStore {
         settings.setAssetStamp(BuildConfig.VERSION_CODE)
     }
 
-    fun buildNative(context: Context, cfg: AppConfig): String {
+    fun buildNative(context: Context, cfg: AppConfig, profileName: String = ConfigFileStore.activeName(context)): String {
         val dir = context.filesDir
         val ads = mutableListOf<File>()
         // 有远端 manifest 的多规则源时，以 manifest 为准；否则兼容旧的单 rulesUrl。
         if (cfg.ruleSources.isEmpty()) {
-            val downloaded = File(dir, "ads_url.txt")
-            if (downloaded.exists() && downloaded.length() > 0) ads.add(downloaded)
+            val downloaded = rulesFile(context, cfg.rulesUrl, profileName)
+            if (cfg.rulesUrl.isNotBlank() && downloaded.exists() && downloaded.length() > 0) ads.add(downloaded)
         } else {
             cfg.ruleSources.filter { it.enabled }.forEach { src ->
-                val f = ruleSourceFile(context, src.id)
+                val f = ruleSourceFile(context, src, profileName)
                 if (f.exists() && f.length() > 0) ads.add(f)
             }
         }
@@ -193,21 +211,20 @@ object ConfigStore {
         // D2/D3：轻量命中摘要与小时历史；关闭命中摘要后内核不写盘。
         root.put("hit_history_file", File(File(context.filesDir, "stats"), "history.json").absolutePath)
         root.put("sniff", cfg.sniff)
+        root.put("skip_proxy", JSONArray().apply { cfg.skipProxyHosts.forEach { put(it) } })
         root.put("mtu", cfg.mtu.coerceIn(1280, 9000))
         root.put("bbr", cfg.bbr)
         root.put("block_dot", true)
         // 「system」表示手机当前底层网络的 DNS；下发前转成内核可用的 UDP 地址。
         val sysDns = SystemDns.selection(context)
-        val effectiveUpstream = if (SystemDns.isFollow(cfg.dnsUpstream) || cfg.dnsUpstream.isBlank()) {
-            sysDns.primaryUpstream ?: SystemDns.FAIL_CLOSED
-        } else {
-            cfg.dnsUpstream
-        }
-        val effectiveFallback = if (SystemDns.isFollow(cfg.dnsFallback) || cfg.dnsFallback.isBlank()) {
-            sysDns.secondaryUpstream.orEmpty()
-        } else {
-            cfg.dnsFallback
-        }
+        fun resolveDnsList(raw: String, systemValue: String?): String = raw.split(',', '\n')
+            .map { it.trim() }.filter { it.isNotBlank() }
+            .joinToString(",") { value ->
+                if (SystemDns.isFollow(value)) systemValue.orEmpty() else value
+            }
+        val effectiveUpstream = resolveDnsList(cfg.dnsUpstream, sysDns.primaryUpstream ?: SystemDns.FAIL_CLOSED)
+            .ifBlank { sysDns.primaryUpstream ?: SystemDns.FAIL_CLOSED }
+        val effectiveFallback = resolveDnsList(cfg.dnsFallback, sysDns.secondaryUpstream)
         root.put(
             "dns",
             JSONObject().apply {
@@ -271,9 +288,20 @@ object ConfigStore {
             cfg.groupSelections.forEach { (k, v) -> if (k.isNotBlank() && v.isNotBlank()) put(k, v) }
         })
         root.put("rules", JSONArray().apply {
+            val routedRules = cfg.rules.filter { it.type !in setOf("URL-REGEX", "USER-AGENT") }.flatMap { rule ->
+                if (rule.type != "RULE-SET" && rule.type != "DOMAIN-SET") return@flatMap listOf(rule)
+                val source = cfg.ruleSources.firstOrNull { it.id == rule.value || it.url == rule.value }
+                val file = if (source != null) ruleSourceFile(context, source, profileName) else ruleSetFile(context, rule.value)
+                val content = runCatching { file.readText() }.getOrDefault("")
+                if (content.isBlank()) {
+                    android.util.Log.w("NamuRules", "规则集尚无本地缓存：${rule.value}")
+                    emptyList()
+                } else RuleSetExpander.expand(rule.type, content, rule.action, "规则集 ${rule.value}")
+                    .map { it.copy(extendedMatch = rule.extendedMatch, preMatch = rule.preMatch) }
+            }
             // 包名类规则在这里展开成 UID：内核只认数值 UID，包名映射属于壳层职责。
             // 未安装的包会解析不到 uid，此时跳过该条并记日志，避免下发一条永远不命中的规则。
-            val (expanded, unresolved) = AppUidResolver.expand(context, cfg.rules.filter { it.enabled })
+            val (expanded, unresolved) = AppUidResolver.expand(context, routedRules.filter { it.enabled })
             if (unresolved.isNotEmpty()) {
                 android.util.Log.w("NamuUid", "包名规则未解析（应用可能未安装）：$unresolved")
             }
@@ -282,6 +310,11 @@ object ConfigStore {
                 val key = "${rule.type}|${rule.value}|${rule.action}"
                 put(
                     rule.copy(
+                        action = buildString {
+                            append(rule.action)
+                            if (rule.extendedMatch) append(",extended-matching")
+                            if (rule.preMatch && rule.action == "block") append(",pre-matching")
+                        },
                         source = rule.source.ifBlank { "配置" },
                         meta = rule.meta ?: configMeta("dns", key, order++),
                     ).toJson(),
@@ -319,6 +352,24 @@ object ConfigStore {
             val body = LinkedHashSet(cfg.mitm.bodyRewrites)
             val wsRules = LinkedHashSet(cfg.mitm.wsRewrites)
             val scripts = LinkedHashMap<String, ScriptConfig>()
+            cfg.rules.filter { it.enabled && it.type == "URL-REGEX" }.forEach { rule ->
+                loon.add("${rule.value} ${rule.action}")
+            }
+            cfg.rules.filter { it.enabled && it.type == "USER-AGENT" }.forEach { rule ->
+                val regex = buildString {
+                    append("(?i)^")
+                    rule.value.forEach { c ->
+                        when (c) {
+                            '*' -> append(".*")
+                            '?' -> append('.')
+                            else -> append(Regex.escape(c.toString()))
+                        }
+                    }
+                    append('$')
+                }
+                val quoted = regex.replace("\\", "\\\\").replace("\"", "\\\"")
+                loon.add("^.*$ ${rule.action} user-agent-regex \"$quoted\"")
+            }
             cfg.mitm.scripts.forEach { sc ->
                 val key = scriptKey(sc)
                 scripts[key] = sc.copy(meta = sc.meta ?: configMeta("script", key, 0))
@@ -421,7 +472,13 @@ object ConfigStore {
 
     fun rulesFile(context: Context): File = File(context.filesDir, "ads_url.txt")
 
-    fun ruleSourceFile(context: Context, id: String): File {
+    fun rulesFile(context: Context, url: String, profileName: String = ConfigFileStore.activeName(context)): File =
+        ruleSetFile(context, "ads-url:$profileName\n$url")
+
+    fun ruleSourceFile(context: Context, source: RuleSource, profileName: String = ConfigFileStore.activeName(context)): File =
+        ruleSetFile(context, "rule-source:$profileName\n${source.url}")
+
+    private fun ruleSourceFile(context: Context, id: String): File {
         val safe = id.lowercase().replace(Regex("[^a-z0-9_-]"), "_").take(40)
             .ifBlank { "source" }
         return File(context.filesDir, "rules_$safe.txt")
@@ -659,11 +716,20 @@ object ConfigStore {
     private fun writeAtomic(file: File, text: String) {
         try {
             file.parentFile?.mkdirs()
-            val tmp = File(file.parentFile, file.name + ".tmp")
-            tmp.writeText(text)
-            if (!tmp.renameTo(file)) {
-                file.writeText(text)
-                tmp.delete()
+            val temporary = File.createTempFile(".${file.name}-", ".tmp", file.parentFile)
+            try {
+                temporary.writeText(text)
+                try {
+                    java.nio.file.Files.move(
+                        temporary.toPath(), file.toPath(),
+                        java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    )
+                } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
+                    java.nio.file.Files.move(temporary.toPath(), file.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+                }
+            } finally {
+                temporary.delete()
             }
         } catch (_: Exception) {
         }
@@ -673,10 +739,12 @@ object ConfigStore {
     fun ruleFiles(context: Context, cfg: AppConfig): List<File> {
         val files = mutableListOf<File>()
         if (cfg.ruleSources.isEmpty()) {
-            rulesFile(context).takeIf { it.exists() && it.length() > 0 }?.let { files.add(it) }
+            if (cfg.rulesUrl.isNotBlank()) {
+                rulesFile(context, cfg.rulesUrl).takeIf { it.exists() && it.length() > 0 }?.let { files.add(it) }
+            }
         } else {
             cfg.ruleSources.filter { it.enabled }.forEach { src ->
-                ruleSourceFile(context, src.id).takeIf { it.exists() && it.length() > 0 }?.let { files.add(it) }
+                ruleSourceFile(context, src).takeIf { it.exists() && it.length() > 0 }?.let { files.add(it) }
             }
         }
         File(context.filesDir, "ads_custom.txt").takeIf { it.exists() && it.length() > 0 }?.let { files.add(it) }

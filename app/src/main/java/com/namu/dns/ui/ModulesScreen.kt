@@ -1,5 +1,6 @@
 package com.namu.dns.ui
 
+import androidx.compose.runtime.mutableIntStateOf
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -9,6 +10,7 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.scrollBy
@@ -25,9 +27,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
@@ -35,8 +37,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.ArrowDownward
 import androidx.compose.material.icons.outlined.ArrowUpward
-import androidx.compose.material.icons.outlined.Delete
-import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.MoreHoriz
+import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.Widgets
 import androidx.compose.material3.CircularProgressIndicator
@@ -82,13 +84,17 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.namu.dns.Actions
 import com.namu.dns.ConfigStore
+import com.namu.dns.ModuleParser
 import com.namu.dns.ModuleSource
+import com.namu.dns.NativeCore
+import com.namu.dns.ParsedModule
 import com.namu.dns.core.LocalAppContainer
 import com.namu.dns.core.LocalDockClearance
 import com.namu.dns.core.config.ModuleOrder
@@ -103,13 +109,12 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 @Composable
-fun ModulesScreen(onRestart: () -> Unit) {
+fun ModulesScreen(
+    onRestart: () -> Unit,
+    onOpenDetail: (String) -> Unit,
+) {
     var showAdd by remember { mutableStateOf(false) }
     var syncing by remember { mutableStateOf(false) }
-    var syncingId by remember { mutableStateOf<String?>(null) }
-    var actionTarget by remember { mutableStateOf<ModuleSource?>(null) }
-    var detailTarget by remember { mutableStateOf<ModuleSource?>(null) }
-    var deleteTarget by remember { mutableStateOf<ModuleSource?>(null) }
     val scope = rememberCoroutineScope()
     val container = LocalAppContainer.current
     val settings = container.settings
@@ -131,13 +136,12 @@ fun ModulesScreen(onRestart: () -> Unit) {
     val autoScrollEdge = with(density) { 88.dp.toPx() }
     val centers = remember { mutableStateMapOf<String, Float>() }
     val rootCenters = remember { mutableStateMapOf<String, Float>() }
-    val heights = remember { mutableStateMapOf<String, Float>() }
     var viewportTop by remember { mutableFloatStateOf(0f) }
     var viewportBottom by remember { mutableFloatStateOf(0f) }
     var draggingId by remember { mutableStateOf<String?>(null) }
     var dragOffsetY by remember { mutableFloatStateOf(0f) }
-    var dragTargetIndex by remember { mutableStateOf(-1) }
-    var autoScrollDirection by remember { mutableStateOf(0) }
+    var dragTargetIndex by remember { mutableIntStateOf(-1) }
+    var autoScrollDirection by remember { mutableIntStateOf(0) }
 
     fun updateDragTarget() {
         val id = draggingId ?: return
@@ -212,6 +216,17 @@ fun ModulesScreen(onRestart: () -> Unit) {
             syncing = syncing,
             syncEnabled = !syncing && enabled > 0,
             onAdd = { showAdd = true },
+            onTriggerGlobal = {
+                // 与 MITM 页原入口保持同一执行范围：只触发 trigger=generic 的脚本。
+                val count = runCatching { NativeCore.nativeTriggerScripts("generic") }.getOrDefault(-1)
+                messages.show(
+                    when {
+                        count > 0 -> "已触发 $count 条全局脚本（后台串行执行）"
+                        count == 0 -> "没有匹配的全局脚本"
+                        else -> "内核未运行，无法触发脚本"
+                    },
+                )
+            },
             onSync = {
                 syncing = true
                 scope.launch {
@@ -276,7 +291,7 @@ fun ModulesScreen(onRestart: () -> Unit) {
                     Row(
                         Modifier
                             .heightIn(min = 48.dp)
-                            .background(NamuColors.Blue, androidx.compose.foundation.shape.RoundedCornerShape(9.dp))
+                            .background(NamuColors.Blue, RoundedCornerShape(NamuTokens.RadiusControl))
                             .clickable { showAdd = true }
                             .padding(horizontal = 14.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -287,61 +302,65 @@ fun ModulesScreen(onRestart: () -> Unit) {
                 }
             }
         } else {
-            GroupCard {
-                ordered.forEachIndexed { index, module ->
-                    val warning = buildList {
-                        if (module.ignored > 0) add("${module.ignored} 条不支持")
-                        if (module.stale) add("更新失败，使用旧缓存")
-                        if (module.error.isNotBlank()) add(module.error)
-                    }.joinToString("\n")
-                    val isDragging = draggingId == module.id
-                    val from = ordered.indexOfFirst { it.id == draggingId }
-                    val target = dragTargetIndex
-                    val draggedHeight = draggingId?.let { heights[it] } ?: 0f
-                    val displacement = if (draggingId == null || isDragging || from < 0 || target < 0) {
-                        0f
-                    } else when {
-                        target > from && index in (from + 1)..target -> -draggedHeight
-                        target < from && index in target until from -> draggedHeight
-                        else -> 0f
+            ordered.forEachIndexed { index, module ->
+                val warning = buildList {
+                    if (module.ignored > 0) add("${module.ignored} 条不支持")
+                    if (module.stale) add("更新失败，使用旧缓存")
+                    if (module.error.isNotBlank()) add(module.error)
+                }.joinToString("\n")
+                val isDragging = draggingId == module.id
+                val from = ordered.indexOfFirst { it.id == draggingId }
+                val target = dragTargetIndex
+                val currentCenter = centers[module.id]
+                val displacement = if (
+                    draggingId == null || isDragging || from < 0 || target < 0 || currentCenter == null
+                ) {
+                    0f
+                } else when {
+                    target > from && index in (from + 1)..target -> {
+                        val previousCenter = centers[ordered[index - 1].id]
+                        if (previousCenter == null) 0f else previousCenter - currentCenter
                     }
-                    ModuleRow(
-                        module = module,
-                        warning = warning,
-                        showDivider = index != ordered.lastIndex,
-                        isDragging = isDragging,
-                        dragOffsetY = if (isDragging) dragOffsetY else 0f,
-                        displacementY = displacement,
-                        onMeasure = { coordinates ->
-                            centers[module.id] = coordinates.positionInParent().y + coordinates.size.height / 2f
-                            rootCenters[module.id] = coordinates.positionInRoot().y + coordinates.size.height / 2f
-                            heights[module.id] = coordinates.size.height.toFloat()
-                        },
-                        onClick = { if (draggingId == null) actionTarget = module },
-                        onDetail = { detailTarget = module },
-                        onCheckedChange = { enabledNow ->
-                            scope.launch { Actions.setModuleEnabled(module.id, enabledNow) }
-                        },
-                        onDragStart = {
-                            if (draggingId == null) {
-                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                draggingId = module.id
-                                dragOffsetY = 0f
-                                dragTargetIndex = index
-                                autoScrollDirection = 0
-                            }
-                        },
-                        onDrag = { amountY ->
-                            if (draggingId == module.id) {
-                                dragOffsetY += amountY
-                                updateDragTarget()
-                                updateAutoScroll()
-                            }
-                        },
-                        onDragEnd = { finishDrag(save = true) },
-                        onDragCancel = { finishDrag(save = false) },
-                    )
+                    target < from && index in target until from -> {
+                        val nextCenter = centers[ordered[index + 1].id]
+                        if (nextCenter == null) 0f else nextCenter - currentCenter
+                    }
+                    else -> 0f
                 }
+                ModuleRow(
+                    module = module,
+                    warning = warning,
+                    isDragging = isDragging,
+                    dragOffsetY = if (isDragging) dragOffsetY else 0f,
+                    displacementY = displacement,
+                    onMeasure = { coordinates ->
+                        centers[module.id] = coordinates.positionInParent().y + coordinates.size.height / 2f
+                        rootCenters[module.id] = coordinates.positionInRoot().y + coordinates.size.height / 2f
+                    },
+                    onClick = { if (draggingId == null) onOpenDetail(module.id) },
+                    onCheckedChange = { enabledNow ->
+                        scope.launch { Actions.setModuleEnabled(module.id, enabledNow) }
+                    },
+                    onDragStart = {
+                        if (draggingId == null) {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            draggingId = module.id
+                            dragOffsetY = 0f
+                            dragTargetIndex = index
+                            autoScrollDirection = 0
+                        }
+                    },
+                    onDrag = { amountY ->
+                        if (draggingId == module.id) {
+                            dragOffsetY += amountY
+                            updateDragTarget()
+                            updateAutoScroll()
+                        }
+                    },
+                    onDragEnd = { finishDrag(save = true) },
+                    onDragCancel = { finishDrag(save = false) },
+                )
+                if (index != ordered.lastIndex) Spacer(Modifier.height(12.dp))
             }
         }
 
@@ -358,69 +377,6 @@ fun ModulesScreen(onRestart: () -> Unit) {
             },
         )
     }
-    actionTarget?.let { target ->
-        val current = ordered.firstOrNull { it.id == target.id } ?: target
-        val index = ordered.indexOfFirst { it.id == current.id }
-        ModuleActionDialog(
-            module = current,
-            index = index,
-            lastIndex = ordered.lastIndex,
-            syncing = syncingId == current.id,
-            onDismiss = { actionTarget = null },
-            onDetail = {
-                actionTarget = null
-                detailTarget = current
-            },
-            onSync = {
-                actionTarget = null
-                if (syncingId == null) {
-                    syncingId = current.id
-                    scope.launch {
-                        try {
-                            val result = Actions.syncModules(current.id)
-                            messages.show(if (result.errors.isEmpty()) {
-                                "已同步「${current.name.ifBlank { "未命名模块" }}」"
-                            } else {
-                                result.errors.first()
-                            })
-                        } catch (e: Exception) {
-                            messages.show(e.message ?: "同步模块失败")
-                        } finally {
-                            syncingId = null
-                        }
-                    }
-                }
-            },
-            onMove = { destination ->
-                actionTarget = null
-                scope.launch { Actions.reorderModule(current.id, destination) }
-            },
-            onDelete = {
-                actionTarget = null
-                deleteTarget = current
-            },
-        )
-    }
-    detailTarget?.let { target ->
-        ModuleDetailSheet(target, onDismiss = { detailTarget = null })
-    }
-    deleteTarget?.let { target ->
-        NamuDialog(
-            title = "删除模块",
-            message = "确定删除「${target.name}」？",
-            confirmText = "删除",
-            confirmColor = NamuColors.Red,
-            onDismiss = { deleteTarget = null },
-            onConfirm = {
-                val id = target.id
-                deleteTarget = null
-                scope.launch {
-                    Actions.deleteModule(id)
-                    messages.show("已删除模块")
-                }
-            },
-        ) {}
-    }
 }
 
 @Composable
@@ -428,59 +384,88 @@ private fun ModuleTopBar(
     syncing: Boolean,
     syncEnabled: Boolean,
     onAdd: () -> Unit,
+    onTriggerGlobal: () -> Unit,
     onSync: () -> Unit,
 ) {
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .background(NamuColors.Bg)
-            .statusBarsPadding()
-            .padding(start = 22.dp, end = 10.dp, top = 14.dp, bottom = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(
-            "模块",
-            modifier = Modifier.weight(1f),
-            fontSize = 30.sp,
-            lineHeight = 37.sp,
-            fontWeight = FontWeight.Bold,
-            color = NamuColors.TextMain,
-        )
-        Box(
-            Modifier
-                .size(44.dp)
-                .clip(RoundedCornerShape(12.dp))
-                .clickable(onClick = onAdd),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(
-                Icons.Outlined.Add,
-                contentDescription = "导入模块",
-                tint = NamuColors.Blue,
-                modifier = Modifier.size(25.dp),
-            )
-        }
-        Spacer(Modifier.width(4.dp))
-        Box(
-            Modifier
-                .size(44.dp)
-                .clip(RoundedCornerShape(12.dp))
-                .alpha(if (syncEnabled || syncing) 1f else 0.35f)
-                .clickable(enabled = syncEnabled, onClick = onSync),
-            contentAlignment = Alignment.Center,
-        ) {
-            if (syncing) {
-                CircularProgressIndicator(
-                    Modifier.size(21.dp),
-                    strokeWidth = 2.dp,
-                    color = NamuColors.Blue,
+    var menuExpanded by remember { mutableStateOf(false) }
+    MainPageTopBar("模块") {
+        Box {
+            Box(
+                Modifier
+                    .size(40.dp)
+                    .clip(CircleShape)
+                    .background(NamuColors.Card)
+                    .border(1.dp, NamuColors.Separator.copy(alpha = 0.8f), CircleShape)
+                    .clickable(enabled = !syncing) { menuExpanded = true },
+                contentAlignment = Alignment.Center,
+            ) {
+                if (syncing) {
+                    CircularProgressIndicator(
+                        Modifier.size(19.dp),
+                        strokeWidth = 2.dp,
+                        color = NamuColors.Blue,
+                    )
+                } else {
+                    Icon(
+                        Icons.Outlined.MoreHoriz,
+                        contentDescription = "模块操作",
+                        tint = NamuColors.TextMain,
+                        modifier = Modifier.size(22.dp),
+                    )
+                }
+            }
+            DropdownMenu(
+                expanded = menuExpanded && !syncing,
+                onDismissRequest = { menuExpanded = false },
+                modifier = Modifier.width(188.dp),
+                shape = RoundedCornerShape(NamuTokens.RadiusMenu),
+                containerColor = NamuColors.Card,
+                shadowElevation = 18.dp,
+            ) {
+                DropdownMenuItem(
+                    text = { Text("导入模块", fontSize = 15.sp) },
+                    leadingIcon = { NamuIcon(Icons.Outlined.Add, tint = NamuColors.TextMain) },
+                    onClick = {
+                        menuExpanded = false
+                        onAdd()
+                    },
                 )
-            } else {
-                Icon(
-                    Icons.Outlined.Sync,
-                    contentDescription = "同步全部模块",
-                    tint = NamuColors.Blue,
-                    modifier = Modifier.size(24.dp),
+                DropdownMenuItem(
+                    text = {
+                        Column {
+                            Text("手动执行全局脚本", fontSize = 15.sp)
+                            Text(
+                                "仅 trigger=generic，与 cron 共用串行队列",
+                                fontSize = 11.sp,
+                                color = NamuColors.TextTertiary,
+                            )
+                        }
+                    },
+                    leadingIcon = { NamuIcon(Icons.Outlined.PlayArrow, tint = NamuColors.TextMain) },
+                    onClick = {
+                        menuExpanded = false
+                        onTriggerGlobal()
+                    },
+                )
+                DropdownMenuItem(
+                    text = {
+                        Text(
+                            "同步全部模块",
+                            fontSize = 15.sp,
+                            color = if (syncEnabled) NamuColors.TextMain else NamuColors.TextTertiary,
+                        )
+                    },
+                    leadingIcon = {
+                        NamuIcon(
+                            Icons.Outlined.Sync,
+                            tint = if (syncEnabled) NamuColors.TextMain else NamuColors.TextTertiary,
+                        )
+                    },
+                    enabled = syncEnabled,
+                    onClick = {
+                        menuExpanded = false
+                        onSync()
+                    },
                 )
             }
         }
@@ -510,13 +495,11 @@ private fun ModuleSectionHeader(title: String, summary: String) {
 private fun ModuleRow(
     module: ModuleSource,
     warning: String,
-    showDivider: Boolean,
     isDragging: Boolean,
     dragOffsetY: Float,
     displacementY: Float,
     onMeasure: (LayoutCoordinates) -> Unit,
     onClick: () -> Unit,
-    onDetail: () -> Unit,
     onCheckedChange: (Boolean) -> Unit,
     onDragStart: () -> Unit,
     onDrag: (Float) -> Unit,
@@ -535,39 +518,28 @@ private fun ModuleRow(
         animationSpec = spring(dampingRatio = 0.72f, stiffness = 520f),
         label = "module-lift",
     )
-    val metadata by rememberModuleMetadata(module)
-    val sourceLine = listOf(
-        if (module.url.startsWith("https://", ignoreCase = true)) "URL" else "本地",
-        metadata ?: module.app,
-    ).filter { it.isNotBlank() }.joinToString(" · ")
-    val statsLine = "${module.blockRules} 条阻断 · ${module.routeRules} 条分流 · " +
-        "${module.mitmRules} 条复写/MITM · ${module.allowRules} 条例外"
+    val shape = RoundedCornerShape(NamuTokens.RadiusCard)
+    val status = moduleStatusLine(module, warning)
     Column(
         Modifier
             .fillMaxWidth()
+            .padding(horizontal = 16.dp)
             .onGloballyPositioned(onMeasure)
-            .zIndex(if (isDragging) 2f else 0f)
+            .zIndex(if (isDragging) 3f else 0f)
             .graphicsLayer {
                 translationY = if (isDragging) dragOffsetY else displaced
                 scaleX = scale
                 scaleY = scale
             }
-            .then(
-                if (isDragging) {
-                    Modifier
-                        .shadow(16.dp, RoundedCornerShape(14.dp))
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(NamuColors.Card)
-                } else {
-                    Modifier.background(if (pressed) NamuColors.FillPressed else Color.Transparent)
-                },
-            ),
+            .shadow(if (isDragging) 20.dp else 2.dp, shape)
+            .clip(shape)
+            .background(if (pressed && !isDragging) NamuColors.CardPressed else NamuColors.Card),
     ) {
         Row(
             Modifier
                 .fillMaxWidth()
-                .heightIn(min = 74.dp)
-                .padding(start = 16.dp, end = 8.dp),
+                .heightIn(min = 76.dp)
+                .padding(start = 16.dp, end = 8.dp, top = 10.dp, bottom = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Row(
@@ -587,77 +559,75 @@ private fun ModuleRow(
                     .clickable(
                         interactionSource = interaction,
                         indication = null,
+                        onClickLabel = "查看模块详情",
                         onClick = onClick,
-                    )
-                    .padding(vertical = 12.dp),
+                    ),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                ModuleLeadingIcon(module)
-                Spacer(Modifier.width(12.dp))
+                ModuleLeadingIcon(module, size = 44.dp)
+                Spacer(Modifier.width(14.dp))
                 Column(Modifier.weight(1f)) {
                     Text(
                         module.name.ifBlank { "未命名模块" },
                         fontSize = 16.sp,
-                        fontWeight = FontWeight.Medium,
+                        lineHeight = 21.sp,
+                        fontWeight = FontWeight.SemiBold,
                         color = NamuColors.TextMain,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    Spacer(Modifier.height(2.dp))
+                    Spacer(Modifier.height(3.dp))
                     Text(
-                        sourceLine,
+                        status.first,
                         fontSize = 12.sp,
-                        color = NamuColors.TextSub,
+                        color = status.second,
                         lineHeight = 16.sp,
-                        maxLines = 2,
+                        maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    if (warning.isNotBlank()) {
-                        Spacer(Modifier.height(2.dp))
-                        Text(
-                            warning,
-                            fontSize = 12.sp,
-                            color = NamuColors.Orange,
-                            lineHeight = 16.sp,
-                            maxLines = 3,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
                 }
             }
-            Spacer(Modifier.width(8.dp))
-            // 手势只挂在左侧内容区，开关的点击和长按都不会触发卡片功能面板或拖拽。
+            Spacer(Modifier.width(6.dp))
+            // 开关独占触摸区域；其余卡片区域单击进入详情，长按开始拖动。
             IosSwitch(checked = module.enabled, onCheckedChange = onCheckedChange)
         }
-        RowDivider(startInset = 16.dp)
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .heightIn(min = 42.dp)
-                .padding(start = 16.dp, end = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                statsLine,
-                modifier = Modifier.weight(1f),
-                fontSize = 12.sp,
-                color = NamuColors.TextSub,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Row(
-                Modifier
-                    .clip(RoundedCornerShape(8.dp))
-                    .clickable(onClick = onDetail)
-                    .padding(horizontal = 6.dp, vertical = 8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("详情", fontSize = 12.sp, color = NamuColors.Blue)
-                Spacer(Modifier.width(4.dp))
-                Chevron(color = NamuColors.Blue)
-            }
-        }
-        if (showDivider) RowDivider(startInset = 68.dp)
+    }
+}
+
+/** 列表只留一行状态：规则规模 + 更新时间 + 异常，避免把详情搬回列表。 */
+private fun moduleStatusLine(module: ModuleSource, warning: String): Pair<String, Color> {
+    val total = module.blockRules + module.routeRules + module.mitmRules + module.allowRules
+    val parts = mutableListOf<String>()
+    if (!module.enabled) parts += "已停用"
+    parts += if (total > 0) "$total 条规则" else "无规则"
+    if (module.ignored > 0) parts += "${module.ignored} 条不支持"
+    if (module.stale) {
+        parts += "使用旧缓存"
+    } else if (module.error.isNotBlank()) {
+        parts += "更新失败"
+    } else if (module.updatedAt > 0) {
+        parts += relativeUpdatedAt(module.updatedAt)
+    }
+    val abnormal = module.ignored > 0 || module.stale || module.error.isNotBlank() || warning.isNotBlank()
+    val color = when {
+        abnormal -> NamuColors.Orange
+        !module.enabled -> NamuColors.TextTertiary
+        else -> NamuColors.TextSub
+    }
+    return parts.joinToString(" · ") to color
+}
+
+private fun relativeUpdatedAt(timestamp: Long): String {
+    val elapsed = (System.currentTimeMillis() - timestamp).coerceAtLeast(0L)
+    val minute = 60_000L
+    val hour = 60 * minute
+    val day = 24 * hour
+    return when {
+        elapsed < minute -> "刚刚更新"
+        elapsed < hour -> "${elapsed / minute} 分钟前"
+        elapsed < day -> "${elapsed / hour} 小时前"
+        elapsed < 30 * day -> "${elapsed / day} 天前"
+        else -> "较早更新"
     }
 }
 
@@ -726,7 +696,7 @@ private fun jsonMetadataValue(json: JSONObject?, key: String): String? {
 
 @Suppress("ProduceStateDoesNotAssignValue")
 @Composable
-private fun ModuleLeadingIcon(module: ModuleSource) {
+private fun ModuleLeadingIcon(module: ModuleSource, size: Dp = 40.dp) {
     val context = LocalContext.current
     val icon by produceState<ImageBitmap?>(
         initialValue = null,
@@ -744,8 +714,8 @@ private fun ModuleLeadingIcon(module: ModuleSource) {
     val hasIcon = icon != null
     Box(
         Modifier
-            .size(40.dp)
-            .clip(RoundedCornerShape(11.dp))
+            .size(size)
+            .clip(RoundedCornerShape(size * 0.275f))
             .background(if (hasIcon) NamuColors.Fill else fallbackColor),
         contentAlignment = Alignment.Center,
     ) {
@@ -761,7 +731,7 @@ private fun ModuleLeadingIcon(module: ModuleSource) {
             NamuIcon(
                 Icons.Outlined.Widgets,
                 tint = Color.White,
-                size = 22.dp,
+                size = size * 0.55f,
             )
         }
     }
@@ -863,164 +833,707 @@ private fun decodeModuleIcon(bytes: ByteArray): Bitmap? {
     return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
 }
 
-@Composable
-private fun ModuleActionDialog(
-    module: ModuleSource,
-    index: Int,
-    lastIndex: Int,
-    syncing: Boolean,
-    onDismiss: () -> Unit,
-    onDetail: () -> Unit,
-    onSync: () -> Unit,
-    onMove: (Int) -> Unit,
-    onDelete: () -> Unit,
-) {
-    NamuDialog(
-        title = module.name.ifBlank { "未命名模块" },
-        confirmText = "关闭",
-        showDismiss = false,
-        onConfirm = onDismiss,
-        onDismiss = onDismiss,
-    ) {
-        Column(Modifier.fillMaxWidth()) {
-            ModuleActionRow(
-                icon = Icons.Outlined.Description,
-                title = "查看详情",
-                onClick = onDetail,
-            )
-            ModuleActionRow(
-                icon = Icons.Outlined.Sync,
-                title = if (syncing) "正在同步" else "立即同步",
-                loading = syncing,
-                enabled = !syncing && module.url.startsWith("https://"),
-                onClick = onSync,
-            )
-            ModuleActionRow(
-                icon = Icons.Outlined.ArrowUpward,
-                title = "上移",
-                enabled = index > 0,
-                onClick = { onMove(index - 1) },
-            )
-            ModuleActionRow(
-                icon = Icons.Outlined.ArrowDownward,
-                title = "下移",
-                enabled = index in 0 until lastIndex,
-                onClick = { onMove(index + 1) },
-            )
-            ModuleActionRow(
-                icon = Icons.Outlined.Delete,
-                title = "删除模块",
-                destructive = true,
-                showDivider = false,
-                onClick = onDelete,
-            )
-        }
-    }
-}
-
-@Composable
-private fun ModuleActionRow(
-    icon: ImageVector,
-    title: String,
-    value: String? = null,
-    enabled: Boolean = true,
-    loading: Boolean = false,
-    chevron: Boolean = false,
-    destructive: Boolean = false,
-    showDivider: Boolean = true,
-    onClick: () -> Unit,
-) {
-    val contentColor = if (destructive) NamuColors.Red else NamuColors.TextMain
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .alpha(if (enabled) 1f else 0.42f)
-            .clickable(enabled = enabled && !loading, onClick = onClick),
-    ) {
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .heightIn(min = 58.dp)
-                .padding(horizontal = 16.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            NamuIcon(icon, null, tint = if (destructive) NamuColors.Red else NamuColors.Brand)
-            Spacer(Modifier.width(13.dp))
-            Text(title, fontSize = 16.sp, color = contentColor, modifier = Modifier.weight(1f))
-            if (loading) {
-                CircularProgressIndicator(Modifier.size(19.dp), strokeWidth = 2.dp, color = NamuColors.Brand)
-            } else if (value != null) {
-                Text(value, fontSize = 12.sp, color = NamuColors.TextSub, maxLines = 1)
-            }
-            if (chevron) {
-                Spacer(Modifier.width(8.dp))
-                Chevron()
-            }
-        }
-        if (showDivider) RowDivider(startInset = 49.dp)
-    }
-}
-
 @Suppress("ProduceStateDoesNotAssignValue")
 @Composable
-private fun ModuleDetailSheet(module: ModuleSource, onDismiss: () -> Unit) {
+fun ModuleDetailScreen(moduleId: String, onBack: () -> Unit) {
     val context = LocalContext.current
-    val cached by produceState<String?>(initialValue = null, module.id, module.updatedAt) {
-        value = withContext(Dispatchers.IO) {
-            runCatching {
-                val file = ConfigStore.moduleFile(context, module.id)
-                if (!file.exists() || file.length() == 0L) {
-                    "暂无本地缓存正文。远程模块可先执行“立即同步当前模块”。"
-                } else {
-                    val text = file.readText()
-                    if (text.length > 20_000) text.take(20_000) + "\n\n… 正文过长，仅显示前 20,000 个字符" else text
-                }
-            }.getOrElse { "读取模块缓存失败：${it.message ?: "未知错误"}" }
-        }
+    val container = LocalAppContainer.current
+    val cfg by container.settings.config.collectAsStateWithLifecycle()
+    val scope = rememberCoroutineScope()
+    val modules = cfg.moduleSources
+    val ordered = remember(modules) {
+        modules.sortedWith(
+            compareBy<ModuleSource> { if (it.order >= 0) it.order else Int.MAX_VALUE }
+                .thenBy { modules.indexOf(it) },
+        )
     }
-    NamuDialog(
-        title = module.name.ifBlank { "未命名模块" },
-        confirmText = "关闭",
-        showDismiss = false,
-        scrollContent = true,
-        onConfirm = onDismiss,
-        onDismiss = onDismiss,
-    ) {
-        Column(Modifier.fillMaxWidth()) {
+    val module = ordered.firstOrNull { it.id == moduleId }
+    if (module == null) {
+        Column(
+            Modifier.fillMaxSize().background(NamuColors.Bg).padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            Text("模块不存在或已删除", fontSize = 16.sp, color = NamuColors.TextSub)
+            Spacer(Modifier.height(16.dp))
             Text(
-                "阻断 ${module.blockRules} · 分流 ${module.routeRules} · 例外 ${module.allowRules} · MITM ${module.mitmRules}" +
-                    "\n来源：${module.url.ifBlank { "本地模块" }}",
-                fontSize = 12.sp,
-                color = NamuColors.TextSub,
-                lineHeight = 17.sp,
-                modifier = Modifier.padding(bottom = 12.dp),
+                "返回模块列表",
+                color = NamuColors.Blue,
+                fontSize = 15.sp,
+                modifier = Modifier.clip(RoundedCornerShape(NamuTokens.RadiusControl)).clickable(onClick = onBack).padding(12.dp),
             )
-            Column(
-                Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 420.dp)
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(NamuColors.Fill)
-                    .verticalScroll(rememberScrollState())
-                    .padding(14.dp),
+        }
+        return
+    }
+
+    val index = ordered.indexOfFirst { it.id == module.id }
+    val metadata by rememberModuleMetadata(module)
+    var syncing by remember(module.id) { mutableStateOf(false) }
+    var confirmDelete by remember(module.id) { mutableStateOf(false) }
+    var showRaw by remember(module.id) { mutableStateOf(false) }
+    val cached by produceState<ModuleDetailCache?>(
+        initialValue = null,
+        module.id,
+        module.updatedAt,
+        module.cacheBytes,
+    ) {
+        value = withContext(Dispatchers.IO) { loadModuleDetailCache(context, module.id) }
+    }
+
+    Column(
+        Modifier.fillMaxSize().background(NamuColors.Bg)
+            .verticalScroll(rememberScrollState()).padding(bottom = 28.dp),
+    ) {
+        Spacer(Modifier.height(12.dp))
+        GroupCard {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 16.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                val text = cached
-                if (text == null) {
-                    CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp, color = NamuColors.Brand)
-                } else {
-                    SelectionContainer {
-                        Text(
-                            text,
-                            fontSize = 11.sp,
-                            lineHeight = 16.sp,
-                            fontFamily = FontFamily.Monospace,
-                            color = NamuColors.TextMain,
+                ModuleLeadingIcon(module, size = 64.dp)
+                Spacer(Modifier.width(14.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        module.name.ifBlank { "未命名模块" },
+                        fontSize = 21.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = NamuColors.TextMain,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        (metadata ?: module.app).ifBlank {
+                            if (module.url.startsWith("https://", ignoreCase = true)) "URL 模块" else "本地模块"
+                        },
+                        fontSize = 12.sp,
+                        color = NamuColors.TextSub,
+                        lineHeight = 16.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                IosSwitch(
+                    checked = module.enabled,
+                    onCheckedChange = { enabled ->
+                        scope.launch { Actions.setModuleEnabled(module.id, enabled) }
+                    },
+                )
+            }
+            val detail = cached
+            if (!detail?.description.isNullOrBlank()) {
+                Text(
+                    detail!!.description!!,
+                    modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 10.dp),
+                    fontSize = 13.sp,
+                    lineHeight = 19.sp,
+                    color = NamuColors.TextSub,
+                )
+            }
+            Text(
+                "来源：${module.url.ifBlank { "本地模块" }}",
+                modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
+                fontSize = 11.sp,
+                lineHeight = 16.sp,
+                color = NamuColors.TextTertiary,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            val warning = buildList {
+                if (module.ignored > 0) add("${module.ignored} 条不支持")
+                if (module.stale) add("更新失败，使用旧缓存")
+                if (module.error.isNotBlank()) add(module.error)
+            }.joinToString(" · ")
+            if (warning.isNotBlank()) {
+                Text(
+                    warning,
+                    modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
+                    fontSize = 12.sp,
+                    lineHeight = 17.sp,
+                    color = NamuColors.Orange,
+                )
+            }
+            RowDivider()
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                ModuleDetailStat(module.blockRules, "阻断", Modifier.weight(1f))
+                ModuleDetailStatDivider()
+                ModuleDetailStat(module.routeRules, "分流", Modifier.weight(1f))
+                ModuleDetailStatDivider()
+                ModuleDetailStat(module.mitmRules, "复写/MITM", Modifier.weight(1f))
+                ModuleDetailStatDivider()
+                ModuleDetailStat(module.allowRules, "例外", Modifier.weight(1f))
+            }
+        }
+
+        SectionHeader(
+            "脚本参数",
+            trailing = {
+                val detail = cached
+                if (detail?.error == null) {
+                    val count = (detail?.declared?.arguments?.size ?: 0) + (detail?.declared?.scripts?.size ?: 0)
+                    Text(if (count > 0) "$count 项" else "未声明", fontSize = 12.sp, color = NamuColors.Blue)
+                }
+            },
+        )
+        GroupCard {
+            when {
+                cached == null -> ModuleDetailLoading()
+                cached?.error != null -> ModuleDetailError(cached!!.error!!)
+                cached?.declared == null -> ModuleDetailEmpty("无法解析模块声明")
+                cached!!.declared!!.arguments.isEmpty() && cached!!.declared!!.scripts.isEmpty() ->
+                    ModuleDetailEmpty("该模块未声明 [Argument] 或 [Script]")
+                else -> {
+                    val declared = cached!!.declared!!
+                    declared.arguments.entries.forEachIndexed { i, (key, value) ->
+                        if (i > 0) RowDivider()
+                        ModuleKeyValueRow(
+                            key = key,
+                            value = value,
+                            note = "默认值 · ${declared.argumentTypes[key] ?: "string"} 类型",
+                            monospaceValue = true,
+                        )
+                    }
+                    if (declared.scripts.isNotEmpty()) {
+                        if (declared.arguments.isNotEmpty()) RowDivider()
+                        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 11.dp)) {
+                            Text(
+                                "脚本条目 ${declared.scripts.size}",
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = NamuColors.TextMain,
+                            )
+                        }
+                        declared.scripts.forEachIndexed { i, script ->
+                            if (i > 0) RowDivider()
+                            ModuleScriptRow(script)
+                        }
+                    }
+                }
+            }
+        }
+
+        SectionHeader(
+            "[General]",
+            trailing = {
+                val count = cached?.declared?.generalOptions?.size ?: 0
+                Text(if (count > 0) "$count 个键" else "未声明", fontSize = 12.sp, color = NamuColors.Blue)
+            },
+        )
+        GroupCard {
+            when {
+                cached == null -> ModuleDetailLoading()
+                cached?.error != null -> ModuleDetailError(cached!!.error!!)
+                cached?.declared?.generalOptions.isNullOrEmpty() -> ModuleDetailEmpty("该模块未声明 [General]")
+                else -> {
+                    val options = cached!!.declared!!.generalOptions
+                    options.entries.forEachIndexed { i, (key, value) ->
+                        if (i > 0) RowDivider()
+                        ModuleKeyValueRow(
+                            key = key,
+                            value = value.ifBlank { "（空）" },
+                            note = generalKeyNote(key),
                         )
                     }
                 }
             }
         }
+
+        SectionHeader(
+            "MITM 规则",
+            trailing = {
+                val count = cached?.declared?.mitmHostnames?.size ?: 0
+                Text(if (count > 0) "$count 个域名" else "未声明", fontSize = 12.sp, color = NamuColors.Blue)
+            },
+        )
+        GroupCard {
+            when {
+                cached == null -> ModuleDetailLoading()
+                cached?.error != null -> ModuleDetailError(cached!!.error!!)
+                cached?.declared == null -> ModuleDetailEmpty("无法解析模块声明")
+                else -> {
+                    val declared = cached!!.declared!!
+                    val rewriteCount = declared.urlRewrites.size + declared.headerRewrites.size +
+                        declared.loonRewrites.size + declared.bodyRewrites.size + declared.wsRewrites.size
+                    val declaredMitm = declared.mitmHostnames.isNotEmpty() ||
+                        declared.mitmSkipHostnames.isNotEmpty() || rewriteCount > 0 || declared.mitmOptions.isNotEmpty()
+                    if (!declaredMitm) {
+                        ModuleDetailEmpty("该模块未声明 [MITM] / 改写规则")
+                    } else {
+                        Text(
+                            "解密 ${declared.mitmHostnames.size} · 跳过 ${declared.mitmSkipHostnames.size} · 改写 $rewriteCount",
+                            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+                            fontSize = 12.sp,
+                            color = NamuColors.TextSub,
+                        )
+                        if (declared.mitmHostnames.isNotEmpty()) {
+                            RowDivider()
+                            ModuleRuleListBlock("解密域名", declared.mitmHostnames)
+                        }
+                        if (declared.mitmSkipHostnames.isNotEmpty()) {
+                            RowDivider()
+                            ModuleRuleListBlock("跳过域名", declared.mitmSkipHostnames)
+                        }
+                        val rewrites = buildList {
+                            if (declared.urlRewrites.isNotEmpty()) add("URL Rewrite" to declared.urlRewrites.size)
+                            if (declared.headerRewrites.isNotEmpty()) add("Header Rewrite" to declared.headerRewrites.size)
+                            if (declared.loonRewrites.isNotEmpty()) add("Rewrite" to declared.loonRewrites.size)
+                            if (declared.bodyRewrites.isNotEmpty()) add("Body Rewrite" to declared.bodyRewrites.size)
+                            if (declared.wsRewrites.isNotEmpty()) add("WebSocket Rewrite" to declared.wsRewrites.size)
+                        }
+                        if (rewrites.isNotEmpty()) {
+                            RowDivider()
+                            rewrites.forEachIndexed { i, (name, count) ->
+                                if (i > 0) RowDivider()
+                                ModuleKeyValueRow(name, "$count 条", note = "由内核逐条解析执行")
+                            }
+                        }
+                        if (declared.mitmOptions.isNotEmpty()) {
+                            RowDivider()
+                            declared.mitmOptions.entries.forEachIndexed { i, (key, value) ->
+                                if (i > 0) RowDivider()
+                                ModuleKeyValueRow(key, value.ifBlank { "（空）" }, note = "[MITM] 细项")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        SectionHeader(
+            "规则与详情",
+            trailing = { Text("本地缓存解析结果", fontSize = 12.sp, color = NamuColors.Blue) },
+        )
+        GroupCard {
+            Text(
+                "阻断 ${module.blockRules} · 分流 ${module.routeRules} · 例外 ${module.allowRules} · MITM ${module.mitmRules}",
+                modifier = Modifier.fillMaxWidth().padding(16.dp),
+                fontSize = 12.sp,
+                color = NamuColors.TextSub,
+            )
+            RowDivider()
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable { showRaw = !showRaw }
+                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("查看原文", fontSize = 15.sp, color = NamuColors.TextMain)
+                    Text(
+                        "按 [分区] 原样展示本地缓存，不联网、不执行",
+                        fontSize = 12.sp,
+                        color = NamuColors.TextSub,
+                    )
+                }
+                Text(
+                    if (showRaw) "收起" else "展开",
+                    fontSize = 13.sp,
+                    color = NamuColors.Blue,
+                )
+                Spacer(Modifier.width(6.dp))
+                Chevron(color = if (showRaw) NamuColors.Blue else NamuColors.TextTertiary)
+            }
+            if (showRaw) {
+                RowDivider()
+                when {
+                    cached == null -> ModuleDetailLoading()
+                    cached?.error != null -> ModuleDetailError(cached!!.error!!)
+                    cached?.sections.isNullOrEmpty() -> ModuleDetailEmpty("暂无本地缓存正文")
+                    else -> {
+                        SelectionContainer {
+                            Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp)) {
+                                cached!!.sections.forEachIndexed { sectionIndex, section ->
+                                    if (sectionIndex > 0) Spacer(Modifier.height(14.dp))
+                                    Text(
+                                        section.title,
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = NamuColors.Blue,
+                                    )
+                                    Spacer(Modifier.height(6.dp))
+                                    Text(
+                                        section.body,
+                                        fontSize = 11.sp,
+                                        lineHeight = 17.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = NamuColors.TextMain,
+                                    )
+                                }
+                            }
+                        }
+                        if (cached?.truncated == true) {
+                            Text(
+                                "正文过长，仅显示前 50,000 个字符",
+                                modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 14.dp),
+                                fontSize = 11.sp,
+                                color = NamuColors.Orange,
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        SectionHeader("模块操作")
+        GroupCard {
+            ModuleDetailActionRow(
+                icon = Icons.Outlined.Sync,
+                iconBackground = Color(0xFF22C58B),
+                title = if (syncing) "正在更新当前模块" else "更新模块",
+                subtitle = if (module.url.startsWith("https://", ignoreCase = true)) {
+                    "重新下载并解析，保留启用状态与顺序"
+                } else {
+                    "本地模块无远程来源"
+                },
+                enabled = !syncing && module.url.startsWith("https://", ignoreCase = true),
+                loading = syncing,
+                onClick = {
+                    scope.launch {
+                        syncing = true
+                        try {
+                            val result = Actions.syncModules(module.id)
+                            container.messages.show(if (result.errors.isEmpty()) {
+                                "已更新「${module.name.ifBlank { "未命名模块" }}」"
+                            } else {
+                                result.errors.first()
+                            })
+                        } catch (e: Exception) {
+                            container.messages.show(e.message ?: "更新模块失败")
+                        } finally {
+                            syncing = false
+                        }
+                    }
+                },
+            )
+            ModuleDetailActionRow(
+                icon = Icons.Outlined.ArrowUpward,
+                iconBackground = Color(0xFF6B7280),
+                title = "上移一位",
+                subtitle = "调整模块执行顺序",
+                enabled = index > 0,
+                onClick = { scope.launch { Actions.reorderModule(module.id, index - 1) } },
+            )
+            ModuleDetailActionRow(
+                icon = Icons.Outlined.ArrowDownward,
+                iconBackground = Color(0xFF6B7280),
+                title = "下移一位",
+                subtitle = "调整模块执行顺序",
+                enabled = index in 0 until ordered.lastIndex,
+                showDivider = false,
+                onClick = { scope.launch { Actions.reorderModule(module.id, index + 1) } },
+            )
+        }
+        Spacer(Modifier.height(16.dp))
+        GroupCard {
+            Text(
+                "删除模块",
+                modifier = Modifier.fillMaxWidth().clickable { confirmDelete = true }.padding(vertical = 16.dp),
+                color = NamuColors.Red,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Medium,
+                textAlign = TextAlign.Center,
+            )
+        }
     }
+
+    if (confirmDelete) {
+        NamuDialog(
+            title = "删除模块",
+            message = "确定删除「${module.name.ifBlank { "未命名模块" }}」？",
+            confirmText = "删除",
+            confirmColor = NamuColors.Red,
+            onDismiss = { confirmDelete = false },
+            onConfirm = {
+                confirmDelete = false
+                scope.launch {
+                    Actions.deleteModule(module.id)
+                    container.messages.show("已删除模块")
+                    onBack()
+                }
+            },
+        ) {}
+    }
+}
+
+@Composable
+private fun ModuleDetailLoading() {
+    Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
+        CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp, color = NamuColors.Brand)
+    }
+}
+
+@Composable
+private fun ModuleDetailError(message: String) {
+    Text(
+        message,
+        modifier = Modifier.fillMaxWidth().padding(16.dp),
+        fontSize = 12.sp,
+        color = NamuColors.Red,
+    )
+}
+
+@Composable
+private fun ModuleDetailEmpty(message: String) {
+    Text(
+        message,
+        modifier = Modifier.fillMaxWidth().padding(16.dp),
+        fontSize = 12.sp,
+        color = NamuColors.TextSub,
+    )
+}
+
+@Composable
+private fun ModuleKeyValueRow(
+    key: String,
+    value: String,
+    note: String?,
+    monospaceValue: Boolean = false,
+) {
+    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                key,
+                modifier = Modifier.weight(1f),
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                color = NamuColors.TextMain,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (!note.isNullOrBlank()) {
+                Text(note, fontSize = 11.sp, color = NamuColors.TextTertiary)
+            }
+        }
+        Spacer(Modifier.height(3.dp))
+        Text(
+            value,
+            fontSize = 12.sp,
+            lineHeight = 17.sp,
+            fontFamily = if (monospaceValue) FontFamily.Monospace else FontFamily.Default,
+            color = NamuColors.TextSub,
+        )
+    }
+}
+
+@Composable
+private fun ModuleRuleListBlock(title: String, values: List<String>) {
+    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp)) {
+        Text(title, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = NamuColors.TextMain)
+        Spacer(Modifier.height(4.dp))
+        Text(
+            values.joinToString(", "),
+            fontSize = 11.sp,
+            lineHeight = 17.sp,
+            fontFamily = FontFamily.Monospace,
+            color = NamuColors.TextSub,
+        )
+    }
+}
+
+@Composable
+private fun ModuleScriptRow(script: com.namu.dns.core.config.ScriptConfig) {
+    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 11.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                script.name.ifBlank { "未命名脚本" },
+                modifier = Modifier.weight(1f),
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                color = NamuColors.TextMain,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                when {
+                    !script.enabled -> "已禁用"
+                    script.enableParam.isNotBlank() -> "跟随开关"
+                    else -> "已启用"
+                },
+                fontSize = 11.sp,
+                color = if (script.enabled) NamuColors.TextTertiary else NamuColors.Orange,
+            )
+        }
+        Spacer(Modifier.height(3.dp))
+        Text(
+            listOf(script.phase, script.pattern).filter { it.isNotBlank() }.joinToString(" · "),
+            fontSize = 11.sp,
+            lineHeight = 16.sp,
+            fontFamily = FontFamily.Monospace,
+            color = NamuColors.TextSub,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (script.scriptPath.isNotBlank()) {
+            Spacer(Modifier.height(2.dp))
+            Text(
+                script.scriptPath,
+                fontSize = 11.sp,
+                color = NamuColors.TextTertiary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (script.arguments.isNotEmpty()) {
+            Spacer(Modifier.height(2.dp))
+            Text(
+                "参数 ${script.arguments.keys.joinToString(", ")}",
+                fontSize = 11.sp,
+                color = NamuColors.TextTertiary,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+/** [General] 只标注壳层实际消费的键，其余保持在详情里可查但不假装生效。 */
+private fun generalKeyNote(key: String): String? = when (key.lowercase()) {
+    "skip-proxy", "bypass" -> "追加 MITM 跳过域名"
+    "ssid-trigger", "ssid-trigger-names" -> "SSID 触发名单（需本地开启）"
+    "proxy-test-url", "internet-test-url" -> "健康检查地址"
+    "test-timeout" -> "健康检查超时（秒）"
+    "force-close-connections" -> "模块变更时重建连接"
+    "legacy-chain" -> "旧模块多脚本链式执行"
+    else -> null
+}
+
+@Composable
+private fun ModuleDetailStat(value: Int, label: String, modifier: Modifier = Modifier) {
+    Row(modifier, horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+        Text("$value", fontSize = 21.sp, fontWeight = FontWeight.SemiBold, color = NamuColors.TextMain)
+        Spacer(Modifier.width(5.dp))
+        Text(label, fontSize = 11.sp, color = NamuColors.TextSub, maxLines = 1)
+    }
+}
+
+@Composable
+private fun ModuleDetailStatDivider() {
+    Box(Modifier.width(0.5.dp).height(30.dp).background(NamuColors.Separator))
+}
+
+@Composable
+private fun ModuleDetailActionRow(
+    icon: ImageVector,
+    iconBackground: Color,
+    title: String,
+    subtitle: String,
+    enabled: Boolean,
+    showDivider: Boolean = true,
+    loading: Boolean = false,
+    onClick: () -> Unit,
+) {
+    Column(
+        Modifier.fillMaxWidth().alpha(if (enabled) 1f else 0.42f)
+            .clickable(enabled = enabled && !loading, onClick = onClick),
+    ) {
+        Row(
+            Modifier.fillMaxWidth().heightIn(min = 64.dp).padding(horizontal = 16.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                Modifier.size(36.dp).clip(RoundedCornerShape(11.dp)).background(iconBackground),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(icon, contentDescription = null, tint = Color.White, modifier = Modifier.size(20.dp))
+            }
+            Spacer(Modifier.width(13.dp))
+            Column(Modifier.weight(1f)) {
+                Text(title, fontSize = 16.sp, color = NamuColors.TextMain)
+                Spacer(Modifier.height(2.dp))
+                Text(subtitle, fontSize = 12.sp, color = NamuColors.TextSub)
+            }
+            if (loading) {
+                CircularProgressIndicator(Modifier.size(19.dp), strokeWidth = 2.dp, color = NamuColors.Brand)
+            } else {
+                Chevron()
+            }
+        }
+        if (showDivider) RowDivider(startInset = 65.dp)
+    }
+}
+
+private data class ModuleDetailCache(
+    val description: String?,
+    val sections: List<ModuleRuleSection>,
+    val truncated: Boolean,
+    /** 只用于详情展示的声明解析；不写配置、不执行脚本。 */
+    val declared: ParsedModule? = null,
+    val error: String? = null,
+)
+
+private data class ModuleRuleSection(
+    val title: String,
+    val body: String,
+)
+
+/** 详情只读取既有缓存并按原文分区，不联网、不执行脚本、不写回模块配置。 */
+private fun loadModuleDetailCache(context: Context, moduleId: String): ModuleDetailCache {
+    return runCatching {
+        val file = ConfigStore.moduleFile(context, moduleId)
+        if (!file.exists() || file.length() == 0L) {
+            ModuleDetailCache(description = null, sections = emptyList(), truncated = false)
+        } else {
+            val raw = file.readText()
+            val truncated = raw.length > 50_000
+            ModuleDetailCache(
+                description = declaredModuleDescription(raw),
+                sections = parseModuleSections(raw.take(50_000)),
+                truncated = truncated,
+                declared = runCatching { ModuleParser.parse(raw) }.getOrNull(),
+            )
+        }
+    }.getOrElse {
+        ModuleDetailCache(
+            description = null,
+            sections = emptyList(),
+            truncated = false,
+            error = "读取模块缓存失败：${it.message ?: "未知错误"}",
+        )
+    }
+}
+
+private fun declaredModuleDescription(text: String): String? {
+    val trimmed = text.removePrefix("\uFEFF").trimStart()
+    return if (trimmed.startsWith("{")) {
+        val json = runCatching { JSONObject(trimmed) }.getOrNull()
+        jsonMetadataValue(json, "desc") ?: jsonMetadataValue(json, "description")
+    } else {
+        moduleMetadataLine(text, "desc") ?: moduleMetadataLine(text, "description")
+    }
+}
+
+private fun parseModuleSections(text: String): List<ModuleRuleSection> {
+    val trimmed = text.removePrefix("\uFEFF").trim()
+    if (trimmed.isEmpty()) return emptyList()
+    if (trimmed.startsWith("{")) return listOf(ModuleRuleSection("JSON 配置", trimmed))
+
+    val sections = mutableListOf<ModuleRuleSection>()
+    val body = StringBuilder()
+    var title = "模块信息"
+    fun flush() {
+        val content = body.toString().trim()
+        if (content.isNotBlank()) sections += ModuleRuleSection(title, content)
+        body.clear()
+    }
+
+    trimmed.lines().forEach { line ->
+        val header = Regex("^\\s*\\[([^]]+)]\\s*$").find(line)
+        if (header != null) {
+            flush()
+            title = "[${header.groupValues[1].trim()}]"
+        } else if (title == "模块信息" && line.trimStart().startsWith("#!")) {
+            // 名称、作者和图标声明已经用于详情头部，不在规则区重复展示。
+        } else {
+            body.appendLine(line.trimEnd())
+        }
+    }
+    flush()
+    if (sections.isEmpty()) return listOf(ModuleRuleSection("模块正文", trimmed))
+    return sections
 }
 
 @Composable
@@ -1157,7 +1670,7 @@ private fun AddModuleDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
             Column(
                 Modifier
                     .fillMaxWidth()
-                    .background(NamuColors.Fill, RoundedCornerShape(10.dp))
+                    .background(NamuColors.Fill, RoundedCornerShape(NamuTokens.RadiusControl))
                     .padding(12.dp),
             ) {
                 Text(

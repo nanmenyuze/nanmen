@@ -39,6 +39,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -102,9 +103,10 @@ fun NamuDialog(
         Column(
             Modifier
                 .fillMaxWidth()
-                .widthIn(max = 320.dp)
+                .widthIn(max = 340.dp)
                 .graphicsLayer { scaleX = scale; scaleY = scale; alpha = fade }
-                .clip(RoundedCornerShape(14.dp))
+                .shadow(24.dp, RoundedCornerShape(NamuTokens.RadiusDialog))
+                .clip(RoundedCornerShape(NamuTokens.RadiusDialog))
                 .background(NamuColors.Card),
         ) {
             val bodyModifier = if (scrollContent) {
@@ -113,7 +115,7 @@ fun NamuDialog(
                 Modifier
             }
             Column(
-                bodyModifier.fillMaxWidth().padding(start = 18.dp, end = 18.dp, top = 20.dp, bottom = 16.dp),
+                bodyModifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 22.dp, bottom = 18.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Text(title, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = NamuColors.TextMain, textAlign = TextAlign.Center)
@@ -131,17 +133,17 @@ fun NamuDialog(
                 content()
             }
             Box(Modifier.fillMaxWidth().height(0.5.dp).background(NamuColors.Separator))
-            Row(Modifier.fillMaxWidth().height(45.dp)) {
+            Row(Modifier.fillMaxWidth().height(50.dp)) {
                 if (showDismiss) {
-                    TextButton(onClick = onDismiss, enabled = !loading, modifier = Modifier.weight(1f).fillMaxWidth().height(45.dp)) {
+                    TextButton(onClick = onDismiss, enabled = !loading, modifier = Modifier.weight(1f).fillMaxWidth().height(50.dp)) {
                         Text(dismissText, fontSize = 17.sp, color = NamuColors.Blue)
                     }
-                    Box(Modifier.width(0.5.dp).height(45.dp).background(NamuColors.Separator))
+                    Box(Modifier.width(0.5.dp).height(50.dp).background(NamuColors.Separator))
                 }
                 TextButton(
                     onClick = onConfirm,
                     enabled = confirmEnabled && !loading,
-                    modifier = Modifier.weight(1f).fillMaxWidth().height(45.dp),
+                    modifier = Modifier.weight(1f).fillMaxWidth().height(50.dp),
                 ) {
                     if (loading) {
                         CircularProgressIndicator(Modifier.size(17.dp), color = NamuColors.Blue, strokeWidth = 2.dp)
@@ -164,9 +166,9 @@ fun NamuTextField(
     value: String,
     onChange: (String) -> Unit,
     placeholder: String,
+    modifier: Modifier = Modifier,
     singleLine: Boolean = false,
     maxLines: Int = 5,
-    modifier: Modifier = Modifier,
 ) {
     BasicTextField(
         modifier = modifier,
@@ -180,7 +182,7 @@ fun NamuTextField(
             Box(
                 Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(10.dp))
+                    .clip(RoundedCornerShape(NamuTokens.RadiusControl))
                     .background(NamuColors.Fill)
                     .padding(horizontal = 12.dp, vertical = 11.dp),
             ) {
@@ -197,7 +199,7 @@ fun NamuTextField(
 fun ChoiceChip(text: String, selected: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
     Box(
         modifier
-            .clip(RoundedCornerShape(9.dp))
+            .clip(RoundedCornerShape(NamuTokens.RadiusControl))
             .heightIn(min = 48.dp)
             .background(if (selected) NamuColors.Blue else NamuColors.Fill)
             .clickable { onClick() }
@@ -312,11 +314,13 @@ internal fun ruleValueError(type: String, raw: String): String? {
             if (com.namu.dns.isValidAdsDomain(d)) null else "请输入合法域名"
         }
         "DOMAIN-KEYWORD" -> if (v.any { it.isWhitespace() }) "关键词不能包含空格" else null
-        "DOMAIN-REGEX" -> runCatching { Regex(v) }.fold(
+        "DOMAIN-REGEX", "URL-REGEX" -> runCatching { Regex(v) }.fold(
             onSuccess = { null },
             onFailure = { "正则无效：${it.message ?: "无法编译"}" },
         )
-        "PORT" -> {
+        "GEOIP" -> if (v.equals("CN", true)) null else "当前内置中国 IP 库，请填写 CN"
+        "FINAL" -> if (v.equals("MATCH", true)) null else "FINAL 的值固定为 MATCH"
+        "DST-PORT", "PORT" -> {
             val p = v.toIntOrNull()
             if (p == null || p !in 1..65535) "端口必须是 1–65535" else null
         }
@@ -362,8 +366,13 @@ internal fun diagnosticCategoryLabel(category: String): String = when (category)
 }
 
 @Composable
-fun CustomAdsDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
-    var items by remember { mutableStateOf(uiSettings.current().customAds) }
+fun CustomAdsDialog(
+    onDismiss: () -> Unit,
+    onDone: () -> Unit,
+    initial: List<String> = uiSettings.current().customAds,
+    onSave: (List<String>) -> Unit = { domains -> uiSettings.update { it.copy(customAds = domains) } },
+) {
+    var items by remember { mutableStateOf(initial) }
     var input by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
 
@@ -387,7 +396,7 @@ fun CustomAdsDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
         confirmEnabled = true,
         onDismiss = onDismiss,
         onConfirm = {
-            uiSettings.update { it.copy(customAds = items.distinct()) }
+            onSave(items.distinct())
             onDone()
         },
     ) {
@@ -452,7 +461,7 @@ fun ScriptArgumentsDialog(
     Dialog(onDismissRequest = onDismiss) {
         Box(
             Modifier.fillMaxWidth().padding(horizontal = 18.dp)
-                .clip(RoundedCornerShape(18.dp)).background(NamuColors.Card),
+                .clip(RoundedCornerShape(NamuTokens.RadiusDialog)).background(NamuColors.Card),
         ) {
             Column(Modifier.padding(18.dp).heightIn(max = 560.dp).verticalScroll(rememberScrollState())) {
                 Text("脚本参数", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = NamuColors.TextMain)
@@ -727,37 +736,77 @@ private fun SourceRow(src: RuleSource) {
 }
 
 @Composable
-fun AddRuleDialog(groups: List<String> = emptyList(), onDismiss: () -> Unit, onAdd: (RuleItem) -> Unit) {
-    var type by remember { mutableStateOf("DOMAIN-SUFFIX") }
-    var value by remember { mutableStateOf("") }
-    var action by remember { mutableStateOf("proxy") }
+fun AddRuleDialog(
+    groups: List<String> = emptyList(),
+    initial: RuleItem? = null,
+    onDismiss: () -> Unit,
+    onAdd: (RuleItem) -> Unit,
+) {
+    var type by remember { mutableStateOf(initial?.type ?: "DOMAIN-SUFFIX") }
+    var value by remember { mutableStateOf(initial?.value.orEmpty()) }
+    var action by remember { mutableStateOf(initial?.action ?: "proxy") }
+    var extendedMatch by remember { mutableStateOf(initial?.extendedMatch ?: false) }
+    var preMatch by remember { mutableStateOf(initial?.preMatch ?: false) }
+    val domainType = type.startsWith("DOMAIN") && type != "DOMAIN-SET"
+    val httpType = type == "URL-REGEX" || type == "USER-AGENT"
 
     val types = listOf(
         "DOMAIN-SUFFIX" to "后缀",
         "DOMAIN" to "域名",
         "DOMAIN-KEYWORD" to "关键词",
         "DOMAIN-REGEX" to "正则",
+        "DOMAIN-WILDCARD" to "通配符",
         "IP-CIDR" to "IPv4 段",
         "IP-CIDR6" to "IPv6 段",
+        "USER-AGENT" to "User-Agent",
+        "URL-REGEX" to "URL 正则",
+        "RULE-SET" to "规则集",
+        "DOMAIN-SET" to "域名集",
+        "DST-PORT" to "目标端口",
         "PORT" to "端口",
+        "GEOIP" to "GEOIP",
+        "FINAL" to "FINAL",
         "APP" to "按应用",
     )
-    val actions = listOf("proxy" to "代理", "direct" to "直连", "block" to "拦截")
+    val actions = if (httpType) listOf(
+        "reject" to "REJECT",
+        "reject-dict" to "空 JSON 对象",
+        "reject-array" to "空 JSON 数组",
+        "reject-200" to "HTTP 200",
+        "reject-img" to "1 像素 GIF",
+        "reject-tinygif" to "TINYGIF",
+        "reject-video" to "空白 MP4",
+        "reject-drop" to "DROP",
+    ) else listOf("proxy" to "PROXY", "direct" to "DIRECT", "block" to "REJECT")
+    LaunchedEffect(type) {
+        if (httpType && actions.none { it.first == action }) action = "reject"
+        if (!httpType && action.startsWith("reject")) action = "block"
+        if (type == "FINAL" && value.isBlank()) value = "MATCH"
+    }
     val inputError = if (value.isBlank()) null else ruleValueError(type, value)
 
     NamuDialog(
-        title = "添加分流规则",
-        confirmText = "添加",
-        confirmEnabled = value.isNotBlank() && inputError == null,
+        title = if (initial == null) "添加规则" else "编辑规则",
+        confirmText = if (initial == null) "添加" else "保存",
+        confirmEnabled = value.isNotBlank() && inputError == null && (!preMatch || action == "block"),
+        scrollContent = true,
         onDismiss = onDismiss,
-        onConfirm = { onAdd(RuleItem(type, value.trim(), action)) },
+        onConfirm = {
+            onAdd(initial?.copy(type = type, value = value.trim(), action = action, extendedMatch = extendedMatch && domainType, preMatch = preMatch && action == "block")
+                ?: RuleItem(type = type, value = value.trim(), action = action, extendedMatch = extendedMatch && domainType, preMatch = preMatch && action == "block"))
+        },
     ) {
         NamuTextField(
             value,
             { value = it },
             when (type) {
                 "DOMAIN-REGEX" -> "^ad[0-9]+\\.example\\.com$"
-                "PORT" -> "443、8443 或 1-65535"
+                "URL-REGEX" -> "^https://example\\.com/ads/"
+                "USER-AGENT" -> "AdBot*"
+                "RULE-SET", "DOMAIN-SET" -> "https://example.com/rules.txt 或规则源 ID"
+                "GEOIP" -> "CN"
+                "FINAL" -> "MATCH"
+                "DST-PORT", "PORT" -> "443、8443 或 1-65535"
                 "IP-CIDR" -> "1.2.3.0/24"
                 "IP-CIDR6" -> "2001:db8::/32"
                 "APP", "PROCESS-NAME", "APP-NAME" -> "com.bilibili.app"
@@ -784,7 +833,12 @@ fun AddRuleDialog(groups: List<String> = emptyList(), onDismiss: () -> Unit, onA
                 "DOMAIN-SUFFIX" -> "会同时匹配该域名和所有子域名"
                 "DOMAIN-KEYWORD" -> "域名里包含该关键词就命中"
                 "DOMAIN-REGEX" -> "按正则表达式匹配域名；非法正则不能添加"
-                "PORT" -> "匹配目标端口，范围 1–65535"
+                "URL-REGEX" -> "匹配完整 URL；需开启 HTTPS 解密，按所选 HTTP 响应拦截"
+                "USER-AGENT" -> "支持 * 通配；需开启 HTTPS 解密，按请求头匹配"
+                "RULE-SET", "DOMAIN-SET" -> "下载并缓存后展开；集合策略覆盖列表内策略"
+                "GEOIP" -> "当前内置中国 IP 库，请填写 CN"
+                "FINAL" -> "最终兜底规则，值固定为 MATCH"
+                "DST-PORT", "PORT" -> "匹配目标端口，范围 1–65535"
                 "IP-CIDR" -> "匹配 IPv4 CIDR；前缀范围 0–32"
                 "IP-CIDR6" -> "匹配 IPv6 CIDR；前缀范围 0–128"
                 "APP", "PROCESS-NAME", "APP-NAME" -> "只对填写的应用生效，其他应用不受影响；识别归属需要 Root"
@@ -799,12 +853,16 @@ fun AddRuleDialog(groups: List<String> = emptyList(), onDismiss: () -> Unit, onA
             Text(inputError, fontSize = 11.sp, color = NamuColors.Red, modifier = Modifier.fillMaxWidth().padding(top = 4.dp))
         }
         Spacer(Modifier.height(12.dp))
-        Text("动作", fontSize = 12.sp, color = NamuColors.TextSub, modifier = Modifier.fillMaxWidth())
+        Text("策略", fontSize = 12.sp, color = NamuColors.TextSub, modifier = Modifier.fillMaxWidth())
         Spacer(Modifier.height(6.dp))
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            actions.forEach { (key, label) ->
-                ChoiceChip(label, action == key, Modifier.weight(1f)) { action = key }
+        actions.chunked(3).forEach { row ->
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                row.forEach { (key, label) ->
+                    ChoiceChip(label, action == key, Modifier.weight(1f)) { action = key }
+                }
+                repeat(3 - row.size) { Spacer(Modifier.weight(1f)) }
             }
+            Spacer(Modifier.height(6.dp))
         }
         if (groups.isNotEmpty()) {
             Spacer(Modifier.height(8.dp))
@@ -820,47 +878,98 @@ fun AddRuleDialog(groups: List<String> = emptyList(), onDismiss: () -> Unit, onA
                 Spacer(Modifier.height(5.dp))
             }
         }
+        Spacer(Modifier.height(8.dp))
+        SwitchRow(
+            title = "扩展匹配",
+            subtitle = if (domainType) "同时匹配 TLS SNI 与 HTTP Host" else "仅域名类规则可用",
+            checked = extendedMatch && domainType,
+        ) { if (domainType) extendedMatch = it }
+        SwitchRow(
+            title = "预匹配",
+            subtitle = if (action == "block") "在普通规则前优先判定" else "仅拦截策略可用",
+            checked = preMatch && action == "block",
+            showDivider = false,
+        ) { if (action == "block") preMatch = it }
     }
 }
 
 @Composable
 fun DnsDialog(current: String, onDismiss: () -> Unit, onSelect: (String) -> Unit) {
-    var text by remember { mutableStateOf(current) }
-    val presets = listOf(
-        "跟随手机默认 DNS" to "system",
-        "阿里 DoH" to "https://dns.alidns.com/dns-query",
-        "DNSPod" to "https://doh.pub/dns-query",
-        "Cloudflare" to "https://1.1.1.1/dns-query",
-        "Google" to "https://8.8.8.8/dns-query",
-    )
-
+    var system by remember { mutableStateOf(current.isBlank() || current == "system") }
+    var address by remember { mutableStateOf(current.takeUnless { it == "system" }.orEmpty()) }
+    val issue = if (system) null else com.namu.dns.core.config.ConfigDnsInput.error(address)
     NamuDialog(
-        title = "DNS 上游",
-        message = "推荐「跟随手机默认 DNS」：使用当前 Wi‑Fi/蜂窝网络下发的 DNS，不经过第三方解析器；也可手填 DoH/DoT/UDP。",
+        title = "DNS 地址",
         confirmText = "保存",
-        confirmEnabled = text.isNotBlank(),
+        confirmEnabled = issue == null,
         onDismiss = onDismiss,
-        onConfirm = { onSelect(text.trim()) },
+        onConfirm = { onSelect(if (system) "system" else address.trim()) },
     ) {
-        presets.forEach { (label, url) ->
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(9.dp))
-                    .background(if (text == url) NamuColors.Blue.copy(alpha = 0.10f) else Color.Transparent)
-                    .clickable { text = url }
-                    .padding(horizontal = 10.dp, vertical = 9.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(Modifier.weight(1f)) {
-                    Text(label, fontSize = 14.sp, color = NamuColors.TextMain)
-                    Text(url, fontSize = 11.sp, color = NamuColors.TextSub, maxLines = 1)
+        SettingsRow("系统 DNS", onClick = { system = true },
+            value = if (system) "✓" else null)
+        SettingsRow("自定义 DNS", onClick = { system = false }, value = if (!system) "✓" else null)
+        if (!system) {
+            NamuTextField(address, { address = it }, "DoH、DoT 或 UDP 地址", singleLine = true)
+            if (address.isNotBlank() && issue != null) Text(issue, color = NamuColors.Red, fontSize = 12.sp)
+        }
+    }
+}
+
+@Composable
+fun DnsListDialog(title: String, current: String, onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
+    val entries = remember {
+        mutableStateListOf<String>().apply {
+            addAll(current.split(',', '\n').map { it.trim() }.filter { it.isNotBlank() }.ifEmpty { listOf("system") })
+        }
+    }
+    val issue = com.namu.dns.core.config.ConfigDnsInput.error(entries.joinToString(","))
+    NamuDialog(
+        title = title,
+        message = "按顺序尝试，前一个不可用时自动尝试下一个。",
+        confirmText = "保存",
+        confirmEnabled = entries.any { it.isNotBlank() } && issue == null,
+        onDismiss = onDismiss,
+        scrollContent = true,
+        onConfirm = { onConfirm(entries.map { it.trim() }.filter { it.isNotBlank() }.joinToString(",")) },
+    ) {
+        entries.forEachIndexed { index, value ->
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = { if (entries.size > 1) entries.removeAt(index) }) {
+                    Text("−", color = NamuColors.Red, fontSize = 22.sp)
                 }
-                if (text == url) CheckMark()
+                Box(Modifier.weight(1f)) {
+                    NamuTextField(value, { entries[index] = it }, "system、DoH、DoT 或 UDP 地址", singleLine = true)
+                }
             }
         }
-        Spacer(Modifier.height(8.dp))
-        NamuTextField(text, { text = it }, "https:// / tls:// / udp://", singleLine = true)
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+            TextButton(onClick = { entries.add("") }) { Text("＋ 添加 DNS", color = NamuColors.Green) }
+        }
+        if (issue != null) Text(issue, color = NamuColors.Red, fontSize = 12.sp)
+    }
+}
+
+@Composable
+fun StringListDialog(
+    title: String,
+    message: String,
+    initial: List<String>,
+    onDismiss: () -> Unit,
+    onConfirm: (List<String>) -> Unit,
+) {
+    var text by remember { mutableStateOf(initial.joinToString("\n")) }
+    val values = text.lines().map { it.trim().trim('.').lowercase() }.filter { it.isNotBlank() }.distinct()
+    val invalid = values.firstOrNull { !Regex("^[a-z0-9_*.-]+$").matches(it) }
+    NamuDialog(
+        title = title,
+        message = message,
+        confirmText = "保存",
+        confirmEnabled = invalid == null,
+        onDismiss = onDismiss,
+        onConfirm = { onConfirm(values) },
+    ) {
+        NamuTextField(text, { text = it }, "example.com\n*.example.org", maxLines = 8)
+        if (invalid != null) Text("无效域名：$invalid", color = NamuColors.Red, fontSize = 12.sp)
     }
 }
 
@@ -885,7 +994,7 @@ fun ChoiceDialog(
             Row(
                 Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(9.dp))
+                    .clip(RoundedCornerShape(NamuTokens.RadiusControl))
                     .clickable { onSelect(key) }
                     .padding(horizontal = 10.dp, vertical = 11.dp),
                 verticalAlignment = Alignment.CenterVertically,
@@ -1050,8 +1159,8 @@ fun ConfigImportDialog(
             val n = ConfigFileStore.sanitize(name)
             if (ConfigFileStore.exists(context, n)) {
                 error = "已存在同名配置文件"
-            } else if (App.container.config.import(n, text.trim())) {
-                onDone(ConfigFileStore.FileInfo(n, 0L, 0L, true, false))
+            } else if (App.container.config.import(n, text.trim(), url.trim().takeIf { urlMode && it.isNotBlank() })) {
+                onDone(ConfigFileStore.FileInfo(n, 0L, 0L, false, false))
             } else {
                 error = "内容不是有效的原生配置，或写入失败"
             }
@@ -1111,6 +1220,8 @@ fun ConfigFileInfoDialog(
     onEdit: () -> Unit,
     onDelete: () -> Unit,
     onRestore: () -> Unit = {},
+    onCopy: () -> Unit,
+    onExport: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val clipboard = LocalClipboardManager.current
@@ -1149,6 +1260,8 @@ fun ConfigFileInfoDialog(
                 }
                 onDismiss()
             }
+            DialogAction("复制为新配置", NamuColors.Blue) { onCopy() }
+            DialogAction("导出配置", NamuColors.Blue) { onExport(); onDismiss() }
             if (!info.isDefault) {
                 Box(Modifier.fillMaxWidth().height(0.5.dp).background(NamuColors.Separator))
                 DialogAction("删除该配置", NamuColors.Red) { onDelete() }
@@ -1163,13 +1276,19 @@ fun ProxyGroupsDialog(
     groups: List<ProxyGroup>,
     nodes: List<String>,
     selections: Map<String, String>,
+    observeRuntime: Boolean = true,
+    onChange: (List<ProxyGroup>, Map<String, String>) -> Boolean = { next, selection ->
+        uiSettings.update { it.copy(proxyGroups = next, groupSelections = selection) }
+        true
+    },
     onDismiss: () -> Unit,
 ) {
     var editing by remember { mutableStateOf<ProxyGroup?>(null) }
     var creating by remember { mutableStateOf(false) }
     // 组页面可见时才轮询内核 stats；对话框销毁即停止，不建常驻通道。
     var liveStats by remember { mutableStateOf<StatsData?>(null) }
-    LaunchedEffect(Unit) {
+    LaunchedEffect(observeRuntime) {
+        if (!observeRuntime) return@LaunchedEffect
         while (true) {
             if (NativeCore.available) {
                 val raw = withContext(Dispatchers.IO) { NativeCore.nativeStats() }
@@ -1185,6 +1304,7 @@ fun ProxyGroupsDialog(
             groups = groups,
             nodes = nodes,
             selections = selections,
+            onChange = onChange,
             onDismiss = {
                 editing = null
                 creating = false
@@ -1271,6 +1391,7 @@ private fun ProxyGroupEditorDialog(
     groups: List<ProxyGroup>,
     nodes: List<String>,
     selections: Map<String, String>,
+    onChange: (List<ProxyGroup>, Map<String, String>) -> Boolean,
     onDismiss: () -> Unit,
 ) {
     var name by remember { mutableStateOf(initial?.name ?: "") }
@@ -1327,8 +1448,7 @@ private fun ProxyGroupEditorDialog(
             }
             if (!isNew && initial?.name != candidate.name) remove(initial?.name ?: "")
         }
-        uiSettings.update { cfg -> cfg.copy(proxyGroups = nextGroups, groupSelections = nextSelections) }
-        onDismiss()
+        if (onChange(nextGroups, nextSelections)) onDismiss()
     }
 
     NamuDialog(
@@ -1451,8 +1571,7 @@ private fun ProxyGroupEditorDialog(
                     onClick = {
                         val next = groups.filterNot { it.name == initial?.name }
                         val nextSel = selections - (initial?.name ?: "")
-                        uiSettings.update { cfg -> cfg.copy(proxyGroups = next, groupSelections = nextSel) }
-                        onDismiss()
+                        if (onChange(next, nextSel)) onDismiss()
                     },
                     modifier = Modifier.fillMaxWidth(),
                 ) {
@@ -1464,13 +1583,17 @@ private fun ProxyGroupEditorDialog(
 }
 
 @Composable
-fun RuleTestDialog(onDismiss: () -> Unit) {
+fun RuleTestDialog(
+    config: AppConfig = uiSettings.current(),
+    useRuntimeAssets: Boolean = true,
+    onDismiss: () -> Unit,
+) {
     var input by remember { mutableStateOf("") }
     var result by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
     NamuDialog(
         title = "测试规则",
-        message = "输入域名或 IPv4，查看会命中哪条规则",
+        message = if (useRuntimeAssets) "输入域名或 IPv4，查看会命中哪条规则" else "测试此方案的自定义规则",
         confirmText = "测试",
         confirmEnabled = input.isNotBlank(),
         onConfirm = {
@@ -1478,10 +1601,10 @@ fun RuleTestDialog(onDismiss: () -> Unit) {
             scope.launch {
                 // 优先用内核算：与运行时同一套判定（含模块规则、CN 直连、模式覆盖）。
                 val native = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                    if (!NativeCore.available) return@withContext null
+                    if (!useRuntimeAssets || !NativeCore.available) return@withContext null
                     runCatching {
                         val json = NativeCore.nativeTestRule(
-                            ConfigStore.buildNative(uiContext, uiSettings.current()),
+                            ConfigStore.buildNative(uiContext, config),
                             text,
                         )
                         val o = org.json.JSONObject(json)
@@ -1525,7 +1648,7 @@ fun RuleTestDialog(onDismiss: () -> Unit) {
                         }
                     }.getOrNull()
                 }
-                result = native ?: evaluateRule(uiSettings.current(), text)
+                result = native ?: evaluateRule(config, text)
             }
         },
         onDismiss = onDismiss,
@@ -1562,6 +1685,7 @@ private fun evaluateRule(cfg: AppConfig, input: String): String {
     val text = input.trim().lowercase()
     val ipv4 = text.matches(Regex("\\d{1,3}(\\.\\d{1,3}){3}"))
     cfg.rules.forEachIndexed { index, r ->
+        if (!r.enabled) return@forEachIndexed
         val hit = when (r.type.uppercase()) {
             "DOMAIN" -> !ipv4 && text == r.value.lowercase()
             "DOMAIN-SUFFIX" -> {

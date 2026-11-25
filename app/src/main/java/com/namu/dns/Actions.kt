@@ -33,7 +33,7 @@ object Actions {
         mimeType: String = "text/plain",
     ): String = exportBytes(context, fileName, content.toByteArray(), mimeType)
 
-    /** 二进制导出统一走公共下载目录；29+ 用 MediaStore，无需存储权限。 */
+    /** 二进制导出统一走公共下载目录；minSdk 31 使用 MediaStore，无需存储权限。 */
     suspend fun exportBytes(
         context: android.content.Context,
         fileName: String,
@@ -41,28 +41,20 @@ object Actions {
         mimeType: String = "application/octet-stream",
     ): String =
         withContext(Dispatchers.IO) {
-            if (android.os.Build.VERSION.SDK_INT >= 29) {
-                deleteExistingDownload(context, fileName)
-                val values = android.content.ContentValues().apply {
-                    put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                    put(android.provider.MediaStore.MediaColumns.MIME_TYPE, mimeType)
-                    put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, "Download/NamuDNS")
-                }
-                val resolver = context.contentResolver
-                val uri = resolver.insert(
-                    android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI,
-                    values,
-                ) ?: throw RuntimeException("无法创建导出文件")
-                resolver.openOutputStream(uri)?.use { it.write(bytes) }
-                    ?: throw RuntimeException("写入导出文件失败")
-                "下载/NamuDNS/$fileName"
-            } else {
-                val base = context.getExternalFilesDir(android.os.Environment.DIRECTORY_DOWNLOADS)
-                    ?: context.filesDir
-                val dir = File(base, "NamuDNS").apply { mkdirs() }
-                File(dir, fileName).also { it.writeBytes(bytes) }
-                "应用外部目录/NamuDNS/$fileName"
+            deleteExistingDownload(context, fileName)
+            val values = android.content.ContentValues().apply {
+                put(android.provider.MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                put(android.provider.MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                put(android.provider.MediaStore.MediaColumns.RELATIVE_PATH, "Download/NamuDNS")
             }
+            val resolver = context.contentResolver
+            val uri = resolver.insert(
+                android.provider.MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                values,
+            ) ?: throw RuntimeException("无法创建导出文件")
+            resolver.openOutputStream(uri)?.use { it.write(bytes) }
+                ?: throw RuntimeException("写入导出文件失败")
+            "下载/NamuDNS/$fileName"
         }
 
     /** MITM 的 PEM/DER 也落公共下载目录，和模块 zip 使用同一出口径。 */
@@ -495,21 +487,25 @@ object Actions {
 
     /** 下载并原子替换所有规则源；单个源失败时保留它的上一份文件。 */
     suspend fun syncRuleSources(
-        sources: List<RuleSource> = settings.current().ruleSources,
+        sources: List<RuleSource>? = null,
+        profileName: String = App.container.config.activeName(),
     ): RuleSyncResult = withContext(Dispatchers.IO) {
+        val profile = withContext(Dispatchers.Main) { App.container.config.loadProfile(profileName) }
+            ?: throw RuntimeException("配置无法读取")
+        val selected = sources ?: profile.ruleSources
         var updated = 0
         var totalLines = 0
         val errors = mutableListOf<String>()
         val results = mutableMapOf<String, RuleSource>()
-        sources.filter { it.enabled }.forEach { src ->
-            val file = ConfigStore.ruleSourceFile(App.context, src.id)
+        selected.filter { it.enabled }.forEach { src ->
+            val file = ConfigStore.ruleSourceFile(App.context, src, profileName)
             val now = System.currentTimeMillis()
             try {
                 val conditional = buildMap {
-                    if (src.etag.isNotBlank()) put("If-None-Match", src.etag)
-                    if (src.lastModified.isNotBlank()) put("If-Modified-Since", src.lastModified)
+                    if (file.length() > 0L && src.etag.isNotBlank()) put("If-None-Match", src.etag)
+                    if (file.length() > 0L && src.lastModified.isNotBlank()) put("If-Modified-Since", src.lastModified)
                 }
-                val headers = headerMapFor(settings.current(), src.url) + conditional
+                val headers = headerMapFor(profile, src.url) + conditional
                 val fetched = fetchTextResult(src.url, maxBytes = 8 * 1024 * 1024, headers = headers)
                 if (fetched.status == 304) {
                     val cachedLines = if (file.exists() && file.length() > 0) file.useLines { it.count() } else 0
@@ -529,14 +525,8 @@ object Actions {
                 }
                 val text = fetched.text
                 validateRules(text)
-                val tmp = File(file.parentFile, file.name + ".tmp")
-                val backup = File(file.parentFile, file.name + ".bak")
-                tmp.writeText(text)
-                if (file.exists()) file.copyTo(backup, overwrite = true)
-                if (!tmp.renameTo(file)) {
-                    tmp.copyTo(file, overwrite = true)
-                    tmp.delete()
-                }
+                ConfigStore.writeAtomicPublic(file, text)
+                check(file.readText() == text) { "规则缓存写入失败" }
                 val lines = text.lines().count()
                 results[src.id] = src.copy(
                     updatedAt = now,
@@ -568,9 +558,11 @@ object Actions {
             }
         }
         withContext(Dispatchers.Main) {
-            val current = settings.current()
-            val next = current.ruleSources.map { results[it.id] ?: it }
-            settings.set(current.copy(ruleSources = next))
+            App.container.config.saveProfile(profileName) { current ->
+                current.copy(ruleSources = current.ruleSources.map { source ->
+                    results[source.id]?.takeIf { it.url == source.url }?.copy(enabled = source.enabled) ?: source
+                })
+            } ?: throw RuntimeException("规则来源状态保存失败")
         }
         RuleSyncResult(updated, totalLines, errors)
     }
@@ -1005,13 +997,12 @@ object Actions {
         if (runtime.current().connected) NamuVpnService.reload(App.context)
     }
 
-    private suspend fun applyRemoteConfig(o: JSONObject, url: String): Pair<AppConfig, List<RuleSource>> {
+    private suspend fun applyRemoteConfig(o: JSONObject, url: String, profileName: String): Pair<AppConfig, List<RuleSource>> = withContext(Dispatchers.Main) {
         val version = o.optInt("version", 1)
         if (version !in 1..2) throw RuntimeException("不支持的配置版本：$version")
         val dns = o.optJSONObject("dns")
         val routing = o.optJSONObject("routing")
-        val failClosed = dns?.optBoolean("fail_closed", false) ?: false
-        val fallback = dns?.optString("fallback", "223.5.5.5")?.trim().orEmpty()
+        val explicitFallback = dns?.takeIf { it.has("fallback") && !it.isNull("fallback") }?.optString("fallback")?.trim()
         var headerName = dns?.optString("header_name", "")?.trim().orEmpty()
         var headerValue = dns?.optString("header_value", "")?.trim().orEmpty()
         dns?.optJSONObject("headers")?.let { h ->
@@ -1046,48 +1037,57 @@ object Actions {
             throw RuntimeException("rule_sources 中存在重复 id")
         }
 
-        val current = settings.current()
-        val next = current.copy(
-            mode = o.optString("mode", current.mode),
-            remoteConfigUrl = url,
-            remoteConfigName = o.optString("name", current.remoteConfigName),
-            remoteConfigUpdatedAt = System.currentTimeMillis(),
-            remoteConfigInterval = (o.optLong("update_interval", 21600L) * 1000L).coerceIn(300_000L, 7L * 24 * 3600_000L),
-            dnsUpstream = dns?.optString("upstream", current.dnsUpstream) ?: current.dnsUpstream,
-            dnsFallback = fallback.ifBlank { current.dnsFallback },
-            dnsBootstrap = dns?.optString("bootstrap", current.dnsBootstrap) ?: current.dnsBootstrap,
-            dnsHeaderName = headerName,
-            dnsHeaderValue = headerValue,
-            dnsCacheTtl = (dns?.optInt("cache_ttl", current.dnsCacheTtl) ?: current.dnsCacheTtl).coerceIn(30, 86400),
-            dnsQueryLog = dns?.optBoolean("query_log", current.dnsQueryLog) ?: current.dnsQueryLog,
-            allowDnsFallback = !failClosed && fallback.isNotBlank(),
-            cnDirect = routing?.optBoolean("cn_direct", current.cnDirect) ?: current.cnDirect,
-            finalPolicy = routing?.optString("final_policy", current.finalPolicy) ?: current.finalPolicy,
-            ruleSources = if (sources.isEmpty()) current.ruleSources else sources,
-        )
-        withContext(Dispatchers.Main) {
-            settings.set(next)
-        }
-        return next to next.ruleSources
+        val next = App.container.config.saveProfile(profileName) { current ->
+            current.copy(
+                mode = o.optString("mode", current.mode),
+                remoteConfigUrl = url,
+                remoteConfigName = o.optString("name", current.remoteConfigName),
+                remoteConfigUpdatedAt = System.currentTimeMillis(),
+                remoteConfigInterval = (o.optLong("update_interval", 21600L) * 1000L).coerceIn(300_000L, 7L * 24 * 3600_000L),
+                dnsUpstream = dns?.optString("upstream", current.dnsUpstream) ?: current.dnsUpstream,
+                dnsFallback = explicitFallback ?: current.dnsFallback,
+                dnsBootstrap = dns?.optString("bootstrap", current.dnsBootstrap) ?: current.dnsBootstrap,
+                dnsHeaderName = headerName,
+                dnsHeaderValue = headerValue,
+                dnsCacheTtl = (dns?.optInt("cache_ttl", current.dnsCacheTtl) ?: current.dnsCacheTtl).coerceIn(30, 86400),
+                dnsQueryLog = dns?.optBoolean("query_log", current.dnsQueryLog) ?: current.dnsQueryLog,
+                allowDnsFallback = when {
+                    dns?.has("fail_closed") == true -> !dns.optBoolean("fail_closed")
+                    explicitFallback != null -> explicitFallback.isNotBlank()
+                    else -> current.allowDnsFallback
+                },
+                cnDirect = routing?.optBoolean("cn_direct", current.cnDirect) ?: current.cnDirect,
+                finalPolicy = routing?.optString("final_policy", current.finalPolicy) ?: current.finalPolicy,
+                ruleSources = if (sources.isEmpty()) current.ruleSources else sources,
+            )
+        } ?: throw RuntimeException("远端配置保存失败")
+        next to next.ruleSources
     }
 
     /** 拉取远端 manifest，应用 DNS/模式/规则源，然后同步规则文件。 */
-    suspend fun importRemoteConfig(url: String): RemoteConfigResult = withContext(Dispatchers.IO) {
+    suspend fun importRemoteConfig(
+        url: String,
+        profileName: String = App.container.config.activeName(),
+    ): RemoteConfigResult = withContext(Dispatchers.IO) {
+        val profile = withContext(Dispatchers.Main) { App.container.config.loadProfile(profileName) }
+            ?: throw RuntimeException("配置无法读取")
         val raw = fetchText(
             url,
             maxBytes = 2 * 1024 * 1024,
-            headers = headerMapFor(settings.current(), url),
+            headers = headerMapFor(profile, url),
         )
         val o = try {
             JSONObject(raw)
         } catch (e: Exception) {
             throw RuntimeException("配置不是有效 JSON：${e.message}")
         }
-        val (cfg, sources) = applyRemoteConfig(o, url.trim())
-        val sync = syncRuleSources(sources)
-        if (runtime.current().connected) {
-            withContext(Dispatchers.Main) { NamuVpnService.reload(App.context) }
+        val currentUrl = withContext(Dispatchers.Main) { App.container.config.loadProfile(profileName)?.remoteConfigUrl }
+        if (currentUrl == null || (currentUrl != profile.remoteConfigUrl && currentUrl != url.trim())) {
+            throw RuntimeException("远端配置地址已改变")
         }
+        val (cfg, sources) = applyRemoteConfig(o, url.trim(), profileName)
+        val sync = if (sources.any { it.enabled }) syncRuleSources(sources, profileName)
+            else RuleSyncResult(0, 0, emptyList())
         RemoteConfigResult(
             name = cfg.remoteConfigName.ifBlank { "远端配置" },
             sources = sources.size,
@@ -1096,49 +1096,62 @@ object Actions {
         )
     }
 
-    suspend fun updateAdsRules(url: String): Int = withContext(Dispatchers.IO) {
-        val text = fetchText(url, maxBytes = 8 * 1024 * 1024, headers = headerMapFor(settings.current(), url))
+    suspend fun updateAdsRules(
+        url: String,
+        profileName: String = App.container.config.activeName(),
+    ): Int = withContext(Dispatchers.IO) {
+        val profile = withContext(Dispatchers.Main) { App.container.config.loadProfile(profileName) }
+            ?: throw RuntimeException("配置无法读取")
+        val text = fetchText(url, maxBytes = 8 * 1024 * 1024, headers = headerMapFor(profile, url))
         validateRules(text)
-        val file = ConfigStore.rulesFile(App.context)
-        val tmp = File(file.parentFile, "ads_url.txt.tmp")
-        val backup = File(file.parentFile, "ads_url.txt.bak")
-        tmp.writeText(text)
-        if (file.exists()) file.copyTo(backup, overwrite = true)
-        if (!tmp.renameTo(file)) {
-            tmp.copyTo(file, overwrite = true)
-            tmp.delete()
-        }
-        val now = System.currentTimeMillis()
+        val file = ConfigStore.rulesFile(App.context, url, profileName)
+        ConfigStore.writeAtomicPublic(file, text)
+        check(file.readText() == text) { "规则缓存写入失败" }
         withContext(Dispatchers.Main) {
-            settings.update { it.copy(rulesUpdatedAt = now) }
+            App.container.config.saveProfile(profileName) {
+                if (it.rulesUrl == url || it.rulesUrl == profile.rulesUrl) {
+                    it.copy(rulesUrl = url, rulesUpdatedAt = System.currentTimeMillis())
+                } else it
+            } ?: throw RuntimeException("规则来源状态保存失败")
         }
         text.lines().size
     }
 
     /** 启动时按需拉取广告规则；成功后返回 true。 */
     suspend fun autoUpdateRulesIfDue(): Boolean = withContext(Dispatchers.IO) {
-        val cfg = settings.current()
+        val (profileName, cfg) = withContext(Dispatchers.Main) {
+            App.container.config.activeName() to settings.current()
+        }
         if (!cfg.autoUpdateRules) return@withContext false
         if (cfg.remoteConfigUrl.isNotBlank()) {
             val age = System.currentTimeMillis() - cfg.remoteConfigUpdatedAt
             if (cfg.remoteConfigUpdatedAt > 0 && age < cfg.remoteConfigInterval) return@withContext false
             return@withContext try {
-                importRemoteConfig(cfg.remoteConfigUrl)
+                importRemoteConfig(cfg.remoteConfigUrl, profileName)
                 true
             } catch (_: Exception) {
                 false
             }
         }
+        if (cfg.ruleSources.isNotEmpty()) {
+            val now = System.currentTimeMillis()
+            val due = cfg.ruleSources.filter { it.enabled && now - it.lastAttemptAt >= 12L * 60 * 60 * 1000 }
+            if (due.isEmpty()) return@withContext false
+            return@withContext try {
+                syncRuleSources(due, profileName).updated > 0
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                false
+            }
+        }
         if (cfg.rulesUrl.isBlank()) return@withContext false
-        val file = ConfigStore.rulesFile(App.context)
+        val file = ConfigStore.rulesFile(App.context, cfg.rulesUrl, profileName)
         val fresh = file.exists() && file.length() > 0 &&
             System.currentTimeMillis() - cfg.rulesUpdatedAt < 12L * 60 * 60 * 1000
         if (fresh) return@withContext false
         try {
-            updateAdsRules(cfg.rulesUrl)
-            withContext(Dispatchers.Main) {
-                if (runtime.current().connected) NamuVpnService.reload(App.context)
-            }
+            updateAdsRules(cfg.rulesUrl, profileName)
             true
         } catch (e: Exception) {
             withContext(Dispatchers.Main) {

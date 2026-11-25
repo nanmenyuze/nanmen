@@ -719,6 +719,8 @@ fn read_mock_file(spec: &loon::MockSpec, base_dir: &str) -> Result<Vec<u8>, Stri
     std::fs::read(&full).map_err(|e| format!("{}: {e}", full.display()))
 }
 
+const EMPTY_MP4: &[u8] = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom\x00\x00\x00\x08mdat";
+
 fn terminal_response(
     term: &Terminal,
     header_ops: &[HeaderOp],
@@ -737,6 +739,7 @@ fn terminal_response(
             RejectKind::TinyGif => (200, "OK", TINY_GIF.to_vec()),
             RejectKind::JsonObject => (200, "OK", b"{}".to_vec()),
             RejectKind::JsonArray => (200, "OK", b"[]".to_vec()),
+            RejectKind::Mp4 => (200, "OK", EMPTY_MP4.to_vec()),
         },
         Terminal::Redirect { status, url } => {
             headers.push(("Location".into(), url.clone()));
@@ -776,6 +779,9 @@ fn terminal_response(
         Terminal::Reject(RejectKind::JsonObject | RejectKind::JsonArray)
     ) {
         headers.push(("Content-Type".into(), "application/json".into()));
+    }
+    if matches!(term, Terminal::Reject(RejectKind::Mp4)) {
+        headers.push(("Content-Type".into(), "video/mp4".into()));
     }
     loon::apply_header_ops(&mut headers, &header_ops.iter().collect::<Vec<_>>());
     if status != 204 {

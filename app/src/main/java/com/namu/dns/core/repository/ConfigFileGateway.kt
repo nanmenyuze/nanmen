@@ -3,6 +3,7 @@ package com.namu.dns.core.repository
 import android.content.Context
 import com.namu.dns.AppConfig
 import com.namu.dns.ConfigFileStore
+import com.namu.dns.ConfigStore
 
 /** 配置文件磁盘访问抽象：仓库只关心“读/写/删/列”，单测可用内存实现。 */
 interface ConfigFileGateway {
@@ -12,6 +13,8 @@ interface ConfigFileGateway {
     fun save(name: String, cfg: AppConfig): Boolean
     fun exists(name: String): Boolean
     fun delete(name: String): Boolean
+    fun importedNodes(name: String): List<com.namu.dns.NodeInfo> = emptyList()
+    fun saveImportedNodes(name: String, nodes: List<com.namu.dns.NodeInfo>): Boolean = false
 }
 
 class AndroidConfigFileGateway(private val context: Context) : ConfigFileGateway {
@@ -23,12 +26,17 @@ class AndroidConfigFileGateway(private val context: Context) : ConfigFileGateway
         }
 
     override fun load(name: String, current: AppConfig): AppConfig? =
-        ConfigFileStore.loadInto(context, name, current)
+        ConfigStore.runProfileFileIo { ConfigFileStore.loadInto(context, name, current) }
 
     override fun save(name: String, cfg: AppConfig): Boolean =
-        ConfigFileStore.save(context, name, cfg)
+        ConfigStore.runProfileFileIo { ConfigFileStore.save(context, name, cfg) }
 
     override fun exists(name: String): Boolean = ConfigFileStore.exists(context, name)
 
     override fun delete(name: String): Boolean = ConfigFileStore.delete(context, name)
+
+    override fun importedNodes(name: String) = ConfigFileStore.importedNodes(context, name)
+
+    override fun saveImportedNodes(name: String, nodes: List<com.namu.dns.NodeInfo>) =
+        ConfigFileStore.saveImportedNodes(context, name, nodes)
 }

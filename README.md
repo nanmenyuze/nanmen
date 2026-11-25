@@ -1,9 +1,15 @@
-# 南门DNS 3.0.6 正式版（内核 1.13.28，versionCode 117）
+# 南门DNS 3.0.12 正式版（内核 1.13.29，versionCode 123）
 
-> 2026-11-25 3.0.6 正式版：在 3.0.5 基础上全量覆盖模块页对齐彩绘版，应用版本提升为 `3.0.6` / `versionCode 117`。模块页改为自绘顶栏与“已安装”分组，模块行使用 40dp 彩色兜底图标，按模块 id 稳定取色；模块声明 `#!icon` 或 JSON 的 `icon / iconUrl / icon-url` 时异步加载图片，失败回退彩色线性图标。模块列表精简为来源、规则数、作者/分类/描述与异常提示，保留点击详情、拖拽排序、启用开关和同步。模块导入与配置导入预览继续只显示“全部可用 / 有 N 个不可用”。内核保持 `nanmen_core 1.13.28`。
+> 2026-11-25 3.0.12 正式版：在 3.0.11 基础上全量覆盖“多 DNS / 规则与重写”增量，应用版本提升为 `3.0.12` / `versionCode 123`，内核升级为 `nanmen_core 1.13.29`。DNS 上游与备用 DNS 均支持最多 8 个有序地址（system、UDP、DoH、DoT 可混排，system 不可与其它混用），主/备各地址按序尝试；新增“跳过代理”域名后缀列表，内核在建连判定中优先直连。规则新增 URL-REGEX、USER-AGENT（含 `*` 通配）、RULE-SET/DOMAIN-SET、DOMAIN-WILDCARD、DST-PORT、GEOIP、FINAL 等类型与扩展匹配/预匹配开关；RULE-SET/DOMAIN-SET 在建连前展开，URL/UA 规则进入 MITM 引擎，新增 `reject-video` 空白 MP4 响应。配置详情页补齐 URL/头部/正文重写、[General]/[MITM] 展示、规则集 URL、远端配置更新、复制/删除/测试规则；配置文件列表增加新建/本地导入/URL 导入入口。模块页修订、运行数据与诊断页、基础配置面板、大圆角与全部消警修复继续保留。
 
 
-> 验收：Rust 356/356、Kotlin 227/227、lint 0 error / 28 warning；双 ABI `.so` 均含 `nanmen_core-1.13.28` 标记；APK v3 签名通过。
+
+
+
+
+
+
+> 验收：Rust 365/365、Kotlin 232/232、lint 0 error / 0 warning / 0 information；双 ABI `.so` 均含 `nanmen_core-1.13.29` 标记；APK v3 签名通过。
 
 # 南门DNS 2.9.2（G2 出口）
 

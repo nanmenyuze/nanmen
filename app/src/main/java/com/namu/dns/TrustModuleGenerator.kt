@@ -3,8 +3,6 @@ package com.namu.dns
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
-import android.os.Build
-import android.os.Environment
 import android.provider.MediaStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -54,7 +52,7 @@ object TrustModuleGenerator {
         return "namu_mitm_ca_${prefix.ifBlank { "unknown" }}.zip"
     }
 
-    /** 生成模块 zip 到公共下载目录（29+ 用 MediaStore，无需存储权限）。 */
+    /** 生成模块 zip 到公共下载目录；minSdk 31 使用 MediaStore，无需存储权限。 */
     suspend fun generate(context: Context, pemPath: String, systemName: String): Result =
         withContext(Dispatchers.IO) {
             try {
@@ -67,38 +65,24 @@ object TrustModuleGenerator {
                 }
                 val bytes = buildModuleBytes(pem.toByteArray(), systemName)
                 val fileName = moduleZipFileName(systemName)
-                if (Build.VERSION.SDK_INT >= 29) {
-                    deleteExistingDownload(context, fileName)
-                    val values = ContentValues().apply {
-                        put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                        put(MediaStore.MediaColumns.MIME_TYPE, "application/zip")
-                        put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/NamuDNS")
-                    }
-                    val uri = context.contentResolver.insert(
-                        MediaStore.Downloads.EXTERNAL_CONTENT_URI, values,
-                    ) ?: return@withContext Result(false, error = "无法在下载目录创建文件")
-                    context.contentResolver.openOutputStream(uri)?.use { out ->
-                        out.write(bytes)
-                    } ?: return@withContext Result(false, error = "写入下载目录失败")
-                    Result(
-                        true,
-                        path = "下载/NamuDNS/$fileName",
-                        fileName = fileName,
-                        fingerprint = systemName.substring(0, 8),
-                    )
-                } else {
-                    val dir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
-                        ?: return@withContext Result(false, error = "无外部存储目录")
-                    val file = File(dir, fileName)
-                    if (file.exists()) file.delete()
-                    file.writeBytes(bytes)
-                    Result(
-                        true,
-                        path = file.absolutePath,
-                        fileName = fileName,
-                        fingerprint = systemName.substring(0, 8),
-                    )
+                deleteExistingDownload(context, fileName)
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, "application/zip")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/NamuDNS")
                 }
+                val uri = context.contentResolver.insert(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI, values,
+                ) ?: return@withContext Result(false, error = "无法在下载目录创建文件")
+                context.contentResolver.openOutputStream(uri)?.use { out ->
+                    out.write(bytes)
+                } ?: return@withContext Result(false, error = "写入下载目录失败")
+                Result(
+                    true,
+                    path = "下载/NamuDNS/$fileName",
+                    fileName = fileName,
+                    fingerprint = systemName.substring(0, 8),
+                )
             } catch (e: Exception) {
                 Result(false, error = e.message ?: "生成失败")
             }

@@ -17,13 +17,22 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Text
+import androidx.compose.material3.IconButton
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.outlined.MoreVert
+import com.namu.dns.AppConfig
+import com.namu.dns.MitmManager
+import com.namu.dns.core.config.ConfigFile
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -39,6 +48,7 @@ import com.namu.dns.Actions
 import com.namu.dns.ConfigFileStore
 import com.namu.dns.ConfigStore
 import com.namu.dns.NamuVpnService
+import com.namu.dns.RuleSource
 import com.namu.dns.RuleItem
 import com.namu.dns.RuleLineParser
 import com.namu.dns.core.ConfigSection
@@ -52,18 +62,18 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 @Composable
-fun ConfigScreen(onOpenQuickEdit: () -> Unit) {
+fun ConfigScreen(onOpenPanel: (String) -> Unit) {
+    var copyFrom by remember { mutableStateOf<String?>(null) }
+    var switching by remember { mutableStateOf(false) }
     var showCreate by remember { mutableStateOf(false) }
     var showImportLocal by remember { mutableStateOf(false) }
     var showImportUrl by remember { mutableStateOf(false) }
-    var addMenu by remember { mutableStateOf(false) }
     var infoFile by remember { mutableStateOf<ConfigFileStore.FileInfo?>(null) }
     var deleteFile by remember { mutableStateOf<ConfigFileStore.FileInfo?>(null) }
-    var revision by remember { mutableStateOf(0) }
+    var revision by remember { mutableIntStateOf(0) }
     val container = LocalAppContainer.current
     val settings = container.settings
     val cfg by settings.config.collectAsStateWithLifecycle()
-    val runtime = container.runtime
     val messages = container.messages
     val context = container.context
     val scope = rememberCoroutineScope()
@@ -72,72 +82,50 @@ fun ConfigScreen(onOpenQuickEdit: () -> Unit) {
         ConfigFileStore.ensureDefault(context, cfg)
         revision++
     }
-    val files = remember(revision) { ConfigFileStore.list(context) }
-    val activeName = container.config.activeName()
+    val activeName by settings.activeProfile.collectAsStateWithLifecycle()
+    val files = remember(revision, activeName) { ConfigFileStore.list(context, activeName) }
 
-    fun activate(name: String, openDetail: Boolean = false) {
-        if (!container.config.switchTo(name)) {
-            messages.show("配置读取失败")
+    fun activate(name: String) {
+        if (switching || name == container.config.activeName()) return
+        if (NamuVpnService.profileSwitchPending()) {
+            messages.show("正在应用上一份配置")
             return
         }
-        revision++
-        messages.show("已切换到 $name")
-        // 配置文件里的 rulesUrl 需要立刻落地，不能等下次冷启动才同步。
-        // 规则同步完成后再进详情，避免 ConfigScreen 被导航销毁时协程一起取消。
-        val ruleUrl = settings.current().rulesUrl
-        if (ruleUrl.isNotBlank()) {
-            scope.launch {
-                try {
-                    val n = Actions.updateAdsRules(ruleUrl)
-                    ConfigStore.rebuildModules(context, settings.current())
-                    if (runtime.current().connected) NamuVpnService.reload(context)
-                    messages.show("规则源已同步：$n 条")
-                } catch (e: Exception) {
-                    messages.show("规则同步失败：${e.message ?: "网络错误"}")
-                } finally {
-                    if (openDetail) onOpenQuickEdit()
+        scope.launch {
+            switching = true
+            try {
+                val problem = container.config.validateProfile(name)
+                if (problem != null) {
+                    messages.show(problem)
+                    return@launch
                 }
+                val target = container.config.loadProfile(name) ?: return@launch
+                if (!prepareProfileCa(target, context)) {
+                    messages.show("CA 准备失败，已保留当前配置")
+                    return@launch
+                }
+                if (!container.config.switchTo(name)) {
+                    messages.show("配置校验失败，已保留当前配置")
+                    return@launch
+                }
+                revision++
+                if (!NamuVpnService.profileSwitchPending() && container.config.activeName() == name) messages.show("已切换到 $name")
+            } finally {
+                switching = false
             }
-        } else if (openDetail) {
-            onOpenQuickEdit()
         }
     }
 
     Column(
         Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
     ) {
-        SectionHeader(
-            text = "配置文件",
-            trailing = {
-                Box {
-                    TextAction("＋") { addMenu = true }
-                    DropdownMenu(
-                        expanded = addMenu,
-                        onDismissRequest = { addMenu = false },
-                        modifier = Modifier.width(128.dp),
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text("新建配置", fontSize = 14.sp) },
-                            modifier = Modifier.height(34.dp),
-                            contentPadding = PaddingValues(horizontal = 12.dp),
-                            onClick = { addMenu = false; showCreate = true },
-                        )
-                        DropdownMenuItem(
-                            text = { Text("本地导入", fontSize = 14.sp) },
-                            modifier = Modifier.height(34.dp),
-                            contentPadding = PaddingValues(horizontal = 12.dp),
-                            onClick = { addMenu = false; showImportLocal = true },
-                        )
-                        DropdownMenuItem(
-                            text = { Text("URL 导入", fontSize = 14.sp) },
-                            modifier = Modifier.height(34.dp),
-                            contentPadding = PaddingValues(horizontal = 12.dp),
-                            onClick = { addMenu = false; showImportUrl = true },
-                        )
-                    }
-                }
-            },
-        )
+        SectionHeader("配置文件")
+        GroupCard {
+            SettingsRow("新建配置", chevron = true, onClick = { showCreate = true })
+            SettingsRow("本地导入", chevron = true, onClick = { showImportLocal = true })
+            SettingsRow("URL 导入", chevron = true, showDivider = false, onClick = { showImportUrl = true })
+        }
+        Spacer(Modifier.height(16.dp))
         GroupCard {
             if (files.isEmpty()) {
                 SettingsRow(title = "暂无配置文件", showDivider = false)
@@ -146,7 +134,9 @@ fun ConfigScreen(onOpenQuickEdit: () -> Unit) {
                     ConfigFileRow(
                         info = f,
                         showDivider = index != files.lastIndex,
-                        onInfo = { infoFile = f },
+                        issue = remember(f, cfg.nodes, revision) { container.config.validateProfile(f.name) },
+                        onActivate = { activate(f.name) },
+                        onInfo = { onOpenPanel(f.name) },
                     )
                 }
             }
@@ -162,7 +152,7 @@ fun ConfigScreen(onOpenQuickEdit: () -> Unit) {
                 showCreate = false
                 if (container.config.create(name)) {
                     revision++
-                    activate(ConfigFileStore.sanitize(name), openDetail = true)
+                    onOpenPanel(ConfigFileStore.sanitize(name))
                 } else {
                     messages.show("已存在同名配置文件")
                 }
@@ -176,7 +166,8 @@ fun ConfigScreen(onOpenQuickEdit: () -> Unit) {
             onDone = { info ->
                 showImportLocal = false
                 showImportUrl = false
-                activate(info.name, openDetail = true)
+                revision++
+                messages.show("已导入 ${info.name}")
             },
             onDismiss = {
                 showImportLocal = false
@@ -193,7 +184,11 @@ fun ConfigScreen(onOpenQuickEdit: () -> Unit) {
             },
             onEdit = {
                 infoFile = null
-                if (f.name == activeName) onOpenQuickEdit() else activate(f.name, openDetail = true)
+                onOpenPanel(f.name)
+            },
+            onCopy = { copyFrom = f.name; infoFile = null },
+            onExport = {
+                scope.launch { exportProfile(f.name) }
             },
             onDelete = {
                 infoFile = null
@@ -204,7 +199,9 @@ fun ConfigScreen(onOpenQuickEdit: () -> Unit) {
                 if (ConfigFileStore.restore(context, f.name)) {
                     // 当前 active 配置回退后，要把回退内容重新套回内存，不能只改磁盘。
                     if (f.name == activeName) {
-                        ConfigFileStore.loadInto(context, f.name, settings.current())?.let { settings.set(it) }
+                        ConfigFileStore.loadInto(context, f.name, settings.current())?.let { restored ->
+                            container.config.saveProfile(f.name) { restored }
+                        }
                     }
                     revision++
                     messages.show("已回退到上一版 ${f.name}")
@@ -213,6 +210,20 @@ fun ConfigScreen(onOpenQuickEdit: () -> Unit) {
                 }
             },
             onDismiss = { infoFile = null },
+        )
+    }
+    copyFrom?.let { source ->
+        ConfigNameDialog(
+            title = "复制配置",
+            initial = source.removeSuffix(".conf") + "-副本.conf",
+            onConfirm = { target ->
+                if (container.config.copyProfile(source, target)) {
+                    copyFrom = null
+                    revision++
+                    messages.show("已复制配置")
+                } else messages.show("复制失败：检查配置名和存储空间")
+            },
+            onDismiss = { copyFrom = null },
         )
     }
     deleteFile?.let { f ->
@@ -238,22 +249,29 @@ fun ConfigScreen(onOpenQuickEdit: () -> Unit) {
 private fun ConfigFileRow(
     info: ConfigFileStore.FileInfo,
     showDivider: Boolean,
+    issue: String?,
+    onActivate: () -> Unit,
     onInfo: () -> Unit,
 ) {
     Row(
         Modifier
             .fillMaxWidth()
-            .clickable(onClick = onInfo)
-            .padding(horizontal = 16.dp, vertical = 13.dp),
+            .padding(start = 16.dp, end = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(Modifier.weight(1f)) {
+        Column(Modifier.weight(1f).clickable(onClick = onActivate).padding(vertical = 12.dp)) {
             Text(info.name, fontSize = 16.sp, color = NamuColors.TextMain)
-            if (info.isDefault) {
+            if (issue != null) {
+                Text("! $issue", fontSize = 12.sp, color = NamuColors.Red)
+            } else if (info.isDefault) {
                 Text("默认配置", fontSize = 12.sp, color = NamuColors.TextSub)
             }
         }
-        if (info.active) CheckMark()
+        // 未激活的行保留蓝勾槽位，所有文件右侧只显示面板入口。
+        Box(Modifier.width(28.dp), contentAlignment = Alignment.Center) {
+            if (info.active) CheckMark()
+        }
+        IconButton(onClick = onInfo) { NamuIcon(Icons.Outlined.Info, "管理 ${info.name}") }
     }
     if (showDivider) RowDivider()
 }
@@ -272,89 +290,145 @@ internal fun SettingsRepository.applyRouting(mode: String, fullRoute: Boolean): 
 }
 
 @Composable
-fun ConfigDetailScreen(onOpenSection: (ConfigSection) -> Unit) {
+fun ConfigDetailScreen(
+    name: String,
+    onOpenSection: (ConfigSection) -> Unit,
+    onOpenRaw: () -> Unit,
+    onDeleted: () -> Unit = {},
+) {
+    val editor = rememberProfileEditor(name) ?: return
+    val cfg = editor.current()
+    val scope = rememberCoroutineScope()
     val container = LocalAppContainer.current
-    val settings = container.settings
-    val cfg by settings.config.collectAsStateWithLifecycle()
+    val context = LocalContext.current
     var showGroups by remember { mutableStateOf(false) }
-    val groupIssues = remember(cfg.proxyGroups, cfg.nodes, cfg.groupSelections) {
-        ProxyGroupValidation.validate(cfg.proxyGroups, cfg.nodes.map { it.name }, cfg.groupSelections)
-    }
-    val errors = groupIssues.count { it.level == com.namu.dns.core.config.ConfigIssueLevel.ERROR }
-    Column(
-        Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
-    ) {
-        SectionHeader("当前配置")
+    var showTest by remember { mutableStateOf(false) }
+    var copyName by remember { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
+    var updating by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState())) {
+        SectionHeader("配置")
         GroupCard {
-            SettingsRow(
-                title = container.config.activeName(),
-                value = "使用中",
-                valueColor = NamuColors.Green,
-                showDivider = false,
-            )
+            SettingsRow("通用", value = configDnsLabel(cfg.dnsUpstream), chevron = true, onClick = { onOpenSection(ConfigSection.General) })
+            SettingsRow("规则", value = "${cfg.rules.size} 条", chevron = true, onClick = { onOpenSection(ConfigSection.Rules) })
+            SettingsRow("Hosts", value = "${cfg.mitm.hostMappings.size} 条", chevron = true, onClick = { onOpenSection(ConfigSection.Hosts) })
+            SettingsRow("URL 重写", value = "${cfg.mitm.urlRewrites.size} 条", chevron = true, onClick = { onOpenSection(ConfigSection.UrlRewrite) })
+            SettingsRow("头部重写", value = "${cfg.mitm.headerRewrites.size} 条", chevron = true, onClick = { onOpenSection(ConfigSection.HeaderRewrite) })
+            SettingsRow("正文重写", value = "${cfg.mitm.bodyRewrites.size} 条", chevron = true, onClick = { onOpenSection(ConfigSection.BodyRewrite) })
+            SettingsRow("HTTPS 解密", value = if (cfg.mitm.enabled) "已开启" else "已关闭", chevron = true, onClick = { onOpenSection(ConfigSection.Https) })
+            SettingsRow("代理分组", value = "${cfg.proxyGroups.size} 个", chevron = true, onClick = { showGroups = true })
+            SettingsRow("高级设置", value = "6 项", chevron = true, showDivider = false, onClick = { onOpenSection(ConfigSection.Advanced) })
         }
-        SectionHeader("配置内容")
+        Spacer(Modifier.height(16.dp))
         GroupCard {
-            SettingsRow(
-                title = ConfigSection.General.title,
-                value = configDnsLabel(cfg.dnsUpstream),
-                chevron = true,
-                onClick = { onOpenSection(ConfigSection.General) },
-            )
-            SettingsRow(
-                title = ConfigSection.Rules.title,
-                value = "${cfg.rules.size} 条自定义规则",
-                chevron = true,
-                onClick = { onOpenSection(ConfigSection.Rules) },
-            )
-            SettingsRow(
-                title = ConfigSection.Sources.title,
-                value = if (cfg.remoteConfigUrl.isNotBlank()) "已配置远端" else null,
-                chevron = true,
-                onClick = { onOpenSection(ConfigSection.Sources) },
-            )
-            SettingsRow(
-                title = "策略组",
-                value = if (errors > 0) "$errors 个错误" else "${cfg.proxyGroups.size} 个",
-                valueColor = if (errors > 0) NamuColors.Red else NamuColors.TextSub,
-                chevron = true,
-                showDivider = false,
-                onClick = { showGroups = true },
-            )
+            SettingsRow("规则集 URL", value = "${cfg.ruleSources.size} 个", chevron = true, onClick = { onOpenSection(ConfigSection.Sources) })
+            if (cfg.remoteConfigUrl.isNotBlank()) {
+                SettingsRow(
+                    "更新配置",
+                    value = if (updating) "更新中…" else "来自 URL",
+                    onClick = {
+                        if (updating) return@SettingsRow
+                        scope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                            updating = true
+                            try {
+                                val conn = java.net.URL(cfg.remoteConfigUrl).openConnection() as java.net.HttpURLConnection
+                                conn.connectTimeout = 15000
+                                conn.readTimeout = 30000
+                                val text = conn.inputStream.bufferedReader().use { it.readText() }
+                                conn.disconnect()
+                                val result = com.namu.dns.core.config.ConfigSourceRegistry.parse(text, cfg)
+                                val parsed = result.config
+                                if (!result.preview.canImport || parsed == null) {
+                                    container.messages.show(result.preview.reason.ifBlank { "远端配置无法导入" })
+                                } else {
+                                    val next = parsed.toAppConfig(cfg).copy(
+                                        remoteConfigUrl = cfg.remoteConfigUrl,
+                                        remoteConfigName = name,
+                                        remoteConfigUpdatedAt = System.currentTimeMillis(),
+                                    )
+                                    if (editor.update { next }) container.messages.show("配置已更新")
+                                    else container.messages.show("配置校验失败，未覆盖当前配置")
+                                }
+                            } catch (e: Exception) {
+                                container.messages.show("更新失败：${e.message ?: "网络错误"}")
+                            } finally { updating = false }
+                        }
+                    },
+                )
+            }
+            SettingsRow("编辑纯文本", chevron = true, onClick = onOpenRaw)
+            SettingsRow("校验配置", onClick = { container.messages.show(container.config.validateProfile(name) ?: "配置校验通过") })
+            SettingsRow("导出配置", showDivider = false, onClick = { scope.launch { exportProfile(name) } })
+        }
+        Spacer(Modifier.height(16.dp))
+        GroupCard {
+            SettingsRow("复制配置", onClick = { copyName = true })
+            SettingsRow("测试规则", showDivider = false, onClick = { showTest = true })
+        }
+        Spacer(Modifier.height(16.dp))
+        GroupCard {
+            SettingsRow("删除配置", valueColor = NamuColors.Red, showDivider = false, onClick = { confirmDelete = true })
         }
         Spacer(Modifier.height(24.dp))
     }
-
     if (showGroups) {
         ProxyGroupsDialog(
             groups = cfg.proxyGroups,
             nodes = cfg.nodes.map { it.name },
             selections = cfg.groupSelections,
+            observeRuntime = editor.isActive,
+            onChange = { groups, selections -> editor.update { it.copy(proxyGroups = groups, groupSelections = selections) } },
             onDismiss = { showGroups = false },
+        )
+    }
+    if (showTest) RuleTestDialog(config = cfg, useRuntimeAssets = editor.isActive, onDismiss = { showTest = false })
+    if (copyName) {
+        ConfigNameDialog(
+            title = "复制配置",
+            initial = name.removeSuffix(".conf") + "-副本.conf",
+            onConfirm = {
+                if (container.config.copyProfile(name, it)) { copyName = false; container.messages.show("已复制配置") }
+                else container.messages.show("复制失败：配置已存在或存储不可用")
+            },
+            onDismiss = { copyName = false },
+        )
+    }
+    if (confirmDelete) {
+        NamuDialog(
+            title = "删除配置？", message = name, confirmText = "删除",
+            onDismiss = { confirmDelete = false },
+            onConfirm = {
+                confirmDelete = false
+                if (container.config.delete(name)) { container.messages.show("已删除配置"); onDeleted() }
+                else container.messages.show("默认配置不能删除")
+            },
         )
     }
 }
 
 @Composable
-fun ConfigSectionScreen(section: ConfigSection, onRestart: () -> Unit) {
+fun ConfigSectionScreen(section: ConfigSection, name: String, onOpenCertificate: () -> Unit) {
+    val editor = rememberProfileEditor(name) ?: return
     when (section) {
-        ConfigSection.General -> ConfigGeneralScreen(onRestart)
-        ConfigSection.Rules -> ConfigRulesScreen(onRestart)
-        ConfigSection.Sources -> ConfigSourcesScreen(onRestart)
+        ConfigSection.General -> ConfigGeneralScreen(editor)
+        ConfigSection.Rules -> ConfigRulesScreen(editor)
+        ConfigSection.Sources -> ConfigSourcesScreen(editor)
+        ConfigSection.Hosts -> ConfigHostsScreen(editor)
+        ConfigSection.UrlRewrite -> ConfigRewriteScreen(editor, "URL 重写")
+        ConfigSection.HeaderRewrite -> ConfigRewriteScreen(editor, "头部重写")
+        ConfigSection.BodyRewrite -> ConfigRewriteScreen(editor, "正文重写")
+        ConfigSection.Https -> ConfigHttpsScreen(editor, onOpenCertificate)
+        ConfigSection.Advanced -> ConfigAdvancedScreen(editor)
     }
 }
 
 @Composable
-private fun ConfigGeneralScreen(onRestart: () -> Unit) {
+private fun ConfigGeneralScreen(settings: ProfileEditor) {
     val container = LocalAppContainer.current
-    val settings = container.settings
-    val cfg by settings.config.collectAsStateWithLifecycle()
-    val runtime = container.runtime
-    val routingMode = RoutingMode.fromConfig(cfg.mode)
-    val filterScope = DirectFilterScope.fromConfig(cfg.mode, cfg.dnsOnlyFullRoute)
-    var showFilterScope by remember { mutableStateOf(false) }
+    val cfg = settings.current()
     var showDns by remember { mutableStateOf(false) }
-    var showHostMap by remember { mutableStateOf(false) }
+    var showFallback by remember { mutableStateOf(false) }
+    var showSkip by remember { mutableStateOf(false) }
 
     Column(
         Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
@@ -379,99 +453,102 @@ private fun ConfigGeneralScreen(onRestart: () -> Unit) {
                     value = cfg.dnsHeaderName,
                 )
             }
+            SettingsRow(title = "备用 DNS", value = configDnsLabel(cfg.dnsFallback), chevron = true, onClick = { showFallback = true })
             SwitchRow(
-                title = "备用 DNS",
+                title = "启用回退",
                 subtitle = "${configDnsLabel(cfg.dnsFallback)} · 关闭后禁止回退",
                 checked = cfg.allowDnsFallback,
             ) {
                 settings.update { current -> current.copy(allowDnsFallback = it) }
-                if (runtime.current().connected) onRestart()
-            }
-            SwitchRow(
-                title = "异常应答复核",
-                subtitle = "使用备用 DNS 复核异常地址",
-                checked = cfg.fallbackFilter,
-            ) {
-                settings.update { current -> current.copy(fallbackFilter = it) }
-                if (runtime.current().connected) onRestart()
-            }
-            SwitchRow(
-                title = "非 CN IP 复核",
-                subtitle = "非中国大陆 IP 也交给备用 DNS 复核",
-                checked = cfg.fallbackGeoCheck,
-            ) {
-                settings.update { current -> current.copy(fallbackGeoCheck = it) }
-                if (runtime.current().connected) onRestart()
             }
             SwitchRow(
                 title = "DNS 查询日志",
                 checked = cfg.dnsQueryLog,
+                showDivider = false,
             ) {
                 settings.update { current -> current.copy(dnsQueryLog = it) }
-                if (runtime.current().connected) onRestart()
             }
-            SwitchRow(
-                title = "关闭 AAAA",
-                subtitle = "适用于仅支持 IPv4 出口的节点",
-                checked = cfg.blockAaaa,
-            ) {
-                settings.update { current -> current.copy(blockAaaa = it) }
-                if (runtime.current().connected) onRestart()
-            }
-            SettingsRow(
-                title = "Host 映射",
-                value = "${cfg.mitm.hostMappings.size} 条",
-                chevron = true,
-                showDivider = false,
-                onClick = { showHostMap = true },
-            )
         }
 
         SectionHeader("连接处理")
         GroupCard {
-            SwitchRow(
-                title = "Fake-IP",
-                subtitle = "仅在接管连接时生效",
-                checked = cfg.fakeIp,
-            ) {
-                settings.update { current -> current.copy(fakeIp = it) }
-                if (runtime.current().connected) onRestart()
-            }
-            SwitchRow(
-                title = "TLS / HTTP 域名嗅探",
-                subtitle = "从连接中识别域名",
-                checked = cfg.sniff,
+            SettingsRow(
+                title = "跳过代理",
+                subtitle = "匹配域名后缀的连接始终直连",
+                value = "${cfg.skipProxyHosts.size} 项",
+                chevron = true,
                 showDivider = false,
-            ) {
-                settings.update { current -> current.copy(sniff = it) }
-                if (runtime.current().connected) onRestart()
-            }
-        }
-        if (routingMode == RoutingMode.Direct) {
-            SectionHeader("过滤")
-            GroupCard {
-                SettingsRow(
-                    title = "过滤范围",
-                    value = filterScope.title,
-                    chevron = true,
-                    showDivider = false,
-                    onClick = { showFilterScope = true },
-                )
-            }
+                onClick = { showSkip = true },
+            )
         }
         Spacer(Modifier.height(24.dp))
     }
 
     if (showDns) {
-        DnsDialog(
+        DnsListDialog(
+            title = "DNS 覆写",
             current = cfg.dnsUpstream,
             onDismiss = { showDns = false },
-            onSelect = { url ->
-                settings.update { current -> current.copy(dnsUpstream = url) }
+            onConfirm = { value ->
+                settings.update { it.copy(dnsUpstream = value) }
                 showDns = false
-                if (runtime.current().connected) onRestart()
             },
         )
+    }
+    if (showFallback) {
+        DnsListDialog(
+            title = "备用 DNS",
+            current = cfg.dnsFallback,
+            onDismiss = { showFallback = false },
+            onConfirm = { value ->
+                settings.update { it.copy(dnsFallback = value) }
+                showFallback = false
+            },
+        )
+    }
+    if (showSkip) {
+        StringListDialog(
+            title = "跳过代理",
+            message = "每行一个域名后缀，匹配连接将直接放行。",
+            initial = cfg.skipProxyHosts,
+            onDismiss = { showSkip = false },
+            onConfirm = { hosts ->
+                settings.update { it.copy(skipProxyHosts = hosts) }
+                showSkip = false
+            },
+        )
+    }
+}
+
+@Composable
+private fun ConfigAdvancedScreen(settings: ProfileEditor) {
+    val cfg = settings.current()
+    var showFilterScope by remember { mutableStateOf(false) }
+    val filterScope = DirectFilterScope.fromConfig(cfg.mode, cfg.dnsOnlyFullRoute)
+    Column(Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState())) {
+        SectionHeader("高级设置")
+        GroupCard {
+            SwitchRow("关闭 AAAA", subtitle = "只返回 IPv4 地址", checked = cfg.blockAaaa) {
+                settings.update { current -> current.copy(blockAaaa = it) }
+            }
+            SwitchRow("异常应答复核", subtitle = "使用备用 DNS 复核异常地址", checked = cfg.fallbackFilter) {
+                settings.update { current -> current.copy(fallbackFilter = it) }
+            }
+            SwitchRow("非 CN IP 复核", subtitle = "非中国大陆 IP 也交给备用 DNS 复核", checked = cfg.fallbackGeoCheck) {
+                settings.update { current -> current.copy(fallbackGeoCheck = it) }
+            }
+            SwitchRow("Fake-IP", subtitle = "仅在接管连接时生效", checked = cfg.fakeIp) {
+                settings.update { current -> current.copy(fakeIp = it) }
+            }
+            SwitchRow("TLS / HTTP 域名嗅探", subtitle = "从连接中识别域名", checked = cfg.sniff, showDivider = false) {
+                settings.update { current -> current.copy(sniff = it) }
+            }
+        }
+        SectionHeader("过滤")
+        GroupCard {
+            SettingsRow("过滤范围", value = filterScope.title, chevron = true, showDivider = false, onClick = { showFilterScope = true })
+        }
+        Spacer(Modifier.height(24.dp))
     }
     if (showFilterScope) {
         ChoiceDialog(
@@ -483,417 +560,262 @@ private fun ConfigGeneralScreen(onRestart: () -> Unit) {
                 showFilterScope = false
                 val selected = DirectFilterScope.valueOf(key)
                 val current = settings.current()
-                // 连接层过滤始终全量接管，保留原有 DNS-only 开关供切回时使用。
                 val fullRoute = if (selected == DirectFilterScope.Connections) current.dnsOnlyFullRoute else selected.fullRoute
-                if (settings.applyRouting(selected.mode, fullRoute) && runtime.current().connected) onRestart()
+                settings.update {
+                    it.copy(mode = selected.mode, dnsOnlyFullRoute = fullRoute, finalPolicy = if (selected.mode == DirectFilterScope.Connections.mode && it.mode != selected.mode) "direct" else it.finalPolicy)
+                }
             },
             onDismiss = { showFilterScope = false },
         )
     }
-    if (showHostMap) {
-        HostMapDialog(
-            initial = cfg.mitm.hostMappings,
-            onDismiss = { showHostMap = false },
-            onDone = { map ->
-                // Host 是配置态：写回后走一次热重载，新 DNS 引擎不继承旧缓存。
-                settings.update { current -> current.copy(mitm = current.mitm.copy(hostMappings = map)) }
-                showHostMap = false
-                if (runtime.current().connected) onRestart()
-            },
-        )
-    }
 }
 
 @Composable
-private fun ConfigRulesScreen(onRestart: () -> Unit) {
+private fun ConfigRulesScreen(settings: ProfileEditor) {
     val container = LocalAppContainer.current
-    val settings = container.settings
-    val cfg by settings.config.collectAsStateWithLifecycle()
-    val runtime = container.runtime
-    val messages = container.messages
     val scope = rememberCoroutineScope()
-    var showBlockMode by remember { mutableStateOf(false) }
-    var showFinalPolicy by remember { mutableStateOf(false) }
+    val cfg = settings.current()
     var showAddRule by remember { mutableStateOf(false) }
-    var ruleAddMenu by remember { mutableStateOf(false) }
-    var showRuleImportLocal by remember { mutableStateOf(false) }
-    var showRuleImportUrl by remember { mutableStateOf(false) }
+    var editRuleIndex by remember { mutableStateOf<Int?>(null) }
     var ruleQuery by remember { mutableStateOf("") }
-    var showCustomAds by remember { mutableStateOf(false) }
-    var updatingIp by remember { mutableStateOf(false) }
-    var showTest by remember { mutableStateOf(false) }
-    var showReset by remember { mutableStateOf(false) }
+    var manageMode by remember { mutableStateOf(false) }
+    var manageMenu by remember { mutableStateOf(false) }
+    var selected by remember { mutableStateOf(setOf<Int>()) }
 
-    Column(
-        Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
-    ) {
-        Spacer(Modifier.height(12.dp))
-        GroupCard {
-            SettingsRow(title = "测试规则", chevron = true, showDivider = false, onClick = { showTest = true })
-        }
-
-        SectionHeader("拦截")
-        GroupCard {
-            SwitchRow(
-                title = "订阅广告规则",
-                subtitle = "仅控制订阅规则文件，自定义规则的拦截不受影响",
-                checked = cfg.blockEnabled,
-            ) {
-                settings.update { current -> current.copy(blockEnabled = it) }
-                if (runtime.current().connected) onRestart()
-            }
-            SettingsRow(
-                title = "拦截响应",
-                value = if (cfg.blockMode == "zero") "0.0.0.0" else "NXDOMAIN",
-                chevron = true,
-                onClick = { showBlockMode = true },
-            )
-            SettingsRow(
-                title = "拦截 TTL",
-                subtitle = "拦截结果的缓存时长",
-                value = "${cfg.blockTtl} 秒",
-                chevron = true,
-                onClick = {
-                    val next = when (cfg.blockTtl) {
-                        15 -> 30
-                        30 -> 60
-                        60 -> 120
-                        120 -> 300
-                        else -> 15
-                    }
-                    settings.update { current -> current.copy(blockTtl = next) }
-                    if (runtime.current().connected) onRestart()
-                },
-            )
-            SettingsRow(
-                title = "本地拦截域名",
-                showDivider = false,
-                value = "${cfg.customAds.size} 条",
-                chevron = true,
-                onClick = { showCustomAds = true },
-            )
-        }
-
-        SectionHeader("分流")
-        GroupCard {
-            SwitchRow(
-                title = "国内域名 / IP 直连",
-                checked = cfg.cnDirect,
-            ) {
-                settings.update { current -> current.copy(cnDirect = it) }
-                if (runtime.current().connected) onRestart()
-            }
-            SettingsRow(
-                title = "最终策略",
-                subtitle = "所有规则都未命中时的处理方式",
-                value = when {
-                    cfg.finalPolicy == "direct" -> "全部直连"
-                    cfg.finalPolicy.startsWith("node:") -> "节点 ${cfg.finalPolicy.removePrefix("node:")}"
-                    else -> "走代理节点"
-                },
-                chevron = true,
-                onClick = { showFinalPolicy = true },
-            )
-            SettingsRow(
-                title = "国内 IP 库",
-                showDivider = false,
-                value = if (updatingIp) "更新中…" else "更新",
-                onClick = {
-                    if (!updatingIp) {
-                        scope.launch {
-                            updatingIp = true
-                            try {
-                                val n = Actions.updateCnIp("https://raw.githubusercontent.com/17mon/china_ip_list/master/china_ip_list.txt")
-                                messages.show("国内 IP 库已更新：$n 条")
-                                if (runtime.current().connected) onRestart()
-                            } catch (e: Exception) {
-                                messages.show("更新失败：${e.message}")
-                            } finally {
-                                updatingIp = false
+    Column(Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState())) {
+        SectionHeader(
+            "规则",
+            trailing = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (manageMode) {
+                        TextAction("完成") { manageMode = false; selected = emptySet() }
+                    } else {
+                        TextAction("＋") { showAddRule = true }
+                        Box {
+                            IconButton(onClick = { manageMenu = true }) { NamuIcon(Icons.Outlined.MoreVert, "管理规则") }
+                            DropdownMenu(expanded = manageMenu, onDismissRequest = { manageMenu = false }) {
+                                DropdownMenuItem(text = { Text("选择规则") }, onClick = {
+                                    manageMenu = false; manageMode = true; selected = emptySet()
+                                })
+                                DropdownMenuItem(text = { Text("全选") }, onClick = {
+                                    manageMenu = false; manageMode = true; selected = cfg.rules.indices.toSet()
+                                })
                             }
                         }
                     }
-                },
-            )
-        }
-
-        SectionHeader(
-            "自定义规则",
-            trailing = {
-                Box {
-                    TextAction("＋") { ruleAddMenu = true }
-                    DropdownMenu(
-                        expanded = ruleAddMenu,
-                        onDismissRequest = { ruleAddMenu = false },
-                        modifier = Modifier.width(128.dp),
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text("添加规则", fontSize = 14.sp) },
-                            modifier = Modifier.height(34.dp),
-                            contentPadding = PaddingValues(horizontal = 12.dp),
-                            onClick = { ruleAddMenu = false; showAddRule = true },
-                        )
-                        DropdownMenuItem(
-                            text = { Text("本地导入", fontSize = 14.sp) },
-                            modifier = Modifier.height(34.dp),
-                            contentPadding = PaddingValues(horizontal = 12.dp),
-                            onClick = { ruleAddMenu = false; showRuleImportLocal = true },
-                        )
-                        DropdownMenuItem(
-                            text = { Text("URL 导入", fontSize = 14.sp) },
-                            modifier = Modifier.height(34.dp),
-                            contentPadding = PaddingValues(horizontal = 12.dp),
-                            onClick = { ruleAddMenu = false; showRuleImportUrl = true },
-                        )
-                    }
                 }
             },
         )
-        if (cfg.rules.isNotEmpty()) {
-            NamuTextField(
-                value = ruleQuery,
-                onChange = { ruleQuery = it },
-                placeholder = "搜索规则（类型/值/动作）",
-                singleLine = true,
-                modifier = Modifier.padding(horizontal = 12.dp),
-            )
-            Spacer(Modifier.height(8.dp))
-        }
+        NamuTextField(
+            value = ruleQuery,
+            onChange = { ruleQuery = it },
+            placeholder = "搜索规则",
+            singleLine = true,
+            modifier = Modifier.padding(horizontal = 12.dp),
+        )
+        Spacer(Modifier.height(8.dp))
         GroupCard {
-            if (cfg.rules.isEmpty()) {
-                SettingsRow(
-                    title = "暂无自定义规则",
-                    showDivider = false,
+            val visibleRules = cfg.rules.withIndex().filter { (_, rule) ->
+                ruleQuery.isBlank() || rule.type.contains(ruleQuery, true) ||
+                    rule.value.contains(ruleQuery, true) || rule.action.contains(ruleQuery, true)
+            }
+            if (visibleRules.isEmpty()) {
+                SettingsRow(title = if (cfg.rules.isEmpty()) "暂无规则" else "没有匹配的规则", showDivider = false)
+            }
+            visibleRules.forEachIndexed { index, (position, rule) ->
+                ConfigRuleRow(
+                    rule = rule,
+                    selected = position in selected,
+                    managing = manageMode,
+                    showDivider = index != visibleRules.lastIndex,
+                    onClick = {
+                        if (manageMode) {
+                            selected = if (position in selected) selected - position else selected + position
+                        } else editRuleIndex = position
+                    },
                 )
-            } else {
-                val visibleRules = cfg.rules.filter {
-                    ruleQuery.isBlank() ||
-                        it.type.contains(ruleQuery, ignoreCase = true) ||
-                        it.value.contains(ruleQuery, ignoreCase = true) ||
-                        it.action.contains(ruleQuery, ignoreCase = true)
-                }
-                if (visibleRules.isEmpty()) {
-                    SettingsRow(title = "没有匹配的规则", showDivider = false)
-                }
-                visibleRules.forEachIndexed { index, rule ->
-                    RuleRow(
-                        rule = rule,
-                        showDivider = index != visibleRules.lastIndex,
-                        onToggle = {
-                            settings.update { current ->
-                                current.copy(rules = current.rules.map {
-                                    if (it.type == rule.type && it.value == rule.value && it.action == rule.action) {
-                                        it.copy(enabled = !it.enabled)
-                                    } else it
-                                })
-                            }
-                            if (runtime.current().connected) onRestart()
-                        },
-                        onDelete = {
-                            settings.update { current -> current.copy(
-                                rules = current.rules.filterNot {
-                                    it.type == rule.type && it.value == rule.value && it.action == rule.action
-                                },
-                            ) }
-                            if (runtime.current().connected) onRestart()
-                        },
-                    )
-                }
             }
         }
-
-        SectionHeader("重置")
-        GroupCard {
-            SettingsRow(
-                title = "重置路由设置",
-                chevron = true,
-                showDivider = false,
-                onClick = { showReset = true },
-            )
+        if (manageMode) {
+            Spacer(Modifier.height(12.dp))
+            GroupCard {
+                SettingsRow(
+                    "删除所选",
+                    value = "${selected.size} 条",
+                    valueColor = NamuColors.Red,
+                    showDivider = false,
+                    onClick = {
+                        if (selected.isNotEmpty()) {
+                            settings.update { current -> current.copy(rules = current.rules.filterIndexed { i, _ -> i !in selected }) }
+                            selected = emptySet()
+                            manageMode = false
+                        }
+                    },
+                )
+            }
         }
         Spacer(Modifier.height(24.dp))
     }
 
-    if (showBlockMode) {
-        ChoiceDialog(
-            title = "拦截响应",
-            message = "命中广告规则时返回哪种 DNS 结果",
-            options = listOf("nxdomain" to "NXDOMAIN（域名不存在）", "zero" to "0.0.0.0（空地址）"),
-            selected = cfg.blockMode,
-            onSelect = { key ->
-                settings.update { current -> current.copy(blockMode = key) }
-                showBlockMode = false
-                if (runtime.current().connected) onRestart()
-            },
-            onDismiss = { showBlockMode = false },
-        )
-    }
-    if (showFinalPolicy) {
-        ChoiceDialog(
-            title = "最终策略",
-            message = "所有规则都未命中时如何处理流量",
-            options = listOf("proxy" to "走当前节点", "direct" to "全部直连") +
-                cfg.proxyGroups.map { it.name to "策略组：${it.name}" },
-            selected = cfg.finalPolicy,
-            onSelect = { key ->
-                settings.update { current -> current.copy(finalPolicy = key) }
-                showFinalPolicy = false
-                if (runtime.current().connected) onRestart()
-            },
-            onDismiss = { showFinalPolicy = false },
-        )
-    }
-    if (showAddRule) {
+    if (showAddRule || editRuleIndex != null) {
+        val targetIndex = editRuleIndex
         AddRuleDialog(
             groups = cfg.proxyGroups.map { it.name },
-            onDismiss = { showAddRule = false },
+            initial = targetIndex?.let(cfg.rules::getOrNull),
+            onDismiss = { showAddRule = false; editRuleIndex = null },
             onAdd = { item ->
-                settings.update { current -> current.copy(rules = current.rules + item) }
-                showAddRule = false
-                if (runtime.current().connected) onRestart()
-            },
-        )
-    }
-    if (showRuleImportLocal || showRuleImportUrl) {
-        RuleImportDialog(
-            urlMode = showRuleImportUrl,
-            onDismiss = {
-                showRuleImportLocal = false
-                showRuleImportUrl = false
-            },
-            onImport = { imported: List<RuleItem> ->
-                val existing = settings.current().rules.map { Triple(it.type, it.value, it.action) }.toSet()
-                val additions = imported
-                    .filter { Triple(it.type, it.value, it.action) !in existing }
-                    .distinctBy { Triple(it.type, it.value, it.action) }
-                settings.update { current -> current.copy(rules = current.rules + additions) }
-                showRuleImportLocal = false
-                showRuleImportUrl = false
-                messages.show("已导入 ${additions.size} 条规则")
-                if (runtime.current().connected) onRestart()
-            },
-        )
-    }
-    if (showCustomAds) {
-        CustomAdsDialog(
-            onDismiss = { showCustomAds = false },
-            onDone = {
-                showCustomAds = false
-                if (runtime.current().connected) onRestart()
-            },
-        )
-    }
-    if (showTest) {
-        RuleTestDialog(onDismiss = { showTest = false })
-    }
-    if (showReset) {
-        NamuDialog(
-            title = "重置路由设置",
-            message = "当前配置将切到「仅过滤」，最终策略设为直连。",
-            confirmText = "重置",
-            confirmColor = NamuColors.Red,
-            onDismiss = { showReset = false },
-            onConfirm = {
-                settings.update { it.copy(mode = "dns_only", finalPolicy = "direct") }
-                ConfigStore.rebuildModules(container.context, settings.current())
-                showReset = false
-                if (runtime.current().connected) onRestart()
+                fun persist(): Boolean {
+                    val saved = settings.update { current ->
+                        val list = if (targetIndex == null) current.rules + item
+                        else current.rules.mapIndexed { index, old -> if (index == targetIndex) item else old }
+                        current.copy(rules = list)
+                    }
+                    if (saved) { showAddRule = false; editRuleIndex = null }
+                    return saved
+                }
+                if ((item.type == "RULE-SET" || item.type == "DOMAIN-SET") && item.value.startsWith("http")) {
+                    scope.launch {
+                        try {
+                            val content = Actions.fetchText(item.value, maxBytes = 8 * 1024 * 1024)
+                            ConfigStore.ruleSetFile(container.context, item.value).writeText(content)
+                            if (persist()) container.messages.show("规则集已下载并保存")
+                        } catch (e: Exception) {
+                            container.messages.show("规则集下载失败：${e.message ?: "网络错误"}")
+                        }
+                    }
+                } else persist()
             },
         )
     }
 }
 
 @Composable
-private fun ConfigSourcesScreen(onRestart: () -> Unit) {
-    val container = LocalAppContainer.current
-    val settings = container.settings
-    val cfg by settings.config.collectAsStateWithLifecycle()
-    val runtime = container.runtime
-    var showRemote by remember { mutableStateOf(false) }
-    var showRuleSources by remember { mutableStateOf(false) }
-    var showRulesUpdate by remember { mutableStateOf(false) }
-
-    Column(
-        Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
+private fun ConfigRuleRow(
+    rule: RuleItem,
+    selected: Boolean,
+    managing: Boolean,
+    showDivider: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        SectionHeader("远端配置")
-        GroupCard {
-            SettingsRow(
-                title = "远端配置",
-                subtitle = if (cfg.remoteConfigUrl.isBlank()) {
-                    null
-                } else {
-                    "${cfg.remoteConfigName.ifBlank { "已配置" }} · ${formatAgo(cfg.remoteConfigUpdatedAt)}"
-                },
-                value = if (cfg.remoteConfigUrl.isBlank()) "未配置" else "已同步",
-                valueColor = if (cfg.remoteConfigUrl.isBlank()) NamuColors.Orange else NamuColors.Green,
-                chevron = true,
-                onClick = { showRemote = true },
+        Column(Modifier.weight(1f)) {
+            Text(rule.value, color = if (rule.enabled) NamuColors.TextMain else NamuColors.TextSub, fontSize = 16.sp)
+            Text(
+                "${rule.type} · ${rule.action}" + (if (rule.extendedMatch) " · 扩展匹配" else "") + (if (rule.preMatch) " · 预匹配" else ""),
+                color = NamuColors.TextSub,
+                fontSize = 12.sp,
             )
-            SwitchRow(
-                title = "自动更新",
-                subtitle = if (cfg.remoteConfigUrl.isNotBlank()) "按远端配置的间隔检查" else "手动规则 URL 每 12 小时更新",
-                checked = cfg.autoUpdateRules,
-                showDivider = false,
-            ) {
-                settings.update { current -> current.copy(autoUpdateRules = it) }
+        }
+        if (managing) Text(if (selected) "✓" else "○", color = if (selected) NamuColors.Blue else NamuColors.TextSub, fontSize = 20.sp)
+        else Text("›", color = NamuColors.TextSub, fontSize = 22.sp)
+    }
+    if (showDivider) RowDivider()
+}
+
+@Composable
+private fun ConfigSourcesScreen(settings: ProfileEditor) {
+    val cfg = settings.current()
+    val messages = LocalAppContainer.current.messages
+    val scope = rememberCoroutineScope()
+    var field by remember { mutableStateOf<String?>(null) }
+    var editingSource by remember { mutableStateOf<RuleSource?>(null) }
+    var address by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    var lastResult by remember { mutableStateOf<String?>(null) }
+
+    fun edit(title: String, initial: String, source: RuleSource? = null) {
+        field = title
+        address = initial
+        editingSource = source
+    }
+
+    fun runUpdate(task: suspend () -> String) {
+        if (busy) return
+        scope.launch {
+            busy = true
+            try {
+                lastResult = task()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                lastResult = e.message ?: "同步失败"
+            } finally {
+                settings.refresh()
+                busy = false
             }
         }
+    }
 
-        SectionHeader("规则来源")
+    Column(Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState())) {
+        SectionHeader("规则来源", trailing = { TextAction("＋") { edit("规则集 URL", "") } })
         GroupCard {
-            SettingsRow(
-                title = "规则集",
-                showDivider = cfg.ruleSources.isEmpty(),
-                subtitle = if (cfg.ruleSources.isEmpty()) {
-                    null
-                } else {
-                    "${cfg.ruleSources.sumOf { it.lines }} 行"
-                },
-                value = if (cfg.ruleSources.isEmpty()) "无" else "${cfg.ruleSources.size} 个",
-                chevron = true,
-                onClick = { showRuleSources = true },
-            )
-            if (cfg.ruleSources.isEmpty()) {
+            cfg.ruleSources.forEach { source ->
                 SettingsRow(
-                    title = "手动规则 URL",
-                    value = if (cfg.rulesUrl.isBlank()) "未设置" else "已设置",
+                    title = source.id,
+                    subtitle = source.error.ifBlank { source.url },
+                    value = if (!source.enabled) "已停用" else if (source.updatedAt > 0) formatAgo(source.updatedAt) else "待同步",
                     chevron = true,
-                    showDivider = false,
-                    onClick = { showRulesUpdate = true },
+                    onClick = { edit("规则集 URL", source.url, source) },
                 )
             }
+            SettingsRow("手动规则 URL", subtitle = cfg.rulesUrl.ifBlank { null },
+                value = if (cfg.rulesUpdatedAt > 0) formatAgo(cfg.rulesUpdatedAt) else null, chevron = true,
+                onClick = { edit("手动规则 URL", cfg.rulesUrl) })
+            SettingsRow("同步规则源", value = if (busy) "处理中" else null, chevron = true, showDivider = false, onClick = {
+                if (cfg.ruleSources.any { it.enabled }) {
+                    runUpdate {
+                        val result = Actions.syncRuleSources(profileName = settings.name)
+                        "已更新 ${result.updated} 个来源" + result.errors.firstOrNull()?.let { " · $it" }.orEmpty()
+                    }
+                } else if (cfg.ruleSources.isNotEmpty()) messages.show("请先启用一个规则来源")
+                else if (cfg.rulesUrl.isNotBlank()) runUpdate {
+                    "已同步 ${Actions.updateAdsRules(cfg.rulesUrl, settings.name)} 条规则"
+                } else messages.show("请先添加规则来源")
+            })
         }
-
-        Spacer(Modifier.height(24.dp))
+        lastResult?.let { result ->
+            Text(result, modifier = Modifier.padding(18.dp), color = NamuColors.TextSub, fontSize = 13.sp)
+        }
     }
 
-    if (showRemote) {
-        RemoteConfigDialog(
-            onDismiss = { showRemote = false },
-            onDone = {
-                showRemote = false
-                if (runtime.current().connected) onRestart()
+    field?.let { title ->
+        val source = editingSource
+        val input = address.trim()
+        val uri = runCatching { java.net.URI(input) }.getOrNull()
+        val valid = (input.isEmpty() && title != "规则集 URL") ||
+            (uri?.scheme in setOf("http", "https") && !uri?.host.isNullOrBlank())
+        var enabled by remember(title, source?.id) { mutableStateOf(source?.enabled ?: true) }
+        NamuDialog(
+            title = title,
+            confirmText = "保存",
+            confirmEnabled = valid,
+            onDismiss = { field = null },
+            onConfirm = {
+                val saved = settings.update { current -> when (title) {
+                    "远端配置 URL" -> if (input == current.remoteConfigUrl) current else current.copy(remoteConfigUrl = input, remoteConfigName = "", remoteConfigUpdatedAt = 0)
+                    "手动规则 URL" -> if (input == current.rulesUrl) current else current.copy(rulesUrl = input, rulesUpdatedAt = 0)
+                    else -> {
+                        val next = if (source != null && source.url == input) source.copy(enabled = enabled)
+                        else RuleSource(id = source?.id ?: "source_${java.util.UUID.randomUUID().toString().take(12)}", url = input, enabled = enabled)
+                        current.copy(ruleSources = if (source == null) current.ruleSources + next else current.ruleSources.map { if (it.id == source.id) next else it })
+                    }
+                } }
+                if (saved) field = null
             },
-        )
-    }
-    if (showRuleSources) {
-        RuleSourcesDialog(
-            onDismiss = { showRuleSources = false },
-            onDone = {
-                showRuleSources = false
-                if (runtime.current().connected) onRestart()
-            },
-        )
-    }
-    if (showRulesUpdate) {
-        RulesUpdateDialog(
-            onDismiss = { showRulesUpdate = false },
-            onDone = {
-                showRulesUpdate = false
-                if (runtime.current().connected) onRestart()
-            },
-        )
+        ) {
+            NamuTextField(address, { address = it }, "https://…", singleLine = true)
+            if (title == "规则集 URL") {
+                SwitchRow("启用规则集", checked = enabled) { enabled = it }
+                if (source != null) {
+                    TextAction("删除来源") {
+                        if (settings.update { it.copy(ruleSources = it.ruleSources.filterNot { entry -> entry.id == source.id }) }) field = null
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -999,21 +921,34 @@ private fun RuleImportDialog(
 }
 
 @Composable
-private fun RuleRow(rule: RuleItem, showDivider: Boolean, onToggle: () -> Unit, onDelete: () -> Unit) {
+private fun RuleRow(
+    rule: RuleItem,
+    showDivider: Boolean,
+    onEdit: () -> Unit,
+    onToggle: () -> Unit,
+    onDelete: () -> Unit,
+    onMove: (Int) -> Unit,
+    canMoveUp: Boolean,
+    canMoveDown: Boolean,
+) {
+    var menu by remember { mutableStateOf(false) }
     SettingsRow(
         title = rule.value,
         subtitle = ruleTypeLabel(rule.type) + if (!rule.enabled) " · 已禁用" else "",
         showDivider = showDivider,
+        chevron = true,
+        onClick = onEdit,
         rightContent = {
-            Text(
-                actionLabel(rule.action),
-                fontSize = 13.sp,
-                color = if (rule.enabled) actionColor(rule.action) else NamuColors.TextTertiary,
-            )
-            Spacer(Modifier.width(8.dp))
-            IosSwitch(checked = rule.enabled, onCheckedChange = { onToggle() })
-            Spacer(Modifier.width(8.dp))
-            MiniTextAction("删除", color = NamuColors.Red) { onDelete() }
+            Text(actionLabel(rule.action), fontSize = 13.sp, color = if (rule.enabled) actionColor(rule.action) else NamuColors.TextTertiary)
+            Box {
+                IconButton(onClick = { menu = true }) { NamuIcon(Icons.Outlined.MoreVert, "规则操作") }
+                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                    DropdownMenuItem(text = { Text(if (rule.enabled) "停用" else "启用") }, onClick = { menu = false; onToggle() })
+                    DropdownMenuItem(text = { Text("上移") }, enabled = canMoveUp, onClick = { menu = false; onMove(-1) })
+                    DropdownMenuItem(text = { Text("下移") }, enabled = canMoveDown, onClick = { menu = false; onMove(1) })
+                    DropdownMenuItem(text = { Text("删除") }, onClick = { menu = false; onDelete() })
+                }
+            }
         },
     )
 }

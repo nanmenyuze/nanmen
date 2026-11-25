@@ -1,5 +1,7 @@
 package com.namu.dns
 
+import com.namu.dns.core.config.ConfigDnsInput
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -33,5 +35,24 @@ class AppConfigDnsRouteTest {
         val cfg = AppConfig().copy(dnsOnlyFullRoute = false)
         val back = AppConfig.fromJson(cfg.toJson().toString())
         assertFalse(back.dnsOnlyFullRoute)
+    }
+
+    @Test
+    fun `rule flags and skip proxy survive json roundtrip`() {
+        val original = AppConfig(
+            rules = listOf(RuleItem("DOMAIN-SUFFIX", "example.com", "block", extendedMatch = true, preMatch = true)),
+            skipProxyHosts = listOf("direct.example"),
+        )
+        val restored = AppConfig.fromJson(original.toJson().toString())
+        assertTrue(restored.rules.single().extendedMatch)
+        assertTrue(restored.rules.single().preMatch)
+        assertEquals(listOf("direct.example"), restored.skipProxyHosts)
+    }
+
+    @Test
+    fun `multiple dns addresses are validated individually`() {
+        assertEquals(null, ConfigDnsInput.error("223.5.5.5,https://dns.example/dns-query"))
+        assertTrue(ConfigDnsInput.error("223.5.5.5,not a host") != null)
+        assertTrue(ConfigDnsInput.error("system,223.5.5.5") != null)
     }
 }

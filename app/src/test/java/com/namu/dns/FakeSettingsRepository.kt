@@ -13,7 +13,11 @@ class FakeSettingsRepository(initial: AppConfig = AppConfig()) : SettingsReposit
     private var stamp = -1
     private var defaultMigrated = false
     private var adsMigrated = false
-    private var active = "default.conf"
+    private val _activeProfile = MutableStateFlow("default.conf")
+    override val activeProfile = _activeProfile
+    private var active: String
+        get() = _activeProfile.value
+        set(value) { _activeProfile.value = value }
     private var pending = false
     private var mode = "opportunistic"
     private var host = ""

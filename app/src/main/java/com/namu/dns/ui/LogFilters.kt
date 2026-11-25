@@ -54,7 +54,7 @@ fun LogFilterBar(
         Modifier
             .fillMaxWidth()
             .padding(horizontal = 12.dp, vertical = 2.dp)
-            .clip(RoundedCornerShape(12.dp))
+            .clip(RoundedCornerShape(NamuTokens.RadiusControl))
             .background(NamuColors.Card)
             .padding(horizontal = 12.dp, vertical = 10.dp),
     ) {

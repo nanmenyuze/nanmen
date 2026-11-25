@@ -101,7 +101,7 @@ fun AddNodeDialog(onDismiss: () -> Unit, onDone: (NodeInfo) -> Unit) {
                     Modifier.weight(1f)
                         .background(
                             if (type == key) NamuColors.Brand.copy(alpha = 0.10f) else NamuColors.Fill,
-                            RoundedCornerShape(9.dp),
+                            RoundedCornerShape(NamuTokens.RadiusControl),
                         )
                         .clickable { type = key; error = null }
                         .padding(vertical = 11.dp),

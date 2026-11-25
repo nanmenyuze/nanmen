@@ -59,6 +59,9 @@ pub struct Config {
     /// 对 TCP 连接嗅探 TLS SNI / HTTP Host；443 优先使用 SNI，不依赖 DNS 反向映射。
     #[serde(default = "default_true")]
     pub sniff: bool,
+    /// 当前配置的域名后缀绕过列表，优先于普通分流规则直连。
+    #[serde(default)]
+    pub skip_proxy: Vec<String>,
     /// 拦截 DoT/DoQ（853）迫使系统私人 DNS 回落到 VPN 下发的 53 端口。
     #[serde(default = "default_true")]
     pub block_dot: bool,
@@ -115,6 +118,7 @@ impl Default for Config {
             fake_ip: false,
             fake_ip_file: None,
             sniff: true,
+            skip_proxy: Vec::new(),
             block_dot: true,
             mitm: crate::mitm::MitmConfig::default(),
             mtu: default_mtu(),

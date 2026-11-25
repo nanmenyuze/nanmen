@@ -19,6 +19,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import org.json.JSONObject
@@ -60,6 +61,35 @@ class NamuVpnService : VpnService() {
         @Volatile private var alive = false
 
         fun isRunning(): Boolean = alive
+
+        private data class ProfileSwitch(val target: String, val oldName: String, val oldConfig: AppConfig)
+
+        @Volatile private var pendingProfileSwitch: ProfileSwitch? = null
+
+        fun profileSwitchPending(): Boolean = pendingProfileSwitch != null
+
+        internal fun reloadProfile(context: android.content.Context, target: String, oldName: String, oldConfig: AppConfig) {
+            val switching = ProfileSwitch(target, oldName, oldConfig)
+            pendingProfileSwitch = switching
+            try {
+                context.startService(Intent(context, NamuVpnService::class.java).setAction(ACTION_RELOAD))
+            } catch (_: Exception) {
+                restoreProfile(switching)
+            }
+        }
+
+        private fun restoreProfile(switching: ProfileSwitch) {
+            if (pendingProfileSwitch != switching) return
+            pendingProfileSwitch = null
+            val container = App.container
+            if (container.settings.activeConfigName() != switching.target) return
+            val current = container.settings.current()
+            val restored = com.namu.dns.core.config.ConfigFile.fromAppConfig(switching.oldConfig)
+                .toAppConfig(current.copy(nodes = switching.oldConfig.nodes, selected = switching.oldConfig.selected))
+            container.settings.applySavedProfile(switching.oldName, restored)
+            ConfigStore.rebuildModules(container.context, restored)
+            container.messages.show("配置应用失败，已恢复 ${switching.oldName}")
+        }
 
         fun reload(context: android.content.Context) {
             try {
@@ -175,28 +205,26 @@ class NamuVpnService : VpnService() {
     }
 
     private fun createChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val manager = getSystemService(NotificationManager::class.java)
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                getString(R.string.vpn_channel),
-                NotificationManager.IMPORTANCE_LOW,
-            ).apply {
-                description = "DNS 过滤与分流运行状态"
-                setShowBadge(false)
-            }
-            manager.createNotificationChannel(channel)
-            manager.createNotificationChannel(
-                NotificationChannel(
-                    SCRIPT_CHANNEL_ID,
-                    "脚本通知",
-                    NotificationManager.IMPORTANCE_DEFAULT,
-                ).apply {
-                    description = "模块脚本通过 \$notification.post 发出的提醒"
-                    setShowBadge(true)
-                },
-            )
+        val manager = getSystemService(NotificationManager::class.java)
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            getString(R.string.vpn_channel),
+            NotificationManager.IMPORTANCE_LOW,
+        ).apply {
+            description = "DNS 过滤与分流运行状态"
+            setShowBadge(false)
         }
+        manager.createNotificationChannel(channel)
+        manager.createNotificationChannel(
+            NotificationChannel(
+                SCRIPT_CHANNEL_ID,
+                "脚本通知",
+                NotificationManager.IMPORTANCE_DEFAULT,
+            ).apply {
+                description = "模块脚本通过 \$notification.post 发出的提醒"
+                setShowBadge(true)
+            },
+        )
     }
 
     // B1 通知每 2 秒刷新实时速率（仅运行中；无通知权限时静默跳过）。
@@ -351,7 +379,7 @@ class NamuVpnService : VpnService() {
                     if (!stopping) {
                         messages.show("VPN 建立失败，请检查是否有其他 VPN 正在运行")
                         runtime.markStartFailed()
-                        mainHandler.post { stopForeground(true); stopSelf() }
+                        mainHandler.post { ServiceCompat.stopForeground(this@NamuVpnService, ServiceCompat.STOP_FOREGROUND_REMOVE); stopSelf() }
                     }
                     return@Thread
                 }
@@ -374,7 +402,7 @@ class NamuVpnService : VpnService() {
                     pfd.close()
                     messages.show("内核启动失败，请查看日志")
                     runtime.markStartFailed()
-                    mainHandler.post { stopForeground(true); stopSelf() }
+                    mainHandler.post { ServiceCompat.stopForeground(this@NamuVpnService, ServiceCompat.STOP_FOREGROUND_REMOVE); stopSelf() }
                     return@Thread
                 }
                 tun = pfd
@@ -393,9 +421,26 @@ class NamuVpnService : VpnService() {
             } catch (t: Throwable) {
                 messages.show("启动失败: ${t.message}")
                 runtime.markStartFailed()
-                mainHandler.post { stopForeground(true); stopSelf() }
+                mainHandler.post { ServiceCompat.stopForeground(this@NamuVpnService, ServiceCompat.STOP_FOREGROUND_REMOVE); stopSelf() }
             }
         }.start()
+    }
+
+    private fun finishProfileSwitch(name: String, success: Boolean): Boolean {
+        val switching = pendingProfileSwitch?.takeIf { it.target == name } ?: return false
+        mainHandler.post {
+            if (pendingProfileSwitch != switching) return@post
+            if (success) {
+                pendingProfileSwitch = null
+                messages.show("已切换到 $name")
+            } else {
+                restoreProfile(switching)
+                if (running && !stopping) {
+                    if (tun == null) rebuildTunnel() else reloadConfig()
+                }
+            }
+        }
+        return true
     }
 
     private fun reloadConfig() {
@@ -405,6 +450,7 @@ class NamuVpnService : VpnService() {
             return
         }
         val pfd = tun ?: return
+        val profileName = settings.activeConfigName()
         val cfg = settings.current()
         UidTablePublisher.setServiceDemand(needsUidMap(cfg))
         if (activeTunnel == null || activeTunnel != tunnelSpec(cfg)) {
@@ -416,7 +462,7 @@ class NamuVpnService : VpnService() {
         reloading = true
         Thread {
             try {
-                val json = ConfigStore.buildNative(this, cfg)
+                val json = ConfigStore.buildNative(this, cfg, profileName)
                 // 内核热重载现在会一并更新运行配置/节点/选中线路，
                 // 优先热重载（连接不中断）；失败才回退整核重启。
                 val ok = synchronized(nativeLock) {
@@ -433,12 +479,14 @@ class NamuVpnService : VpnService() {
                 }
                 if (ok) {
                     lastGoodJson = json
+                    finishProfileSwitch(profileName, success = true)
                     App.container.stats.resetSession()
                     runtime.markConnected(0L)
                     App.container.refreshRuntime()
                 } else {
                     // 新配置没有生效：尽量把上一版成功配置重新下发，避免内核停在半套规则。
                     val rolledBack = rollbackToLastGood(pfd, cfg.mode)
+                    if (finishProfileSwitch(profileName, success = false)) return@Thread
                     if (rolledBack) {
                         messages.show("新设置未生效，已回滚到上一版配置")
                     } else {
@@ -447,6 +495,7 @@ class NamuVpnService : VpnService() {
                 }
             } catch (t: Throwable) {
                 val rolledBack = rollbackToLastGood(pfd, cfg.mode)
+                if (finishProfileSwitch(profileName, success = false)) return@Thread
                 messages.show(
                     if (rolledBack) "配置生成失败，已回滚到上一版配置"
                     else "配置生成失败：${t.message ?: "未知错误"}，请手动重连",
@@ -523,6 +572,7 @@ class NamuVpnService : VpnService() {
         return builder.establish()
     }
 
+    @Suppress("DEPRECATION")
     private fun pickUnderlyingNetwork(): Network? {
         val cm = getSystemService(ConnectivityManager::class.java) ?: return null
         val candidates = cm.allNetworks.mapNotNull { network ->
@@ -650,9 +700,11 @@ class NamuVpnService : VpnService() {
         rebuilding = true
         Thread {
             var success = false
+            var profileName = ""
             try {
                 synchronized(nativeLock) {
                     if (!running || stopping) return@synchronized
+                    profileName = settings.activeConfigName()
                     val cfg = settings.current()
                     try {
                         NativeCore.nativeStop()
@@ -670,7 +722,7 @@ class NamuVpnService : VpnService() {
                     if (applied != null) {
                         val pfd = applied.pfd
                         val rebuiltJson = try {
-                            ConfigStore.buildNative(this, settings.current())
+                            ConfigStore.buildNative(this, settings.current(), profileName)
                         } catch (_: Throwable) {
                             null
                         }
@@ -696,6 +748,7 @@ class NamuVpnService : VpnService() {
                 rebuilding = false
             }
             if (success) {
+                finishProfileSwitch(profileName, success = true)
                 rebuildRetried = false
                 runtime.markConnected(0L)
                 App.container.refreshRuntime()
@@ -703,7 +756,7 @@ class NamuVpnService : VpnService() {
                     pendingReload = false
                     reloadConfig()
                 }
-            } else if (running && !stopping) {
+            } else if (running && !stopping && !finishProfileSwitch(profileName, success = false)) {
                 if (!rebuildRetried) {
                     // 自动重试一次：切网瞬间 establish 偶发失败，第二次通常即成。
                     rebuildRetried = true
@@ -728,6 +781,7 @@ class NamuVpnService : VpnService() {
 
     private fun stopVpn() {
         if (stopping) return
+        pendingProfileSwitch?.let { restoreProfile(it) }
         stopping = true
         running = false
         reloading = false
@@ -756,7 +810,7 @@ class NamuVpnService : VpnService() {
                 runtime.markStopped()
                 App.container.refreshRuntime()
                 alive = false
-                stopForeground(true)
+                ServiceCompat.stopForeground(this@NamuVpnService, ServiceCompat.STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
         }.start()

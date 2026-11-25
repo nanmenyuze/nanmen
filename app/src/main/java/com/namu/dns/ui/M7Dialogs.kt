@@ -20,6 +20,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -294,7 +295,7 @@ fun LiveConnectionsDialog(
     val net = remember { NetworkStatus.current(ctx) }
     val store = remember { LiveConnStore() }
     var rows by remember { mutableStateOf<List<LiveConn>>(emptyList()) }
-    var total by remember { mutableStateOf(0) }
+    var total by remember { mutableIntStateOf(0) }
 
     // 连接页是 UID 表的临时消费者：打开才读配置侧未覆盖的归属，关闭立即释放。
     DisposableEffect(Unit) {

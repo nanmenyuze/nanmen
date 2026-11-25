@@ -1302,7 +1302,7 @@ fn decide_action_uid(
     kind: ConnKind,
     uid: Option<u32>,
 ) -> Action {
-    decide_detail_for(ctx, domain, ip, port, kind, uid).0
+    decide_detail_for(ctx, domain, ip, port, kind, uid, false, None).0
 }
 
 /// 同 decide_action_uid，额外返回「为什么这么判」的可读说明，供连接列表展示。
@@ -1314,6 +1314,8 @@ fn decide_detail_for(
     port: u16,
     kind: ConnKind,
     uid: Option<u32>,
+    sniffed_domain: bool,
+    base_domain: Option<&str>,
 ) -> (Action, String) {
     // mihomo/sing-box 同款：853 是 DoT/DoQ，私人 DNS 开着时会绕过 53 劫持。
     // 直接拒绝，让 Android 的 opportunistic 模式回落到 VPN DNS。
@@ -1336,13 +1338,13 @@ fn decide_detail_for(
                 .rules
                 .read()
                 .unwrap_or_else(|p| p.into_inner())
-                .decide_input_attributed(&crate::engine::MatchInput {
+                .decide_input_attributed_with_sources(&crate::engine::MatchInput {
                     domain,
                     ip,
                     port,
                     kind,
                     uid,
-                });
+                }, sniffed_domain, base_domain);
             if let Some(meta) = identity {
                 let host = domain
                     .map(|d| d.to_string())
@@ -2251,6 +2253,8 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             port,
                             ConnKind::Tcp,
                             client_uid,
+                            sni.is_some(),
+                            domain.as_deref(),
                         )
                     };
                     let conn_id = ctx.stats.new_conn_id();

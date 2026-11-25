@@ -561,9 +561,9 @@ pub struct DnsEngine {
     pub stats: Arc<Stats>,
     pub reverse: Mutex<ReverseMap>,
     cache: Mutex<Cache>,
-    primary: UpstreamKind,
-    /// 备用上游支持 udp://、tls://、https://（DoH）三种写法。
-    fallback: Option<UpstreamKind>,
+    primary: Vec<UpstreamKind>,
+    /// 主/备上游均支持有序多地址，前一个失败后尝试下一个。
+    fallback: Vec<UpstreamKind>,
     block_mode: String,
     block_enabled: bool,
     fake_enabled: bool,
@@ -640,7 +640,7 @@ impl DnsEngine {
                 fake_filter.push(p);
             }
         }
-        let hosts = HostMap::from_config(cfg, &primary, fallback.as_ref());
+        let hosts = HostMap::from_config(cfg, &primary[0], fallback.first());
         for issue in &hosts.rejected {
             logging::warn("dns", format!("Host 配置未生效：{}", issue));
         }
@@ -696,8 +696,8 @@ impl DnsEngine {
     /// `[Host]` 配置热替换：和 swap_filter 一样清掉旧结论，避免改映射后仍回旧 IP。
     /// 当前外壳走整颗 DNS 引擎热重载；保留这个方法给后续原地刷新复用。
     pub fn swap_hosts(&self, cfg: &DnsConfig) {
-        let primary = self.primary.clone();
-        let map = HostMap::from_config(cfg, &primary, self.fallback.as_ref());
+        let primary = self.primary[0].clone();
+        let map = HostMap::from_config(cfg, &primary, self.fallback.first());
         for issue in &map.rejected {
             logging::warn("dns", format!("Host 配置未生效：{}", issue));
         }
@@ -1540,16 +1540,14 @@ impl DnsEngine {
             .lock()
             .map(|b| b.open_until.map(|t| Instant::now() < t).unwrap_or(false))
             .unwrap_or(false);
-        if open {
-            if let Some(fb) = self.fallback.clone() {
-                let r = self.query_kind(&fb, fwd, req).await;
-                if r.is_some() {
-                    self.stats.record_fallback(FallbackReason::Breaker);
-                }
-                return (r, "备用·熔断");
+        if open && !self.fallback.is_empty() {
+            let r = self.query_fallback(fwd, req).await;
+            if r.is_some() {
+                self.stats.record_fallback(FallbackReason::Breaker);
             }
+            return (r, "备用·熔断");
         }
-        if self.race && self.fallback.is_some() {
+        if self.race && !self.fallback.is_empty() {
             let (r, via) = self.race_query(fwd, req).await;
             self.record_breaker(r.is_some());
             return (r, via);
@@ -1559,27 +1557,24 @@ impl DnsEngine {
         if let Some(resp) = r {
             // 异常应答复核：默认只复核私网/保留/广播等明显异常；
             // 非 CN IP 只有显式开启 fallback_geo_check 才复核，避免把正常境外 CDN 当污染。
-            if self.fallback_filter && self.should_use_fallback(&resp) {
-                if let Some(fb) = self.fallback.clone() {
-                    if let Some(fb_resp) = self.query_kind(&fb, fwd, req).await {
-                        if has_usable_answer(&fb_resp) {
-                            self.stats.record_fallback(FallbackReason::Review);
-                            return (Some(fb_resp), "备用·污染复核");
-                        }
+            if self.fallback_filter && self.should_use_fallback(&resp) && !self.fallback.is_empty() {
+                if let Some(fb_resp) = self.query_fallback(fwd, req).await {
+                    if has_usable_answer(&fb_resp) {
+                        self.stats.record_fallback(FallbackReason::Review);
+                        return (Some(fb_resp), "备用·污染复核");
                     }
                 }
             }
             return (Some(resp), "上游");
         }
-        match self.fallback.clone() {
-            Some(fb) => {
-                let r = self.query_kind(&fb, fwd, req).await;
-                if r.is_some() {
-                    self.stats.record_fallback(FallbackReason::PrimaryFailure);
-                }
-                (r, "备用")
+        if self.fallback.is_empty() {
+            (None, "无备用")
+        } else {
+            let r = self.query_fallback(fwd, req).await;
+            if r.is_some() {
+                self.stats.record_fallback(FallbackReason::PrimaryFailure);
             }
-            None => (None, "无备用"),
+            (r, "备用")
         }
     }
 
@@ -1656,11 +1651,11 @@ impl DnsEngine {
     }
 
     async fn race_query(&self, fwd: &[u8], req: &Message) -> (Option<Vec<u8>>, &'static str) {
-        let Some(fb) = self.fallback.clone() else {
+        if self.fallback.is_empty() {
             return (None, "无备用");
-        };
+        }
         let primary = self.query_primary(fwd, req);
-        let fallback = self.query_kind(&fb, fwd, req);
+        let fallback = self.query_fallback(fwd, req);
         tokio::pin!(primary);
         tokio::pin!(fallback);
         let mut p_done = false;
@@ -1693,7 +1688,21 @@ impl DnsEngine {
     }
 
     async fn query_primary(&self, req_bytes: &[u8], req: &Message) -> Option<Vec<u8>> {
-        self.query_kind(&self.primary, req_bytes, req).await
+        for upstream in &self.primary {
+            if let Some(response) = self.query_kind(upstream, req_bytes, req).await {
+                return Some(response);
+            }
+        }
+        None
+    }
+
+    async fn query_fallback(&self, req_bytes: &[u8], req: &Message) -> Option<Vec<u8>> {
+        for upstream in &self.fallback {
+            if let Some(response) = self.query_kind(upstream, req_bytes, req).await {
+                return Some(response);
+            }
+        }
+        None
     }
 
     /// 执行任意一种上游：主上游与 fallback 共用，fallback 因此也支持 DoH/DoT/UDP。
@@ -2297,21 +2306,26 @@ fn prepare_forward(req: &Message) -> Message {
     fwd
 }
 
-fn parse_upstream(cfg: &DnsConfig) -> UpstreamKind {
-    build_upstream(cfg, &cfg.upstream)
-        .or_else(|| build_upstream(cfg, &cfg.fallback))
-        .unwrap_or_else(|| UpstreamKind::Udp("223.5.5.5".into(), 53))
+fn parse_upstream(cfg: &DnsConfig) -> Vec<UpstreamKind> {
+    let mut values: Vec<UpstreamKind> = cfg.upstream.split([',', '\n'])
+        .filter_map(|raw| build_upstream(cfg, raw).or_else(|| parse_host_port(raw.trim(), 53).map(|(h, p)| UpstreamKind::Udp(h, p))))
+        .collect();
+    if values.is_empty() {
+        values = cfg.fallback.split([',', '\n']).filter_map(|raw| build_upstream(cfg, raw)).collect();
+    }
+    if values.is_empty() {
+        values.push(UpstreamKind::Udp("223.5.5.5".into(), 53));
+    }
+    values
 }
 
-fn parse_fallback(cfg: &DnsConfig) -> Option<UpstreamKind> {
-    let raw = cfg.fallback.trim();
-    if raw.is_empty() {
-        return None;
+fn parse_fallback(cfg: &DnsConfig) -> Vec<UpstreamKind> {
+    if cfg.fallback.trim().is_empty() {
+        return Vec::new();
     }
-    if let Some(k) = build_upstream(cfg, raw) {
-        return Some(k);
-    }
-    parse_host_port(raw, 53).map(|(h, p)| UpstreamKind::Udp(h, p))
+    cfg.fallback.split([',', '\n'])
+        .filter_map(|raw| build_upstream(cfg, raw).or_else(|| parse_host_port(raw.trim(), 53).map(|(h, p)| UpstreamKind::Udp(h, p))))
+        .collect()
 }
 
 fn build_upstream(cfg: &DnsConfig, raw: &str) -> Option<UpstreamKind> {

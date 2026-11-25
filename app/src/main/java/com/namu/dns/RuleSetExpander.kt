@@ -22,7 +22,7 @@ import org.json.JSONObject
 object RuleSetExpander {
     private val LIST_TYPES = setOf(
         "DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DOMAIN-REGEX", "DOMAIN-WILDCARD",
-        "IP-CIDR", "IP-CIDR6", "GEOIP", "PORT", "PROTOCOL",
+        "IP-CIDR", "IP-CIDR6", "GEOIP", "PORT", "DST-PORT", "PROTOCOL",
     )
     private val SINGBOX_KEYS = listOf("domain", "domain_suffix", "domain_keyword", "domain_regex")
 

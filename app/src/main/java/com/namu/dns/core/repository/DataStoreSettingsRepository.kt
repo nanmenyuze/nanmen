@@ -35,6 +35,7 @@ private object Keys {
     val PRIVATE_DNS_PENDING = booleanPreferencesKey("private_dns_pending")
     val PRIVATE_DNS_MODE = stringPreferencesKey("private_dns_mode")
     val PRIVATE_DNS_HOST = stringPreferencesKey("private_dns_host")
+    val PROFILE_DEVICE_PREFS = booleanPreferencesKey("profile_device_prefs_migrated")
     val LEGACY_MIGRATED = booleanPreferencesKey("legacy_migrated")
 }
 
@@ -50,7 +51,11 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
     private var assetStampCache = -1
     private var defaultRulesMigratedCache = false
     private var legacyAdsMigratedCache = false
-    private var activeConfigCache = ConfigFileStore.DEFAULT_NAME
+    private val _activeProfile = MutableStateFlow(ConfigFileStore.DEFAULT_NAME)
+    override val activeProfile = _activeProfile.asStateFlow()
+    private var activeConfigCache: String
+        get() = _activeProfile.value
+        set(value) { _activeProfile.value = value }
     private var privateDnsPendingCache = false
     private var privateDnsModeCache = "opportunistic"
     private var privateDnsHostCache = ""
@@ -81,10 +86,33 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
             }
             // 2.x 起 active .conf 才是配置源；旧扁平文件先不用，等 2.2 迁移完成后再切过来。
             val activeText = ConfigFileStore.exportText(context, activeConfigCache)
-            _config.value = if (activeText != null && ConfigFile.isNewFormat(activeText)) {
-                ConfigFileStore.loadInto(context, activeConfigCache, stored) ?: stored
-            } else {
-                stored
+            val activeProfile = activeText?.takeIf(ConfigFile::isNewFormat)
+                ?.let { ConfigFile.fromExternal(it, stored) }
+            val base = if (p[Keys.PROFILE_DEVICE_PREFS] == true) stored else {
+                activeProfile?.general?.restoreLegacyDevicePreferences(stored) ?: stored
+            }
+            _config.value = activeProfile?.toAppConfig(base) ?: base
+            if (p[Keys.PROFILE_DEVICE_PREFS] != true) {
+                dataStore.edit {
+                    it[Keys.CONFIG] = base.toJson().toString()
+                    it[Keys.PROFILE_DEVICE_PREFS] = true
+                }
+            }
+        }
+    }
+
+    override fun applySavedProfile(name: String, config: AppConfig) {
+        synchronized(stateLock) {
+            activeConfigCache = name
+            _config.value = config
+            val json = config.toJson().toString()
+            scope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+                writeLock.withLock {
+                    dataStore.edit {
+                        it[Keys.ACTIVE_CONFIG] = name
+                        it[Keys.CONFIG] = json
+                    }
+                }
             }
         }
     }
@@ -110,7 +138,7 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
 
     private fun persist(cfg: AppConfig) {
         val json = cfg.toJson().toString()
-        scope.launch {
+        scope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
             writeLock.withLock {
                 dataStore.edit { it[Keys.CONFIG] = json }
             }

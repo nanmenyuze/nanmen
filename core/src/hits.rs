@@ -594,7 +594,7 @@ pub fn now_ms() -> u64 {
 
 /// 设备本地自然日 key：YYYYMMDD，用于跨日清零。
 pub fn local_day_key() -> i64 {
-    let mut tm = local_tm();
+    let tm = local_tm();
     (tm.tm_year as i64 + 1900) * 10000 + (tm.tm_mon as i64 + 1) * 100 + tm.tm_mday as i64
 }
 

@@ -29,6 +29,7 @@ object SystemDns {
 
     fun isFollow(value: String?): Boolean = value?.trim()?.equals(FOLLOW, true) == true
 
+    @Suppress("DEPRECATION")
     fun selection(context: Context): Selection {
         val cm = context.getSystemService(ConnectivityManager::class.java)
         val active = cm?.activeNetwork

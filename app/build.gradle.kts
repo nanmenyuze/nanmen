@@ -92,8 +92,8 @@ android {
         applicationId = "com.namu.dns"
         minSdk = 31
         targetSdk = 36
-        versionCode = 117
-        versionName = "3.0.6"
+        versionCode = 123
+        versionName = "3.0.12"
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }
@@ -145,6 +145,12 @@ android {
         jniLibs {
             useLegacyPackaging = false
         }
+    }
+
+    lint {
+        // 依赖版本由当前 Compose BOM/编译组合锁定，升级需单独回归；ChromeOS x86_64 不在双 ABI 交付范围。
+        disable += setOf("GradleDependency", "ChromeOsAbiSupport", "ObsoleteSdkInt")
+        warningsAsErrors = true
     }
 }
 

@@ -4,7 +4,6 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
-import com.namu.dns.Actions
 import com.namu.dns.AppConfig
 import com.namu.dns.core.AppContainer
 import com.namu.dns.core.repository.HitRepository
@@ -58,6 +57,13 @@ class DataViewModel(
         settings.update { it.copy(autoClearLogs = enabled) }
     }
 
+    /** 运行数据与诊断页的「立即清空」：运行日志与 DNS 记录一起清，不动命中历史。 */
+    fun clearLogsNow() {
+        logs.clearRuntime()
+        logs.clearDns()
+        messages.show("已清空运行日志与 DNS 记录")
+    }
+
     fun setHitWindow(hours: Int) = hits.setWindow(hours)
 
     fun clearHits() = hits.clear()
@@ -71,22 +77,6 @@ class DataViewModel(
 
     fun clearAllNodes() {
         nodes.update { it.copy(nodes = emptyList(), selected = null) }
-    }
-
-    suspend fun syncRules(): Int? {
-        val url = settings.current().rulesUrl
-        if (url.isBlank()) {
-            messages.show("当前配置没有 rulesUrl")
-            return null
-        }
-        return try {
-            val n = Actions.updateAdsRules(url)
-            messages.show("规则源已同步：$n 条")
-            n
-        } catch (e: Exception) {
-            messages.show(e.message ?: "规则同步失败")
-            null
-        }
     }
 
     fun showMessage(message: String) = messages.show(message)

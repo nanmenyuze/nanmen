@@ -43,7 +43,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -192,7 +192,7 @@ fun ScanScreen(onDone: () -> Unit) {
                 Modifier
                     .align(Alignment.Center)
                     .size(230.dp)
-                    .border(1.dp, Color.White.copy(alpha = 0.75f), RoundedCornerShape(18.dp)),
+                    .border(1.dp, Color.White.copy(alpha = 0.75f), RoundedCornerShape(NamuTokens.RadiusCard)),
             )
             Text(
                 "将节点或订阅二维码放入框内",
@@ -201,7 +201,7 @@ fun ScanScreen(onDone: () -> Unit) {
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .padding(top = 22.dp)
-                    .background(Color(0x99000000), RoundedCornerShape(10.dp))
+                    .background(Color(0x99000000), RoundedCornerShape(NamuTokens.RadiusControl))
                     .padding(horizontal = 12.dp, vertical = 7.dp),
             )
             TextAction(
@@ -226,7 +226,7 @@ fun ScanScreen(onDone: () -> Unit) {
                 Modifier
                     .align(Alignment.Center)
                     .padding(28.dp)
-                    .clip(RoundedCornerShape(14.dp))
+                    .clip(RoundedCornerShape(NamuTokens.RadiusDialog))
                     .background(NamuColors.Card)
                     .padding(18.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,

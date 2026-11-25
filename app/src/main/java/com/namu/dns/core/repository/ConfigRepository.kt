@@ -2,6 +2,7 @@ package com.namu.dns.core.repository
 
 import com.namu.dns.AppConfig
 import com.namu.dns.ConfigFileStore
+import com.namu.dns.NodeInfo
 import com.namu.dns.core.config.ConfigFile
 import com.namu.dns.core.config.ConfigSourceRegistry
 import com.namu.dns.core.config.GroupValidator
@@ -22,15 +23,20 @@ interface ConfigRepository {
 
     fun configFiles(): List<ConfigEntry>
     fun activeName(): String
+    fun loadProfile(name: String): AppConfig?
+    fun saveProfile(name: String, transform: (AppConfig) -> AppConfig): AppConfig?
+    fun validateProfile(name: String): String?
+    fun copyProfile(from: String, name: String): Boolean
 
     /** 切换 active 配置：整体替换配置字段，节点/订阅保留；成功后触发 onApplied。 */
     fun switchTo(name: String): Boolean
 
-    /** 以当前配置为模板新建；不自动切换。 */
+    /** 新建基础方案；复制当前配置使用 copyProfile。 */
     fun create(name: String): Boolean
 
     /** 导入旧扁平或新嵌套 JSON；同名拒绝。 */
     fun import(name: String, text: String): Boolean
+    fun import(name: String, text: String, sourceUrl: String?): Boolean
 
     /** 删除；default.conf 永远拒绝。删掉当前配置时回落到 default。 */
     fun delete(name: String): Boolean
@@ -40,6 +46,7 @@ class DefaultConfigRepository(
     private val settings: SettingsRepository,
     private val files: ConfigFileGateway,
     private val onApplied: (AppConfig) -> Unit = {},
+    private val onSwitched: ((String, AppConfig, AppConfig) -> Unit)? = null,
 ) : ConfigRepository {
     override fun current(): AppConfig = settings.current()
 
@@ -56,69 +63,107 @@ class DefaultConfigRepository(
 
     override fun activeName(): String = settings.activeConfigName()
 
+    override fun loadProfile(name: String): AppConfig? {
+        val n = ConfigFileStore.sanitize(name)
+        val current = settings.current()
+        if (n == activeName()) return current
+        return files.load(n, current)?.let { withImportedNodes(it, files.importedNodes(n)) }
+    }
+
+    override fun validateProfile(name: String): String? {
+        val config = loadProfile(name) ?: return "配置无法读取"
+        return profileError(name, config)
+    }
+
+    override fun saveProfile(name: String, transform: (AppConfig) -> AppConfig): AppConfig? {
+        val n = ConfigFileStore.sanitize(name)
+        val current = loadProfile(n) ?: return null
+        val next = transform(current)
+        if (next == current) return current
+        if (profileError(n, next) != null || !files.save(n, next)) return null
+        if (n == activeName()) {
+            settings.applySavedProfile(n, next)
+            onApplied(next)
+        }
+        return next
+    }
+
     override fun switchTo(name: String): Boolean {
         val n = ConfigFileStore.sanitize(name)
-        val loaded = files.load(n, settings.current()) ?: return false
-        // S1：切换前校验组引用，孤立组/串组不允许进入运行时；warning 不阻断。
-        if (!GroupValidator.validate(n, loaded).ok) return false
-        // 先改 active 名，再写内存配置：persist 会用新 active 名刷新 .conf，
-        // 顺序反了会把旧配置文件覆盖成新配置内容。
-        settings.setActiveConfigName(n)
-        settings.set(loaded)
-        onApplied(settings.current())
+        val loaded = loadProfile(n) ?: return false
+        if (profileError(n, loaded) != null) return false
+        val beforeName = activeName()
+        if (n == beforeName) return true
+        val before = settings.current()
+        settings.applySavedProfile(n, loaded)
+        if (onSwitched != null) onSwitched(beforeName, before, loaded) else onApplied(loaded)
         return true
     }
 
     override fun create(name: String): Boolean {
         val n = ConfigFileStore.sanitize(name)
         if (files.exists(n)) return false
-        return files.save(n, settings.current())
+        return files.save(n, AppConfig(dnsUpstream = "system", dnsFallback = "system"))
     }
 
-    override fun import(name: String, text: String): Boolean {
+    override fun copyProfile(from: String, name: String): Boolean {
         val n = ConfigFileStore.sanitize(name)
         if (files.exists(n)) return false
-        // 非原生格式（Clash/Loon/小火箭）只做识别/预览，不因为解析成功就启用。
+        val source = loadProfile(from) ?: return false
+        return saveImportedProfile(n, source, files.importedNodes(ConfigFileStore.sanitize(from)))
+    }
+
+    override fun import(name: String, text: String): Boolean = import(name, text, null)
+
+    override fun import(name: String, text: String, sourceUrl: String?): Boolean {
+        val n = ConfigFileStore.sanitize(name)
+        if (files.exists(n)) return false
         val current = settings.current()
         val result = ConfigSourceRegistry.parse(text, current)
         if (!result.preview.canImport) return false
         val parsed = result.config ?: return false
-        val next = parsed.toAppConfig(current)
-        if (result.nodes.isEmpty()) {
-            // S1：纯配置文件导入先按当前设备节点校验组引用。
-            if (!GroupValidator.validate(n, next).ok) return false
-            return files.save(n, next)
-        }
-        // Loon/小火箭配置把节点内联在文件里；节点仍属于设备侧，不写进 .conf。
-        // 先写好新配置，再激活它，避免把导入内容覆盖到当前 active .conf。
-        val first = result.nodes.firstOrNull()?.name
-        val merged = next.copy(
-            nodes = result.nodes,
-            selected = if (next.selected != null && result.nodes.any { it.name == next.selected }) next.selected else first,
+        val next = withImportedNodes(parsed.toAppConfig(current), result.nodes).copy(
+            remoteConfigUrl = sourceUrl.orEmpty(),
+            remoteConfigName = if (sourceUrl.isNullOrBlank()) "" else n,
+            remoteConfigUpdatedAt = if (sourceUrl.isNullOrBlank()) 0L else System.currentTimeMillis(),
         )
-        // S1：节点内联的文件必须用合并后的节点表校验，否则组引用会被误判缺失。
-        if (!GroupValidator.validate(n, merged).ok) return false
-        if (!files.save(n, merged)) return false
-        settings.setActiveConfigName(n)
-        settings.set(merged)
-        onApplied(merged)
-        return true
+        if (profileError(n, next) != null) return false
+        return saveImportedProfile(n, next, result.nodes)
     }
+
+    private fun saveImportedProfile(name: String, config: AppConfig, nodes: List<NodeInfo>): Boolean {
+        if (!files.save(name, config)) return false
+        if (nodes.isEmpty() || files.saveImportedNodes(name, nodes)) return true
+        files.delete(name)
+        return false
+    }
+
+    private fun withImportedNodes(config: AppConfig, imported: List<NodeInfo>): AppConfig {
+        if (imported.isEmpty()) return config
+        val nodes = (config.nodes + imported).distinctBy { it.name }
+        return config.copy(nodes = nodes, selected = config.selected ?: nodes.firstOrNull()?.name)
+    }
+
+    private fun profileError(name: String, config: AppConfig): String? =
+        com.namu.dns.core.config.ConfigDnsInput.error(config.dnsUpstream.ifBlank { "system" })
+            ?: config.dnsFallback.takeIf { config.allowDnsFallback && it.isNotBlank() }
+                ?.let(com.namu.dns.core.config.ConfigDnsInput::error)
+            ?: GroupValidator.validate(name, config).errors
+                .firstOrNull()?.let { it.message }
 
     override fun delete(name: String): Boolean {
         val n = ConfigFileStore.sanitize(name)
         if (n == ConfigFileStore.DEFAULT_NAME) return false
         if (!files.exists(n)) return false
+        val fallback = if (activeName() == n) {
+            files.ensureDefault(settings.current())
+            files.load(ConfigFileStore.DEFAULT_NAME, settings.current()) ?: return false
+        } else null
         if (!files.delete(n)) return false
 
-        if (settings.activeConfigName() == n) {
-            files.ensureDefault(settings.current())
-            val fallback = files.load(ConfigFileStore.DEFAULT_NAME, settings.current())
-            settings.setActiveConfigName(ConfigFileStore.DEFAULT_NAME)
-            if (fallback != null) {
-                settings.set(fallback)
-                onApplied(settings.current())
-            }
+        if (fallback != null) {
+            settings.applySavedProfile(ConfigFileStore.DEFAULT_NAME, fallback)
+            onApplied(fallback)
         }
         return true
     }

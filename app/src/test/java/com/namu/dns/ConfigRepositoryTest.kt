@@ -95,4 +95,37 @@ class ConfigRepositoryTest {
         assertEquals("rule", loaded?.mode)
         assertEquals(listOf("x.example.com"), loaded?.customAds)
     }
+    @Test
+    fun `editing or importing backup profile leaves current profile untouched`() {
+        val original = AppConfig(themeMode = "dark", autoConnect = true, pingMethod = "http")
+        val settings = FakeSettingsRepository(original)
+        val files = FakeGateway().apply { ensureDefault(original) }
+        val originalText = files.files.getValue(ConfigFileStore.DEFAULT_NAME)
+        var applied = 0
+        val repository = DefaultConfigRepository(settings, files, onApplied = { applied++ })
+        val imported = """
+            {"general":{"dnsUpstream":"system","themeMode":"light","autoConnect":false,"pingMethod":"tcp"}}
+        """.trimIndent()
+        assertTrue(repository.import("backup.conf", imported))
+        repository.saveProfile("backup.conf") {
+            it.copy(
+                dnsUpstream = "https://dns.example/query",
+                mitm = it.mitm.copy(enabled = true, hostMappings = mapOf("nas.home" to "192.168.1.2")),
+            )
+        }
+        assertEquals(ConfigFileStore.DEFAULT_NAME, repository.activeName())
+        assertEquals(originalText, files.files[ConfigFileStore.DEFAULT_NAME])
+        assertEquals(original, settings.current())
+        assertEquals(0, applied)
+
+        assertTrue(repository.switchTo("backup.conf"))
+        assertEquals("https://dns.example/query", settings.current().dnsUpstream)
+        assertTrue(settings.current().mitm.enabled)
+        assertEquals("192.168.1.2", settings.current().mitm.hostMappings["nas.home"])
+        assertEquals("dark", settings.current().themeMode)
+        assertEquals("http", settings.current().pingMethod)
+        assertTrue(settings.current().autoConnect)
+        assertEquals(1, applied)
+    }
+
 }

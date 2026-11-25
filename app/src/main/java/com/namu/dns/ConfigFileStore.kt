@@ -126,7 +126,31 @@ object ConfigFileStore {
 
     fun delete(context: Context, name: String): Boolean {
         if (name == DEFAULT_NAME) return false
-        return file(context, sanitize(name)).delete()
+        val n = sanitize(name)
+        if (!file(context, n).delete()) return false
+        file(context, "$n.nodes").delete()
+        return true
+    }
+
+    internal fun importedNodes(context: Context, name: String): List<NodeInfo> = runCatching {
+        val nodes = org.json.JSONArray(file(context, "${sanitize(name)}.nodes").readText())
+        List(nodes.length()) { NodeInfo.fromJson(nodes.getJSONObject(it)) }
+    }.getOrDefault(emptyList())
+
+    internal fun saveImportedNodes(context: Context, name: String, nodes: List<NodeInfo>): Boolean = runCatching {
+        val target = file(context, "${sanitize(name)}.nodes")
+        val encoded = org.json.JSONArray().apply { nodes.forEach { put(it.toJson()) } }.toString()
+        ConfigStore.writeAtomicPublic(target, encoded)
+        target.readText() == encoded
+    }.getOrDefault(false)
+
+    internal fun exportImportedNodes(context: Context, name: String): org.json.JSONArray? =
+        importedNodes(context, name).takeIf { it.isNotEmpty() }?.let { entries ->
+            org.json.JSONArray().apply { entries.forEach { put(it.toJson()) } }
+        }
+
+    internal fun clearImportedNodes(context: Context, name: String) {
+        file(context, "${sanitize(name)}.nodes").delete()
     }
 
     fun exportText(context: Context, name: String): String? = try {

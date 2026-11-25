@@ -1504,6 +1504,11 @@ fn send_terminal(
                 );
                 (200, "", h, b"[]".to_vec())
             }
+            super::RejectKind::Mp4 => {
+                let mut h = HeaderMap::new();
+                h.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
+                (200, "", h, super::EMPTY_MP4.to_vec())
+            }
         },
         Terminal::Redirect { status, url } => {
             let mut h = HeaderMap::new();

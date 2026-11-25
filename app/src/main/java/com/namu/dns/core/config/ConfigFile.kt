@@ -46,10 +46,13 @@ data class ConfigFile(
         val base = configJson(pretty = false).encodeToString(this)
         val root = Json.parseToJsonElement(base).jsonObject
         val merged = buildJsonObject {
-            root.forEach { (key, value) -> put(key, value) }
+            root.forEach { (key, value) ->
+                if (key == "general") put(key, JsonObject(value.jsonObject - DEVICE_GENERAL_KEYS))
+                else put(key, value)
+            }
             // unknownRoot 只补原生模型没有的 key，绝不能覆盖已知字段。
             unknownRoot.forEach { (key, value) ->
-                if (!root.containsKey(key) && key !in KNOWN_ROOT_KEYS) put(key, value)
+                if (!root.containsKey(key) && key !in KNOWN_ROOT_KEYS && key !in DEVICE_GENERAL_KEYS) put(key, value)
             }
             put("version", JsonPrimitive(CURRENT_VERSION))
         }
@@ -78,6 +81,12 @@ data class ConfigFile(
         const val SOURCE_CLASH = "clash-yaml"
         const val SOURCE_LOON = "loon-conf"
         const val SOURCE_SHADOWROCKET = "shadowrocket-conf"
+
+        private val DEVICE_GENERAL_KEYS = setOf(
+            "themeMode", "autoConnect", "pingMethod", "autoDisablePrivateDns",
+            "ssidTriggerEnabled", "ssidTriggerNames", "ssidLocationOptIn",
+            "financeProtect", "nodes", "selected", "subscription",
+        )
 
         private val KNOWN_ROOT_KEYS = setOf(
             "version", "general", "rules", "proxyGroups", "ruleSources", "modules", "groupSelections", "customAds", "mitm",
@@ -138,7 +147,17 @@ data class ConfigFile(
                 if (key !in deviceOnly) merged.put(key, old.get(key))
             }
             val app = AppConfig.fromJson(merged.toString())
-            return fromAppConfig(app).copy(
+            val fresh = fromAppConfig(app)
+            return fresh.copy(
+                general = fresh.general.copy(
+                    autoDisablePrivateDns = app.autoDisablePrivateDns,
+                    themeMode = app.themeMode,
+                    autoConnect = app.autoConnect,
+                    pingMethod = app.pingMethod,
+                    ssidTriggerEnabled = app.ssidTriggerEnabled,
+                    ssidTriggerNames = app.ssidTriggerNames,
+                    ssidLocationOptIn = app.ssidLocationOptIn,
+                ),
                 modelVersion = CURRENT_VERSION,
                 unknownRoot = extractUnknown(merged),
                 sourceFormat = SOURCE_NATIVE,
@@ -234,6 +253,10 @@ data class GeneralConfig(
         sniff = sniff,
         autoSelectNode = autoSelectNode,
         autoClearLogs = autoClearLogs,
+        subscriptionInfo = subscriptionInfo,
+    )
+
+    internal fun restoreLegacyDevicePreferences(base: AppConfig): AppConfig = base.copy(
         autoDisablePrivateDns = autoDisablePrivateDns,
         themeMode = themeMode,
         autoConnect = autoConnect,
@@ -241,7 +264,6 @@ data class GeneralConfig(
         ssidTriggerEnabled = ssidTriggerEnabled,
         ssidTriggerNames = ssidTriggerNames,
         ssidLocationOptIn = ssidLocationOptIn,
-        subscriptionInfo = subscriptionInfo,
     )
 
     companion object {
@@ -276,13 +298,6 @@ data class GeneralConfig(
             sniff = cfg.sniff,
             autoSelectNode = cfg.autoSelectNode,
             autoClearLogs = cfg.autoClearLogs,
-            autoDisablePrivateDns = cfg.autoDisablePrivateDns,
-            themeMode = cfg.themeMode,
-            autoConnect = cfg.autoConnect,
-            pingMethod = cfg.pingMethod,
-            ssidTriggerEnabled = cfg.ssidTriggerEnabled,
-            ssidTriggerNames = cfg.ssidTriggerNames,
-            ssidLocationOptIn = cfg.ssidLocationOptIn,
             subscriptionInfo = cfg.subscriptionInfo,
         )
     }

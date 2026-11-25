@@ -206,6 +206,10 @@ data class RuleItem(
     val source: String = "",
     /** B3 单条启用开关：禁用规则不下发内核（壳层过滤），旧 JSON 缺省启用。 */
     val enabled: Boolean = true,
+    /** 同时匹配 TLS SNI / HTTP Host 嗅探结果。 */
+    val extendedMatch: Boolean = false,
+    /** 拦截规则在普通规则之前优先判定。 */
+    val preMatch: Boolean = false,
     /** D0 归因身份；模块规则在重建时生成，手写配置在 nativeJson 时补默认身份。 */
     @kotlinx.serialization.Transient val meta: RuleMeta? = null,
 ) {
@@ -215,6 +219,8 @@ data class RuleItem(
         put("action", action)
         if (source.isNotBlank()) put("source", source)
         if (!enabled) put("enabled", false)
+        if (extendedMatch) put("extendedMatch", true)
+        if (preMatch) put("preMatch", true)
         meta?.let { put("meta", it.toJson()) }
     }
 
@@ -225,6 +231,8 @@ data class RuleItem(
             o.optString("action", "proxy"),
             o.optString("source", ""),
             o.optBoolean("enabled", true),
+            o.optBoolean("extendedMatch", false),
+            o.optBoolean("preMatch", false),
             if (o.has("meta") && !o.isNull("meta")) RuleMeta.fromJson(o.getJSONObject("meta")) else null,
         )
     }
@@ -731,6 +739,8 @@ data class AppConfig(
     /** 是否把非中国大陆 IP 也交给 fallback 复核；默认关闭。 */
     var fallbackGeoCheck: Boolean = false,
     var dnsQueryLog: Boolean = true,
+    /** 按当前配置绕过代理的域名后缀列表。 */
+    var skipProxyHosts: List<String> = emptyList(),
     var remoteConfigUrl: String = "",
     var remoteConfigName: String = "",
     var remoteConfigUpdatedAt: Long = 0L,
@@ -816,6 +826,7 @@ data class AppConfig(
         put("fallbackFilter", fallbackFilter)
         put("fallbackGeoCheck", fallbackGeoCheck)
         put("dnsQueryLog", dnsQueryLog)
+        put("skipProxyHosts", JSONArray().apply { skipProxyHosts.forEach { put(it) } })
         put("remoteConfigUrl", remoteConfigUrl)
         put("remoteConfigName", remoteConfigName)
         put("remoteConfigUpdatedAt", remoteConfigUpdatedAt)
@@ -878,7 +889,7 @@ data class AppConfig(
         private val KNOWN_JSON_KEYS = setOf(
             "mode", "selected", "nodes", "dnsUpstream", "dnsFallback", "dnsBootstrap",
             "dnsHeaderName", "dnsHeaderValue", "dnsCacheTtl", "blockTtl", "fallbackFilter",
-            "fallbackGeoCheck", "dnsQueryLog", "remoteConfigUrl", "remoteConfigName",
+            "fallbackGeoCheck", "dnsQueryLog", "skipProxyHosts", "remoteConfigUrl", "remoteConfigName",
             "remoteConfigUpdatedAt", "remoteConfigInterval", "ruleSources", "moduleSources",
             "blockEnabled", "blockMode", "cnDirect", "finalPolicy", "subscription", "rulesUrl",
             "customAds", "autoUpdateRules", "financeProtect", "rulesUpdatedAt", "allowDnsFallback", "blockWhenNoNode",
@@ -963,6 +974,10 @@ data class AppConfig(
                     fallbackFilter = o.optBoolean("fallbackFilter", true),
                     fallbackGeoCheck = o.optBoolean("fallbackGeoCheck", false),
                     dnsQueryLog = o.optBoolean("dnsQueryLog", true),
+                    skipProxyHosts = o.optJSONArray("skipProxyHosts")?.let { a ->
+                        (0 until a.length()).map { i -> a.optString(i, "").trim().lowercase() }
+                            .filter { it.isNotBlank() }.distinct()
+                    } ?: emptyList(),
                     remoteConfigUrl = o.optString("remoteConfigUrl", ""),
                     remoteConfigName = o.optString("remoteConfigName", ""),
                     remoteConfigUpdatedAt = o.optLong("remoteConfigUpdatedAt", 0L),
