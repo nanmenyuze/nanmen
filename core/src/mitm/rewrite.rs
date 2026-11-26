@@ -26,6 +26,9 @@ fn default_body_limit() -> usize {
 fn default_fail_open_ttl() -> u64 {
     300
 }
+fn default_true() -> bool {
+    true
+}
 
 /// 单条 URL Rewrite 规则（配置/模块合并后的中间表示）。
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -65,6 +68,12 @@ pub struct MitmConfig {
     /// 1.33 壳层使用 `skip_hostnames` 键，这里做别名兼容。
     #[serde(default, alias = "skip_hostnames")]
     pub skip: Vec<String>,
+    /// 规则驱动 MITM（默认开）：只对「确有改写/脚本/WS 规则可能命中」的域名解密。
+    /// 模块 [MITM] 里登记了但一条规则都命中不了的域名（如 gRPC 长连接）走透明转发，
+    /// 省掉无意义的 TLS 终止与签发开销。规则里无法定位域名时一律保守保留，
+    /// 保证不会因为收敛而丢功能。
+    #[serde(default = "default_true", alias = "hostnames_rule_driven")]
+    pub hostnames_rule_driven: bool,
     #[serde(default)]
     pub rules: Vec<MitmRuleConf>,
     /// 1.33 壳层（M1）下发的原始 [URL Rewrite] 行，由内核解析成 rules。
@@ -135,6 +144,7 @@ impl Default for MitmConfig {
             ca_file: String::new(),
             hostnames: Vec::new(),
             skip: Vec::new(),
+            hostnames_rule_driven: true,
             rules: Vec::new(),
             url_rewrites: Vec::new(),
             header_rewrites: Vec::new(),
@@ -305,6 +315,296 @@ impl HostMatcher {
     pub fn is_empty(&self) -> bool {
         self.exact.is_empty() && self.suffix.is_empty() && self.globs.is_empty()
     }
+
+    /// 生效模式条数（诊断/日志用）。
+    pub fn count(&self) -> usize {
+        self.exact.len() + self.suffix.len() + self.globs.len()
+    }
+}
+
+// ---------------- 规则驱动 MITM：从改写规则反推「需要解密的域名」 ----------------
+
+/// 被规则驱动收敛剔除的 MITM 域名快照（诊断用）。
+/// 只做只读展示，不参与判定；配置重载时整体替换。
+static SCOPE_DROPPED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn set_scope_dropped(list: &[String]) {
+    let mut g = match SCOPE_DROPPED.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    g.clear();
+    g.extend(list.iter().cloned());
+}
+
+/// 剔除域名快照，格式 `host1、host2`；空 = 没有收敛。
+pub fn scope_dropped_snapshot() -> String {
+    let g = match SCOPE_DROPPED.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    g.join("、")
+}
+
+pub fn scope_dropped_count() -> u64 {
+    let g = match SCOPE_DROPPED.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    g.len() as u64
+}
+
+/// 从一条 URL 正则里推出域名模式（`*.suffix` / 精确 / 前缀通配）。
+///
+/// 只做保守截取：scheme 之后到第一个路径分隔符之间的部分，分组、字符类、
+/// 量词一律折叠成 `*`。返回 `None` 表示这条规则没写明域名（`^https?://`、
+/// `.*` 之类），调用方必须按「全域」处理——绝不能因此把域名从 MITM 名单里剔掉。
+fn host_pattern_from_url_regex(pat: &str) -> Option<String> {
+    let p = pat.trim();
+    let p = p.strip_prefix('^').unwrap_or(p);
+    // scheme 分隔符可能是 `://`、`:\/\/` 或 `:\\/\\/`（不同模块转义层级不同）。
+    let mut start = None;
+    for (i, b) in p.bytes().enumerate() {
+        if b != b':' {
+            continue;
+        }
+        let rest = &p[i + 1..];
+        if rest.starts_with("//") {
+            start = Some(i + 3);
+            break;
+        }
+        if rest.starts_with("\\/\\/") {
+            start = Some(i + 5);
+            break;
+        }
+        if rest.starts_with("\\\\/\\\\/") {
+            start = Some(i + 7);
+            break;
+        }
+    }
+    let seg = &p[start?..];
+    // 主机段到第一个未转义的 `/` 为止。`?` 在主机段里只会是量词
+    // （`(www\.)?x.com`），查询串在路径之后、已被 `/` 截断，所以不当分隔符。
+    let mut end = seg.len();
+    let mut escaped = false;
+    for (idx, ch) in seg.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '/' | '#' => {
+                end = idx;
+                break;
+            }
+            _ => {}
+        }
+    }
+    host_segment_to_pattern(&seg[..end])
+}
+
+/// 把正则的「主机段」折算成域名模式；遇到解析不了的构造返回 None。
+fn host_segment_to_pattern(seg: &str) -> Option<String> {
+    // 量词作用在前一个单元上：把那个单元整体换成通配。
+    fn widen(out: &mut String) {
+        if out.ends_with('*') {
+            return;
+        }
+        out.pop();
+        out.push('*');
+    }
+    let mut out = String::new();
+    let mut chars = seg.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next()? {
+                n @ ('.' | '-' | '_') => out.push(n),
+                '/' => break,
+                // \d \w \s 之类：字符类，只能当通配
+                _ => out.push('*'),
+            },
+            '.' | '-' | '_' => out.push(c),
+            '[' => {
+                // 字符类整体当通配，跳到闭合的 ]
+                let mut closed = false;
+                for n in chars.by_ref() {
+                    if n == ']' {
+                        closed = true;
+                        break;
+                    }
+                }
+                if !closed {
+                    return None;
+                }
+                out.push('*');
+            }
+            '(' => {
+                // 分组（含 (?:) 前缀、或 (a|b) 选择）：无法枚举，当通配
+                let mut depth = 1usize;
+                for n in chars.by_ref() {
+                    match n {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                out.push('*');
+            }
+            '{' => {
+                // {n,m} 量词：丢掉数字，作用在前一个单元
+                for n in chars.by_ref() {
+                    if n == '}' {
+                        break;
+                    }
+                }
+                widen(&mut out);
+            }
+            '*' | '+' | '?' => widen(&mut out),
+            c if c.is_ascii_alphanumeric() => out.push(c),
+            // $ | ^ 等无法定位的构造
+            _ => return None,
+        }
+    }
+    // 折叠连续通配、去掉首尾的孤立点
+    let mut cleaned = String::with_capacity(out.len());
+    for ch in out.chars() {
+        if ch == '*' && cleaned.ends_with('*') {
+            continue;
+        }
+        cleaned.push(ch);
+    }
+    let t = cleaned.trim_matches('.');
+    if t.is_empty() || t.trim_matches('*').is_empty() {
+        return None;
+    }
+    Some(t.to_ascii_lowercase())
+}
+
+fn domain_hints(text: &str) -> Vec<String> {
+    let cleaned: String = text.replace("\\.", ".").replace("\\/", "/");
+    let Ok(re) = regex::Regex::new(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for m in re.find_iter(&cleaned) {
+        let tok = m.as_str();
+        // 纯数字（IPv4/IPv6 片段）与超长串不是域名
+        if tok.len() < 5 || tok.len() > 253 {
+            continue;
+        }
+        if tok.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+            continue;
+        }
+        let Some(last) = tok.rsplit('.').next() else {
+            continue;
+        };
+        if last.len() < 2 {
+            continue;
+        }
+        out.push(tok.to_ascii_lowercase());
+    }
+    out
+}
+
+/// 规则驱动的域名作用域。
+struct RuleHostScope {
+    /// 能定位到域名的规则 → 域名模式。
+    patterns: Vec<String>,
+    /// 有规则无法定位域名（`.*`）→ 这些规则要求全域解密。
+    global: bool,
+    /// 参与推导的规则总条数。
+    rules: usize,
+}
+
+fn rule_host_scope(
+    rules: &[RewriteRule],
+    loon: &[LoonRule],
+    ws: &crate::mitm::ws::WsRules,
+    scripts: &ScriptEngine,
+) -> RuleHostScope {
+    let mut patterns: Vec<String> = Vec::new();
+    let mut global = false;
+    let mut total = 0usize;
+
+    let mut push = |text: &str, extra: &str, patterns: &mut Vec<String>, global: &mut bool| {
+        total += 1;
+        match host_pattern_from_url_regex(text) {
+            Some(p) => patterns.push(p),
+            None => {
+                // 正则里没写域名：退到「文本里的域名片段」（脚本条件树常写在 extra），
+                // 再不行就按全域
+                let mut hints = domain_hints(text);
+                hints.extend(domain_hints(extra));
+                if hints.is_empty() {
+                    *global = true;
+                } else {
+                    patterns.extend(hints);
+                }
+            }
+        }
+    };
+
+    for r in rules {
+        push(r.url.as_str(), "", &mut patterns, &mut global);
+    }
+    for r in loon {
+        push(r.url.as_str(), "", &mut patterns, &mut global);
+    }
+    for r in &ws.rules {
+        push(r.url.as_str(), "", &mut patterns, &mut global);
+    }
+    for r in &scripts.rules {
+        // 定时/事件脚本不参与 HTTP 命中，与域名无关
+        if r.phase == crate::script::ScriptPhase::Cron {
+            continue;
+        }
+        // 预筛正则被放宽成 `.*` 时，真正的域名写在条件树里
+        push(r.url.as_str(), &r.scope_text, &mut patterns, &mut global);
+    }
+
+    patterns.sort();
+    patterns.dedup();
+    RuleHostScope {
+        patterns,
+        global,
+        rules: total,
+    }
+}
+
+/// 配置里的 MITM 域名模式，是否可能与某条规则相交。
+/// 判断不出来就返回 true（保留），宁可多解密也不让规则失效。
+fn hostname_may_match(rule_hosts: &HostMatcher, patterns: &[String], pat: &str) -> bool {
+    let p = pat.trim().trim_end_matches('.').to_ascii_lowercase();
+    if p.is_empty() {
+        return true;
+    }
+    if let Some(suffix) = p.strip_prefix("*.") {
+        if rule_hosts.matches(suffix) {
+            return true;
+        }
+        // 规则域名落在该后缀之下（api.x.com 对 *.x.com）
+        return patterns.iter().any(|r| {
+            let r = r.trim_start_matches("*.").to_ascii_lowercase();
+            if r.contains('*') || r.contains('?') {
+                // 中段通配无法精确求交，保守保留
+                return true;
+            }
+            r == *suffix
+                || (r.len() > suffix.len()
+                    && r.ends_with(suffix)
+                    && r.as_bytes()[r.len() - suffix.len() - 1] == b'.')
+        });
+    }
+    if p.contains('*') || p.contains('?') {
+        return true;
+    }
+    rule_hosts.matches(&p)
 }
 
 pub struct MitmEngine {
@@ -314,6 +614,14 @@ pub struct MitmEngine {
     /// section|key → 身份，供 URL/Header/Body/WS/Script 命中反查。
     pub rule_meta: HashMap<String, crate::hits::RuleMeta>,
     pub hosts: HostMatcher,
+    /// 规则驱动收敛后仍保留的全部规则域名模式（诊断用）。
+    pub rule_host_patterns: Vec<String>,
+    /// 因「没有任何规则可能命中」被剔除的 MITM 域名。
+    pub scope_dropped: Vec<String>,
+    /// 存在无法定位域名的规则（`.*` 之类），本次未做收敛。
+    pub scope_global: bool,
+    /// 推导作用域时参与的规则条数（URL/Header/Loon/Body/WS/Script）。
+    pub scope_rules: usize,
     pub skip: HostMatcher,
     pub rules: Vec<RewriteRule>,
     /// Loon [Rewrite] 规则（与 Surge [URL Rewrite] 分开，避免语法互相推导）。
@@ -423,11 +731,40 @@ impl MitmEngine {
         loon.unsupported.extend(body_loon.unsupported);
         let ws_rules = crate::mitm::ws::WsRules::parse(&cfg.websocket_rewrites);
         let scripts = ScriptEngine::from_config(&cfg.scripts, &cfg.script_store_file);
+        // 规则驱动 MITM：只有「确有规则可能命中」的域名才值得解密。
+        // 无法定位域名的规则（`.*` 之类）按全域处理，绝不因此丢功能。
+        let scope = rule_host_scope(&rules, &loon.rules, &ws_rules, &scripts);
+        let mut scope_dropped: Vec<String> = Vec::new();
+        let narrow = cfg.enabled
+            && cfg.hostnames_rule_driven
+            && !scope.global
+            && !scope.patterns.is_empty()
+            && !cfg.hostnames.is_empty();
+        let hosts = if narrow {
+            let rule_hosts = HostMatcher::new(&scope.patterns);
+            let mut kept: Vec<String> = Vec::new();
+            for h in &cfg.hostnames {
+                if hostname_may_match(&rule_hosts, &scope.patterns, h) {
+                    kept.push(h.clone());
+                } else {
+                    scope_dropped.push(h.clone());
+                }
+            }
+            HostMatcher::new(&kept)
+        } else {
+            HostMatcher::new(&cfg.hostnames)
+        };
+        scope_dropped.sort();
+        set_scope_dropped(&scope_dropped);
         Self {
             enabled: cfg.enabled,
             stats: None,
             rule_meta,
-            hosts: HostMatcher::new(&cfg.hostnames),
+            hosts,
+            rule_host_patterns: scope.patterns.clone(),
+            scope_dropped,
+            scope_global: scope.global,
+            scope_rules: scope.rules,
             skip: HostMatcher::new(&cfg.skip),
             rules,
             loon_rules: loon.rules,
@@ -956,6 +1293,143 @@ mod tests {
             source: None,
             raw: String::new(),
         }
+    }
+
+    #[test]
+    fn host_pattern_extraction_handles_module_shapes() {
+        assert_eq!(
+            host_pattern_from_url_regex(r"^https?://api\.bilibili\.com/v2/feed"),
+            Some("api.bilibili.com".into())
+        );
+        // 转义层级不同的 scheme 分隔符都要认
+        assert_eq!(
+            host_pattern_from_url_regex(r"^https?:\/\/x\.example\.com\/a"),
+            Some("x.example.com".into())
+        );
+        // 可选子域：`(?:[a-z0-9-]+\.)?example.com` —— 点包含在分组里，
+        // 折算成前缀通配 `*example.com`，仍能覆盖 api.example.com
+        assert_eq!(
+            host_pattern_from_url_regex(r"^https?://(?:[a-z0-9-]+\.)?example.com/x"),
+            Some("*example.com".into())
+        );
+        // 分组/选择 → 前缀通配，仍然定位到主域
+        assert_eq!(
+            host_pattern_from_url_regex(r"^https?://(?:www\.)?example.com/"),
+            Some("*example.com".into())
+        );
+        assert_eq!(
+            host_pattern_from_url_regex(r"^https?://(app|api)\.bilibili\.com/x"),
+            Some("*.bilibili.com".into())
+        );
+        // 字符类 → 通配
+        assert_eq!(
+            host_pattern_from_url_regex(r"^https?://[a-z0-9-]+\.example.net/"),
+            Some("*.example.net".into())
+        );
+        // 没写域名的规则必须返回 None（调用方按全域保守处理）
+        assert_eq!(host_pattern_from_url_regex(".*"), None);
+        assert_eq!(host_pattern_from_url_regex("^https?://"), None);
+    }
+
+    #[test]
+    fn rule_driven_scope_drops_hosts_without_any_rule() {
+        // 复刻现场：模块把 grpc 长连接也登记进 [MITM]，但它一条改写规则都没有。
+        let engine = MitmEngine::from_config(&MitmConfig {
+            enabled: true,
+            hostnames: vec![
+                "app.bilibili.com".into(),
+                "grpc.biliapi.net".into(),
+                "api.bilibili.com".into(),
+            ],
+            url_rewrites: vec![r"^https?://app\.bilibili\.com/x/v2/feed reject".into()],
+            ..Default::default()
+        });
+        assert!(engine.should_mitm("app.bilibili.com"));
+        assert!(!engine.should_mitm("grpc.biliapi.net"));
+        assert!(!engine.should_mitm("api.bilibili.com"));
+        assert_eq!(
+            engine.scope_dropped,
+            vec!["api.bilibili.com".to_string(), "grpc.biliapi.net".to_string()]
+        );
+        assert!(!engine.scope_global);
+        assert_eq!(engine.scope_rules, 1);
+    }
+
+    #[test]
+    fn rule_driven_scope_keeps_suffix_when_rule_lies_under_it() {
+        // MITM 侧是 *.bilibili.com，规则只点名 app.bilibili.com：不能剔。
+        let engine = MitmEngine::from_config(&MitmConfig {
+            enabled: true,
+            hostnames: vec!["*.bilibili.com".into()],
+            url_rewrites: vec![r"^https?://app\.bilibili\.com/x reject".into()],
+            ..Default::default()
+        });
+        assert!(engine.should_mitm("app.bilibili.com"));
+        assert!(engine.should_mitm("api.bilibili.com"));
+        assert!(engine.scope_dropped.is_empty());
+    }
+
+    #[test]
+    fn rule_driven_scope_defers_to_global_rules() {
+        // 存在 `.*` 这类无法定位域名的规则时必须整体放弃收敛，否则会打断它。
+        let engine = MitmEngine::from_config(&MitmConfig {
+            enabled: true,
+            hostnames: vec!["grpc.biliapi.net".into()],
+            url_rewrites: vec![
+                r"^https?://app\.bilibili\.com/x reject".into(),
+                ".* - reject-dict".into(),
+            ],
+            ..Default::default()
+        });
+        assert!(engine.scope_global);
+        assert!(engine.scope_dropped.is_empty());
+        assert!(engine.should_mitm("grpc.biliapi.net"));
+    }
+
+    #[test]
+    fn rule_driven_scope_can_be_turned_off() {
+        let engine = MitmEngine::from_config(&MitmConfig {
+            enabled: true,
+            hostnames_rule_driven: false,
+            hostnames: vec!["grpc.biliapi.net".into()],
+            url_rewrites: vec![r"^https?://app\.bilibili\.com/x reject".into()],
+            ..Default::default()
+        });
+        assert!(engine.scope_dropped.is_empty());
+        assert!(engine.should_mitm("grpc.biliapi.net"));
+    }
+
+    #[test]
+    fn rule_driven_scope_without_rules_changes_nothing() {
+        // 没有任何改写规则时保持原范围：此时收敛没有意义，也不该悄悄关掉 MITM。
+        let engine = MitmEngine::from_config(&MitmConfig {
+            enabled: true,
+            hostnames: vec!["api.example.com".into()],
+            ..Default::default()
+        });
+        assert!(engine.scope_dropped.is_empty());
+        assert!(engine.should_mitm("api.example.com"));
+    }
+
+    #[test]
+    fn script_with_glob_pattern_uses_condition_hint() {
+        // Loon Script v2：预筛是 `.*`，域名只写在条件里，仍能推出作用域。
+        let engine = MitmEngine::from_config(&MitmConfig {
+            enabled: true,
+            hostnames: vec!["api.site.cn".into(), "other.site.cn".into()],
+            scripts: vec![crate::script::ScriptRuleConf {
+                name: "demo".into(),
+                phase: "request".into(),
+                pattern: ".*".into(),
+                condition: "${url} ~= /^https?:\\/\\/api\\.site\\.cn\\//".into(),
+                source: "1;".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(!engine.scope_global);
+        assert!(engine.should_mitm("api.site.cn"));
+        assert!(!engine.should_mitm("other.site.cn"));
     }
 
     #[test]

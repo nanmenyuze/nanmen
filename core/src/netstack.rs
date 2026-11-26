@@ -690,6 +690,20 @@ struct DialFails {
     recent: VecDeque<(DialKey, Instant)>,
     /// 链路自愈：多目标同时失败时暂停熔断，期间一律真实拨号。
     suspend_until: Option<Instant>,
+    /// IP 级熔断：同一个地址被「多个不同高端口」轮番超时，说明该地址对本机
+    /// 整体不可达（P2P 探测、被丢包、对端防火墙），换端口重试只会重复等超时。
+    ip_fails: HashMap<IpAddr, IpFails>,
+}
+
+/// 单个 IP 的多端口失败记账。
+#[derive(Default)]
+struct IpFails {
+    /// 窗口内失败过的端口 → 最近失败时刻。
+    ports: HashMap<u16, Instant>,
+    /// 触发轮次，用于冷却升级。
+    strikes: u32,
+    /// 冷却截止。
+    until: Option<Instant>,
 }
 
 /// 链路自愈判据：10s 内 ≥8 个不同目标失败，基本只能是本机链路问题
@@ -700,6 +714,55 @@ const LINK_FAIL_DISTINCT_TARGETS: usize = 8;
 const LINK_SELF_HEAL_SUSPEND_SECS: u64 = 30;
 /// 熔断命中后的失败时序：必须与真实拨号超时（outbound 2s）一致。
 const SUPPRESSED_DIAL_FAIL_SECS: u64 = 2;
+/// IP 级熔断：统计窗口 / 触发所需的不同端口数 / 冷却基数与上限。
+/// 只统计 ≥1024 的端口：443/80/8080 这些业务口的可达性单独由 key 级熔断判定，
+/// 不能因为某个 P2P 探测把同一 CDN IP 的 HTTPS 也一起静音。
+const IP_BREAKER_WINDOW_SECS: u64 = 120;
+const IP_BREAKER_DISTINCT_PORTS: usize = 3;
+const IP_BREAKER_MIN_PORT: u16 = 1024;
+const IP_BREAKER_BASE_SECS: u64 = 60;
+const IP_BREAKER_CAP_SECS: u64 = 300;
+
+/// 该 IP 是否处于 IP 级冷却（只对高端口生效）。
+fn ip_breaker_armed(fails: &DialFails, ip: IpAddr, port: u16, now: Instant) -> bool {
+    if port < IP_BREAKER_MIN_PORT {
+        return false;
+    }
+    fails
+        .ip_fails
+        .get(&ip)
+        .and_then(|s| s.until)
+        .map(|u| now < u)
+        .unwrap_or(false)
+}
+
+/// 记录一次高端口失败；返回 true 表示本次刚刚进入 IP 级冷却（调用方负责打日志）。
+fn ip_breaker_record(fails: &mut DialFails, ip: IpAddr, port: u16, now: Instant) -> bool {
+    if port < IP_BREAKER_MIN_PORT {
+        return false;
+    }
+    let window = Duration::from_secs(IP_BREAKER_WINDOW_SECS);
+    let st = fails.ip_fails.entry(ip).or_default();
+    st.ports
+        .retain(|_, t| now.saturating_duration_since(*t) <= window);
+    st.ports.insert(port, now);
+    if st.ports.len() < IP_BREAKER_DISTINCT_PORTS {
+        return false;
+    }
+    st.strikes = st.strikes.saturating_add(1);
+    let exp = (st.strikes - 1).min(3);
+    let cd = (IP_BREAKER_BASE_SECS << exp).min(IP_BREAKER_CAP_SECS);
+    st.until = Some(now + Duration::from_secs(cd));
+    st.ports.clear();
+    true
+}
+
+/// 成功拨通即清除该端口的 IP 失败记账；冷却本身不下调（它已经按轮次计过）。
+fn ip_breaker_clear(fails: &mut DialFails, ip: IpAddr, port: u16) {
+    if let Some(st) = fails.ip_fails.get_mut(&ip) {
+        st.ports.remove(&port);
+    }
+}
 
 /// 按连续失败次数算冷却时长：1 次不冷却，2 次 10s，翻倍封顶 60s。
 fn dial_cooldown(fails: u32) -> Option<Duration> {
@@ -751,6 +814,7 @@ fn dial_breaker_record(fails: &mut DialFails, key: DialKey, now: Instant) -> boo
     if distinct.len() >= LINK_FAIL_DISTINCT_TARGETS {
         fails.fails.clear();
         fails.recent.clear();
+        fails.ip_fails.clear();
         fails.suspend_until = Some(now + Duration::from_secs(LINK_SELF_HEAL_SUSPEND_SECS));
         return true;
     }
@@ -767,6 +831,15 @@ fn dial_breaker_sweep(fails: &mut DialFails) {
     fails
         .fails
         .retain(|_, (_, until)| until.elapsed() < Duration::from_secs(300));
+    let stale = Duration::from_secs(300);
+    fails.ip_fails.retain(|_, st| {
+        st.ports.retain(|_, t| t.elapsed() < stale);
+        !st.ports.is_empty()
+            || st
+                .until
+                .map(|u| u.elapsed() < stale)
+                .unwrap_or(false)
+    });
 }
 
 /// 上限淘汰的排序键：先按「有没有堆积」分组（有堆积的排在后面，别踢正在传输的连接），
@@ -2397,11 +2470,16 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                     // 失败时序：静默等待后按「拨号失败」的同一条路径关闭连接。
                     if !dns_conn && matches!(action, Action::Direct) {
                         let key = dial_key(route_domain.as_deref(), local_ip, port);
-                        let suppressed = {
+                        let (key_hit, ip_hit) = {
                             let br = dial_fails.lock().unwrap_or_else(|p| p.into_inner());
-                            dial_breaker_active(&br, &key, Instant::now())
+                            let now = Instant::now();
+                            let key_hit = dial_breaker_active(&br, &key, now);
+                            // IP 级只在 key 级没命中时单独计数，避免同一连接算两次
+                            let ip_hit =
+                                !key_hit && ip_breaker_armed(&br, local_ip, port, now);
+                            (key_hit, ip_hit)
                         };
-                        if suppressed {
+                        if key_hit || ip_hit {
                             let (stx, srx) = mpsc::channel::<Vec<u8>>(1);
                             tokio::spawn(async move {
                                 tokio::time::sleep(Duration::from_secs(SUPPRESSED_DIAL_FAIL_SECS))
@@ -2432,14 +2510,24 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             });
                             ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                             ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
-                            ctx.stats
-                                .dial_breaker_rejected
-                                .fetch_add(1, Ordering::Relaxed);
+                            if ip_hit {
+                                ctx.stats
+                                    .dial_breaker_ip_rejected
+                                    .fetch_add(1, Ordering::Relaxed);
+                            } else {
+                                ctx.stats
+                                    .dial_breaker_rejected
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
                             logging::info(
                                 "conn",
                                 format!(
-                                    "#{} 熔断冷却中，本机按拨号失败时序收尾（未发 SYN） {}:{}（{}s）",
-                                    conn_id, target_label, port, SUPPRESSED_DIAL_FAIL_SECS
+                                    "#{} {}冷却中，本机按拨号失败时序收尾（未发 SYN） {}:{}（{}s）",
+                                    conn_id,
+                                    if ip_hit { "IP 级熔断" } else { "熔断" },
+                                    target_label,
+                                    port,
+                                    SUPPRESSED_DIAL_FAIL_SECS
                                 ),
                             );
                             continue;
@@ -2635,32 +2723,46 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 Ok(stream) => {
                                     // 直连成功即清除冷却计数：路径恢复后不该继续被熔断。
                                     if matches!(health_action, Action::Direct) {
-                                        dial_breaker_clear(
-                                            &mut dial_fails2
-                                                .lock()
-                                                .unwrap_or_else(|p| p.into_inner()),
-                                            &breaker_key,
-                                        );
+                                        let mut br = dial_fails2
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner());
+                                        dial_breaker_clear(&mut br, &breaker_key);
+                                        ip_breaker_clear(&mut br, local_ip, port);
                                     }
                                     relay_stream(stream, rx, stx, relay_wake2, read_wake2).await
                                 }
                                 Err(e) => {
                                     // 直连失败记入冷却表：连续失败升级冷却，阻断无限重试。
                                     // 多目标同时失败会触发链路自愈（判定为本机链路问题）。
+                                    // 同一地址多个高端口轮番超时会触发 IP 级熔断。
                                     if matches!(health_action, Action::Direct) {
-                                        let healed = dial_breaker_record(
-                                            &mut dial_fails2
+                                        let now = Instant::now();
+                                        let (healed, ip_armed) = {
+                                            let mut br = dial_fails2
                                                 .lock()
-                                                .unwrap_or_else(|p| p.into_inner()),
-                                            breaker_key,
-                                            Instant::now(),
-                                        );
+                                                .unwrap_or_else(|p| p.into_inner());
+                                            let healed =
+                                                dial_breaker_record(&mut br, breaker_key, now);
+                                            let armed = ip_breaker_record(&mut br, local_ip, port, now);
+                                            (healed, armed)
+                                        };
                                         if healed {
                                             logging::warn(
                                                 "conn",
                                                 format!(
                                                     "{}s 内多个不同目标拨号失败，判定为本地链路问题：清空熔断并暂停 {}s",
                                                     LINK_FAIL_WINDOW_SECS, LINK_SELF_HEAL_SUSPEND_SECS
+                                                ),
+                                            );
+                                        }
+                                        if ip_armed {
+                                            logging::warn(
+                                                "conn",
+                                                format!(
+                                                    "{} 在 {}s 内有 {} 个不同高端口拨号超时，判定该地址整体不可达：IP 级熔断生效（仅高端口）",
+                                                    local_ip,
+                                                    IP_BREAKER_WINDOW_SECS,
+                                                    IP_BREAKER_DISTINCT_PORTS
                                                 ),
                                             );
                                         }
@@ -3755,6 +3857,95 @@ mod tests {
         dial_breaker_record(&mut f, victim.clone(), after);
         dial_breaker_record(&mut f, victim.clone(), after);
         assert!(dial_breaker_active(&f, &victim, after));
+    }
+
+    #[test]
+    fn ip_breaker_arms_on_multiple_high_ports() {
+        let mut f = DialFails::default();
+        let ip = IpAddr::V4(std::net::Ipv4Addr::new(42, 81, 252, 154));
+        let now = Instant::now();
+        // 复刻现场：同一地址每分钟换一个高端口重试。
+        assert!(!ip_breaker_record(&mut f, ip, 63861, now));
+        assert!(!ip_breaker_record(&mut f, ip, 23861, now + Duration::from_secs(60)));
+        // 第 3 个不同端口才触发，前两次仍真实拨号
+        assert!(!ip_breaker_armed(&f, ip, 53861, now));
+        assert!(ip_breaker_record(&mut f, ip, 13861, now + Duration::from_secs(120)));
+        assert!(ip_breaker_armed(&f, ip, 53861, now + Duration::from_secs(120)));
+        // 冷却期内换任何高端口都直接命中
+        assert!(ip_breaker_armed(&f, ip, 63861, now + Duration::from_secs(170)));
+        // 业务端口不受 IP 级熔断影响，仍由 key 级单独判定
+        assert!(!ip_breaker_armed(&f, ip, 443, now + Duration::from_secs(120)));
+        assert!(!ip_breaker_armed(&f, ip, 80, now + Duration::from_secs(120)));
+        // 冷却到期自动解除
+        assert!(!ip_breaker_armed(
+            &f,
+            ip,
+            port_hint(),
+            now + Duration::from_secs(IP_BREAKER_BASE_SECS + 130)
+        ));
+    }
+
+    fn port_hint() -> u16 {
+        40000
+    }
+
+    #[test]
+    fn ip_breaker_counts_only_high_ports_and_isolates_ips() {
+        let mut f = DialFails::default();
+        let now = Instant::now();
+        let a = IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4));
+        let b = IpAddr::V4(std::net::Ipv4Addr::new(5, 6, 7, 8));
+        // 443/80 这类业务口不参与 IP 级累计：不能因为 CDN 同 IP 的 HTTPS
+        // 偶发失败就把整台服务器的动态端口静音。
+        for p in [443u16, 80, 8080] {
+            assert!(!ip_breaker_record(&mut f, a, p, now));
+        }
+        assert!(!ip_breaker_armed(&f, a, 40000, now));
+        // 另一个 IP 完全不受牵连
+        assert!(!ip_breaker_record(&mut f, b, 50001, now));
+        assert!(!ip_breaker_record(&mut f, b, 50002, now));
+        assert!(!ip_breaker_armed(&f, a, 50001, now));
+        // 窗口外的失败不计入（每 120s 一次，永远攒不到 3 个端口）
+        assert!(!ip_breaker_record(
+            &mut f,
+            b,
+            50003,
+            now + Duration::from_secs(IP_BREAKER_WINDOW_SECS + 10)
+        ));
+        assert!(!ip_breaker_armed(&f, b, 50001, now + Duration::from_secs(130)));
+    }
+
+    #[test]
+    fn ip_breaker_clears_port_on_success_and_escalates() {
+        let mut f = DialFails::default();
+        let ip = IpAddr::V4(std::net::Ipv4Addr::new(9, 9, 9, 9));
+        let now = Instant::now();
+        ip_breaker_record(&mut f, ip, 30001, now);
+        ip_breaker_record(&mut f, ip, 30002, now);
+        // 其中一条拨通了：该端口记账被清掉，不至于把「偶发失败」攒成熔断
+        ip_breaker_clear(&mut f, ip, 30001);
+        assert!(!ip_breaker_record(&mut f, ip, 30003, now));
+        assert!(!ip_breaker_armed(&f, ip, 30003, now));
+        // 再补两个端口才触发
+        assert!(ip_breaker_record(&mut f, ip, 30004, now));
+        assert!(ip_breaker_armed(&f, ip, 30005, now));
+        // 上一轮冷却结束后再触发一次：冷却从 60s 升级到 120s
+        let later = now + Duration::from_secs(IP_BREAKER_BASE_SECS + 1);
+        ip_breaker_record(&mut f, ip, 31001, later);
+        ip_breaker_record(&mut f, ip, 31002, later);
+        assert!(ip_breaker_record(&mut f, ip, 31003, later));
+        assert!(ip_breaker_armed(
+            &f,
+            ip,
+            31004,
+            later + Duration::from_secs(IP_BREAKER_BASE_SECS + 1)
+        ));
+        assert!(!ip_breaker_armed(
+            &f,
+            ip,
+            31004,
+            later + Duration::from_secs(IP_BREAKER_BASE_SECS * 2 + 2)
+        ));
     }
 
     #[test]

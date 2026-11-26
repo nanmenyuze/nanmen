@@ -130,6 +130,8 @@ pub struct Stats {
     pub loop_round_ms_max: AtomicU64,
     /// 直连拨号熔断：冷却期内被抑制拨号的连接数。
     pub dial_breaker_rejected: AtomicU64,
+    /// IP 级熔断：同一地址多端口轮番超时后被整体抑制的拨号数。
+    pub dial_breaker_ip_rejected: AtomicU64,
     /// App 归属解析：成功查到 UID 的 TCP 连接数 / 有 UID 规则但查不到归属的连接数。
     /// 后者持续增长通常意味着无 root 或壳层轮询没跟上。
     pub uid_resolved: AtomicU64,
@@ -312,6 +314,7 @@ impl Stats {
             "bigTierInUse": self.big_tier_in_use.load(Ordering::Relaxed),
             "tcpLimitEvicted": self.tcp_limit_evicted.load(Ordering::Relaxed),
             "dialBreakerRejected": self.dial_breaker_rejected.load(Ordering::Relaxed),
+            "dialBreakerIpRejected": self.dial_breaker_ip_rejected.load(Ordering::Relaxed),
             "uidResolved": self.uid_resolved.load(Ordering::Relaxed),
             "uidUnknown": self.uid_unknown.load(Ordering::Relaxed),
             "dnsAnySplit": self.dns_any_split.load(Ordering::Relaxed),
@@ -335,6 +338,9 @@ impl Stats {
         });
         v["mitmBypassHosts"] = json!(bypass_hosts);
         v["mitmHosts"] = crate::mitm::host_stats::HOST_STATS.snapshot_json();
+        // 规则驱动 MITM：被收敛剔除的域名（无任何规则可命中，故不解密）。
+        v["mitmScopeDropped"] = crate::mitm::rewrite::scope_dropped_count().into();
+        v["mitmScopeDroppedHosts"] = json!(crate::mitm::rewrite::scope_dropped_snapshot());
         v.to_string()
     }
 }

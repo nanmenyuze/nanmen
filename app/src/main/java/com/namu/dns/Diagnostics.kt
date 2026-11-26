@@ -144,6 +144,7 @@ object Diagnostics {
             )
             sb.appendLine("DoT/DoQ 拦截：${statsJson.optLong("dotBlocked")} 次")
             sb.appendLine("直连熔断抑制拨号：${statsJson.optLong("dialBreakerRejected")} 次")
+            sb.appendLine("IP 级熔断抑制拨号：${statsJson.optLong("dialBreakerIpRejected")} 次")
             sb.appendLine(
                 "MITM：连接 ${statsJson.optLong("mitmConns")}，失败 ${statsJson.optLong("mitmFailed")}，" +
                     "改写 ${statsJson.optLong("mitmRewritten")}，请求 ${statsJson.optLong("mitmReqs")}，" +
@@ -180,6 +181,10 @@ object Diagnostics {
             val bypassHosts = statsJson.optString("mitmBypassHosts")
             if (bypassHosts.isNotEmpty()) {
                 sb.appendLine("MITM 临时放行域名（此间完全不解密）：$bypassHosts")
+            }
+            val scopeDropped = statsJson.optString("mitmScopeDroppedHosts")
+            if (scopeDropped.isNotEmpty()) {
+                sb.appendLine("MITM 规则驱动剔除域名（无规则命中，走透明转发）：$scopeDropped")
             }
             sb.appendLine(
                 "主循环耗时：上轮 ${statsJson.optLong("loopRoundMsLast")} ms，峰值 ${statsJson.optLong("loopRoundMsMax")} ms；" +

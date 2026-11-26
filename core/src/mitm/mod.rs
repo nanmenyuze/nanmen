@@ -202,13 +202,35 @@ impl MitmState {
                     logging::info(
                         "mitm",
                         format!(
-                            "MITM 就绪：{} 个域名模式，{} 条 Surge 改写规则，{} 条 Loon 重写（Loon 不支持 {} 条，脚本不支持 {} 条，跳过 {} 条非法规则）",
-                            cfg.hostnames.len(),
+                            "MITM 就绪：{} 个域名模式（规则驱动收敛，剔除 {} 个无规则域名{}），{} 条 Surge 改写规则，{} 条 Loon 重写（Loon 不支持 {} 条，脚本不支持 {} 条，跳过 {} 条非法规则）",
+                            engine.hosts.count(),
+                            engine.scope_dropped.len(),
+                            if engine.scope_dropped.is_empty() {
+                                String::new()
+                            } else {
+                                format!("：{}", engine.scope_dropped.join("、"))
+                            },
                             engine.rules.len(),
                             engine.loon_rules.len(),
                             engine.loon_unsupported.len(),
                             engine.scripts.unsupported.len(),
                             engine.skipped_rules
+                        ),
+                    );
+                    // 收敛是否真的生效，必须能一眼看出来：全局规则会让收敛整体让位。
+                    logging::info(
+                        "mitm",
+                        format!(
+                            "MITM 作用域：{} 条规则参与推导，{} 个域名提示{}",
+                            engine.scope_rules,
+                            engine.rule_host_patterns.len(),
+                            if engine.scope_global {
+                                "（存在无法定位域名的规则，本次不做收敛）"
+                            } else if engine.scope_dropped.is_empty() {
+                                "（无可剔除域名）"
+                            } else {
+                                ""
+                            }
                         ),
                     );
                     let c = Arc::new(c);

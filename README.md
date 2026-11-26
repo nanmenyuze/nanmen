@@ -1,3 +1,9 @@
+# 南门DNS 3.5.2 正式版（内核 1.13.35，versionCode 141）
+
+> 2026-11-26 3.5.2 正式版：规则驱动 MITM 与 IP 级熔断。MITM 新增 `hostnames_rule_driven`（默认开启）：从 Surge URL/Header/Body、Loon 与 WebSocket 重写、脚本预筛正则及条件树反推可能命中的域名，只对确有规则覆盖的模块域名解密；模块 `[MITM]` 里登记但无任何规则可命中的域名（如 gRPC 长连接）改为透明转发。规则里无法定位域名（`.*`、`^https?://` 等）时整体放弃收敛，宁可多解密也不让规则失效；被剔除域名写入 `mitmScopeDropped` 并显示在诊断报告。直连新增 IP 级熔断：同一地址在 120 秒内被 3 个不同高端口（≥1024）轮番拨号超时，判定该地址整体不可达，冷却从 60 秒按轮次升到 120/240/300 秒；443/80/8080 等业务端口不参与 IP 级累计，仍由原 key 级熔断独立判定，成功拨通会清掉对应端口失败记账。新增 `dialBreakerIpRejected` 统计。保留 3.5.1 的 MITM 证书入口收敛、DNS 日志单一枢纽与 GlassDock 实色表面，以及 3.5.0 的应用排除、CA 热重载、DNS 缓存分域和 UDP DNS 并发上限。
+
+> 验收：Rust 385/385、Kotlin 252/252、lint 0 error / 0 warning（1 information）；内核保持 `nanmen_core-1.13.35`；双 ABI 重编；release 构建通过。
+
 # 南门DNS 3.5.1 正式版（内核 1.13.35，versionCode 140）
 
 > 2026-11-26 3.5.1 正式版：去重与导航栏修复。设置页移除顶部重复的「MITM 证书」卡，证书入口统一保留在 HTTPS 解密区的「证书」分组；DNS 与拦截详情移除「日志」段，DNS 查询日志入口归并到「日志与诊断 → 日志与导出」，并显示当前条数，日志入口收敛到单一枢纽。GlassDock 取消页面层采样：不再放大 Dock 后方页面内容，改为实色卡片表面加主色浅底的选中 lens，保留 pill 造型、按压反馈与液态切换动效；NavHost 同步移除 `pageLayer`/`pageOrigin` 捕获，消除玻璃透底与选中 lens 造成的穿影。保留 3.5.0 的应用排除、MITM 热重载、DNS 缓存分域、UDP DNS 并发上限、QUIC UID 判定与 H2 无改写直通修复。

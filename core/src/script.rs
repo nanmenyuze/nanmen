@@ -202,6 +202,9 @@ pub struct CompiledScriptRule {
     pub legacy_chain: bool,
     /// `enable=${name}` 的参数名；空 = 不看参数（静态启用）。
     pub enable_param: String,
+    /// 规则驱动的 MITM 作用域推导用：原始 pattern + 条件表达式全文。
+    /// 条件树里常写着真正的域名，而预筛正则被放宽成 `.*`，只看正则推不出域名。
+    pub scope_text: String,
 }
 
 /// 已编译脚本集合；非法正则/阶段/空源码不会进入执行列表。
@@ -342,6 +345,7 @@ impl ScriptEngine {
                 meta: c.meta.clone(),
                 legacy_chain: c.legacy_chain,
                 enable_param: c.enable_param.trim().to_string(),
+                scope_text: format!("{} {}", c.pattern.trim(), c.condition.trim()),
             });
         }
         let mut overrides = HashMap::new();
