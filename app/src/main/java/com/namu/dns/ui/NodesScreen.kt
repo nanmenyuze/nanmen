@@ -228,7 +228,7 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
                 }
             }
             item {
-                Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                Column(Modifier.padding(horizontal = NamuTokens.Space16, vertical = 8.dp)) {
                     NamuTextField(
                         value = query,
                         onChange = { query = it },
@@ -257,8 +257,8 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
                     Row(
                         Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 4.dp)
-                            .clip(RoundedCornerShape(NamuTokens.RadiusControl))
+                            .padding(horizontal = NamuTokens.Space16, vertical = 4.dp)
+                            .clip(RoundedCornerShape(NamuTokens.RadiusCard))
                             .background(NamuColors.Card)
                             .padding(horizontal = 14.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,

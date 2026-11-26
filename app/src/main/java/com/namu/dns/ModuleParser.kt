@@ -48,6 +48,7 @@ data class ParsedModule(
     val mitmOptions: Map<String, String> = emptyMap(),
     /** [General] 已解析的全局项；DNS/TUN 类由壳层按能力选择性接入。 */
     val generalOptions: Map<String, String> = emptyMap(),
+    val dnsPolicies: List<com.namu.dns.core.config.DnsPolicyRule> = emptyList(),
     /** [URL Rewrite] 原始规则行，由内核解析执行。 */
     val urlRewrites: List<String> = emptyList(),
     /** [Header Rewrite] 原始规则行。 */
@@ -89,6 +90,7 @@ object ModuleParser {
     private val supportedRouteTypes = setOf(
         "DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DOMAIN-REGEX", "DOMAIN-WILDCARD",
         "IP-CIDR", "IP-CIDR6", "GEOIP", "PORT", "PROTOCOL", "UID",
+        "AND", "OR", "NOT", "SCRIPT",
     )
 
     fun readIconUrl(lines: Sequence<String>): String =
@@ -118,6 +120,7 @@ object ModuleParser {
         val mitmSkips = LinkedHashSet<String>()
         val mitmOptions = linkedMapOf<String, String>()
         val generalOptions = linkedMapOf<String, String>()
+        val dnsPolicies = mutableListOf<com.namu.dns.core.config.DnsPolicyRule>()
         val urlRewrites = mutableListOf<String>()
         val headerRewrites = mutableListOf<String>()
         val loonRewrites = mutableListOf<String>()
@@ -288,6 +291,18 @@ object ModuleParser {
                         if (key in supportedGeneralOptions) acc(section).ok++ else ignore("general_option")
                     } else ignore("general_option")
                 }
+                section == "dns" -> {
+                    acc(section).lines++
+                    val i = line.indexOf('=')
+                    if (i > 0) {
+                        val p = line.substring(0, i).trim()
+                        val sv = line.substring(i + 1).trim()
+                        if (p.isNotBlank() && sv.isNotBlank()) {
+                            dnsPolicies += com.namu.dns.core.config.DnsPolicyRule(p, sv)
+                            acc(section).ok++
+                        } else ignore("invalid_dns_policy")
+                    } else ignore("invalid_dns_policy")
+                }
                 section == "host" -> {
                     acc(section).lines++
                     val key = line.substringBefore('=', "").trim().lowercase()
@@ -343,6 +358,7 @@ object ModuleParser {
                 "argument" -> "Argument"
                 "general" -> "General"
                 "host" -> "Host"
+                "dns" -> "DNS"
                 "script" -> "Script"
                 "rule" -> "Rule"
                 "adblock" -> "AdBlock"
@@ -395,6 +411,13 @@ object ModuleParser {
                 } else {
                     "stored" to "General 已保留原文；未识别的键不改变内核行为"
                 }
+                "dns" -> if (a.ok > 0 && a.lines == a.ok) {
+                    "executed" to "DNS 按域名策略已下发；最长后缀命中替换主上游"
+                } else if (a.ok > 0) {
+                    "partial" to "已 ${a.ok}/${a.lines} 条 DNS 策略生效"
+                } else {
+                    "stored" to "DNS 策略无有效条目"
+                }
                 "host" -> if (a.ok > 0 && a.lines == a.ok) {
                     "executed" to "Host 映射已下发 DNS；IP/别名在本地生效，server 仅复用现有上游客户端"
                 } else if (a.ok > 0) {
@@ -425,6 +448,7 @@ object ModuleParser {
             blockLines = blocks.toList(),
             routeRules = routes.distinctBy { "${it.type}|${it.value}|${it.action}" },
             ruleSets = ruleSets.distinctBy { "${it.kind}|${it.url}" },
+            dnsPolicies = dnsPolicies.toList(),
             ignored = ignoredReasons.values.sum(),
             mitmHostnames = mitmHosts.toList(),
             mitmSkipHostnames = mitmSkips.toList(),
@@ -683,6 +707,8 @@ object ModuleParser {
             "UID" -> v.toLongOrNull()?.let { it in 0..4_294_967_295L } == true
             "IP-CIDR" -> validCidr(v, ipv6 = false)
             "IP-CIDR6" -> validCidr(v, ipv6 = true)
+            "AND", "OR", "NOT" -> ruleLogicValueOk(type, v)
+            "SCRIPT" -> v.none { it.isWhitespace() }
             else -> false
         }
     }

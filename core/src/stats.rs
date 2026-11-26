@@ -152,6 +152,7 @@ pub struct Stats {
     pub udp_target_buf_bytes: AtomicU64,
     /// 动态 DNS socket 被淘汰/复用后，旧异步回包按 generation 丢弃的次数。
     pub dns_stale_reply: AtomicU64,
+    pub dns_overload_dropped: AtomicU64,
 }
 
 impl Stats {
@@ -324,6 +325,7 @@ impl Stats {
             "udpTargets": self.udp_targets.load(Ordering::Relaxed),
             "udpTargetBufKb": self.udp_target_buf_bytes.load(Ordering::Relaxed) / 1024,
             "dnsStaleReply": self.dns_stale_reply.load(Ordering::Relaxed),
+            "dnsOverloadDropped": self.dns_overload_dropped.load(Ordering::Relaxed),
             "tunPoolMiss": crate::netstack::pool_misses().0,
             "tunPoolMissRx": crate::netstack::pool_misses().1,
             "tunPoolMissTx": crate::netstack::pool_misses().2,

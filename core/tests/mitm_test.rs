@@ -365,6 +365,8 @@ async fn spawn_h2_origin_with_fail(
                             http1::gzip_encode(plain).unwrap(),
                             true,
                         )
+                    } else if path == "/binary" {
+                        ("application/octet-stream", None, vec![0, 255, 2], true)
                     } else if path == "/big" {
                         // 故意不写 content-length，用来触发 DATA 超限回退路径。
                         ("text/plain", None, vec![b'x'; 9000], false)
@@ -770,6 +772,43 @@ async fn mitm_h2_grpc_reject_uses_trailers() {
     assert_eq!(trailers.get("grpc-status").unwrap(), "7");
     assert_eq!(stats.mitm_conns.load(Ordering::Relaxed), 1);
     assert_eq!(stats.mitm_rejected.load(Ordering::Relaxed), 1);
+    let _ = std::fs::remove_file(&ca_path);
+}
+
+#[tokio::test]
+async fn h2_binary_response_runs_binary_script() {
+    let ca_path = tmp_ca("e2e_h2_binary_script.pem");
+    let (port, _, _) = spawn_h2_origin().await;
+    let config = MitmConfig {
+        enabled: true,
+        ca_file: ca_path.clone(),
+        hostnames: vec!["grpc.test.local".into()],
+        scripts: vec![ScriptRuleConf {
+            phase: "response".into(),
+            pattern: r"/binary$".into(),
+            source: "const b = $response.body; $done({body: new Uint8Array([b[0] + 1, b[1], b[2]])});".into(),
+            binary_body_mode: true,
+            ..Default::default()
+        }],
+        upstream_insecure: true,
+        ..Default::default()
+    };
+    let (_, tls) = start_h2_mitm(&ca_path, port, config).await;
+    let (mut sender, connection) = h2::client::handshake(tls).await.unwrap();
+    tokio::spawn(connection);
+    let request = http::Request::get("https://grpc.test.local/binary").body(()).unwrap();
+    let (response, _) = sender.send_request(request, true).unwrap();
+    let received = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let mut body = response.await.unwrap().into_body();
+        let mut output = Vec::new();
+        while let Some(chunk) = body.data().await {
+            output.extend_from_slice(&chunk.unwrap());
+        }
+        output
+    })
+    .await
+    .unwrap();
+    assert_eq!(received, [1, 255, 2]);
     let _ = std::fs::remove_file(&ca_path);
 }
 

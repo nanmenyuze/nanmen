@@ -14,6 +14,8 @@ interface SettingsRepository {
     fun current(): AppConfig
     fun set(config: AppConfig)
     fun update(transform: (AppConfig) -> AppConfig): AppConfig
+    /** 3.0.18：应用失败回滚用——只恢复内存与落盘，不触发再次应用。 */
+    fun restoreSilent(cfg: AppConfig)
     fun save()
     fun applySavedProfile(name: String, config: AppConfig) {
         setActiveConfigName(name)

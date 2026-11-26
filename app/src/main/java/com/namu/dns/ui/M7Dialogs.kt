@@ -32,6 +32,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.namu.dns.ApplyCoordinator
 import com.namu.dns.App
 import com.namu.dns.AppConfig
 import com.namu.dns.CrashGuard
@@ -105,7 +106,7 @@ fun BackupRestoreDialog(onDismiss: () -> Unit) {
                         container.messages.show(
                             "已恢复 ${r.files} 个配置/资源、${r.nodes} 个节点、${r.modules} 个模块，当前配置 ${r.activeConfig}$warn$caNote",
                         )
-                        if (container.runtime.current().connected) NamuVpnService.reload(ctx)
+                        ApplyCoordinator.requestApply(ctx, "设置变更")
                         pendingText = null
                         onDismiss()
                     } catch (e: Exception) {

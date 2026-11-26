@@ -109,6 +109,6 @@ class MainActivity : ComponentActivity() {
     private fun restartVpn() {
         if (!App.container.runtime.current().connected) return
         // 不停止 VPN：服务内部热重启内核；模式变化时才重建 TUN。
-        NamuVpnService.reload(this)
+        ApplyCoordinator.requestApply(this, "手动刷新")
     }
 }

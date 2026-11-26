@@ -1858,7 +1858,7 @@ pub struct ScriptWorkerPool {
 
 impl ScriptWorkerPool {
     pub fn new(workers: usize) -> Self {
-        let count = workers.clamp(1, 8);
+        let count = workers.min(8);
         let mut senders = Vec::with_capacity(count);
         let stats = Arc::new(ScriptWorkerStats::default());
         for index in 0..count {

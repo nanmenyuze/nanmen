@@ -9,7 +9,9 @@ object NativeCore {
     }
 
     @JvmStatic external fun nativeStart(tunFd: Int, configJson: String): Boolean
-    @JvmStatic external fun nativeReloadRules(configJson: String): Boolean
+    const val RELOAD_OK = 1
+    const val RELOAD_CA_UNAVAILABLE = -1
+    @JvmStatic external fun nativeReloadRules(configJson: String): Int
     /** 运行期修改脚本参数（只换 $argument 注入值，不重编译脚本）。 */
     @JvmStatic external fun nativeSetScriptArguments(payloadJson: String): Boolean
     /** 手动/网络事件触发：network-changed / generic；返回启动的脚本条数。 */

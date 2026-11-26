@@ -1,13 +1,9 @@
 package com.namu.dns.ui
 
 import android.content.Context
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -23,6 +19,7 @@ import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.namu.dns.Actions
+import com.namu.dns.GlobalRuleStore
 import com.namu.dns.App
 import com.namu.dns.AppConfig
 import com.namu.dns.MitmManager
@@ -89,7 +86,7 @@ internal suspend fun exportProfile(name: String) {
 internal fun ConfigHostsScreen(editor: ProfileEditor) {
     val hosts = editor.current().mitm.hostMappings
     var editing by remember { mutableStateOf(false) }
-    Column(Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState())) {
+    DetailList {
         SectionHeader("域名映射", trailing = { TextAction("编辑") { editing = true } })
         GroupCard {
             if (hosts.isEmpty()) {
@@ -119,12 +116,12 @@ internal fun ConfigRewriteScreen(editor: ProfileEditor, kind: String) {
         "头部重写" -> config.mitm.headerRewrites
         else -> config.mitm.bodyRewrites
     }
-    Column(Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState())) {
+    DetailList {
         SectionHeader(kind)
         GroupCard {
             SettingsRow(
                 title = "编辑重写规则",
-                subtitle = "每行一条，保存后立即写入当前配置",
+                subtitle = if (kind == "URL 重写") "每行一条；支持 reject 族 / 302 / 307 / mock / header / body" else "每行一条，保存后立即写入当前配置",
                 value = "${values.size} 条",
                 chevron = true,
                 showDivider = false,
@@ -149,18 +146,22 @@ internal fun ConfigRewriteScreen(editor: ProfileEditor, kind: String) {
                 }) editing = false
             },
         ) {
-            NamuTextField(text, { text = it }, "每行一条", maxLines = 12)
+            NamuTextField(
+                text,
+                { text = it },
+                if (kind == "URL 重写") "每行一条，例如：\n^https://a.com/ad reject-dict\n^https://a.com/old https://a.com/new 302\n^https://a.com/x mock-response-body data-type=json data={\"code\":0}" else "每行一条",
+                maxLines = 12,
+            )
         }
     }
 }
 
 @Composable
-internal fun ConfigHttpsScreen(editor: ProfileEditor, onOpenCertificate: () -> Unit) {
-    val cfg = editor.current()
-    val mitm = cfg.mitm
+internal fun HttpsScopeSection(onOpenCertificate: () -> Unit) {
+    val scope = GlobalRuleStore.state.scope
     val container = LocalAppContainer.current
     val context = container.context
-    val scope = rememberCoroutineScope()
+    val coroutine = rememberCoroutineScope()
     val vm: MitmViewModel = viewModel(factory = MitmViewModel.factory(container, context))
     val trust by vm.trust.collectAsStateWithLifecycle()
     val exists by vm.caExists.collectAsStateWithLifecycle()
@@ -171,52 +172,48 @@ internal fun ConfigHttpsScreen(editor: ProfileEditor, onOpenCertificate: () -> U
     var apps by remember { mutableStateOf(false) }
     var text by remember { mutableStateOf("") }
 
-    fun edit(title: String, entries: List<String>) {
-        field = title
-        text = entries.joinToString("\n")
-    }
-
-    Column(Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState())) {
-        SectionHeader("HTTPS 解密")
-        GroupCard {
-            SwitchRow("启用 HTTPS 解密", subtitle = if (preparing) "正在准备证书" else null, checked = mitm.enabled) { enabled ->
-                if (preparing) return@SwitchRow
-                scope.launch {
-                    preparing = true
-                    try {
-                        val candidate = cfg.copy(mitm = mitm.copy(enabled = enabled))
-                        if (!editor.isActive || prepareProfileCa(candidate, context)) {
-                            editor.update { it.copy(mitm = it.mitm.copy(enabled = enabled)) }
-                        } else container.messages.show("CA 准备失败")
-                    } finally {
-                        preparing = false
-                    }
+    SectionHeader("HTTPS 解密")
+    GroupCard {
+        SwitchRow("启用 HTTPS 解密", subtitle = if (preparing) "正在准备证书" else "设备级总开关；模块声明的解密域名仍受此控制", checked = scope.enabled) { enabled ->
+            if (preparing) return@SwitchRow
+            coroutine.launch {
+                preparing = true
+                try {
+                    if (MitmManager.caFile(context).exists() || MitmManager.export(context).ok) {
+                        Actions.setMitmEnabled(enabled)
+                    } else container.messages.show("CA 准备失败")
+                } finally {
+                    preparing = false
                 }
             }
-            SettingsRow("手动解密域名", value = "${mitm.hostnames.size} 个", chevron = true, onClick = { edit("手动解密域名", mitm.hostnames) })
-            SettingsRow("排除域名", value = "${mitm.skipHostnames.size} 个", chevron = true, onClick = { edit("排除域名", mitm.skipHostnames) })
-            SettingsRow("应用范围", value = when (mitm.appMode) {
-                "allow" -> "仅 ${mitm.apps.size} 个应用"
-                "deny" -> "排除 ${mitm.apps.size} 个应用"
-                else -> "全部应用"
-            }, chevron = true, showDivider = false, onClick = { apps = true })
         }
-        SectionHeader("证书")
-        GroupCard {
-            SettingsRow("MITM 证书", value = if (ready) "已生效" else "未核验生效",
-                chevron = true, showDivider = false, onClick = onOpenCertificate)
+        SettingsRow("手动解密域名", value = "${scope.hostnames.size} 个", chevron = true, onClick = {
+            field = "手动解密域名"; text = scope.hostnames.joinToString("\n")
+        })
+        SettingsRow("排除域名", value = "${scope.skipHostnames.size} 个", chevron = true, onClick = {
+            field = "排除域名"; text = scope.skipHostnames.joinToString("\n")
+        })
+        SettingsRow("应用范围", value = when (scope.appMode) {
+            "allow" -> "仅 ${scope.apps.size} 个应用"
+            "deny" -> "排除 ${scope.apps.size} 个应用"
+            else -> "全部应用"
+        }, chevron = true, showDivider = false, onClick = { apps = true })
+    }
+    SectionHeader("证书")
+    GroupCard {
+        SettingsRow("MITM 证书", value = if (ready) "已生效" else "未核验生效",
+            chevron = true, showDivider = false, onClick = onOpenCertificate)
+    }
+    SectionHeader("高级")
+    GroupCard {
+        SwitchRow("上游连接复用（实验）", checked = scope.poolEnabled, showDivider = false) { enabled ->
+            coroutine.launch { Actions.setMitmPoolEnabled(enabled) }
         }
-        SectionHeader("高级")
-        GroupCard {
-            SwitchRow("上游连接复用（实验）", checked = mitm.poolEnabled, showDivider = false) { enabled ->
-                editor.update { it.copy(mitm = it.mitm.copy(poolEnabled = enabled)) }
-            }
-        }
-        Spacer(Modifier.height(24.dp))
     }
     if (apps) {
-        AppScopeDialog(mitm.appMode, mitm.apps, onDismiss = { apps = false }) { mode, selection ->
-            if (editor.update { it.copy(mitm = it.mitm.copy(appMode = mode, apps = selection)) }) apps = false
+        AppScopeDialog(scope.appMode, scope.apps, onDismiss = { apps = false }) { mode, selection ->
+            coroutine.launch { Actions.setMitmApps(mode, selection) }
+            apps = false
         }
     }
     field?.let { title ->
@@ -225,16 +222,12 @@ internal fun ConfigHttpsScreen(editor: ProfileEditor, onOpenCertificate: () -> U
             confirmText = "保存",
             onDismiss = { field = null },
             onConfirm = {
-                val entries = if (title.endsWith("域名")) text.split(',', '，', '\n') else text.lines()
-                val values = if (title.endsWith("域名")) MitmManager.parseHostList(text)
-                    else entries.map(String::trim).filter(String::isNotEmpty).distinct()
-                if (editor.update { config -> config.copy(mitm = when (title) {
-                    "手动解密域名" -> config.mitm.copy(hostnames = values)
-                    "排除域名" -> config.mitm.copy(skipHostnames = values)
-                    "URL 重写" -> config.mitm.copy(urlRewrites = values)
-                    "头部重写" -> config.mitm.copy(headerRewrites = values)
-                    else -> config.mitm.copy(bodyRewrites = values)
-                }) }) field = null
+                val values = MitmManager.parseHostList(text)
+                val k = title
+                coroutine.launch {
+                    if (k == "手动解密域名") Actions.setMitmHostnames(values) else Actions.setMitmSkip(values)
+                }
+                field = null
             },
         ) {
             NamuTextField(text, { text = it }, "每行一条", maxLines = 9)

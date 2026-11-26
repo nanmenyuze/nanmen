@@ -1,5 +1,6 @@
 package com.namu.dns
 
+import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -7,6 +8,10 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
 
 class ActionsRegressionTest {
     private fun group(
@@ -19,6 +24,35 @@ class ActionsRegressionTest {
         put("members", JSONArray().put("a").put("b"))
         if (strategy != null) put("strategy", strategy)
         put("switch_interval", switchInterval)
+    }
+
+    @Test
+    fun `conditional fetch returns not modified without requiring a location`() {
+        ServerSocket(0, 2, InetAddress.getByName("127.0.0.1")).use { server ->
+            server.soTimeout = 5_000
+            val served = CompletableFuture.runAsync {
+                server.accept().use { socket ->
+                    socket.soTimeout = 5_000
+                    val request = socket.getInputStream().bufferedReader().lineSequence()
+                        .takeWhile { it.isNotEmpty() }.toList()
+                    assertTrue(request.any { it.equals("If-None-Match: revision-1", ignoreCase = true) })
+                    socket.getOutputStream().write(
+                        ("HTTP/1.1 304 Not Modified\r\nETag: revision-1\r\n" +
+                            "Connection: close\r\nContent-Length: 0\r\n\r\n").toByteArray(),
+                    )
+                }
+            }
+            val result = runBlocking {
+                Actions.fetchTextResult(
+                    "http://127.0.0.1:${server.localPort}/module",
+                    headers = mapOf("If-None-Match" to "revision-1"),
+                )
+            }
+            served.get(5, TimeUnit.SECONDS)
+            assertEquals(304, result.status)
+            assertEquals("", result.text)
+            assertEquals("revision-1", result.headers["etag"])
+        }
     }
 
     @Test

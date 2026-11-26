@@ -83,12 +83,18 @@ class NamuVpnServiceSwitchTest {
     }
     @Test
     fun mitmTemporarilyEnablesConnectionRoutingWithoutChangingDirectMode() {
-        val light = AppConfig(mode = "dns_only", dnsOnlyFullRoute = false, mtu = 1500)
-        val enabled = light.copy(mitm = light.mitm.copy(enabled = true))
-        assertEquals(TunnelSpec("dns_only", 1500, fullRoute = true), tunnelSpec(enabled))
-        assertEquals(false, enabled.dnsOnlyFullRoute)
-        val disabled = enabled.copy(mitm = enabled.mitm.copy(enabled = false))
-        assertEquals(tunnelSpec(light), tunnelSpec(disabled))
-        assertEquals(true, tunnelSpec(disabled.copy(dnsOnlyFullRoute = true)).fullRoute)
+        // 3.0.18：MITM 总开关设备级（全局 scope），不再随配置方案。
+        val saved = GlobalRuleStore.state
+        try {
+            val light = AppConfig(mode = "dns_only", dnsOnlyFullRoute = false, mtu = 1500)
+            GlobalRuleStore.state = saved.copy(scope = saved.scope.copy(enabled = true))
+            assertEquals(TunnelSpec("dns_only", 1500, fullRoute = true), tunnelSpec(light))
+            assertEquals(false, light.dnsOnlyFullRoute)
+            GlobalRuleStore.state = saved.copy(scope = saved.scope.copy(enabled = false))
+            assertEquals(false, tunnelSpec(light).fullRoute)
+            assertEquals(true, tunnelSpec(light.copy(dnsOnlyFullRoute = true)).fullRoute)
+        } finally {
+            GlobalRuleStore.state = saved
+        }
     }
 }

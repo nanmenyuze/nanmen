@@ -57,6 +57,27 @@ fn cache_key(
     )
 }
 
+/// Persist only answers from the same resolver settings. Old cache files without a
+/// scope are cold-started once, since their upstream cannot be inferred.
+fn dns_cache_scope(cfg: &DnsConfig) -> String {
+    use sha2::{Digest, Sha256};
+    let settings = (
+        &cfg.upstream,
+        &cfg.fallback,
+        &cfg.bootstrap,
+        &cfg.headers,
+        &cfg.policies,
+        &cfg.hosts,
+        cfg.race,
+        cfg.block_aaaa,
+        cfg.rebind_protection,
+        cfg.fallback_filter,
+        cfg.fallback_geo_check,
+    );
+    let bytes = serde_json::to_vec(&settings).expect("DNS resolver settings are serializable");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 struct Cache {
     map: HashMap<String, CacheEntry>,
     clock: u64,
@@ -145,7 +166,8 @@ impl Cache {
         remaining < (e.orig_ttl / 5).max(5)
     }
     fn mark_refreshing(&mut self, key: &str) -> bool {
-        self.refreshing.insert(key.to_string())
+        const MAX_BACKGROUND_REFRESHES: usize = 16;
+        self.refreshing.len() < MAX_BACKGROUND_REFRESHES && self.refreshing.insert(key.to_string())
     }
     fn finish_refresh(&mut self, key: &str) {
         self.refreshing.remove(key);
@@ -400,7 +422,7 @@ struct HostMap {
 impl HostMap {
     fn from_config(
         cfg: &DnsConfig,
-        primary: &UpstreamKind,
+        primary: Option<&UpstreamKind>,
         fallback: Option<&UpstreamKind>,
     ) -> Self {
         let mut map = HostMap::default();
@@ -411,7 +433,9 @@ impl HostMap {
             }
         }
         let mut allowed: HashSet<&'static str> = HashSet::new();
-        allowed.insert(upstream_protocol(primary));
+        if let Some(upstream) = primary {
+            allowed.insert(upstream_protocol(upstream));
+        }
         if let Some(f) = fallback {
             allowed.insert(upstream_protocol(f));
         }
@@ -562,6 +586,10 @@ pub struct DnsEngine {
     pub reverse: Mutex<ReverseMap>,
     cache: Mutex<Cache>,
     primary: Vec<UpstreamKind>,
+    /// [DNS] 按域名策略：(后缀, ".后缀", 上游列表)，按后缀长度降序，最长命中优先。
+    policies: Vec<(String, String, Vec<UpstreamKind>)>,
+    hijack: bool,
+    prefer_ipv6: bool,
     /// 主/备上游均支持有序多地址，前一个失败后尝试下一个。
     fallback: Vec<UpstreamKind>,
     block_mode: String,
@@ -570,7 +598,7 @@ pub struct DnsEngine {
     fake_pool: Mutex<FakeIpPool>,
     fake_path: Option<String>,
     /// Fake-IP 排除表：局域网、联网探测、NTP/STUN 等必须返回真实地址。
-    fake_filter: Vec<String>,
+    fake_filter: Vec<FakeFilterEntry>,
     /// fallback 污染复核开关与 CN IP 段（来自 cnip.txt）。
     fallback_filter: bool,
     /// 是否把「非 CN IP」也作为复核条件；默认关闭，避免把正常境外 CDN 当污染。
@@ -590,6 +618,7 @@ pub struct DnsEngine {
     block_aaaa: bool,
     /// 缓存落盘路径（sing-box cache_file 同款）：重启后热域仍然命中。
     cache_path: Option<String>,
+    cache_scope: String,
     /// DoT 连接池（sing-box/dnsproxy 同款）：复用 TLS 连接，且最多 4 条并行，
     /// 突发查询不再排在单条连接后面。
     dot_pool: tokio::sync::Mutex<Vec<DotConn>>,
@@ -633,14 +662,44 @@ impl DnsEngine {
     ) -> Self {
         let primary = parse_upstream(cfg);
         let fallback = parse_fallback(cfg);
-        let mut fake_filter = default_fake_filter();
+        let mut fake_filter: Vec<FakeFilterEntry> = default_fake_filter()
+            .into_iter()
+            .map(FakeFilterEntry::new)
+            .collect();
         for p in &cfg.fake_ip_filter {
-            let p = p.trim().trim_end_matches('.').to_ascii_lowercase();
-            if !p.is_empty() && !fake_filter.contains(&p) {
-                fake_filter.push(p);
+            let e = FakeFilterEntry::new(p.trim().trim_end_matches('.').to_ascii_lowercase());
+            if !e.pattern.is_empty() && !fake_filter.iter().any(|x| x.pattern == e.pattern) {
+                fake_filter.push(e);
             }
         }
-        let hosts = HostMap::from_config(cfg, &primary[0], fallback.first());
+        let mut policies: Vec<(String, String, Vec<UpstreamKind>)> = Vec::new();
+        for p in &cfg.policies {
+            let suffix = p
+                .pattern
+                .trim()
+                .trim_start_matches("*.")
+                .trim_start_matches('.')
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            if suffix.is_empty() {
+                continue;
+            }
+            let servers: Vec<UpstreamKind> = p
+                .servers
+                .split([',', '\n'])
+                .filter_map(|raw| {
+                    build_upstream(cfg, raw)
+                        .or_else(|| parse_host_port(raw.trim(), 53).map(|(h, port)| UpstreamKind::Udp(h, port)))
+                })
+                .collect();
+            if servers.is_empty() {
+                logging::warn("dns", format!("[DNS] 策略 {} 无可用上游，跳过", p.pattern));
+                continue;
+            }
+            policies.push((suffix.clone(), format!(".{}", suffix), servers));
+        }
+        policies.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        let hosts = HostMap::from_config(cfg, primary.first(), fallback.first());
         for issue in &hosts.rejected {
             logging::warn("dns", format!("Host 配置未生效：{}", issue));
         }
@@ -650,6 +709,9 @@ impl DnsEngine {
             reverse: Mutex::new(ReverseMap::new()),
             cache: Mutex::new(Cache::new(cfg.cache_size, cfg.cache_ttl)),
             primary,
+            policies,
+            hijack: cfg.hijack,
+            prefer_ipv6: false,
             fallback,
             block_mode: block_mode.to_string(),
             block_enabled,
@@ -675,6 +737,7 @@ impl DnsEngine {
             blocked_cache: Mutex::new(HashMap::new()),
             block_aaaa: cfg.block_aaaa,
             cache_path: None,
+            cache_scope: dns_cache_scope(cfg),
             dot_pool: tokio::sync::Mutex::new(Vec::new()),
             dot_sem: tokio::sync::Semaphore::new(4),
             real_cache: Mutex::new(HashMap::new()),
@@ -696,8 +759,7 @@ impl DnsEngine {
     /// `[Host]` 配置热替换：和 swap_filter 一样清掉旧结论，避免改映射后仍回旧 IP。
     /// 当前外壳走整颗 DNS 引擎热重载；保留这个方法给后续原地刷新复用。
     pub fn swap_hosts(&self, cfg: &DnsConfig) {
-        let primary = self.primary[0].clone();
-        let map = HostMap::from_config(cfg, &primary, self.fallback.first());
+        let map = HostMap::from_config(cfg, self.primary.first(), self.fallback.first());
         for issue in &map.rejected {
             logging::warn("dns", format!("Host 配置未生效：{}", issue));
         }
@@ -731,6 +793,28 @@ impl DnsEngine {
                     .lookup(qname)
                     .map(|(e, m)| (e.clone(), m.cloned()))
             })
+    }
+
+    /// hijack-dns 开关：TUN 内 :53 是否接管到本地解析。
+    pub fn hijack_enabled(&self) -> bool {
+        self.hijack
+    }
+
+    /// prefer-ipv6：直连候选地址排序是否 v6 优先。
+    pub fn prefer_ipv6(&self) -> bool {
+        self.prefer_ipv6
+    }
+
+    pub fn set_prefer_ipv6(&mut self, v: bool) {
+        self.prefer_ipv6 = v;
+    }
+
+    /// [DNS] 按域名策略：最长后缀命中返回其上游列表（Host server 优先级更高，在交换入口先判）。
+    fn policy_servers(&self, qname: &str) -> Option<&Vec<UpstreamKind>> {
+        self.policies
+            .iter()
+            .find(|(suffix, dot, _)| qname == suffix || qname.ends_with(dot.as_str()))
+            .map(|(_, _, servers)| servers)
     }
 
     fn host_server(&self, qname: &str) -> Option<UpstreamKind> {
@@ -770,6 +854,9 @@ impl DnsEngine {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
             return;
         };
+        if v.get("scope").and_then(|v| v.as_str()) != Some(self.cache_scope.as_str()) {
+            return;
+        }
         let Some(arr) = v.get("entries").and_then(|a| a.as_array()) else {
             return;
         };
@@ -846,7 +933,7 @@ impl DnsEngine {
         if entries.is_empty() {
             return;
         }
-        let body = serde_json::json!({"v": 1, "entries": entries}).to_string();
+        let body = serde_json::json!({"v": 2, "scope": self.cache_scope, "entries": entries}).to_string();
         let tmp = format!("{}.tmp", p);
         if std::fs::write(&tmp, body).is_ok() {
             let _ = std::fs::rename(&tmp, p);
@@ -1534,6 +1621,19 @@ impl DnsEngine {
                 self.record_breaker(r.is_some());
                 return (r, "Host·指定上游");
             }
+            // [DNS] 按域名策略：与 Host server 同语义——只替换本次主上游（列表内有序重试），
+            // 不静默回退全局 fallback，避免改变用户显式指定的出口预期。
+            if let Some(servers) = self.policy_servers(&qname) {
+                let mut r = None;
+                for kind in servers {
+                    r = self.query_kind(kind, fwd, req).await;
+                    if r.is_some() {
+                        break;
+                    }
+                }
+                self.record_breaker(r.is_some());
+                return (r, "DNS·域名策略");
+            }
         }
         let open = self
             .breaker
@@ -1812,9 +1912,7 @@ impl DnsEngine {
     }
 
     fn is_fake_filtered(&self, qname: &str) -> bool {
-        self.fake_filter
-            .iter()
-            .any(|pattern| wildcard_match(pattern, qname))
+        self.fake_filter.iter().any(|e| e.matches(qname))
     }
 
     /// 主上游应答是否需要 fallback 复核：
@@ -2207,6 +2305,32 @@ fn default_fake_filter() -> Vec<String> {
 }
 
 /// 域名通配符匹配，只支持 `*`（mihomo fake-ip-filter 的常见写法），大小写不敏感。
+/// Fake-IP 排除条目：含 * / ? 走 glob；裸域为后缀语义（含自身与全部子域，
+/// 与 Loon always-real-ip / skip-proxy 一致），预计算 ".后缀" 避免热路径分配。
+struct FakeFilterEntry {
+    pattern: String,
+    dot: String,
+    glob: bool,
+}
+
+impl FakeFilterEntry {
+    fn new(pattern: String) -> Self {
+        // mihomo fake-ip-filter 的 `+.` 前缀 = 后缀语义，归一化成裸域。
+        let pattern = pattern.strip_prefix("+.").map(|r| r.to_string()).unwrap_or(pattern);
+        let glob = pattern.contains('*') || pattern.contains('?');
+        let dot = format!(".{}", pattern);
+        Self { pattern, dot, glob }
+    }
+
+    fn matches(&self, qname: &str) -> bool {
+        if self.glob {
+            wildcard_match(&self.pattern, qname)
+        } else {
+            qname == self.pattern || qname.ends_with(self.dot.as_str())
+        }
+    }
+}
+
 fn wildcard_match(pattern: &str, text: &str) -> bool {
     let p = pattern.as_bytes();
     let t = text.as_bytes();
@@ -2312,9 +2436,6 @@ fn parse_upstream(cfg: &DnsConfig) -> Vec<UpstreamKind> {
         .collect();
     if values.is_empty() {
         values = cfg.fallback.split([',', '\n']).filter_map(|raw| build_upstream(cfg, raw)).collect();
-    }
-    if values.is_empty() {
-        values.push(UpstreamKind::Udp("223.5.5.5".into(), 53));
     }
     values
 }
@@ -2546,6 +2667,25 @@ fn root_store() -> rustls::RootCertStore {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn dns_does_not_add_a_public_fallback() {
+        use super::{parse_fallback, parse_upstream, HostEntry, HostMap, UpstreamKind};
+        use crate::config::DnsConfig;
+
+        let mut cfg: DnsConfig =
+            serde_json::from_str(r#"{"upstream":""}"#).expect("valid DNS config");
+        assert!(DnsConfig::default().fallback.is_empty());
+        assert!(parse_upstream(&cfg).is_empty());
+        assert!(parse_fallback(&cfg).is_empty());
+
+        cfg.hosts.insert("internal.example".into(), "192.0.2.10".into());
+        let hosts = HostMap::from_config(&cfg, None, None);
+        assert!(matches!(hosts.lookup("internal.example"), Some((HostEntry::Ip(_), _))));
+
+        cfg.fallback = "udp://192.0.2.53:53".into();
+        assert!(matches!(&parse_upstream(&cfg)[..], [UpstreamKind::Udp(host, 53)] if host == "192.0.2.53"));
+    }
+
+    #[test]
     fn host_map_classifies_ip_alias_server_and_wildcard() {
         use super::{HostEntry, HostMap, UpstreamKind};
         use crate::config::DnsConfig;
@@ -2558,8 +2698,8 @@ mod tests {
             .insert("server.example".into(), "server:1.1.1.1".into());
         cfg.hosts
             .insert("bad.example".into(), "server:system".into());
-        let primary = UpstreamKind::Udp("223.5.5.5".into(), 53);
-        let map = HostMap::from_config(&cfg, &primary, None);
+        let primary = UpstreamKind::Udp("192.0.2.53".into(), 53);
+        let map = HostMap::from_config(&cfg, Some(&primary), None);
         assert!(matches!(map.lookup("ip.example"), Some((HostEntry::Ip(v), _)) if v.len() == 2));
         assert!(
             matches!(map.lookup("a.wild.example"), Some((HostEntry::Alias(v), _)) if v == "alias.example")
@@ -2571,6 +2711,76 @@ mod tests {
         ));
         assert!(map.lookup("bad.example").is_none());
         assert!(map.rejected.iter().any(|s| s.contains("server:system")));
+    }
+
+    #[test]
+    fn dns_policy_longest_suffix_wins_and_hijack_flag() {
+        let cfg = DnsConfig {
+            policies: vec![
+                crate::config::DnsPolicyConf {
+                    pattern: "example.com".into(),
+                    servers: "1.1.1.1".into(),
+                },
+                crate::config::DnsPolicyConf {
+                    pattern: "*.ads.example.com".into(),
+                    servers: "8.8.8.8,9.9.9.9".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let e = DnsEngine::new(
+            &cfg,
+            Arc::new(FilterEngine::new()),
+            Arc::new(Stats::new()),
+            "nxdomain",
+            true,
+            false,
+            false,
+        );
+        let hit = e.policy_servers("x.ads.example.com").expect("最长后缀应命中");
+        assert_eq!(hit.len(), 2, "策略列表内有序重试");
+        assert!(e.policy_servers("example.com").is_some(), "裸域含自身");
+        assert!(e.policy_servers("a.example.com").is_some(), "裸域含子域");
+        assert!(e.policy_servers("other.com").is_none());
+        assert!(e.hijack_enabled(), "hijack 默认开");
+        let cfg2 = DnsConfig {
+            hijack: false,
+            ..Default::default()
+        };
+        let e2 = DnsEngine::new(
+            &cfg2,
+            Arc::new(FilterEngine::new()),
+            Arc::new(Stats::new()),
+            "nxdomain",
+            true,
+            false,
+            false,
+        );
+        assert!(!e2.hijack_enabled());
+    }
+
+    #[test]
+    fn fake_filter_bare_domain_is_suffix() {
+        let cfg = DnsConfig {
+            fake_ip_filter: vec!["example.com".into(), "*.glob.com".into(), "+.plus.org".into()],
+            ..Default::default()
+        };
+        let e = DnsEngine::new(
+            &cfg,
+            Arc::new(FilterEngine::new()),
+            Arc::new(Stats::new()),
+            "nxdomain",
+            true,
+            false,
+            false,
+        );
+        assert!(e.is_fake_filtered("example.com"), "裸域含自身");
+        assert!(e.is_fake_filtered("a.example.com"), "裸域含子域（Loon always-real-ip 语义）");
+        assert!(!e.is_fake_filtered("notexample.com"));
+        assert!(e.is_fake_filtered("x.glob.com"), "glob 子域命中");
+        assert!(!e.is_fake_filtered("glob.com"), "glob 不含裸域");
+        assert!(e.is_fake_filtered("a.plus.org"), "+. 前缀归一为后缀");
+        assert!(e.is_fake_filtered("plus.org"), "+. 前缀含裸域");
     }
 
     #[test]
@@ -2589,7 +2799,7 @@ mod tests {
             "https://dns.alidns.com/dns-query".into(),
             reqwest::header::HeaderMap::new(),
         );
-        let map = HostMap::from_config(&cfg, &doh, None);
+        let map = HostMap::from_config(&cfg, Some(&doh), None);
         assert!(matches!(
             map.lookup("doh.example"),
             Some((HostEntry::Server(UpstreamKind::Doh(..)), _))
@@ -2633,6 +2843,8 @@ mod tests {
         // 关闭 AAAA 时，即使 Host 有 v6 也不返回。
         let engine_blocked = DnsEngine::new(
             &DnsConfig {
+                policies: Vec::new(),
+                hijack: true,
                 block_aaaa: true,
                 ..DnsConfig::default()
             },
@@ -2792,6 +3004,8 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let cfg = DnsConfig {
+                policies: Vec::new(),
+                hijack: true,
                 block_aaaa: true,
                 ..Default::default()
             };
@@ -2862,6 +3076,8 @@ mod tests {
     #[test]
     fn breaker_opens_after_three_failures() {
         let cfg = DnsConfig {
+                policies: Vec::new(),
+                hijack: true,
             upstream: "udp://127.0.0.1:1".into(),
             ..Default::default()
         };
@@ -2954,7 +3170,8 @@ mod tests {
         let bytes = msg.to_vec().unwrap();
         let now = crate::stats::now_ms() / 1000;
         let body = serde_json::json!({
-            "v": 1,
+            "v": 2,
+            "scope": dns_cache_scope(&DnsConfig::default()),
             "entries": [{
                 "k": "ttl.example.com|1",
                 "b": base64::engine::general_purpose::STANDARD.encode(&bytes),
@@ -2989,6 +3206,21 @@ mod tests {
             "TTL 膨胀: {}",
             parsed.answers()[0].ttl()
         );
+        let changed = DnsConfig {
+            upstream: "udp://127.0.0.1:5353".into(),
+            ..DnsConfig::default()
+        };
+        let mut fresh = DnsEngine::new(
+            &changed,
+            Arc::new(FilterEngine::new()),
+            Arc::new(Stats::new()),
+            "nxdomain",
+            true,
+            false,
+            false,
+        );
+        fresh.set_cache_path(Some(path.to_string_lossy().to_string()));
+        assert!(fresh.cache.lock().unwrap().map.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3060,6 +3292,8 @@ mod tests {
     #[test]
     fn blocked_nxdomain_carries_soa() {
         let cfg = DnsConfig {
+                policies: Vec::new(),
+                hijack: true,
             block_ttl: 42,
             ..Default::default()
         };
@@ -3181,7 +3415,8 @@ mod tests {
         std::fs::write(
             &path,
             format!(
-                r#"{{"entries":[{{"k":"short","b":"{}","e":{}}}]}}"#,
+                r#"{{"scope":"{}","entries":[{{"k":"short","b":"{}","e":{}}}]}}"#,
+                engine.cache_scope,
                 encoded,
                 now + 2
             ),
@@ -3255,6 +3490,8 @@ mod tests {
     fn fallback_filter_flags_non_cn_and_bogus() {
         // 默认只复核明显异常，不把境外 IP 当污染。
         let cfg = DnsConfig {
+                policies: Vec::new(),
+                hijack: true,
             fallback_filter: true,
             ..Default::default()
         };
@@ -3298,6 +3535,8 @@ mod tests {
 
         // 显式开启 geo check 后，非 CN 才进入复核。
         let cfg_geo = DnsConfig {
+                policies: Vec::new(),
+                hijack: true,
             fallback_filter: true,
             fallback_geo_check: true,
             ..Default::default()

@@ -27,9 +27,19 @@ data object SettingsRoute
 @Serializable
 data object AdvancedSettingsRoute
 
-/** 设置 → 运行数据与诊断：DNS 拦截、流量连接、MITM 统计与日志导出的总览二级页。 */
+/** 数据 → 日志与诊断。 */
 @Serializable
 data object DiagnosticsRoute
+
+@Keep
+@Serializable
+enum class DataSection(val title: String) {
+    Dns("DNS 与拦截"),
+    Traffic("流量与连接"),
+}
+
+@Serializable
+data class DataAnalyticsRoute(val section: DataSection)
 
 @Serializable
 data object NodesRoute
@@ -62,7 +72,7 @@ enum class ConfigSection(val title: String) {
     HeaderRewrite("头部重写"),
     BodyRewrite("正文重写"),
     Https("HTTPS 解密"),
-    Advanced("高级设置"),
+    Advanced("连接与路由"),
 }
 
 @Serializable
@@ -91,7 +101,8 @@ enum class MainTab(
     val route: Any,
 ) {
     Home("首页", R.drawable.ic_tab_home, HomeRoute),
-    Modules("模块", R.drawable.ic_tab_rules, ModulesRoute),
+    Config("配置", R.drawable.ic_tab_config, ConfigRoute),
+    Data("数据", R.drawable.ic_tab_data, DataRoute),
     Settings("设置", R.drawable.ic_tab_settings, SettingsRoute),
 }
 

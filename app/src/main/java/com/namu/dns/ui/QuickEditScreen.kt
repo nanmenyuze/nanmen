@@ -13,15 +13,17 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.outlined.Description
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -49,7 +51,6 @@ import androidx.compose.ui.text.input.OffsetMapping
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.TransformedText
 import androidx.compose.ui.text.input.VisualTransformation
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.namu.dns.ConfigFileStore
@@ -100,9 +101,10 @@ fun QuickEditScreen(
     }
 
     fun requestBack() {
+        if (saving) return
         if (editor.text == initial) onBack() else confirmExit = true
     }
-    BackHandler { requestBack() }
+    BackHandler(enabled = saving || editor.text != initial) { requestBack() }
     if (confirmExit) {
         NamuDialog(
             title = "保存修改？",
@@ -123,23 +125,23 @@ fun QuickEditScreen(
     val currentLineColor = NamuColors.Orange.copy(alpha = if (NamuColors.isDark) 0.13f else 0.08f)
 
     Column(Modifier.fillMaxSize().background(NamuColors.Bg)) {
-        Row(
-            Modifier.fillMaxWidth().statusBarsPadding().height(52.dp).padding(horizontal = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            TextButton(onClick = { requestBack() }) { Text("取消", color = NamuColors.Blue) }
-            Text(
-                "快速编辑",
-                modifier = Modifier.weight(1f),
-                textAlign = TextAlign.Center,
-                fontSize = 17.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = NamuColors.TextMain,
-            )
-            TextButton(onClick = { save() }, enabled = !saving) {
-                Text("保存", color = NamuColors.Brand, fontWeight = FontWeight.SemiBold)
-            }
-        }
+        ShadowTopBar(
+            title = "快速编辑",
+            left = {
+                IconButton(onClick = ::requestBack, enabled = !saving) {
+                    NamuIcon(Icons.AutoMirrored.Rounded.ArrowBack, "返回")
+                }
+            },
+            right = {
+                IconButton(onClick = ::save, enabled = !saving && editor.text != initial) {
+                    NamuIcon(
+                        Icons.Filled.Check,
+                        "保存配置",
+                        tint = if (!saving && editor.text != initial) NamuColors.Brand else NamuColors.TextTertiary,
+                    )
+                }
+            },
+        )
 
         Spacer(Modifier.height(8.dp))
         GroupCard {

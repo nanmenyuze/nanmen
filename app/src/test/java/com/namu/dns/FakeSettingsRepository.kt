@@ -36,6 +36,10 @@ class FakeSettingsRepository(initial: AppConfig = AppConfig()) : SettingsReposit
 
     override fun save() = Unit
 
+    override fun restoreSilent(cfg: AppConfig) {
+        _config.value = cfg
+    }
+
     override fun assetStamp(): Int = stamp
 
     override fun setAssetStamp(stamp: Int) {

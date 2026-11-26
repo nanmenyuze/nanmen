@@ -176,6 +176,13 @@ object Actions {
             }
             try {
                 val code = conn.responseCode
+                if (code == HttpURLConnection.HTTP_NOT_MODIFIED) {
+                    val responseHeaders = conn.headerFields
+                        .filterKeys { it != null }
+                        .mapKeys { (key, _) -> key.lowercase() }
+                        .mapValues { (_, values) -> values.firstOrNull().orEmpty() }
+                    return@withContext FetchResult("", responseHeaders, 304)
+                }
                 if (code in 300..399) {
                     val location = conn.getHeaderField("Location")
                         ?: throw RuntimeException("HTTP $code 没有 Location")
@@ -194,13 +201,6 @@ object Actions {
                     if (redirects > 3) throw RuntimeException("重定向次数过多")
                     current = next
                     continue
-                }
-                if (code == 304) {
-                    val responseHeaders = conn.headerFields
-                        .filterKeys { it != null }
-                        .mapKeys { (key, _) -> key.lowercase() }
-                        .mapValues { (_, values) -> values.firstOrNull().orEmpty() }
-                    return@withContext FetchResult("", responseHeaders, 304)
                 }
                 if (code !in 200..299) throw RuntimeException("HTTP $code")
                 val declared = conn.contentLengthLong
@@ -490,22 +490,20 @@ object Actions {
         sources: List<RuleSource>? = null,
         profileName: String = App.container.config.activeName(),
     ): RuleSyncResult = withContext(Dispatchers.IO) {
-        val profile = withContext(Dispatchers.Main) { App.container.config.loadProfile(profileName) }
-            ?: throw RuntimeException("配置无法读取")
-        val selected = sources ?: profile.ruleSources
+        val selected = sources ?: GlobalRuleStore.state.ruleSets
         var updated = 0
         var totalLines = 0
         val errors = mutableListOf<String>()
         val results = mutableMapOf<String, RuleSource>()
         selected.filter { it.enabled }.forEach { src ->
-            val file = ConfigStore.ruleSourceFile(App.context, src, profileName)
+            val file = ConfigStore.globalRuleSetFile(App.context, src.url)
             val now = System.currentTimeMillis()
             try {
                 val conditional = buildMap {
                     if (file.length() > 0L && src.etag.isNotBlank()) put("If-None-Match", src.etag)
                     if (file.length() > 0L && src.lastModified.isNotBlank()) put("If-Modified-Since", src.lastModified)
                 }
-                val headers = headerMapFor(profile, src.url) + conditional
+                val headers = headerMapFor(settings.current(), src.url) + conditional
                 val fetched = fetchTextResult(src.url, maxBytes = 8 * 1024 * 1024, headers = headers)
                 if (fetched.status == 304) {
                     val cachedLines = if (file.exists() && file.length() > 0) file.useLines { it.count() } else 0
@@ -515,6 +513,7 @@ object Actions {
                         lines = cachedLines,
                         error = "",
                         stale = false,
+                        notModified = true,
                         etag = fetched.headers["etag"] ?: src.etag,
                         lastModified = fetched.headers["last-modified"] ?: src.lastModified,
                         cacheBytes = if (file.exists()) file.length() else 0,
@@ -534,6 +533,7 @@ object Actions {
                     lines = lines,
                     error = "",
                     stale = false,
+                    notModified = false,
                     etag = fetched.headers["etag"] ?: "",
                     lastModified = fetched.headers["last-modified"] ?: "",
                     cacheBytes = file.length(),
@@ -558,11 +558,12 @@ object Actions {
             }
         }
         withContext(Dispatchers.Main) {
-            App.container.config.saveProfile(profileName) { current ->
-                current.copy(ruleSources = current.ruleSources.map { source ->
-                    results[source.id]?.takeIf { it.url == source.url }?.copy(enabled = source.enabled) ?: source
+            GlobalRuleStore.update(App.context) { st ->
+                st.copy(ruleSets = st.ruleSets.map { source ->
+                    results[source.id]?.takeIf { it.url == source.url }
+                        ?.copy(enabled = source.enabled, origin = source.origin, order = source.order) ?: source
                 })
-            } ?: throw RuntimeException("规则来源状态保存失败")
+            }
         }
         RuleSyncResult(updated, totalLines, errors)
     }
@@ -690,6 +691,8 @@ object Actions {
         val parsed: ParsedModule,
         val duplicateBlock: Int,
         val duplicateRoute: Int,
+        /** 3.0.18：模块附带 DNS 参数摘要；导入预览提示，经确认才合并。 */
+        val dnsNotes: List<String> = emptyList(),
     )
 
     /** 导入前预览：只下载和解析，不落盘；同时统计与现有模块重复的规则条数。 */
@@ -720,7 +723,7 @@ object Actions {
         }
         val existingBlocks = HashSet<String>()
         val existingRoutes = HashSet<String>()
-        settings.current().moduleSources.filter { it.url != target }.forEach { src ->
+        GlobalRuleStore.state.modules.filter { it.url != target }.forEach { src ->
             val f = ConfigStore.moduleFile(App.context, src.id)
             if (f.exists() && f.length() > 0) {
                 runCatching { ModuleParser.parse(f.readText()) }.getOrNull()?.let { old ->
@@ -740,12 +743,19 @@ object Actions {
             parsed = parsed,
             duplicateBlock = parsed.blockLines.count { it in existingBlocks },
             duplicateRoute = parsed.routeRules.count { "${it.type}|${it.value}|${it.action}" in existingRoutes },
+            dnsNotes = buildList {
+                if (parsed.dnsPolicies.isNotEmpty()) add("按域名 DNS 策略 ${parsed.dnsPolicies.size} 条")
+                parsed.generalOptions["always-real-ip"]?.let { add("always-real-ip：$it") }
+                listOf("ipv6" to "IPv6 开关", "prefer-ipv6" to "IPv6 优先", "hijack-dns" to "DNS 接管开关").forEach { (k, label) ->
+                    parsed.generalOptions[k]?.let { add("$label：$it") }
+                }
+            },
         )
     }
 
     /** 预览确认后直接落盘导入，不再重复下载。 */
-    suspend fun importPreview(preview: ModulePreview): ModuleResult {
-        saveParsedModule(preview.url, preview.name, preview.text, preview.parsed)
+    suspend fun importPreview(preview: ModulePreview, approveDns: Boolean = false): ModuleResult {
+        saveParsedModule(preview.url, preview.name, preview.text, preview.parsed, dnsApproved = approveDns)
         return ModuleResult(
             preview.name,
             preview.parsed.app,
@@ -762,8 +772,9 @@ object Actions {
         displayName: String,
         text: String,
         parsed: ParsedModule,
+        dnsApproved: Boolean? = null,
     ): ModuleResult {
-        val existing = settings.current().moduleSources.firstOrNull { it.url == target }
+        val existing = GlobalRuleStore.state.modules.firstOrNull { it.url == target }
         val id = existing?.id ?: moduleId(target)
         saveModuleFile(id, text)
         fetchRuleSets(parsed)
@@ -787,14 +798,14 @@ object Actions {
             lastModified = existing?.lastModified ?: "",
             stale = false,
             cacheBytes = text.toByteArray().size.toLong(),
+            dnsApproved = dnsApproved ?: existing?.dnsApproved ?: false,
+            order = existing?.order ?: -1,
         )
         withContext(Dispatchers.Main) {
-            val current = settings.current()
-            val next = current.copy(
-                moduleSources = current.moduleSources.filterNot { it.url == target } + source,
-            )
-            settings.set(next)
-            ConfigStore.rebuildModules(App.context, next)
+            GlobalRuleStore.update(App.context) { st ->
+                st.copy(modules = st.modules.filterNot { it.url == target } + source)
+            }
+            ConfigStore.rebuildModules(App.context, settings.current())
         }
         return ModuleResult(
             source.name,
@@ -832,6 +843,7 @@ object Actions {
             lastModified = synced.lastModified,
             stale = synced.stale,
             cacheBytes = synced.cacheBytes,
+            notModified = synced.notModified,
         )
 
     /** 同一 id 但 URL 已在同步期间被用户改掉时，旧下载结果必须丢弃。 */
@@ -852,7 +864,7 @@ object Actions {
         var updated = 0
         val errors = mutableListOf<String>()
         val results = mutableMapOf<String, ModuleSource>()
-        settings.current().moduleSources.filter { src ->
+        GlobalRuleStore.state.modules.filter { src ->
             if (moduleId == null) src.enabled else src.id == moduleId
         }.forEach { src ->
             if (!src.url.startsWith("https://")) {
@@ -868,8 +880,10 @@ object Actions {
             val now = System.currentTimeMillis()
             try {
                 val conditional = buildMap {
-                    if (src.etag.isNotBlank()) put("If-None-Match", src.etag)
-                    if (src.lastModified.isNotBlank()) put("If-Modified-Since", src.lastModified)
+                    if (file.length() > 0L) {
+                        if (src.etag.isNotBlank()) put("If-None-Match", src.etag)
+                        if (src.lastModified.isNotBlank()) put("If-Modified-Since", src.lastModified)
+                    }
                 }
                 val fetched = fetchTextResult(
                     src.url,
@@ -879,7 +893,7 @@ object Actions {
                 if (fetched.status == 304) {
                     if (!file.exists() || file.length() == 0L) throw RuntimeException("304 但没有本地缓存")
                     results[src.id] = src.copy(
-                        lastAttemptAt = now, error = "", stale = false,
+                        lastAttemptAt = now, error = "", stale = false, notModified = true,
                         cacheBytes = file.length(),
                         etag = fetched.headers["etag"] ?: src.etag,
                         lastModified = fetched.headers["last-modified"] ?: src.lastModified,
@@ -910,6 +924,7 @@ object Actions {
                     ignored = parsed.ignored,
                     error = "",
                     stale = false,
+                    notModified = false,
                     cacheBytes = file.length(),
                     etag = fetched.headers["etag"] ?: "",
                     lastModified = fetched.headers["last-modified"] ?: "",
@@ -928,73 +943,58 @@ object Actions {
             }
         }
         withContext(Dispatchers.Main) {
-            val current = settings.current()
-            val next = current.copy(
-                // 只合并同步字段，不在写回时复活用户刚关闭的模块。
-                moduleSources = mergeModuleSyncResults(current.moduleSources, results),
-            )
-            settings.set(next)
-            ConfigStore.rebuildModules(App.context, next)
+            // 只合并同步字段，不在写回时复活用户刚关闭的模块。
+            GlobalRuleStore.update(App.context) { st ->
+                st.copy(modules = mergeModuleSyncResults(st.modules, results))
+            }
+            ConfigStore.rebuildModules(App.context, settings.current())
         }
         if (updated > 0 && runtime.current().connected) {
-            withContext(Dispatchers.Main) { NamuVpnService.reload(App.context) }
+            withContext(Dispatchers.Main) { ApplyCoordinator.requestApply(App.context, "配置变更") }
         }
         ModuleSyncResult(updated, errors)
     }
 
     suspend fun setModuleEnabled(id: String, enabled: Boolean) = withContext(Dispatchers.Main) {
-        val current = settings.current()
-        val next = current.copy(
-            moduleSources = current.moduleSources.map { if (it.id == id) it.copy(enabled = enabled) else it },
-        )
-        settings.set(next)
-        ConfigStore.rebuildModules(App.context, next)
-        if (runtime.current().connected) NamuVpnService.reload(App.context)
+        GlobalRuleStore.update(App.context) { st ->
+            st.copy(modules = st.modules.map { if (it.id == id) it.copy(enabled = enabled) else it })
+        }
+        ConfigStore.rebuildModules(App.context, settings.current())
+        if (runtime.current().connected) ApplyCoordinator.requestApply(App.context, "配置变更")
     }
 
     /** U2：只改 Profile 内模块顺序，重建规则后热重载，identity 不变。 */
     suspend fun moveModule(from: Int, to: Int) = withContext(Dispatchers.Main) {
-        val current = settings.current()
-        val next = current.copy(moduleSources = ModuleOrder.move(current.moduleSources, from, to))
-        settings.set(next)
-        ConfigStore.rebuildModules(App.context, next)
-        if (runtime.current().connected) NamuVpnService.reload(App.context)
+        val moved = ModuleOrder.move(GlobalRuleStore.orderedModules(), from, to)
+        GlobalRuleStore.update(App.context) { st -> st.copy(modules = moved) }
+        ConfigStore.rebuildModules(App.context, settings.current())
+        if (runtime.current().connected) ApplyCoordinator.requestApply(App.context, "配置变更")
     }
 
     /** 长按拖拽松手后一次落盘，避免拖动过程中反复重建规则。 */
     suspend fun reorderModule(id: String, to: Int) = withContext(Dispatchers.Main) {
-        val current = settings.current()
-        val ordered = current.moduleSources.sortedWith(
-            compareBy<ModuleSource> { if (it.order >= 0) it.order else Int.MAX_VALUE }
-                .thenBy { current.moduleSources.indexOf(it) },
-        )
+        val ordered = GlobalRuleStore.orderedModules()
         val from = ordered.indexOfFirst { it.id == id }
         if (from >= 0) {
-            val next = current.copy(moduleSources = ModuleOrder.move(ordered, from, to))
-            settings.set(next)
-            ConfigStore.rebuildModules(App.context, next)
-            if (runtime.current().connected) NamuVpnService.reload(App.context)
+            val moved = ModuleOrder.move(ordered, from, to)
+            GlobalRuleStore.update(App.context) { st -> st.copy(modules = moved) }
+            ConfigStore.rebuildModules(App.context, settings.current())
+            if (runtime.current().connected) ApplyCoordinator.requestApply(App.context, "配置变更")
         }
     }
 
     /** 编辑模块的 #!app 分组元数据；这不是系统级 UID 隔离开关。 */
     suspend fun setModuleApp(id: String, app: String) = withContext(Dispatchers.Main) {
-        val current = settings.current()
-        val next = current.copy(
-            moduleSources = current.moduleSources.map {
-                if (it.id == id) it.copy(app = app.trim()) else it
-            },
-        )
-        settings.set(next)
+        GlobalRuleStore.update(App.context) { st ->
+            st.copy(modules = st.modules.map { if (it.id == id) it.copy(app = app.trim()) else it })
+        }
     }
 
     suspend fun deleteModule(id: String) = withContext(Dispatchers.Main) {
-        val current = settings.current()
-        val next = current.copy(moduleSources = current.moduleSources.filterNot { it.id == id })
-        settings.set(next)
-        ConfigStore.rebuildModules(App.context, next)
+        GlobalRuleStore.update(App.context) { st -> st.copy(modules = st.modules.filterNot { it.id == id }) }
+        ConfigStore.rebuildModules(App.context, settings.current())
         runCatching { ConfigStore.moduleFile(App.context, id).delete() }
-        if (runtime.current().connected) NamuVpnService.reload(App.context)
+        if (runtime.current().connected) ApplyCoordinator.requestApply(App.context, "配置变更")
     }
 
     private suspend fun applyRemoteConfig(o: JSONObject, url: String, profileName: String): Pair<AppConfig, List<RuleSource>> = withContext(Dispatchers.Main) {
@@ -1051,6 +1051,15 @@ object Actions {
                 dnsHeaderValue = headerValue,
                 dnsCacheTtl = (dns?.optInt("cache_ttl", current.dnsCacheTtl) ?: current.dnsCacheTtl).coerceIn(30, 86400),
                 dnsQueryLog = dns?.optBoolean("query_log", current.dnsQueryLog) ?: current.dnsQueryLog,
+                dnsPolicies = dns?.optJSONArray("policies")?.let { arr ->
+                    (0 until arr.length()).mapNotNull { i ->
+                        val o = arr.optJSONObject(i) ?: return@mapNotNull null
+                        val p = o.optString("pattern").trim()
+                        val sv = o.optString("servers").trim()
+                        if (p.isBlank() || sv.isBlank()) null else com.namu.dns.core.config.DnsPolicyRule(p, sv)
+                    }
+                } ?: current.dnsPolicies,
+                dnsHijack = if (dns?.has("hijack") == true) dns.optBoolean("hijack") else current.dnsHijack,
                 allowDnsFallback = when {
                     dns?.has("fail_closed") == true -> !dns.optBoolean("fail_closed")
                     explicitFallback != null -> explicitFallback.isNotBlank()
@@ -1100,19 +1109,25 @@ object Actions {
         url: String,
         profileName: String = App.container.config.activeName(),
     ): Int = withContext(Dispatchers.IO) {
-        val profile = withContext(Dispatchers.Main) { App.container.config.loadProfile(profileName) }
-            ?: throw RuntimeException("配置无法读取")
-        val text = fetchText(url, maxBytes = 8 * 1024 * 1024, headers = headerMapFor(profile, url))
+        val text = fetchText(url, maxBytes = 8 * 1024 * 1024, headers = headerMapFor(settings.current(), url))
         validateRules(text)
-        val file = ConfigStore.rulesFile(App.context, url, profileName)
+        val file = ConfigStore.globalRuleSetFile(App.context, url)
         ConfigStore.writeAtomicPublic(file, text)
         check(file.readText() == text) { "规则缓存写入失败" }
         withContext(Dispatchers.Main) {
-            App.container.config.saveProfile(profileName) {
-                if (it.rulesUrl == url || it.rulesUrl == profile.rulesUrl) {
-                    it.copy(rulesUrl = url, rulesUpdatedAt = System.currentTimeMillis())
-                } else it
-            } ?: throw RuntimeException("规则来源状态保存失败")
+            GlobalRuleStore.update(App.context) { st ->
+                val exist = st.ruleSets.firstOrNull { it.url == url }
+                val src = (exist ?: RuleSource(id = "legacy-ads-url", url = url)).copy(
+                    updatedAt = System.currentTimeMillis(),
+                    lines = text.lines().size,
+                    error = "",
+                    stale = false,
+                    cacheBytes = file.length(),
+                    format = detectRuleSourceFormat(text, exist?.format ?: "adblock"),
+                )
+                st.copy(ruleSets = st.ruleSets.filterNot { it.url == url } + src)
+            }
+            ConfigStore.rebuildModules(App.context, settings.current())
         }
         text.lines().size
     }
@@ -1133,9 +1148,10 @@ object Actions {
                 false
             }
         }
-        if (cfg.ruleSources.isNotEmpty()) {
+        val globalSets = GlobalRuleStore.state.ruleSets
+        if (globalSets.isNotEmpty()) {
             val now = System.currentTimeMillis()
-            val due = cfg.ruleSources.filter { it.enabled && now - it.lastAttemptAt >= 12L * 60 * 60 * 1000 }
+            val due = globalSets.filter { it.enabled && now - it.lastAttemptAt >= 12L * 60 * 60 * 1000 }
             if (due.isEmpty()) return@withContext false
             return@withContext try {
                 syncRuleSources(due, profileName).updated > 0
@@ -1145,20 +1161,7 @@ object Actions {
                 false
             }
         }
-        if (cfg.rulesUrl.isBlank()) return@withContext false
-        val file = ConfigStore.rulesFile(App.context, cfg.rulesUrl, profileName)
-        val fresh = file.exists() && file.length() > 0 &&
-            System.currentTimeMillis() - cfg.rulesUpdatedAt < 12L * 60 * 60 * 1000
-        if (fresh) return@withContext false
-        try {
-            updateAdsRules(cfg.rulesUrl, profileName)
-            true
-        } catch (e: Exception) {
-            withContext(Dispatchers.Main) {
-                messages.show("规则源同步失败：${e.message ?: "网络错误"}")
-            }
-            false
-        }
+        false
     }
 
     suspend fun updateCnIp(url: String): Int = withContext(Dispatchers.IO) {
@@ -1239,30 +1242,30 @@ object Actions {
                     selected = nextSelected,
                 )
             }
-            if (changed && runtime.current().connected) NamuVpnService.reload(App.context)
+            if (changed && runtime.current().connected) ApplyCoordinator.requestApply(App.context, "配置变更")
         }
         results.count { it.second != null }
     }
 
-    /** MITM 总开关：写配置 → 重建模块 MITM 合并 → 运行中热重载。 */
-    suspend fun setMitmEnabled(enabled: Boolean) = updateMitm { it.copy(enabled = enabled) }
+    /** MITM 总开关（设备级）：写全局 → 重建合并 → 运行中热重载。 */
+    suspend fun setMitmEnabled(enabled: Boolean) = updateScope { it.copy(enabled = enabled) }
 
     /** 手动 MITM 域名（支持 *.example.com 通配）。 */
-    suspend fun setMitmHostnames(hostnames: List<String>) = updateMitm { it.copy(hostnames = hostnames) }
+    suspend fun setMitmHostnames(hostnames: List<String>) = updateScope { it.copy(hostnames = hostnames) }
 
     /** 永不 MITM 的跳过域名（银行/支付等）。 */
-    suspend fun setMitmSkip(hostnames: List<String>) = updateMitm { it.copy(skipHostnames = hostnames) }
+    suspend fun setMitmSkip(hostnames: List<String>) = updateScope { it.copy(skipHostnames = hostnames) }
 
     /** 灰度：MITM 上游连接池；默认关闭，只影响新连接。 */
     suspend fun setMitmPoolEnabled(on: Boolean) =
-        updateMitm { it.copy(poolEnabled = on, poolIdleSecs = it.poolIdleSecs) }
+        updateScope { it.copy(poolEnabled = on, poolIdleSecs = it.poolIdleSecs) }
 
     /**
      * 按 App MITM：mode = all / allow / deny，apps 是包名列表。
      * 写配置后重建模块并热重载；包名到 UID 的展开在下发内核时完成。
      */
     suspend fun setMitmApps(mode: String, apps: List<String>) =
-        updateMitm { it.copy(appMode = mode, apps = apps) }
+        updateScope { it.copy(appMode = mode, apps = apps) }
 
     /**
      * 脚本参数当前值：写配置后只把新值推给运行中的内核，不重建 MITM/不重编译脚本。
@@ -1271,9 +1274,10 @@ object Actions {
     suspend fun setMitmScriptArguments(script: com.namu.dns.core.config.ScriptConfig, values: Map<String, String>) =
         withContext(Dispatchers.IO) {
             val key = ConfigStore.scriptArgumentKey(script)
-            val next = settings.update { cfg ->
-                cfg.copy(mitm = cfg.mitm.copy(scriptArguments = cfg.mitm.scriptArguments + (key to values)))
+            GlobalRuleStore.update(App.context) { st ->
+                st.copy(scriptArguments = st.scriptArguments + (key to values))
             }
+            val next = settings.current()
             if (runtime.current().connected) {
                 val payload = JSONObject().apply {
                     put("key", key)
@@ -1284,9 +1288,86 @@ object Actions {
             next
         }
 
-    private suspend fun updateMitm(transform: (MitmConfig) -> MitmConfig) = withContext(Dispatchers.IO) {
-        val next = settings.update { cfg -> cfg.copy(mitm = transform(cfg.mitm)) }
-        ConfigStore.rebuildModules(App.context, next)
-        if (runtime.current().connected) NamuVpnService.reload(App.context)
+    private suspend fun updateScope(transform: (GlobalRuleStore.MitmScope) -> GlobalRuleStore.MitmScope) =
+        withContext(Dispatchers.IO) {
+            GlobalRuleStore.update(App.context) { st -> st.copy(scope = transform(st.scope)) }
+            ConfigStore.rebuildModules(App.context, settings.current())
+            if (runtime.current().connected) ApplyCoordinator.requestApply(App.context, "配置变更")
+        }
+
+    // ---------- 3.0.18 全局规则/模块操作 ----------
+
+    private suspend fun applyGlobal(transform: (GlobalRuleStore.State) -> GlobalRuleStore.State) =
+        withContext(Dispatchers.Main) {
+            GlobalRuleStore.update(App.context, transform)
+            ConfigStore.rebuildModules(App.context, settings.current())
+            if (runtime.current().connected) ApplyCoordinator.requestApply(App.context, "配置变更")
+        }
+
+    /** 3.0.18：独立导入规则集 → 一条全局模块记录（DNS 过滤）。 */
+    suspend fun importRuleSet(url: String, displayName: String = ""): Int = withContext(Dispatchers.IO) {
+        val target = url.trim()
+        if (target.isBlank()) throw RuntimeException("规则集来源为空")
+        val text = fetchText(target, maxBytes = 8 * 1024 * 1024, headers = headerMapFor(settings.current(), target))
+        validateRules(text)
+        val file = ConfigStore.globalRuleSetFile(App.context, target)
+        ConfigStore.writeAtomicPublic(file, text)
+        check(file.readText() == text) { "规则缓存写入失败" }
+        withContext(Dispatchers.Main) {
+            GlobalRuleStore.update(App.context) { st ->
+                val exist = st.ruleSets.firstOrNull { it.url == target }
+                val src = (exist ?: RuleSource(id = moduleId(target), url = target)).copy(
+                    updatedAt = System.currentTimeMillis(),
+                    lines = text.lines().size,
+                    error = "",
+                    stale = false,
+                    cacheBytes = file.length(),
+                    format = detectRuleSourceFormat(text, exist?.format ?: "adblock"),
+                )
+                st.copy(ruleSets = st.ruleSets.filterNot { it.url == target } + src)
+            }
+            ConfigStore.rebuildModules(App.context, settings.current())
+        }
+        text.lines().size
+    }
+
+    suspend fun setRuleSetEnabled(id: String, on: Boolean) =
+        applyGlobal { st -> st.copy(ruleSets = st.ruleSets.map { if (it.id == id) it.copy(enabled = on) else it }) }
+    suspend fun setLocalRulesEnabled(on: Boolean) = applyGlobal { it.copy(localRulesEnabled = on) }
+    suspend fun setLocalMitmEnabled(on: Boolean) = applyGlobal { it.copy(localMitmEnabled = on) }
+    suspend fun setExtraMitmEnabled(id: String, on: Boolean) =
+        applyGlobal { st -> st.copy(extraMitm = st.extraMitm.map { if (it.id == id) it.copy(enabled = on) else it }) }
+    suspend fun updateLocalRules(transform: (List<RuleItem>) -> List<RuleItem>) =
+        applyGlobal { it.copy(localRules = transform(it.localRules)) }
+    suspend fun updateLocalAds(transform: (List<String>) -> List<String>) =
+        applyGlobal { it.copy(localAds = transform(it.localAds)) }
+    suspend fun updateLocalMitm(transform: (GlobalRuleStore.MitmContent) -> GlobalRuleStore.MitmContent) =
+        applyGlobal { it.copy(localMitm = transform(it.localMitm)) }
+    suspend fun updateExtraMitm(id: String, transform: (GlobalRuleStore.MitmContent) -> GlobalRuleStore.MitmContent) =
+        applyGlobal { st -> st.copy(extraMitm = st.extraMitm.map { if (it.id == id) it.copy(content = transform(it.content)) else it }) }
+    suspend fun deleteRuleSet(id: String) = applyGlobal { it.copy(ruleSets = it.ruleSets.filterNot { s -> s.id == id }) }
+    suspend fun deleteExtraMitm(id: String) = applyGlobal { it.copy(extraMitm = it.extraMitm.filterNot { e -> e.id == id }) }
+    suspend fun setModuleDnsApproved(id: String, approved: Boolean) =
+        applyGlobal { st -> st.copy(modules = st.modules.map { if (it.id == id) it.copy(dnsApproved = approved) else it }) }
+
+    /** 长按拖拽：模块/规则集/来源重写统一排序；本地伪模块置顶不参与。 */
+    suspend fun reorderEntry(id: String, to: Int) = withContext(Dispatchers.Main) {
+        val rest = GlobalRuleStore.displayEntries()
+            .filter { it.id != GlobalRuleStore.ID_LOCAL_RULES && it.id != GlobalRuleStore.ID_LOCAL_MITM }
+        val from = rest.indexOfFirst { it.id == id }
+        if (from < 0 || rest.isEmpty()) return@withContext
+        val ids = rest.map { it.id }.toMutableList()
+        val item = ids.removeAt(from.coerceIn(0, ids.lastIndex))
+        ids.add(to.coerceIn(0, ids.size), item)
+        val orderOf = ids.withIndex().associate { (i, k) -> k to i }
+        GlobalRuleStore.update(App.context) { st ->
+            st.copy(
+                modules = st.modules.map { m -> orderOf[m.id]?.let { m.copy(order = it) } ?: m },
+                ruleSets = st.ruleSets.map { r -> orderOf[GlobalRuleStore.ID_RULESET_PREFIX + r.id]?.let { r.copy(order = it) } ?: r },
+                extraMitm = st.extraMitm.map { e -> orderOf[e.id]?.let { e.copy(order = it) } ?: e },
+            )
+        }
+        ConfigStore.rebuildModules(App.context, settings.current())
+        if (runtime.current().connected) ApplyCoordinator.requestApply(App.context, "配置变更")
     }
 }

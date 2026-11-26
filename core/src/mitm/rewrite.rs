@@ -121,6 +121,8 @@ pub struct MitmConfig {
     /// app_mode 使用的 UID 列表；壳层把用户选的包名解析成 UID 后下发。
     #[serde(default)]
     pub app_uids: Vec<u32>,
+    #[serde(default)]
+    pub app_scope_incomplete: bool,
     /// 金融连接保护：支付/银行/账号安全连接在 MITM 判定之前排除。
     #[serde(default)]
     pub finance: crate::finance::FinanceConf,
@@ -152,6 +154,7 @@ impl Default for MitmConfig {
             pool_idle_secs: default_pool_idle(),
             app_mode: String::new(),
             app_uids: Vec::new(),
+            app_scope_incomplete: false,
             finance: crate::finance::FinanceConf::default(),
         }
     }
@@ -159,7 +162,7 @@ impl Default for MitmConfig {
 
 /// MITM 的 App 生效范围。UID 未知时按最保守的一侧处理：
 /// - `Allow`：不解密，避免把银行/支付这类证书固定应用误伤；
-/// - `Deny`：仍解密（列表外的应用本来就要处理），保持与全局模式一致。
+/// - `Deny`：同样放行未知归属，防止排除的应用被误解密。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum AppScope {
     #[default]
@@ -171,12 +174,9 @@ pub enum AppScope {
 impl AppScope {
     pub fn parse(mode: &str, uids: &[u32]) -> Self {
         let set: HashSet<u32> = uids.iter().copied().collect();
-        if set.is_empty() {
-            return AppScope::All;
-        }
         match mode.trim().to_ascii_lowercase().as_str() {
             "allow" | "only" => AppScope::Allow(set),
-            "deny" | "skip" | "bypass" => AppScope::Deny(set),
+            "deny" | "skip" | "bypass" if !set.is_empty() => AppScope::Deny(set),
             _ => AppScope::All,
         }
     }
@@ -185,7 +185,7 @@ impl AppScope {
         match self {
             AppScope::All => true,
             AppScope::Allow(set) => uid.is_some_and(|u| set.contains(&u)),
-            AppScope::Deny(set) => uid.is_none_or(|u| !set.contains(&u)),
+            AppScope::Deny(set) => uid.is_some_and(|u| !set.contains(&u)),
         }
     }
 
@@ -441,7 +441,11 @@ impl MitmEngine {
             upstream_insecure: cfg.upstream_insecure,
             skipped_rules: skipped,
             fail_open_ttl: Duration::from_secs(cfg.fail_open_ttl.max(1)),
-            app_scope: AppScope::parse(&cfg.app_mode, &cfg.app_uids),
+            app_scope: if cfg.app_scope_incomplete {
+                AppScope::Allow(HashSet::new())
+            } else {
+                AppScope::parse(&cfg.app_mode, &cfg.app_uids)
+            },
             finance: crate::finance::FinanceProtect::from_config(&cfg.finance),
             bypass: Mutex::new(HashMap::new()),
         }
@@ -979,6 +983,30 @@ mod tests {
     }
 
     #[test]
+    fn surge_307_and_reject_array_translate() {
+        let p = parse_surge_module(
+            "[URL Rewrite]\n\
+             ^https://api.a.com/m https://api.b.com/m 307\n\
+             ^https://api.a.com/list reject-array\n\
+             ^https://api.a.com/obj - reject-dict",
+        );
+        let set = crate::mitm::loon::parse_loon_rewrites(&p.loon);
+        assert_eq!(set.rules.len(), 3, "unsupported={:?}", set.unsupported);
+        assert!(matches!(
+            set.rules[0].action,
+            crate::mitm::loon::LoonAction::Redirect { status: 307, .. }
+        ));
+        assert!(matches!(
+            set.rules[1].action,
+            crate::mitm::loon::LoonAction::Reject(crate::mitm::RejectKind::JsonArray)
+        ));
+        assert!(matches!(
+            set.rules[2].action,
+            crate::mitm::loon::LoonAction::Reject(crate::mitm::RejectKind::JsonObject)
+        ));
+    }
+
+    #[test]
     fn surge_302_header_mock_translate_to_loon() {
         let p = parse_surge_module(
             "[URL Rewrite]\n\
@@ -1068,20 +1096,24 @@ mod tests {
         // 银行/支付在这份名单里：无论域名是否命中都不解密。
         assert!(!e.should_mitm_uid("x.ads.com", Some(10086)));
         assert!(e.should_mitm_uid("x.ads.com", Some(10010)));
-        // 未知归属保持旧行为（照常解密），否则等于把全局 MITM 悄悄关掉。
-        assert!(e.should_mitm_uid("x.ads.com", None));
+        // 未知归属直通，确保被排除的应用不会被误解密。
+        assert!(!e.should_mitm_uid("x.ads.com", None));
     }
 
     #[test]
-    fn app_scope_all_and_empty_fall_back_to_global() {
+    fn app_scope_empty_allow_never_becomes_global() {
         let all = MitmEngine::from_config(&app_conf("all", &[1, 2]));
         assert!(all.should_mitm_uid("x.ads.com", None));
         assert!(all.should_mitm_uid("x.ads.com", Some(999)));
-        // 模式写 allow 但列表为空：退化为全局，避免一条规则配错就静默全关。
         let empty = MitmEngine::from_config(&app_conf("allow", &[]));
-        assert!(empty.should_mitm_uid("x.ads.com", None));
-        assert!(empty.should_mitm_uid("x.ads.com", Some(7)));
-        assert_eq!(empty.app_scope.mode_name(), "all");
+        assert!(!empty.should_mitm_uid("x.ads.com", None));
+        assert!(!empty.should_mitm_uid("x.ads.com", Some(7)));
+        assert_eq!(empty.app_scope.mode_name(), "allow");
+
+        let mut incomplete = app_conf("deny", &[10086]);
+        incomplete.app_scope_incomplete = true;
+        let e = MitmEngine::from_config(&incomplete);
+        assert!(!e.should_mitm_uid("x.ads.com", Some(10010)));
     }
 
     #[test]

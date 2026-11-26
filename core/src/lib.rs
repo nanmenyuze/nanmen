@@ -161,8 +161,10 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStart<'local>(
         stats
             .filter_skipped
             .store(filter.skipped as u64, Ordering::Relaxed);
+        let mut dns_cfg = cfg.dns.clone();
+        dns_cfg.block_aaaa = cfg.dns.block_aaaa || !cfg.ipv6;
         let mut dns = DnsEngine::new(
-            &cfg.dns,
+            &dns_cfg,
             filter.clone(),
             stats.clone(),
             &cfg.block_mode,
@@ -170,6 +172,7 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStart<'local>(
             cfg.fake_ip && cfg.mode != "dns_only" && cfg.mode != "filter_only",
             cfg.dns.query_log,
         );
+        dns.set_prefer_ipv6(cfg.prefer_ipv6);
         dns.set_fake_path(if cfg.fake_ip && cfg.mode != "dns_only" {
             cfg.fake_ip_file.clone()
         } else {
@@ -571,17 +574,17 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeReloadRules<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     config_json: JString<'local>,
-) -> jboolean {
-    let result = catch_unwind(AssertUnwindSafe(|| -> bool {
+) -> jint {
+    let result = catch_unwind(AssertUnwindSafe(|| -> jint {
         let json = match read_string(&mut env, &config_json) {
             Some(s) => s,
-            None => return false,
+            None => return 0,
         };
         let cfg: Config = match serde_json::from_str(&json) {
             Ok(c) => c,
             Err(e) => {
                 logging::error("core", format!("热重载配置解析失败: {}", e));
-                return false;
+                return 0;
             }
         };
         let guard = match ENGINE.lock() {
@@ -589,9 +592,23 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeReloadRules<'local>(
             Err(p) => p.into_inner(),
         };
         let Some(engine) = guard.as_ref() else {
-            return false;
+            return 0;
         };
-        crate::outbound::set_tuning(cfg.bbr, engine.stats.clone());
+        let old_mitm = engine.ctx.mitm();
+        let reuse_mitm = {
+            let previous = engine.ctx.cfg.read().unwrap_or_else(|p| p.into_inner());
+            old_mitm.can_reuse(&cfg.mitm, &previous.mitm)
+        };
+        let new_mitm = if reuse_mitm {
+            old_mitm
+        } else {
+            let candidate = mitm::MitmState::build_with_stats(&cfg.mitm, Some(engine.stats.clone()));
+            if candidate.ca_unavailable() {
+                logging::warn("mitm", "热重载未应用：无法加载 MITM CA，继续使用原配置");
+                return -1;
+            }
+            Arc::new(candidate)
+        };
         let filter = Arc::new(build_filter(&cfg));
         let rules = Arc::new(RuleEngine::from_config(&cfg));
         let strategy = Arc::new(strategy::StrategySet::from_config(&cfg));
@@ -603,14 +620,6 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeReloadRules<'local>(
                 );
             }
         }
-        engine
-            .stats
-            .filter_rules
-            .store(filter.rule_count() as u64, Ordering::Relaxed);
-        engine
-            .stats
-            .filter_skipped
-            .store(filter.skipped as u64, Ordering::Relaxed);
         // 旧引擎状态先落盘，新引擎从盘加载，Fake-IP 与缓存都不丢
         engine
             .ctx
@@ -618,8 +627,10 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeReloadRules<'local>(
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .save_state();
+        let mut new_dns_cfg = cfg.dns.clone();
+        new_dns_cfg.block_aaaa = cfg.dns.block_aaaa || !cfg.ipv6;
         let mut new_dns = DnsEngine::new(
-            &cfg.dns,
+            &new_dns_cfg,
             filter.clone(),
             engine.stats.clone(),
             &cfg.block_mode,
@@ -627,6 +638,7 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeReloadRules<'local>(
             cfg.fake_ip && cfg.mode != "dns_only" && cfg.mode != "filter_only",
             cfg.dns.query_log,
         );
+        new_dns.set_prefer_ipv6(cfg.prefer_ipv6);
         new_dns.set_fake_path(if cfg.fake_ip && cfg.mode != "dns_only" {
             cfg.fake_ip_file.clone()
         } else {
@@ -645,6 +657,15 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeReloadRules<'local>(
             .decision
             .write()
             .unwrap_or_else(|p| p.into_inner());
+        crate::outbound::set_tuning(cfg.bbr, engine.stats.clone());
+        engine
+            .stats
+            .filter_rules
+            .store(filter.rule_count() as u64, Ordering::Relaxed);
+        engine
+            .stats
+            .filter_skipped
+            .store(filter.skipped as u64, Ordering::Relaxed);
         if let Ok(mut d) = engine.ctx.dns.write() {
             *d = Arc::new(new_dns);
         }
@@ -664,21 +685,15 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeReloadRules<'local>(
         }
         // MITM 引擎与 CA 一并热更：规则/域名列表改动不中断现有连接。
         if let Ok(mut m) = engine.ctx.mitm.write() {
-            *m = Arc::new(mitm::MitmState::build_with_stats(
-                &cfg.mitm,
-                Some(engine.stats.clone()),
-            ));
+            *m = new_mitm;
         }
         if let Ok(mut c) = engine.ctx.cfg.write() {
             *c = cfg;
         }
         logging::info("core", "配置热重载完成，TUN 与连接未中断");
-        true
+        1
     }));
-    match result {
-        Ok(true) => 1,
-        _ => 0,
-    }
+    result.unwrap_or(0)
 }
 
 /// 脚本参数运行期热更新：只替换 `$argument` 注入值，不重编译脚本，
@@ -1025,13 +1040,13 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeVersion<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
-    to_jstring(&mut env, "1.13.29".into())
+    to_jstring(&mut env, "1.13.35".into())
 }
 
 /// 给发布产物做独立校验用：即使 JNI 入口被裁剪，`llvm-strings` 仍能在
-/// libnanmen_core.so 里读到 `nanmen_core-1.13.29`，不必只信清单文件。
+/// libnanmen_core.so 里读到 `nanmen_core-1.13.35`，不必只信清单文件。
 #[no_mangle]
-pub static NAMU_CORE_VERSION: [u8; 19] = *b"nanmen_core-1.13.29";
+pub static NAMU_CORE_VERSION: [u8; 19] = *b"nanmen_core-1.13.35";
 
 #[cfg(test)]
 mod rule_test_transport_tests {

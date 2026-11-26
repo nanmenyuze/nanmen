@@ -33,14 +33,16 @@ internal data class TunnelSpec(
     val mode: String,
     val mtu: Int,
     val fullRoute: Boolean,
+    val ipv6: Boolean = true,
 )
 
 internal fun tunnelSpec(cfg: AppConfig, appliedMtu: Int = cfg.mtu.coerceIn(1280, 9000)) =
     TunnelSpec(
         mode = cfg.mode,
         mtu = appliedMtu,
+        ipv6 = cfg.ipv6 ?: true,
         // MITM 需要 HTTPS 连接进 TUN；仅扩展隧道路由，仍按当前模式决定如何转发。
-        fullRoute = cfg.mode != "dns_only" || cfg.dnsOnlyFullRoute || cfg.mitm.enabled,
+        fullRoute = cfg.mode != "dns_only" || cfg.dnsOnlyFullRoute || GlobalRuleStore.state.scope.enabled,
     )
 
 private data class EstablishedTun(
@@ -408,6 +410,7 @@ class NamuVpnService : VpnService() {
                 tun = pfd
                 activeTunnel = applied.spec
                 lastGoodJson = json
+                ApplyCoordinator.onServiceResult(this, true, "连接成功", json)
                 running = true
                 alive = true
                 rebuildRetried = false
@@ -452,7 +455,6 @@ class NamuVpnService : VpnService() {
         val pfd = tun ?: return
         val profileName = settings.activeConfigName()
         val cfg = settings.current()
-        UidTablePublisher.setServiceDemand(needsUidMap(cfg))
         if (activeTunnel == null || activeTunnel != tunnelSpec(cfg)) {
             // MTU、实际接管范围、mode 任一变化都会改系统隧道参数；
             // 热重载只换内核配置，改不了已建立的 TUN，必须重建。
@@ -465,20 +467,25 @@ class NamuVpnService : VpnService() {
                 val json = ConfigStore.buildNative(this, cfg, profileName)
                 // 内核热重载现在会一并更新运行配置/节点/选中线路，
                 // 优先热重载（连接不中断）；失败才回退整核重启。
-                val ok = synchronized(nativeLock) {
-                    if (stopping || !running) false
+                val result = synchronized(nativeLock) {
+                    if (stopping || !running) 0
                     else try {
-                        if (NativeCore.nativeReloadRules(json)) {
-                            true
-                        } else {
-                            NativeCore.nativeStart(pfd.fd, json)
+                        when (val status = NativeCore.nativeReloadRules(json)) {
+                            0 -> if (NativeCore.nativeStart(pfd.fd, json)) NativeCore.RELOAD_OK else 0
+                            else -> status
                         }
                     } catch (_: Throwable) {
-                        false
+                        0
                     }
                 }
-                if (ok) {
+                if (result == NativeCore.RELOAD_CA_UNAVAILABLE) {
+                    val reason = "MITM 证书加载失败，仍在使用上一版配置"
+                    ApplyCoordinator.onServiceResult(this, false, reason, null)
+                    if (!finishProfileSwitch(profileName, success = false)) messages.show(reason)
+                } else if (result == NativeCore.RELOAD_OK) {
                     lastGoodJson = json
+                    UidTablePublisher.setServiceDemand(needsUidMap(cfg))
+                    ApplyCoordinator.onServiceResult(this, true, "应用成功", json)
                     finishProfileSwitch(profileName, success = true)
                     App.container.stats.resetSession()
                     runtime.markConnected(0L)
@@ -486,6 +493,7 @@ class NamuVpnService : VpnService() {
                 } else {
                     // 新配置没有生效：尽量把上一版成功配置重新下发，避免内核停在半套规则。
                     val rolledBack = rollbackToLastGood(pfd, cfg.mode)
+                    ApplyCoordinator.onServiceResult(this, false, if (rolledBack) "新设置未生效，已回滚到上一版配置" else "设置应用失败，且上一版配置回滚失败，请手动重连", null)
                     if (finishProfileSwitch(profileName, success = false)) return@Thread
                     if (rolledBack) {
                         messages.show("新设置未生效，已回滚到上一版配置")
@@ -495,6 +503,7 @@ class NamuVpnService : VpnService() {
                 }
             } catch (t: Throwable) {
                 val rolledBack = rollbackToLastGood(pfd, cfg.mode)
+                ApplyCoordinator.onServiceResult(this, false, if (rolledBack) "配置生成失败，已回滚到上一版配置" else "配置生成失败，请手动重连", null)
                 if (finishProfileSwitch(profileName, success = false)) return@Thread
                 messages.show(
                     if (rolledBack) "配置生成失败，已回滚到上一版配置"
@@ -517,8 +526,11 @@ class NamuVpnService : VpnService() {
         return synchronized(nativeLock) {
             if (stopping || !running) return@synchronized false
             try {
-                if (NativeCore.nativeReloadRules(prev)) true
-                else NativeCore.nativeStart(pfd.fd, prev)
+                when (NativeCore.nativeReloadRules(prev)) {
+                    NativeCore.RELOAD_OK -> true
+                    NativeCore.RELOAD_CA_UNAVAILABLE -> false
+                    else -> NativeCore.nativeStart(pfd.fd, prev)
+                }
             } catch (_: Throwable) {
                 false
             }
@@ -550,14 +562,17 @@ class NamuVpnService : VpnService() {
             .addAddress("10.10.10.1", 24)
             .addRoute("10.10.10.53", 32)
             .addDnsServer("10.10.10.53")
-            .addAddress("fd00:1::1", 64)
-            .addRoute("fd00:1::53", 128)
-            .addDnsServer("fd00:1::53")
             .setBlocking(false)
 
+        // IPv6 总开关关闭时不建 v6 地址/路由：v6 流量留在物理网络，AAAA 已被内核等效关闭。
+        if (spec.ipv6) {
+            builder.addAddress("fd00:1::1", 64)
+            builder.addRoute("fd00:1::53", 128)
+            builder.addDnsServer("fd00:1::53")
+        }
         if (spec.fullRoute) {
             builder.addRoute("0.0.0.0", 0)
-            builder.addRoute("::", 0)
+            if (spec.ipv6) builder.addRoute("::", 0)
         }
         try {
             builder.addDisallowedApplication(packageName)
@@ -736,6 +751,7 @@ class NamuVpnService : VpnService() {
                             tun = pfd
                             activeTunnel = applied.spec
                             lastGoodJson = rebuiltJson
+                            ApplyCoordinator.onServiceResult(this, true, "隧道重建成功", rebuiltJson)
                             success = true
                         } else {
                             try { NativeCore.nativeStop() } catch (_: Throwable) {}
@@ -765,6 +781,7 @@ class NamuVpnService : VpnService() {
                 } else {
                     // 连续两次失败：干净停止。旧逻辑留 running=true/tun=null 的半死态，
                     // 界面显示失败但服务自认在跑，后续重载/切网全部静默失效。
+                    ApplyCoordinator.onServiceResult(this, false, "隧道重建连续失败，已自动停止", null)
                     messages.show("网络已切换，但隧道重建连续失败，已自动停止，请重新连接")
                     stopVpn()
                 }

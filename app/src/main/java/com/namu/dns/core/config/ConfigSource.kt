@@ -4,6 +4,8 @@ import com.namu.dns.AppConfig
 import com.namu.dns.NodeInfo
 import com.namu.dns.ProxyGroup
 import com.namu.dns.RuleItem
+import com.namu.dns.ruleLogicValueOk
+import com.namu.dns.ruleLogicKinds
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
@@ -343,13 +345,13 @@ private object ClashConfigParser : ConfigSourceParser {
                 finalPolicy = actionOf(parts.getOrNull(1)?.trim().orEmpty(), "rules[$index]")
                 return@forEachIndexed
             }
-            val value = parts.getOrNull(1)?.trim().orEmpty()
+            val value = if (kind in ruleLogicKinds) parts.drop(1).dropLast(1).joinToString(",").trim() else parts.getOrNull(1)?.trim().orEmpty()
             val type = when (kind) {
                 "DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DOMAIN-REGEX", "DOMAIN-WILDCARD",
-                "IP-CIDR", "IP-CIDR6", "GEOIP", "PORT" -> kind
+                "IP-CIDR", "IP-CIDR6", "GEOIP", "PORT", "AND", "OR", "NOT", "SCRIPT" -> kind
                 else -> null
             }
-            if (type == null || value.isBlank()) {
+            if (type == null || value.isBlank() || (type in ruleLogicKinds && !ruleLogicValueOk(type, value)) || (type == "SCRIPT" && value.any { it.isWhitespace() })) {
                 unsupportedRuleCount++
             } else {
                 nativeRules += RuleItem(
@@ -449,6 +451,11 @@ private fun parseSectionConfig(
     var dnsUpstream = ""
     var dnsFallback = ""
     var blockAaaa = false
+    var dnsHijack: Boolean? = null
+    var ipv6: Boolean? = null
+    var preferIpv6: Boolean? = null
+    val alwaysRealIp = mutableListOf<String>()
+    val dnsPolicies = mutableListOf<DnsPolicyRule>()
     var finalPolicy = "proxy"
 
     fun options(parts: List<String>): Map<String, String> =
@@ -482,7 +489,16 @@ private fun parseSectionConfig(
                     }
                 }
                 "dns-fallback" -> if (dnsFallback.isBlank()) dnsFallback = value.substringBefore(',').trim()
-                "ipv6" -> if (value.equals("false", true) || value == "0") blockAaaa = true
+                "ipv6" -> {
+                    ipv6 = !(value.equals("false", true) || value == "0")
+                    if (ipv6 == false) blockAaaa = true
+                }
+                "prefer-ipv6" -> preferIpv6 = value.equals("true", true) || value == "1"
+                "always-real-ip", "fake-ip-filter" -> value.split(',', ';', ' ')
+                    .map { it.trim().trim('"').lowercase() }
+                    .filter { it.isNotBlank() && it != "*" }
+                    .forEach { if (!alwaysRealIp.contains(it)) alwaysRealIp += it }
+                "hijack-dns" -> dnsHijack = parseHijackDns(value)
             }
             return@forEach
         }
@@ -533,6 +549,15 @@ private fun parseSectionConfig(
                 val key = line.substring(0, i).trim().lowercase().trim('.')
                 val value = line.substring(i + 1).trim()
                 if (key.isNotBlank() && value.isNotBlank()) hostMappings[key] = value
+            }
+            return@forEach
+        }
+        if (lower == "dns") {
+            val i = line.indexOf('=')
+            if (i > 0) {
+                val pattern = line.substring(0, i).trim()
+                val servers = line.substring(i + 1).trim()
+                if (pattern.isNotBlank() && servers.isNotBlank()) dnsPolicies += DnsPolicyRule(pattern, servers)
             }
             return@forEach
         }
@@ -591,7 +616,7 @@ private fun parseSectionConfig(
         }
         val type = when (kind) {
             "DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DOMAIN-REGEX", "DOMAIN-WILDCARD",
-            "IP-CIDR", "IP-CIDR6", "GEOIP", "PORT" -> kind
+            "IP-CIDR", "IP-CIDR6", "GEOIP", "PORT", "AND", "OR", "NOT", "SCRIPT" -> kind
             else -> null
         }
         if (type == null) {
@@ -604,15 +629,21 @@ private fun parseSectionConfig(
             issues += ConfigIssue(ConfigIssueLevel.ERROR, "[Rule] line $line", "规则缺少值")
             return@forEach
         }
+        val joinedValue = valueParts.joinToString(",").trim()
+        if ((type in ruleLogicKinds && !ruleLogicValueOk(type, joinedValue)) || (type == "SCRIPT" && joinedValue.any { it.isWhitespace() })) {
+            skippedRules++
+            issues += ConfigIssue(ConfigIssueLevel.WARNING, "[Rule] line $line", "跳过非法逻辑/脚本规则：$kind")
+            return@forEach
+        }
         val target = parts.last().trim()
         val action = targetAction(target, nodeNames, groupNames, issues, "[Rule] line $line")
-        nativeRules += RuleItem(type = type, value = valueParts.joinToString(",").trim(), action = action, source = "[Rule]")
+        nativeRules += RuleItem(type = type, value = joinedValue, action = action, source = "[Rule]")
     }
 
     val knownSections = if (loon) {
-        setOf("General", "Proxy", "Proxy Group", "Rule", "MITM", "Rewrite", "URL Rewrite", "Header Rewrite", "Host")
+        setOf("General", "Proxy", "Proxy Group", "Rule", "MITM", "Rewrite", "URL Rewrite", "Header Rewrite", "Host", "DNS")
     } else {
-        setOf("General", "Proxy", "Proxy Group", "Rule", "MITM", "URL Rewrite", "Header Rewrite", "Host")
+        setOf("General", "Proxy", "Proxy Group", "Rule", "MITM", "URL Rewrite", "Header Rewrite", "Host", "DNS")
     }
     sections.distinct().forEach { if (it !in knownSections) unknownSections += it }
     val supported = mutableListOf<String>()
@@ -620,6 +651,7 @@ private fun parseSectionConfig(
     if (groupDefs.isNotEmpty()) supported += "Proxy Group(${groupDefs.size})"
     if (nativeRules.isNotEmpty()) supported += "Rule(${nativeRules.size})"
     if (dnsUpstream.isNotBlank() || dnsFallback.isNotBlank()) supported += "DNS"
+    if (dnsPolicies.isNotEmpty()) supported += "DNS策略(${dnsPolicies.size})"
     val partial = mutableListOf<String>()
     val skipped = mutableListOf<String>()
     sections.distinct().forEach {
@@ -644,6 +676,11 @@ private fun parseSectionConfig(
                 dnsUpstream = dnsUpstream.ifBlank { "system" },
                 dnsFallback = dnsFallback.ifBlank { "system" },
                 blockAaaa = blockAaaa,
+                dnsPolicies = dnsPolicies.toList(),
+                dnsHijack = dnsHijack,
+                ipv6 = ipv6,
+                preferIpv6 = preferIpv6,
+                alwaysRealIp = alwaysRealIp.toList(),
                 finalPolicy = finalPolicy,
             ),
             rules = nativeRules.distinctBy { "${it.type}|${it.value}|${it.action}" },

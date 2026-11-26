@@ -2,8 +2,8 @@ package com.namu.dns.core
 
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInVertically
-import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -11,6 +11,9 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.calculateStartPadding
 import androidx.compose.foundation.layout.calculateEndPadding
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -19,6 +22,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
@@ -36,6 +40,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.layer.drawLayer
@@ -50,7 +55,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.NavBackStackEntry
 import androidx.navigation.NavDestination
+import androidx.navigation.NavGraphBuilder
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -64,7 +71,9 @@ import com.namu.dns.ui.AdvancedSettingsScreen
 import com.namu.dns.ui.ConfigDetailScreen
 import com.namu.dns.ui.ConfigScreen
 import com.namu.dns.ui.ConfigSectionScreen
+import com.namu.dns.ui.DataAnalyticsScreen
 import com.namu.dns.ui.DataScreen
+import com.namu.dns.ui.DetailChrome
 import com.namu.dns.ui.DiagnosticsScreen
 import com.namu.dns.ui.DnsLogsScreen
 import com.namu.dns.ui.FirstRunVpnGuide
@@ -124,7 +133,6 @@ fun NamuAppShell(
         val destination = entry?.destination
         val tabs = MainTab.entries
         val currentTab = tabs.firstOrNull { destination.matches(it.route::class) }
-        val isDetail = destination != null && currentTab == null
 
         // 规则更新/自动测速已交给 WorkManager（RuleUpdateWorker / NodeTestWorker），
         // 不再绑在 Activity 的 LaunchedEffect 上，划掉界面也不会停。
@@ -136,33 +144,6 @@ fun NamuAppShell(
         var pageOrigin by remember { mutableStateOf(Offset.Zero) }
         Scaffold(
             containerColor = NamuColors.Bg,
-            topBar = {
-                if (destination.matches(HomeRoute::class) ||
-                    destination.matches(ModulesRoute::class) ||
-                    destination.matches(SettingsRoute::class) ||
-                    destination.matches(QuickEditRoute::class)
-                ) {
-                    Unit
-                } else {
-                    ShadowTopBar(
-                        title = titleFor(destination, entry),
-                        left = {
-                            if (isDetail) {
-                                NavIcon(Icons.AutoMirrored.Rounded.ArrowBack, "返回") {
-                                    navController.popBackStack()
-                                }
-                            }
-                        },
-                        right = {
-                            if (destination.matches(NodesRoute::class)) {
-                                NavIcon(Icons.Rounded.QrCodeScanner, "扫码导入节点") {
-                                    navController.navigate(ScanRoute)
-                                }
-                            }
-                        },
-                    )
-                }
-            },
             snackbarHost = {
                 SnackbarHost(snackbar) { data ->
                     Box(
@@ -207,7 +188,7 @@ fun NamuAppShell(
                     end = padding.calculateEndPadding(direction),
                     top = padding.calculateTopPadding(),
                     bottom = if (hasDock) 0.dp else padding.calculateBottomPadding(),
-                ),
+                ).consumeWindowInsets(PaddingValues(top = padding.calculateTopPadding())),
                 contentAlignment = Alignment.TopCenter,
             ) {
                 CompositionLocalProvider(LocalDockClearance provides
@@ -232,18 +213,26 @@ fun NamuNavHost(
     onRestart: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val container = LocalAppContainer.current
+    val direction = if (LocalLayoutDirection.current == androidx.compose.ui.unit.LayoutDirection.Ltr) 1 else -1
     NavHost(
         navController = navController,
         startDestination = HomeRoute,
-        modifier = modifier,
+        modifier = modifier.clipToBounds(),
         enterTransition = {
-            fadeIn(tween(180)) + slideInVertically(tween(220)) { it / 48 }
+            if (targetState.destination.isMainTab()) fadeIn(tween(160))
+            else slideInHorizontally(tween(300)) { direction * it }
         },
-        exitTransition = { fadeOut(tween(120)) },
-        popEnterTransition = { fadeIn(tween(170)) },
+        exitTransition = {
+            if (targetState.destination.isMainTab()) fadeOut(tween(140))
+            else slideOutHorizontally(tween(300)) { -direction * it / 4 }
+        },
+        popEnterTransition = {
+            if (initialState.destination.isMainTab()) fadeIn(tween(160))
+            else slideInHorizontally(tween(280)) { -direction * it / 4 }
+        },
         popExitTransition = {
-            fadeOut(tween(140)) + slideOutVertically(tween(180)) { it / 60 }
+            if (initialState.destination.isMainTab()) fadeOut(tween(140))
+            else slideOutHorizontally(tween(280)) { direction * it }
         },
     ) {
         composable<HomeRoute> {
@@ -251,60 +240,54 @@ fun NamuNavHost(
                 onToggle = onToggle,
                 onOpenNodes = { navController.navigate(NodesRoute) },
                 onRestart = onRestart,
-                onOpenData = { navController.navigate(DataRoute) },
-                onOpenDnsLogs = { navController.navigate(LogsRoute(LogKind.Dns)) },
-                onOpenQuickEdit = { navController.navigate(ConfigDetailRoute(container.config.activeName())) },
-                onOpenMitm = { navController.navigate(MitmRoute) },
             )
         }
         composable<ConfigRoute> {
             ConfigScreen(
                 onOpenPanel = { navController.navigate(ConfigDetailRoute(it)) },
+                onOpenModules = { navController.navigate(ModulesRoute) },
             )
         }
         composable<DataRoute> {
             DataScreen(
+                onOpenAnalytics = { navController.navigate(DataAnalyticsRoute(it)) },
+                onOpenDiagnostics = { navController.navigate(DiagnosticsRoute) },
+                onOpenMitmDetails = { navController.navigate(MitmRuntimeRoute) },
+            )
+        }
+        detail<DataAnalyticsRoute>(navController) { entry ->
+            DataAnalyticsScreen(
+                section = entry.toRoute<DataAnalyticsRoute>().section,
                 onOpenDnsLogs = { navController.navigate(LogsRoute(LogKind.Dns)) },
                 onRestart = onRestart,
                 onStartVpn = onToggle,
-                onOpenMitmDetails = { navController.navigate(MitmRuntimeRoute) },
             )
         }
         composable<SettingsRoute> {
             SettingsScreen(
-                onOpenConfig = { navController.navigate(ConfigRoute) },
                 onOpenMitm = { navController.navigate(MitmRoute) },
-                onOpenDiagnostics = { navController.navigate(DiagnosticsRoute) },
                 onOpenAdvanced = { navController.navigate(AdvancedSettingsRoute) },
             )
         }
-        composable<DiagnosticsRoute> {
-            DiagnosticsScreen(
-                onOpenDnsAnalytics = { navController.navigate(DataRoute) },
-                onOpenDnsLogs = { navController.navigate(LogsRoute(LogKind.Dns)) },
-                onOpenRuntimeLogs = { navController.navigate(LogsRoute(LogKind.Runtime)) },
-                onOpenMitmDetails = { navController.navigate(MitmRuntimeRoute) },
-            )
+        detail<DiagnosticsRoute>(navController) {
+            DiagnosticsScreen(onOpenRuntimeLogs = { navController.navigate(LogsRoute(LogKind.Runtime)) })
         }
-        composable<AdvancedSettingsRoute> {
-            AdvancedSettingsScreen(
-                onOpenLogs = { navController.navigate(LogsRoute(LogKind.Runtime)) },
-                onRestart = onRestart,
-            )
+        detail<AdvancedSettingsRoute>(navController) {
+            AdvancedSettingsScreen(onRestart = onRestart)
         }
-        composable<NodesRoute> {
+        detail<NodesRoute>(navController) {
             NodesScreen(
                 onRestart = onRestart,
                 onBack = { navController.popBackStack() },
             )
         }
-        composable<LogsRoute> { logsEntry ->
+        detail<LogsRoute>(navController) { logsEntry ->
             when (logsEntry.toRoute<LogsRoute>().kind) {
                 LogKind.Runtime -> LogsScreen()
                 LogKind.Dns -> DnsLogsScreen()
             }
         }
-        composable<ConfigDetailRoute> { entry ->
+        detail<ConfigDetailRoute>(navController) { entry ->
             val name = entry.toRoute<ConfigDetailRoute>().name
             ConfigDetailScreen(
                 name = name,
@@ -314,28 +297,84 @@ fun NamuNavHost(
             )
         }
         composable<QuickEditRoute> { entry ->
-            QuickEditScreen(name = entry.toRoute<QuickEditRoute>().name, onBack = { navController.popBackStack() })
+            DetailChrome {
+                QuickEditScreen(name = entry.toRoute<QuickEditRoute>().name, onBack = { navController.popBackStack() })
+            }
         }
         composable<ConfigSectionRoute> { entry ->
             val route = entry.toRoute<ConfigSectionRoute>()
-            ConfigSectionScreen(route.section, route.name, onOpenCertificate = { navController.navigate(MitmRoute) })
+            val content: @Composable () -> Unit = {
+                ConfigSectionScreen(
+                    route.section,
+                    route.name,
+                    onOpenCertificate = { navController.navigate(MitmRoute) },
+                    onBack = { navController.popBackStack() },
+                )
+            }
+            if (route.section == ConfigSection.General) {
+                DetailChrome(content)
+            } else {
+                DetailDestination(entry, navController, content)
+            }
         }
         composable<ModulesRoute> {
-            ModulesScreen(
-                onRestart = onRestart,
-                onOpenDetail = { navController.navigate(ModuleDetailRoute(it)) },
-            )
+            DetailChrome {
+                ModulesScreen(
+                    onRestart = onRestart,
+                    onOpenDetail = { navController.navigate(ModuleDetailRoute(it)) },
+                    onBack = { navController.popBackStack() },
+                )
+            }
         }
-        composable<ModuleDetailRoute> { detailEntry ->
+        detail<ModuleDetailRoute>(navController) { detailEntry ->
             ModuleDetailScreen(
                 moduleId = detailEntry.toRoute<ModuleDetailRoute>().moduleId,
                 onBack = { navController.popBackStack() },
             )
         }
-        composable<MitmRoute> { MitmScreen(certificateOnly = true) }
-        composable<MitmRuntimeRoute> { MitmScreen(certificateOnly = false) }
-        composable<ScanRoute> {
+        detail<MitmRoute>(navController) { MitmScreen(certificateOnly = true) }
+        detail<MitmRuntimeRoute>(navController) { MitmScreen(certificateOnly = false) }
+        detail<ScanRoute>(navController) {
             ScanScreen(onDone = { navController.popBackStack() })
+        }
+    }
+}
+
+private fun NavDestination.isMainTab(): Boolean = MainTab.entries.any { matches(it.route::class) }
+
+private inline fun <reified T : Any> NavGraphBuilder.detail(
+    navController: NavHostController,
+    crossinline content: @Composable (NavBackStackEntry) -> Unit,
+) {
+    composable<T> { entry ->
+        DetailDestination(entry, navController) { content(entry) }
+    }
+}
+
+@Composable
+private fun DetailDestination(
+    entry: NavBackStackEntry,
+    navController: NavHostController,
+    content: @Composable () -> Unit,
+) {
+    DetailChrome {
+        Column(Modifier.fillMaxSize()) {
+            ShadowTopBar(
+                title = titleFor(entry.destination, entry),
+                left = {
+                    NavIcon(Icons.AutoMirrored.Rounded.ArrowBack, "返回") {
+                        navController.popBackStack()
+                    }
+                },
+                right = {
+                    if (entry.destination.matches(NodesRoute::class)) {
+                        NavIcon(Icons.Rounded.QrCodeScanner, "扫码导入节点") {
+                            navController.navigate(ScanRoute)
+                        }
+                    }
+                },
+            )
+            Box(Modifier.weight(1f).fillMaxWidth()) { content() }
         }
     }
 }
@@ -350,13 +389,14 @@ private fun NavHostController.openMainTab(tab: MainTab) {
 
 private fun titleFor(destination: NavDestination?, entry: androidx.navigation.NavBackStackEntry?): String = when {
     destination.matches(HomeRoute::class) -> "南门 DNS"
-    destination.matches(ConfigRoute::class) -> "配置文件"
-    destination.matches(DataRoute::class) -> "DNS 与拦截"
+    destination.matches(ConfigRoute::class) -> "配置"
+    destination.matches(DataRoute::class) -> "数据"
+    destination.matches(DataAnalyticsRoute::class) -> entry?.toRoute<DataAnalyticsRoute>()?.section?.title ?: "数据详情"
     destination.matches(ModulesRoute::class) -> "模块"
     destination.matches(ModuleDetailRoute::class) -> "模块详情"
     destination.matches(SettingsRoute::class) -> "设置"
     destination.matches(AdvancedSettingsRoute::class) -> "高级设置"
-    destination.matches(DiagnosticsRoute::class) -> "运行数据与诊断"
+    destination.matches(DiagnosticsRoute::class) -> "日志与诊断"
     destination.matches(NodesRoute::class) -> "节点与订阅"
     destination.matches(LogsRoute::class) ->
         if (entry?.toRoute<LogsRoute>()?.kind == LogKind.Dns) "DNS 查询" else "运行日志"
@@ -379,8 +419,8 @@ private fun NavIcon(
     val interaction = remember { MutableInteractionSource() }
     Box(
         Modifier
-            .size(48.dp)
-            .clip(RoundedCornerShape(NamuTokens.RadiusControl))
+            .size(44.dp)
+            .clip(CircleShape)
             .clickable(interactionSource = interaction, indication = null) { onClick() },
         contentAlignment = Alignment.Center,
     ) {

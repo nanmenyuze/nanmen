@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, Notify, Semaphore};
 
 pub struct Ctx {
     /// 运行配置可热更：nativeReloadRules 会整体替换，
@@ -1538,7 +1538,13 @@ async fn relay_stream(
     let _ = w.shutdown().await;
 }
 
-async fn dns_tcp_server(dns: Arc<DnsEngine>, pipe: DuplexStream) {
+const DNS_MAX_IN_FLIGHT: usize = 128;
+const DNS_TCP_MAX_PER_CONN: usize = 8;
+const DNS_MAX_PENDING_REPLIES: usize = 256;
+type DnsUdpPacket = (DnsReplyTarget, IpEndpoint, Vec<u8>);
+
+async fn dns_tcp_server(ctx: Arc<Ctx>, pipe: DuplexStream, slots: Arc<Semaphore>) {
+    let conn_slots = Arc::new(Semaphore::new(DNS_TCP_MAX_PER_CONN));
     let (mut pr, pw) = tokio::io::split(pipe);
     // RFC 7766 允许乱序应答（客户端按 ID 匹配）：每条查询独立 spawn，
     // 慢查询不再阻塞同一连接上的后续 pipelined 查询。
@@ -1562,12 +1568,21 @@ async fn dns_tcp_server(dns: Arc<DnsEngine>, pipe: DuplexStream) {
             if buf.len() < 2 + len {
                 break;
             }
+            let Ok(conn_slot) = conn_slots.clone().acquire_owned().await else {
+                return;
+            };
+            let Ok(resolve_slot) = slots.clone().acquire_owned().await else {
+                return;
+            };
             let query = buf[2..2 + len].to_vec();
             buf.drain(..2 + len);
-            let dns = dns.clone();
+            let dns = ctx.dns();
             let pw = pw.clone();
             tokio::spawn(async move {
-                if let Some(resp) = dns.resolve(&query).await {
+                let _conn_slot = conn_slot;
+                let response = dns.resolve(&query).await;
+                drop(resolve_slot);
+                if let Some(resp) = response {
                     if resp.len() > 0xFFFF {
                         // DNS over TCP 的长度前缀只有 16 位，超长应答只能丢弃
                         return;
@@ -1578,6 +1593,111 @@ async fn dns_tcp_server(dns: Arc<DnsEngine>, pipe: DuplexStream) {
                     let _ = pw.lock().await.write_all(&out).await;
                 }
             });
+        }
+    }
+}
+
+fn reap_udp_targets(
+    sockets: &mut SocketSet<'_>,
+    targets: &mut HashMap<(IpAddress, u16), UdpTarget>,
+    now: Instant,
+    can_reap: impl Fn(&(IpAddress, u16)) -> bool,
+) {
+    targets.retain(|key, target| {
+        if !can_reap(key) || !udp_target_idle(sockets, target, now, true) {
+            return true;
+        }
+        let _ = sockets.remove(target.handle);
+        false
+    });
+}
+
+fn dispatch_udp_dns(
+    sockets: &mut SocketSet<'_>,
+    fixed: [SocketHandle; 2],
+    dynamic: &mut HashMap<(IpAddress, u16), UdpTarget>,
+    ctx: &Ctx,
+    slots: &Arc<Semaphore>,
+    tx: &mpsc::Sender<DnsUdpPacket>,
+) {
+    let dns = ctx.dns();
+    let mut dispatch = |handle, binding| {
+        let socket = sockets.get_mut::<udp::Socket>(handle);
+        let mut received = false;
+        while let Ok((payload, meta)) = socket.recv() {
+            received = true;
+            let Ok(slot) = slots.clone().try_acquire_owned() else {
+                ctx.stats.dns_overload_dropped.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            let query = payload.to_vec();
+            let endpoint = meta.endpoint;
+            let dns = dns.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let _slot = slot;
+                if let Some(response) = dns.resolve(&query).await {
+                    let response = crate::dns::fit_udp_response(&query, response);
+                    let _ = tx.send((binding, endpoint, response)).await;
+                }
+            });
+        }
+        received
+    };
+    for handle in fixed {
+        dispatch(handle, DnsReplyTarget::Fixed(handle));
+    }
+    for (key, target) in dynamic {
+        let binding = DnsReplyTarget::Dynamic {
+            key: *key,
+            generation: target.generation,
+        };
+        if dispatch(target.handle, binding) {
+            target.last = Instant::now();
+        }
+    }
+}
+
+fn flush_udp_dns_replies(
+    sockets: &mut SocketSet<'_>,
+    dynamic: &mut HashMap<(IpAddress, u16), UdpTarget>,
+    rx: &mut mpsc::Receiver<DnsUdpPacket>,
+    pending: &mut VecDeque<DnsUdpPacket>,
+    stats: &Stats,
+) {
+    while pending.len() < DNS_MAX_PENDING_REPLIES {
+        match rx.try_recv() {
+            Ok(reply) => pending.push_back(reply),
+            Err(_) => break,
+        }
+    }
+    // Each queued reply gets one chance per round. A full destination socket
+    // should not delay replies to other destinations.
+    for _ in 0..pending.len() {
+        let Some((binding, endpoint, data)) = pending.pop_front() else {
+            break;
+        };
+        let handle = match binding {
+            DnsReplyTarget::Fixed(handle) => Some(handle),
+            DnsReplyTarget::Dynamic { key, generation } => {
+                dynamic_dns_handle(dynamic, key, generation)
+            }
+        };
+        let Some(handle) = handle else {
+            stats.dns_stale_reply.fetch_add(1, Ordering::Relaxed);
+            continue;
+        };
+        let socket = sockets.get_mut::<udp::Socket>(handle);
+        match socket.send_slice(&data, endpoint) {
+            Ok(()) => {
+                if let DnsReplyTarget::Dynamic { key, .. } = binding {
+                    if let Some(target) = dynamic.get_mut(&key) {
+                        target.last = Instant::now();
+                    }
+                }
+            }
+            Err(udp::SendError::BufferFull) => pending.push_back((binding, endpoint, data)),
+            Err(udp::SendError::Unaddressable) => {}
         }
     }
 }
@@ -1671,8 +1791,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
         .map_err(|e| outbound::io_err(format!("绑定 IPv6 DNS 端口失败: {:?}", e)))?;
     let dns6_handle = sockets.add(dns6_socket);
 
-    let (dns_tx, mut dns_rx) = mpsc::channel::<(DnsReplyTarget, IpEndpoint, Vec<u8>)>(128);
-    let mut dns_pending: VecDeque<(DnsReplyTarget, IpEndpoint, Vec<u8>)> = VecDeque::new();
+    let dns_slots = Arc::new(Semaphore::new(DNS_MAX_IN_FLIGHT));
+    let (dns_tx, mut dns_rx) = mpsc::channel::<DnsUdpPacket>(128);
+    let mut dns_pending = VecDeque::new();
     // 任意目的地址的 53 端口：按目的地址动态建 socket，应答源地址才能保持 8.8.8.8:53 等原值。
     let mut dns_udp_dsts: HashMap<(IpAddress, u16), UdpTarget> = HashMap::new();
 
@@ -1742,7 +1863,11 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
         // 新报文到达、TUN 可写、出站数据入队都会立即唤醒，这里的兜底只防漏唤醒。
         let idle = conns.is_empty() && udp_clients.is_empty();
         let backlogged = pending_out.len() >= device.pending_cap;
-        let wait = if write_blocked || !pending_out.is_empty() || has_relay_backlog(&conns) {
+        let wait = if write_blocked
+            || !pending_out.is_empty()
+            || !dns_pending.is_empty()
+            || has_relay_backlog(&conns)
+        {
             Duration::from_millis(1)
         } else if idle {
             Duration::from_millis(250)
@@ -1781,11 +1906,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                     }
                 }
             }
-            r = dns_rx.recv() => {
-                if let Some((binding, ep, data)) = r {
-                    if dns_pending.len() < 256 {
-                        dns_pending.push_back((binding, ep, data));
-                    }
+            r = dns_rx.recv(), if dns_pending.len() < DNS_MAX_PENDING_REPLIES => {
+                if let Some(reply) = r {
+                    dns_pending.push_back(reply);
                 }
             }
             // 出站数据到达即唤醒：relay 读到上游数据后 notify_one，
@@ -1848,8 +1971,8 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             }
                         }
                         if let Some((src, dst)) = lookup_udp_flow(&pkt) {
-                            if dst.port == 53 {
-                                // TUN 内所有 :53 一律交给本地 DNS 引擎（mihomo dns-hijack any:53）。
+                            if dst.port == 53 && ctx.dns().hijack_enabled() {
+                                // hijack-dns 开启时 TUN 内所有 :53 交给本地 DNS 引擎（mihomo dns-hijack any:53）。
                                 // 本地 10.10.10.53/fd00:1::53 已有固定 socket；其他目的地址按地址动态建，
                                 // 这样应答源仍是 8.8.8.8:53、114.114.114.114:53，客户端不会因源地址不符丢弃。
                                 if !is_local_dns_endpoint(dst) {
@@ -1865,46 +1988,31 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                     );
                                 }
                             } else {
-                                // QUIC 精确迫降：共享 CDN IP 上反查必然 ambiguous，旧门永不开，
-                                // App 走 HTTP/3 就整条绕过 MITM。这里直接解 Initial 的 SNI，
-                                // 命中 MITM 清单才丢包；同 IP 的非 MITM 域名不受连坐。
-                                if dst.port == 443 {
-                                    if let Some(payload) = udp_payload(&pkt) {
-                                        if let Some(sni) = crate::quic::initial_sni(payload) {
-                                            let client_uid =
-                                                ctx.uid_map.read().ok().and_then(|m| {
-                                                    m.lookup_flow(
-                                                        IpAddr::from(src.addr),
-                                                        src.port,
-                                                        IpAddr::from(dst.addr),
-                                                        dst.port,
-                                                    )
-                                                });
-                                            if ctx.mitm().should_mitm_uid(&sni, client_uid) {
-                                                ctx.stats
-                                                    .mitm_quic_blocked
-                                                    .fetch_add(1, Ordering::Relaxed);
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                }
                                 let domain = ctx
                                     .dns()
                                     .reverse
                                     .lock()
                                     .ok()
                                     .and_then(|m| m.lookup_confident(IpAddr::from(dst.addr)));
-                                // 只有反向映射唯一时才丢 QUIC/HTTP3；共享 CDN IP 上
-                                // 其他域名不能被一起迫降到 TCP。
-                                if dst.port == 443
-                                    && domain
+                                if dst.port == 443 {
+                                    let host = udp_payload(&pkt)
+                                        .and_then(crate::quic::initial_sni)
+                                        .or_else(|| domain.clone());
+                                    let uid = ctx.uid_map.read().ok().and_then(|m| {
+                                        m.lookup_flow(
+                                            IpAddr::from(src.addr),
+                                            src.port,
+                                            IpAddr::from(dst.addr),
+                                            dst.port,
+                                        )
+                                    });
+                                    if host
                                         .as_deref()
-                                        .map(|d| ctx.mitm().should_mitm(d))
-                                        .unwrap_or(false)
-                                {
-                                    ctx.stats.mitm_quic_blocked.fetch_add(1, Ordering::Relaxed);
-                                    continue;
+                                        .is_some_and(|host| ctx.mitm().should_mitm_uid(host, uid))
+                                    {
+                                        ctx.stats.mitm_quic_blocked.fetch_add(1, Ordering::Relaxed);
+                                        continue;
+                                    }
                                 }
                                 let decision_guard =
                                     ctx.decision.read().unwrap_or_else(|p| p.into_inner());
@@ -2124,7 +2232,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         .lock()
                         .ok()
                         .and_then(|m| m.lookup(local_ip));
-                    let dns_conn = port == 53;
+                    let dns_conn = port == 53 && ctx.dns().hijack_enabled();
                     let mut sni: Option<String> = None;
                     // 443 不能只信 DNS 反向映射：CDN 共用 IP 时反向域名可能属于
                     // 另一个站点。优先从本次 ClientHello 读取 SNI；读不到就不 MITM，
@@ -2152,7 +2260,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         // （MITM 可能命中时仍必须等 SNI，避免签错证书。）
                         let mitm_maybe = domain
                             .as_deref()
-                            .map(|d| ctx.mitm().should_mitm(d))
+                            .map(|d| ctx.mitm().should_mitm_uid(d, client_uid))
                             .unwrap_or(true);
                         if (domain.is_none() || (port == 443 && sni.is_none()))
                             && accepted_at.elapsed() < Duration::from_millis(SNI_WAIT_MS)
@@ -2442,8 +2550,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                     }
                     if dns_conn {
                         let (a, b) = tokio::io::duplex(DNS_TCP_DUPLEX_CAP);
-                        let dns = ctx.dns.read().unwrap_or_else(|p| p.into_inner()).clone();
-                        tokio::spawn(dns_tcp_server(dns, a));
+                        tokio::spawn(dns_tcp_server(ctx.clone(), a, dns_slots.clone()));
                         let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
                         let (stx, srx) = mpsc::channel::<Vec<u8>>(64);
                         let read_wake = Arc::new(Notify::new());
@@ -3073,30 +3180,10 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                 udp_clients.remove(&key);
             }
 
-            let expired_dst: Vec<(IpAddress, u16)> = udp_dsts
-                .iter()
-                .filter(|(key, target)| {
-                    !udp_target_has_session(&udp_clients, key.0, key.1)
-                        && udp_target_idle(&sockets, target, now_i, true)
-                })
-                .map(|(k, _)| *k)
-                .collect();
-            for key in expired_dst {
-                if let Some(target) = udp_dsts.remove(&key) {
-                    let _ = sockets.remove(target.handle);
-                }
-            }
-
-            let expired_dns_dst: Vec<(IpAddress, u16)> = dns_udp_dsts
-                .iter()
-                .filter(|(_, target)| udp_target_idle(&sockets, target, now_i, true))
-                .map(|(k, _)| *k)
-                .collect();
-            for key in expired_dns_dst {
-                if let Some(target) = dns_udp_dsts.remove(&key) {
-                    let _ = sockets.remove(target.handle);
-                }
-            }
+            reap_udp_targets(&mut sockets, &mut udp_dsts, now_i, |key| {
+                !udp_target_has_session(&udp_clients, key.0, key.1)
+            });
+            reap_udp_targets(&mut sockets, &mut dns_udp_dsts, now_i, |_| true);
 
             ctx.stats.udp_targets.store(
                 (udp_dsts.len() + dns_udp_dsts.len()) as u64,
@@ -3148,101 +3235,21 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             }
         }
 
-        // DNS UDP：固定 10.10.10.53/fd00:1::53 + 任意目的地址的动态 :53 socket
-        {
-            let mut queries: Vec<(DnsReplyTarget, IpEndpoint, Vec<u8>)> = Vec::new();
-            for handle in [dns4_handle, dns6_handle] {
-                let s = sockets.get_mut::<udp::Socket>(handle);
-                while s.can_recv() {
-                    // 按实际查询长度收包：EDNS0 允许 >2048 的查询，固定 2048
-                    // recv_slice 遇超长会 Truncated 整包丢弃。
-                    match s.recv() {
-                        Ok((payload, meta)) => {
-                            queries.push((
-                                DnsReplyTarget::Fixed(handle),
-                                meta.endpoint,
-                                payload.to_vec(),
-                            ));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
-            for (key, target) in dns_udp_dsts.iter_mut() {
-                let s = sockets.get_mut::<udp::Socket>(target.handle);
-                let mut got = false;
-                while s.can_recv() {
-                    match s.recv() {
-                        Ok((payload, meta)) => {
-                            queries.push((
-                                DnsReplyTarget::Dynamic {
-                                    key: *key,
-                                    generation: target.generation,
-                                },
-                                meta.endpoint,
-                                payload.to_vec(),
-                            ));
-                            got = true;
-                        }
-                        Err(_) => break,
-                    }
-                }
-                if got {
-                    target.last = Instant::now();
-                }
-            }
-            for (binding, endpoint, buf) in queries {
-                let dns = ctx.dns.read().unwrap_or_else(|p| p.into_inner()).clone();
-                let tx = dns_tx.clone();
-                tokio::spawn(async move {
-                    if let Some(resp) = dns.resolve(&buf).await {
-                        // UDP 客户端按自身 EDNS 大小收包，超长回 TC 让客户端走 TCP
-                        let resp = crate::dns::fit_udp_response(&buf, resp);
-                        let _ = tx.send((binding, endpoint, resp)).await;
-                    }
-                });
-            }
-        }
-        loop {
-            if dns_pending.len() >= 256 {
-                break;
-            }
-            match dns_rx.try_recv() {
-                Ok((binding, ep, data)) => dns_pending.push_back((binding, ep, data)),
-                Err(_) => break,
-            }
-        }
-        while let Some((binding, ep, data)) = dns_pending.front() {
-            let handle = match binding {
-                DnsReplyTarget::Fixed(handle) => Some(*handle),
-                DnsReplyTarget::Dynamic { key, generation } => {
-                    dynamic_dns_handle(&dns_udp_dsts, *key, *generation)
-                }
-            };
-            let Some(handle) = handle else {
-                // 动态 socket 已被淘汰/复用：旧查询回包必须丢弃，不能按旧句柄回包。
-                ctx.stats.dns_stale_reply.fetch_add(1, Ordering::Relaxed);
-                dns_pending.pop_front();
-                continue;
-            };
-            let s = sockets.get_mut::<udp::Socket>(handle);
-            if s.can_send() {
-                if s.send_slice(data, *ep).is_ok() {
-                    if let DnsReplyTarget::Dynamic { key, generation } = binding {
-                        if let Some(t) = dns_udp_dsts.get_mut(key) {
-                            if t.generation == *generation {
-                                t.last = Instant::now();
-                            }
-                        }
-                    }
-                    dns_pending.pop_front();
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
+        dispatch_udp_dns(
+            &mut sockets,
+            [dns4_handle, dns6_handle],
+            &mut dns_udp_dsts,
+            &ctx,
+            &dns_slots,
+            &dns_tx,
+        );
+        flush_udp_dns_replies(
+            &mut sockets,
+            &mut dns_udp_dsts,
+            &mut dns_rx,
+            &mut dns_pending,
+            &ctx.stats,
+        );
 
         // 发送到 TUN
         let _ = iface.poll(smol_now(start), &mut device, &mut sockets);

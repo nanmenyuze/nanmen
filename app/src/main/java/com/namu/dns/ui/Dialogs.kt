@@ -3,7 +3,6 @@ package com.namu.dns.ui
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import android.content.Intent
-import android.content.pm.PackageManager
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,10 +17,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Text
@@ -29,6 +30,8 @@ import androidx.compose.material3.TextButton
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.runtime.Composable
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
@@ -42,12 +45,12 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
@@ -59,6 +62,8 @@ import com.namu.dns.Actions
 import com.namu.dns.AppConfig
 import com.namu.dns.ConfigFileStore
 import com.namu.dns.ConfigStore
+import com.namu.dns.ruleLogicValueOk
+import com.namu.dns.ruleLogicKinds
 import com.namu.dns.core.config.ConfigIssueLevel
 import com.namu.dns.core.config.ConfigSourceRegistry
 import com.namu.dns.NativeCore
@@ -98,62 +103,82 @@ fun NamuDialog(
     Dialog(onDismissRequest = { if (!loading) onDismiss() }) {
         var shown by remember { mutableStateOf(false) }
         LaunchedEffect(Unit) { shown = true }
-        val scale by animateFloatAsState(if (shown) 1f else 0.92f, spring(dampingRatio = 0.76f, stiffness = 420f), label = "dlg-scale")
-        val fade by animateFloatAsState(if (shown) 1f else 0f, label = "dlg-alpha")
+        val scale by animateFloatAsState(
+            if (shown) 1f else .96f,
+            spring(dampingRatio = NamuTokens.PressDamping, stiffness = NamuTokens.PressStiffness),
+            label = "dialog-scale",
+        )
+        val opacity by animateFloatAsState(if (shown) 1f else 0f, label = "dialog-opacity")
+        val shape = RoundedCornerShape(NamuTokens.RadiusDialog)
         Column(
             Modifier
+                .widthIn(max = if (scrollContent) 380.dp else 320.dp)
                 .fillMaxWidth()
-                .widthIn(max = 340.dp)
-                .graphicsLayer { scaleX = scale; scaleY = scale; alpha = fade }
-                .shadow(24.dp, RoundedCornerShape(NamuTokens.RadiusDialog))
-                .clip(RoundedCornerShape(NamuTokens.RadiusDialog))
-                .background(NamuColors.Card),
+                .graphicsLayer { scaleX = scale; scaleY = scale; alpha = opacity }
+                .shadow(14.dp, shape)
+                .clip(shape)
+                .background(NamuColors.Floating),
         ) {
-            val bodyModifier = if (scrollContent) {
-                Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())
-            } else {
-                Modifier
-            }
             Column(
-                bodyModifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 22.dp, bottom = 18.dp),
+                Modifier.weight(1f, fill = false).fillMaxWidth().verticalScroll(rememberScrollState())
+                    .padding(horizontal = 20.dp, vertical = if (scrollContent) 20.dp else 16.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                Text(title, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = NamuColors.TextMain, textAlign = TextAlign.Center)
-                if (message != null) {
-                    Spacer(Modifier.height(5.dp))
+                Text(
+                    title,
+                    style = NamuTokens.Type.Title,
+                    color = NamuColors.TextMain,
+                    textAlign = TextAlign.Center,
+                )
+                if (!message.isNullOrBlank()) {
+                    Spacer(Modifier.height(6.dp))
                     Text(
                         message,
-                        fontSize = 13.sp,
+                        fontSize = 14.sp,
                         color = NamuColors.TextSub,
                         textAlign = TextAlign.Center,
-                        lineHeight = 17.sp,
+                        lineHeight = 20.sp,
                     )
                 }
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(10.dp))
                 content()
             }
-            Box(Modifier.fillMaxWidth().height(0.5.dp).background(NamuColors.Separator))
-            Row(Modifier.fillMaxWidth().height(50.dp)) {
+            RowDivider(startInset = 0.dp)
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
                 if (showDismiss) {
-                    TextButton(onClick = onDismiss, enabled = !loading, modifier = Modifier.weight(1f).fillMaxWidth().height(50.dp)) {
-                        Text(dismissText, fontSize = 17.sp, color = NamuColors.Blue)
+                    TextButton(
+                        onClick = onDismiss,
+                        enabled = !loading,
+                        modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                        shape = CircleShape,
+                        colors = ButtonDefaults.textButtonColors(
+                            containerColor = NamuColors.Fill,
+                            contentColor = NamuColors.TextMain,
+                        ),
+                    ) {
+                        Text(dismissText, style = NamuTokens.Type.NavigationTitle, textAlign = TextAlign.Center)
                     }
-                    Box(Modifier.width(0.5.dp).height(50.dp).background(NamuColors.Separator))
                 }
                 TextButton(
                     onClick = onConfirm,
                     enabled = confirmEnabled && !loading,
-                    modifier = Modifier.weight(1f).fillMaxWidth().height(50.dp),
+                    modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                    shape = CircleShape,
+                    colors = ButtonDefaults.textButtonColors(
+                        containerColor = confirmColor.copy(alpha = .12f),
+                        contentColor = confirmColor,
+                        disabledContainerColor = NamuColors.Fill,
+                        disabledContentColor = NamuColors.TextTertiary,
+                    ),
                 ) {
                     if (loading) {
-                        CircularProgressIndicator(Modifier.size(17.dp), color = NamuColors.Blue, strokeWidth = 2.dp)
+                        CircularProgressIndicator(Modifier.size(17.dp), color = confirmColor, strokeWidth = 2.dp)
                     } else {
-                        Text(
-                            confirmText,
-                            fontSize = 17.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = if (confirmEnabled) confirmColor else NamuColors.TextTertiary,
-                        )
+                        Text(confirmText, style = NamuTokens.Type.NavigationTitle, textAlign = TextAlign.Center)
                     }
                 }
             }
@@ -176,18 +201,21 @@ fun NamuTextField(
         onValueChange = onChange,
         singleLine = singleLine,
         maxLines = if (singleLine) 1 else maxLines,
-        textStyle = TextStyle(fontSize = 14.sp, color = NamuColors.TextMain),
+        textStyle = NamuTokens.Type.Body.copy(fontSize = 15.sp, lineHeight = 20.sp, color = NamuColors.TextMain),
+        cursorBrush = SolidColor(NamuColors.Brand),
         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
         decorationBox = { inner ->
             Box(
                 Modifier
                     .fillMaxWidth()
+                    .heightIn(min = 46.dp)
                     .clip(RoundedCornerShape(NamuTokens.RadiusControl))
                     .background(NamuColors.Fill)
-                    .padding(horizontal = 12.dp, vertical = 11.dp),
+                    .padding(horizontal = 14.dp, vertical = 11.dp),
+                contentAlignment = Alignment.CenterStart,
             ) {
                 if (value.isEmpty()) {
-                    Text(placeholder, fontSize = 14.sp, color = NamuColors.TextSub.copy(alpha = 0.7f))
+                    Text(placeholder, fontSize = 15.sp, color = NamuColors.TextSub)
                 }
                 inner()
             }
@@ -328,6 +356,8 @@ internal fun ruleValueError(type: String, raw: String): String? {
         "IP-CIDR6" -> if (validCidrValue(v, ipv6 = true)) null else "请输入合法 IPv6 CIDR（前缀 0–128）"
         "APP", "PROCESS-NAME", "APP-NAME" -> if (validPackageName(v)) null else "请输入应用包名，如 com.bilibili.app"
         "UID" -> if (v.toIntOrNull() != null) null else "UID 必须是数字"
+        "AND", "OR", "NOT" -> if (ruleLogicValueOk(type, v)) null else "格式：((DOMAIN,a.com),(PORT,443))，子项可嵌套"
+        "SCRIPT" -> if (v.none { it.isWhitespace() }) null else "脚本名不能含空格"
         else -> null
     }
 }
@@ -458,47 +488,38 @@ fun ScriptArgumentsDialog(
     onSave: (com.namu.dns.core.config.ScriptConfig, Map<String, String>) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    Dialog(onDismissRequest = onDismiss) {
-        Box(
-            Modifier.fillMaxWidth().padding(horizontal = 18.dp)
-                .clip(RoundedCornerShape(NamuTokens.RadiusDialog)).background(NamuColors.Card),
-        ) {
-            Column(Modifier.padding(18.dp).heightIn(max = 560.dp).verticalScroll(rememberScrollState())) {
-                Text("脚本参数", fontSize = 17.sp, fontWeight = FontWeight.SemiBold, color = NamuColors.TextMain)
-                Text(
-                    "只改 \$argument 当前值：保存后立即生效，不重编译脚本；number/boolean 按声明类型注入。",
-                    fontSize = 11.sp, color = NamuColors.TextSub, modifier = Modifier.padding(top = 4.dp, bottom = 10.dp),
-                )
-                if (scripts.isEmpty()) {
-                    Text("当前没有可编辑参数的脚本。", fontSize = 12.sp, color = NamuColors.TextSub)
-                }
-                scripts.forEach { script ->
-                    val key = ConfigStore.scriptArgumentKey(script)
-                    var values by remember(script, saved) {
-                        mutableStateOf(
-                            script.arguments.mapValues { (k, v) -> saved[key]?.get(k) ?: v },
-                        )
-                    }
-                    Text(
-                        "${script.name.ifBlank { script.pattern }} · ${script.phase}",
-                        fontSize = 13.sp, fontWeight = FontWeight.Medium, color = NamuColors.TextMain,
-                        modifier = Modifier.padding(top = 12.dp, bottom = 4.dp),
+    NamuDialog(
+        title = "脚本参数",
+        confirmText = "关闭",
+        showDismiss = false,
+        scrollContent = true,
+        onDismiss = onDismiss,
+        onConfirm = onDismiss,
+    ) {
+        Column(Modifier.fillMaxWidth()) {
+            scripts.forEach { script ->
+                val key = ConfigStore.scriptArgumentKey(script)
+                var values by remember(script, saved) {
+                    mutableStateOf(
+                        script.arguments.mapValues { (k, v) -> saved[key]?.get(k) ?: v },
                     )
-                    if (script.arguments.isEmpty()) {
-                        Text("无声明参数（[Argument] 为空）", fontSize = 11.sp, color = NamuColors.TextSub)
-                    } else {
-                        script.arguments.keys.sorted().forEach { name ->
-                            val type = script.argumentTypes[name] ?: "string"
-                            Text("$name ($type)", fontSize = 11.sp, color = NamuColors.TextSub)
-                            NamuTextField(values[name] ?: "", { v -> values = values + (name to v) }, "值")
-                        }
-                        TextButton(onClick = { onSave(script, values) }) {
-                            Text("保存该脚本参数", fontSize = 12.sp, color = NamuColors.Accent)
-                        }
-                    }
                 }
-                Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.End) {
-                    TextButton(onClick = onDismiss) { Text("关闭", color = NamuColors.TextSub) }
+                Text(
+                    "${script.name.ifBlank { script.pattern }} · ${script.phase}",
+                    fontSize = 13.sp, fontWeight = FontWeight.Medium, color = NamuColors.TextMain,
+                    modifier = Modifier.padding(top = 12.dp, bottom = 4.dp),
+                )
+                if (script.arguments.isEmpty()) {
+                    Text("无声明参数（[Argument] 为空）", fontSize = 11.sp, color = NamuColors.TextSub)
+                } else {
+                    script.arguments.keys.sorted().forEach { name ->
+                        val type = script.argumentTypes[name] ?: "string"
+                        Text("$name ($type)", fontSize = 11.sp, color = NamuColors.TextSub)
+                        NamuTextField(values[name] ?: "", { v -> values = values + (name to v) }, "值")
+                    }
+                    TextButton(onClick = { onSave(script, values) }) {
+                        Text("保存该脚本参数", fontSize = 12.sp, color = NamuColors.Accent)
+                    }
                 }
             }
         }
@@ -767,6 +788,10 @@ fun AddRuleDialog(
         "GEOIP" to "GEOIP",
         "FINAL" to "FINAL",
         "APP" to "按应用",
+        "AND" to "逻辑与",
+        "OR" to "逻辑或",
+        "NOT" to "逻辑非",
+        "SCRIPT" to "脚本",
     )
     val actions = if (httpType) listOf(
         "reject" to "REJECT",
@@ -811,9 +836,11 @@ fun AddRuleDialog(
                 "IP-CIDR6" -> "2001:db8::/32"
                 "APP", "PROCESS-NAME", "APP-NAME" -> "com.bilibili.app"
                 "UID" -> "10100"
+                "AND", "OR", "NOT" -> "((DOMAIN-SUFFIX,ads.com),(PORT,443))"
+                "SCRIPT" -> "脚本名（脚本内定义 match(ctx) 返回布尔）"
                 else -> "example.com 或 1.2.3.0/24"
             },
-            singleLine = true,
+            singleLine = type !in ruleLogicKinds,
         )
         Spacer(Modifier.height(12.dp))
         Text("类型", fontSize = 12.sp, color = NamuColors.TextSub, modifier = Modifier.fillMaxWidth())
@@ -912,40 +939,6 @@ fun DnsDialog(current: String, onDismiss: () -> Unit, onSelect: (String) -> Unit
             NamuTextField(address, { address = it }, "DoH、DoT 或 UDP 地址", singleLine = true)
             if (address.isNotBlank() && issue != null) Text(issue, color = NamuColors.Red, fontSize = 12.sp)
         }
-    }
-}
-
-@Composable
-fun DnsListDialog(title: String, current: String, onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
-    val entries = remember {
-        mutableStateListOf<String>().apply {
-            addAll(current.split(',', '\n').map { it.trim() }.filter { it.isNotBlank() }.ifEmpty { listOf("system") })
-        }
-    }
-    val issue = com.namu.dns.core.config.ConfigDnsInput.error(entries.joinToString(","))
-    NamuDialog(
-        title = title,
-        message = "按顺序尝试，前一个不可用时自动尝试下一个。",
-        confirmText = "保存",
-        confirmEnabled = entries.any { it.isNotBlank() } && issue == null,
-        onDismiss = onDismiss,
-        scrollContent = true,
-        onConfirm = { onConfirm(entries.map { it.trim() }.filter { it.isNotBlank() }.joinToString(",")) },
-    ) {
-        entries.forEachIndexed { index, value ->
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                TextButton(onClick = { if (entries.size > 1) entries.removeAt(index) }) {
-                    Text("−", color = NamuColors.Red, fontSize = 22.sp)
-                }
-                Box(Modifier.weight(1f)) {
-                    NamuTextField(value, { entries[index] = it }, "system、DoH、DoT 或 UDP 地址", singleLine = true)
-                }
-            }
-        }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
-            TextButton(onClick = { entries.add("") }) { Text("＋ 添加 DNS", color = NamuColors.Green) }
-        }
-        if (issue != null) Text(issue, color = NamuColors.Red, fontSize = 12.sp)
     }
 }
 
@@ -1212,64 +1205,6 @@ fun ConfigImportDialog(
         }
     }
 }
-
-@Composable
-fun ConfigFileInfoDialog(
-    info: ConfigFileStore.FileInfo,
-    onActivate: () -> Unit,
-    onEdit: () -> Unit,
-    onDelete: () -> Unit,
-    onRestore: () -> Unit = {},
-    onCopy: () -> Unit,
-    onExport: () -> Unit,
-    onDismiss: () -> Unit,
-) {
-    val clipboard = LocalClipboardManager.current
-    val context = uiContext
-    NamuDialog(
-        title = info.name,
-        confirmText = "关闭",
-        showDismiss = false,
-        onConfirm = onDismiss,
-        onDismiss = onDismiss,
-    ) {
-        Column(Modifier.fillMaxWidth()) {
-            InfoLine("大小", formatBytes(info.size))
-            InfoLine("修改时间", formatAbsoluteTime(info.modified))
-            InfoLine("默认配置", if (info.isDefault) "是" else "否")
-            InfoLine("状态", if (info.active) "正在使用" else "未使用")
-            Spacer(Modifier.height(6.dp))
-            Box(Modifier.fillMaxWidth().height(0.5.dp).background(NamuColors.Separator))
-            if (!info.active) {
-                DialogAction("设为当前配置", NamuColors.Blue) { onActivate() }
-                Box(Modifier.fillMaxWidth().height(0.5.dp).background(NamuColors.Separator))
-            }
-            if (ConfigFileStore.hasBackup(context, info.name)) {
-                DialogAction("回退到上一版", NamuColors.Orange) { onRestore() }
-                Box(Modifier.fillMaxWidth().height(0.5.dp).background(NamuColors.Separator))
-            }
-            DialogAction("编辑配置", NamuColors.Blue) { onEdit() }
-            Box(Modifier.fillMaxWidth().height(0.5.dp).background(NamuColors.Separator))
-            DialogAction("复制配置内容", NamuColors.Blue) {
-                val text = ConfigFileStore.exportText(context, info.name)
-                if (text.isNullOrBlank()) {
-                    uiMessages.show("读取失败")
-                } else {
-                    clipboard.setText(AnnotatedString(text))
-                    uiMessages.show("配置内容已复制")
-                }
-                onDismiss()
-            }
-            DialogAction("复制为新配置", NamuColors.Blue) { onCopy() }
-            DialogAction("导出配置", NamuColors.Blue) { onExport(); onDismiss() }
-            if (!info.isDefault) {
-                Box(Modifier.fillMaxWidth().height(0.5.dp).background(NamuColors.Separator))
-                DialogAction("删除该配置", NamuColors.Red) { onDelete() }
-            }
-        }
-    }
-}
-
 
 @Composable
 fun ProxyGroupsDialog(
@@ -1721,16 +1656,6 @@ private fun cidrContains(cidr: String, ip: String): Boolean {
     }
 }
 
-private fun formatAbsoluteTime(ts: Long): String {
-    if (ts <= 0L) return "-"
-    return try {
-        val fmt = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault())
-        fmt.format(java.util.Date(ts))
-    } catch (_: Exception) {
-        "-"
-    }
-}
-
 /** 可启动应用项：按 App MITM 选择器的数据源。 */
 data class AppEntry(val pkg: String, val label: String)
 
@@ -1741,8 +1666,7 @@ data class AppEntry(val pkg: String, val label: String)
 private fun loadLaunchableApps(ctx: android.content.Context): List<AppEntry> {
     val pm = ctx.packageManager
     val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-    val resolved = runCatching { pm.queryIntentActivities(intent, PackageManager.MATCH_DEFAULT_ONLY) }
-        .getOrDefault(emptyList())
+    val resolved = pm.queryIntentActivities(intent, 0)
     return resolved.mapNotNull { info ->
         val pkg = info.activityInfo?.packageName ?: return@mapNotNull null
         val label = runCatching { info.loadLabel(pm).toString() }.getOrDefault(pkg)
@@ -1761,23 +1685,34 @@ fun AppScopeDialog(
     var localMode by remember { mutableStateOf(if (mode == "allow" || mode == "deny") mode else "all") }
     val selected = remember { mutableStateListOf<String>().apply { addAll(apps) } }
     var query by remember { mutableStateOf("") }
-    var entries by remember { mutableStateOf<List<AppEntry>>(emptyList()) }
+    var loaded by remember { mutableStateOf<Result<List<AppEntry>>?>(null) }
     LaunchedEffect(Unit) {
-        entries = withContext(Dispatchers.IO) { loadLaunchableApps(ctx) }
+        loaded = withContext(Dispatchers.IO) { runCatching { loadLaunchableApps(ctx) } }
     }
-    val filtered = remember(entries, query, selected.size) {
-        val q = query.trim().lowercase()
-        val base = if (q.isEmpty()) entries else entries.filter {
-            it.label.lowercase().contains(q) || it.pkg.lowercase().contains(q)
+    val entries = loaded?.getOrNull().orEmpty()
+    val visiblePackages = remember(entries) { entries.mapTo(HashSet()) { it.pkg } }
+    val savedEntries = remember(apps, visiblePackages) {
+        apps.filterNot { it in visiblePackages }.distinct().map { AppEntry(it, it) }
+    }
+    val filtered = remember(entries, savedEntries, query) {
+        val q = query.trim()
+        (savedEntries + entries).filter {
+            it.label.contains(q, ignoreCase = true) || it.pkg.contains(q, ignoreCase = true)
         }
-        base
+    }
+    val selection = selected.toList()
+    var unresolved by remember { mutableStateOf<List<String>>(emptyList()) }
+    LaunchedEffect(selection) {
+        unresolved = withContext(Dispatchers.IO) {
+            com.namu.dns.AppUidResolver.resolveUids(ctx, selection).second
+        }
     }
     NamuDialog(
         title = "按 App MITM",
-        message = "只解密指定应用，或把银行/支付等证书固定应用排除在外；范围之外的连接保持原样直通",
+        scrollContent = true,
         confirmText = "保存",
         onConfirm = {
-            if (localMode == "all") onApply("all", emptyList())
+            if (localMode == "all" || (localMode == "deny" && selected.isEmpty())) onApply("all", emptyList())
             else onApply(localMode, selected.toList())
             onDismiss()
         },
@@ -1799,18 +1734,21 @@ fun AppScopeDialog(
                 )
                 Spacer(Modifier.height(6.dp))
                 Text(
-                    "已选 ${selected.size} 个${if (entries.isEmpty()) " · 读取中…" else ""}",
+                    "已选 ${selected.size} 个 · 桌面应用 ${entries.size} 个",
                     fontSize = 12.sp,
                     color = NamuColors.TextSub,
                     modifier = Modifier.fillMaxWidth(),
                 )
-                Column(
-                    Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 210.dp)
-                        .verticalScroll(rememberScrollState()),
-                ) {
-                    filtered.forEach { e ->
+                if (unresolved.any { it in selected }) {
+                    Text(
+                        if (localMode == "deny") "有应用无法识别，MITM 将暂停"
+                        else "有应用无法识别，将跳过这些应用",
+                        fontSize = 12.sp,
+                        color = NamuColors.TextSub,
+                    )
+                }
+                LazyColumn(Modifier.fillMaxWidth().heightIn(max = 320.dp)) {
+                    items(filtered, key = { it.pkg }) { e ->
                         val checked = selected.contains(e.pkg)
                         Row(
                             Modifier
@@ -1839,20 +1777,20 @@ fun AppScopeDialog(
                             }
                         }
                     }
-                    if (filtered.isEmpty()) {
+                    if (filtered.isEmpty()) item {
                         Text(
-                            if (entries.isEmpty()) "正在读取应用列表" else "没有匹配的应用",
+                            when {
+                                loaded == null -> "正在读取应用列表"
+                                loaded?.isFailure == true -> "读取应用失败"
+                                entries.isEmpty() && query.isBlank() -> "没有可见的桌面应用"
+                                else -> "没有匹配的应用"
+                            },
                             fontSize = 12.sp,
                             color = NamuColors.TextSub,
                             modifier = Modifier.padding(vertical = 10.dp),
                         )
                     }
                 }
-                Text(
-                    "仅列表内应用生效；未列出通常是系统未开放可见性，可换成 root 授权访问",
-                    fontSize = 11.sp,
-                    color = NamuColors.TextTertiary,
-                )
             }
         }
     }

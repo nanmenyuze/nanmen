@@ -75,6 +75,26 @@ pub fn body_bypass_reason(
     None
 }
 
+/// Run the shared response transforms without copying the body on a no-op path.
+fn rewrite_response_body(
+    mut body: Vec<u8>,
+    surge: &[&RewriteRule],
+    loon: &[BodyOp],
+    limit: usize,
+) -> Option<(Vec<u8>, bool)> {
+    let mut changed = false;
+    if !surge.is_empty() {
+        (body, changed) = rewrite::apply_body_rules_limited(&body, surge, limit)?;
+    }
+    if !loon.is_empty() {
+        let ops: Vec<&BodyOp> = loon.iter().collect();
+        let (out, loon_changed) = loon::apply_body_ops(&body, &ops, limit)?;
+        body = out;
+        changed |= loon_changed;
+    }
+    Some((body, changed))
+}
+
 /// 单条 MITM 连接的观测计数：请求数 / 无规则命中数 / 是否已记录过首条无规则请求。
 /// h2 与 h1 共用同一份，连接结束时汇总一条日志，避免逐请求刷屏。
 #[derive(Default)]
@@ -137,6 +157,7 @@ impl Drop for RewritePermit {
 pub struct MitmState {
     pub engine: Arc<MitmEngine>,
     pub ca: Option<Arc<MitmCa>>,
+    ca_revision: Option<(std::time::SystemTime, u64)>,
     pub rewrite_budget: Arc<RewriteBudget>,
     /// 限制并发脚本数：拿不到许可时排队等待（有上限），不跳过脚本。
     /// 并发是内部实现细节，不能改变模块应得的改写结果。
@@ -150,6 +171,23 @@ pub struct MitmState {
 }
 
 impl MitmState {
+    fn ca_revision(path: &str) -> Option<(std::time::SystemTime, u64)> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some((metadata.modified().ok()?, metadata.len()))
+    }
+
+    pub fn ca_unavailable(&self) -> bool {
+        self.engine.enabled && !self.engine.hosts.is_empty() && self.ca.is_none()
+    }
+
+    pub fn can_reuse(&self, cfg: &MitmConfig, previous: &MitmConfig) -> bool {
+        !self.ca_unavailable()
+            && (self.ca.is_none()
+                || (self.ca_revision.is_some() && self.ca_revision == Self::ca_revision(&cfg.ca_file)))
+            && serde_json::to_value(cfg).expect("MITM configuration is serializable")
+                == serde_json::to_value(previous).expect("MITM configuration is serializable")
+    }
+
     pub fn build(cfg: &MitmConfig) -> Self {
         Self::build_with_stats(cfg, None)
     }
@@ -193,13 +231,20 @@ impl MitmState {
                 .saturating_mul(REWRITE_BUFFER_COPIES)
                 .saturating_mul(MAX_CONCURRENT_REWRITE_STREAMS),
         );
+        let script_workers = if engine.scripts.rules.is_empty() {
+            0
+        } else {
+            4
+        };
+        let ca_revision = ca.as_ref().and_then(|_| Self::ca_revision(&cfg.ca_file));
         Self {
             engine,
             ca,
+            ca_revision,
             rewrite_budget,
             script_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             ws_slots: Arc::new(tokio::sync::Semaphore::new(8)),
-            script_pool: Arc::new(ScriptWorkerPool::new(4)),
+            script_pool: Arc::new(ScriptWorkerPool::new(script_workers)),
             pool: Arc::new(pool::MitmPool::new(
                 cfg.pool_enabled,
                 cfg.pool_idle_secs,
@@ -1735,29 +1780,10 @@ where
         let enc = http1::get_header(&head.headers, "content-encoding").unwrap_or("");
         match http1::decode_content_limited(&decoded, enc, limit) {
             Some(plain) => {
-                // Surge [URL Rewrite] 与 Loon [Rewrite] 分开执行，互不推断语法。
-                let surge_out = if body_rules.is_empty() {
-                    Some((plain.clone(), false))
-                } else {
-                    rewrite::apply_body_rules_limited(&plain, body_rules, limit)
-                };
-                let loon_ops: Vec<&BodyOp> = response_body_ops.iter().collect();
-                let loon_out = if loon_ops.is_empty() {
-                    Some((
-                        surge_out
-                            .as_ref()
-                            .map(|(b, _)| b.clone())
-                            .unwrap_or_default(),
-                        false,
-                    ))
-                } else {
-                    let base = surge_out
-                        .as_ref()
-                        .map(|(b, _)| b.as_slice())
-                        .unwrap_or(&plain);
-                    loon::apply_body_ops(base, &loon_ops, limit)
-                };
-                let Some((new_body, loon_changed)) = loon_out else {
+                let original_len = plain.len();
+                let Some((new_body, body_changed)) =
+                    rewrite_response_body(plain, body_rules, response_body_ops, limit)
+                else {
                     // 改写后超过上限：不能把放大后的正文发给客户端，回退原始响应。
                     ctx.stats.mitm_body_bypassed.fetch_add(1, Ordering::Relaxed);
                     let mut h = resp_headers.clone();
@@ -1782,7 +1808,6 @@ where
                     cio.stream.flush().await?;
                     return Ok(keep);
                 };
-                let surge_changed = surge_out.map(|(_, c)| c).unwrap_or(false);
                 let mut status_out = head.status;
                 let mut headers_out = resp_headers.clone();
                 let mut body_out = new_body;
@@ -1827,12 +1852,25 @@ where
                         }
                     }
                 }
-                let changed = surge_changed || loon_changed || script_changed;
+                let changed = body_changed || script_changed;
                 let mut h = headers_out;
                 for k in ["transfer-encoding", "content-encoding", "content-length"] {
                     http1::remove_header(&mut h, k);
                 }
-                http1::set_header(&mut h, "Content-Length", &body_out.len().to_string());
+                if changed {
+                    http1::set_header(&mut h, "Content-Length", &body_out.len().to_string());
+                } else {
+                    // Keep the original encoding and wire framing on a no-op.
+                    body_out = raw_body;
+                    if !enc.is_empty() {
+                        http1::set_header(&mut h, "Content-Encoding", enc);
+                    }
+                    match framing {
+                        Framing::Length(n) => http1::set_header(&mut h, "Content-Length", &n.to_string()),
+                        Framing::Chunked => http1::set_header(&mut h, "Transfer-Encoding", "chunked"),
+                        _ => {}
+                    }
+                }
                 let keep = framing != Framing::Eof;
                 http1::set_header(
                     &mut h,
@@ -1865,7 +1903,7 @@ where
                             host,
                             http1::redact_path(&req.path),
                             status_out,
-                            plain.len(),
+                            original_len,
                             body_out.len()
                         ),
                     );

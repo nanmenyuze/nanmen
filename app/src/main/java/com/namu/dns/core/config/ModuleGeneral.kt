@@ -15,8 +15,16 @@ data class ModuleGeneralEffects(
     val testUrl: String = "",
     val testTimeout: Int = 0,
     val forceCloseConnections: Boolean = false,
+    val hijackDns: Boolean? = null,
+    val ipv6: Boolean? = null,
+    val preferIpv6: Boolean? = null,
+    val alwaysRealIp: List<String> = emptyList(),
     val raw: Map<String, String> = emptyMap(),
 )
+
+/** hijack-dns 值语义：false/off/no/0/disable 关；true、*:53、any:53、服务器列表等一律开。 */
+internal fun parseHijackDns(raw: String): Boolean =
+    raw.trim().lowercase() !in setOf("false", "off", "no", "0", "disable", "disabled")
 
 object ModuleGeneral {
     fun parse(options: Map<String, String>): ModuleGeneralEffects {
@@ -34,6 +42,10 @@ object ModuleGeneral {
             testTimeout = timeout,
             forceCloseConnections = options["force-close-connections"]
                 ?.let { it.equals("true", true) || it == "1" } ?: false,
+            hijackDns = options["hijack-dns"]?.let { parseHijackDns(it) },
+            ipv6 = options["ipv6"]?.let { it.equals("true", true) || it == "1" },
+            preferIpv6 = options["prefer-ipv6"]?.let { it.equals("true", true) || it == "1" },
+            alwaysRealIp = split("always-real-ip", "fake-ip-filter"),
             raw = options,
         )
     }

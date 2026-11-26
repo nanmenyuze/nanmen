@@ -2,6 +2,7 @@ package com.namu.dns.ui
 
 import com.namu.dns.core.LocalDockClearance
 import com.namu.dns.AppUidResolver
+import com.namu.dns.GlobalRuleStore
 import com.namu.dns.UidTablePublisher
 
 import androidx.compose.foundation.Canvas
@@ -23,7 +24,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Insights
-import androidx.compose.material.icons.outlined.History
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -34,9 +34,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -47,9 +50,9 @@ import androidx.compose.ui.platform.LocalContext
 import android.content.Intent
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.namu.dns.Diagnostics
 import com.namu.dns.NetworkStatus
 import com.namu.dns.PrivateDnsController
+import com.namu.dns.core.DataSection
 import com.namu.dns.core.LocalAppContainer
 import com.namu.dns.core.config.RoutingMode
 import com.namu.dns.core.repository.HitsUiState
@@ -58,12 +61,181 @@ import com.namu.dns.core.repository.windowPoints
 import com.namu.dns.ui.viewmodel.DataViewModel
 import kotlinx.coroutines.launch
 
+/**
+ * 数据主栏展示 DNS 和流量摘要，诊断入口集中放在页尾。
+ * 卡片标清统计时段；未采集显示「未采集」；只有具备趋势数据时才画曲线。
+ */
 @Composable
 fun DataScreen(
+    onOpenAnalytics: (DataSection) -> Unit,
+    onOpenDiagnostics: () -> Unit,
+    onOpenMitmDetails: () -> Unit,
+) {
+    val container = LocalAppContainer.current
+    val vm: DataViewModel = viewModel(factory = DataViewModel.factory(container))
+    val state by vm.state.collectAsStateWithLifecycle()
+    val stats = state.stats.stats
+    val cfg = state.config
+    val sessionSampled = state.stats.sessionActive || stats.uptime > 0L
+    val observesConnections = cfg.mode != "dns_only" || cfg.dnsOnlyFullRoute || GlobalRuleStore.state.scope.enabled
+    val mitmSampled = (GlobalRuleStore.state.scope.enabled && sessionSampled) ||
+        stats.mitmConns > 0L || stats.mitmRewritten > 0L || stats.mitmFailed > 0L
+    val hits = state.hits
+    val useWindow = hits.phase == ShellPhase.SUCCESS
+    val dnsPeriod = when {
+        useWindow && hits.windowHours >= 168 -> "近 7 天"
+        useWindow -> "近 24 小时"
+        else -> "本次运行"
+    }
+    val dnsQueries = if (useWindow) hits.window.queries else stats.dnsQueries
+    val dnsBlocked = if (useWindow) hits.window.blocked else stats.dnsBlocked
+    val dnsCollected = useWindow || sessionSampled
+    val trafficCollected = observesConnections && sessionSampled
+    Column(
+        Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
+    ) {
+        MainPageTopBar("数据")
+        DataOverviewCard(
+            title = "DNS 与拦截",
+            period = dnsPeriod,
+            firstLabel = "DNS 查询",
+            firstValue = if (dnsCollected) "%,d".format(dnsQueries) else null,
+            secondLabel = "已拦截",
+            secondValue = if (dnsCollected) "%,d".format(dnsBlocked) else null,
+            samples = if (useWindow) hits.window.points.map { it.queries } else emptyList(),
+            onClick = { onOpenAnalytics(DataSection.Dns) },
+        )
+        Spacer(Modifier.height(12.dp))
+        DataOverviewCard(
+            title = "流量与连接",
+            period = "本次运行",
+            firstLabel = "上传",
+            firstValue = if (trafficCollected) formatBytes(stats.up) else null,
+            secondLabel = "下载",
+            secondValue = if (trafficCollected) formatBytes(stats.down) else null,
+            onClick = { onOpenAnalytics(DataSection.Traffic) },
+        )
+        Spacer(Modifier.height(12.dp))
+        DataOverviewCard(
+            title = "MITM 统计",
+            period = "本次运行",
+            firstLabel = "改写",
+            firstValue = if (mitmSampled) "%,d".format(stats.mitmRewritten) else null,
+            secondLabel = "失败",
+            secondValue = if (mitmSampled) "%,d".format(stats.mitmFailed) else null,
+            onClick = onOpenMitmDetails,
+        )
+        Spacer(Modifier.height(16.dp))
+        GroupCard {
+            SettingsRow(
+                title = "日志与诊断",
+                chevron = true,
+                showDivider = false,
+                onClick = onOpenDiagnostics,
+            )
+        }
+        Spacer(Modifier.height(LocalDockClearance.current + 24.dp))
+    }
+}
+
+@Composable
+private fun DataOverviewCard(
+    title: String,
+    period: String,
+    firstLabel: String,
+    firstValue: String?,
+    secondLabel: String,
+    secondValue: String?,
+    samples: List<Long> = emptyList(),
+    onClick: () -> Unit,
+) {
+    GroupCard(radius = NamuTokens.RadiusDataCard) {
+        Column(
+            Modifier.fillMaxWidth().clickable(onClickLabel = "查看${title}详情", onClick = onClick).padding(18.dp),
+        ) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text(title, Modifier.weight(1f), style = NamuTokens.Type.Title, color = NamuColors.TextMain)
+                Text(period, style = NamuTokens.Type.Caption, color = NamuColors.TextSub)
+                Spacer(Modifier.width(8.dp))
+                Chevron()
+            }
+            Spacer(Modifier.height(14.dp))
+            Row(Modifier.fillMaxWidth()) {
+                DataMetric(firstLabel, firstValue, Modifier.weight(1f))
+                DataMetric(secondLabel, secondValue, Modifier.weight(1f))
+            }
+            if (samples.size >= 2) {
+                DataCardSparkline(samples, Modifier.fillMaxWidth().padding(top = 12.dp).height(44.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun DataMetric(label: String, value: String?, modifier: Modifier) {
+    Column(modifier.padding(end = 8.dp)) {
+        Text(label, style = NamuTokens.Type.Caption, color = NamuColors.TextSub)
+        Text(
+            value ?: "—",
+            style = NamuTokens.Type.Title.copy(
+                fontSize = if (value == null) 24.sp else 30.sp,
+                lineHeight = 38.sp,
+                letterSpacing = (-0.55).sp,
+                fontFeatureSettings = "tnum",
+            ),
+            color = if (value == null) NamuColors.TextTertiary else NamuColors.TextMain,
+        )
+    }
+}
+
+/** 实际采样曲线：不足两个采样点不画，避免把空数据画成假趋势。 */
+@Composable
+private fun DataCardSparkline(samples: List<Long>, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        if (samples.size < 2) return@Canvas
+        val maxValue = maxOf(samples.maxOrNull() ?: 0L, 1L).toDouble()
+        val top = 2.dp.toPx()
+        val bottom = size.height - 2.dp.toPx()
+        val drawHeight = (bottom - top).coerceAtLeast(1f)
+        val points = samples.mapIndexed { index, value ->
+            Offset(
+                size.width * index / (samples.size - 1),
+                bottom - (value.toDouble() / maxValue).coerceIn(0.0, 1.0).toFloat() * drawHeight,
+            )
+        }
+        val line = Path().apply {
+            moveTo(points.first().x, points.first().y)
+            for (index in 1 until points.size) {
+                val previous = points[index - 1]
+                val current = points[index]
+                val middleX = (previous.x + current.x) / 2f
+                cubicTo(middleX, previous.y, middleX, current.y, current.x, current.y)
+            }
+        }
+        val fill = Path().apply {
+            addPath(line)
+            lineTo(size.width, bottom)
+            lineTo(0f, bottom)
+            close()
+        }
+        drawPath(
+            path = fill,
+            brush = Brush.verticalGradient(
+                listOf(NamuColors.Blue.copy(alpha = .18f), NamuColors.Blue.copy(alpha = 0f)),
+                startY = top,
+                endY = bottom,
+            ),
+        )
+        drawPath(path = line, color = NamuColors.Blue, style = Stroke(width = 1.8.dp.toPx(), cap = StrokeCap.Round))
+    }
+}
+
+@Composable
+fun DataAnalyticsScreen(
+    section: DataSection,
     onOpenDnsLogs: () -> Unit,
     onRestart: () -> Unit,
     onStartVpn: () -> Unit = {},
-    onOpenMitmDetails: () -> Unit = {},
 ) {
     val container = LocalAppContainer.current
     val vm: DataViewModel = viewModel(factory = DataViewModel.factory(container))
@@ -75,278 +247,233 @@ fun DataScreen(
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    Column(
-        Modifier
-            .fillMaxSize()
-            .background(NamuColors.Bg)
-            .verticalScroll(rememberScrollState()),
-    ) {
-        SectionHeader("DNS 过滤与查询统计")
-        HitWindowSelector(selected = state.hits.windowHours) { vm.setHitWindow(it) }
-        GroupCard {
-            HitAnalytics(
-                state = state.hits,
-                onRetry = { vm.repairHits() },
-                onStartVpn = onStartVpn,
-                onHistoryEnabled = { vm.setHitHistoryEnabled(it) },
-                onClear = { vm.clearHits() },
-            )
-        }
+    DetailList {
+        if (section == DataSection.Dns) {
+            SectionHeader("DNS 过滤与查询统计")
+            HitWindowSelector(selected = state.hits.windowHours) { vm.setHitWindow(it) }
+            GroupCard {
+                HitAnalytics(
+                    state = state.hits,
+                    onRetry = { vm.repairHits() },
+                    onStartVpn = onStartVpn,
+                    onHistoryEnabled = { vm.setHitHistoryEnabled(it) },
+                    onClear = { vm.clearHits() },
+                )
+            }
 
-        SectionHeader("流量统计")
-        GroupCard {
-            Row(Modifier.fillMaxWidth().padding(top = 16.dp, bottom = 6.dp)) {
-                DataMetric("上行", formatBytes(stats.up), Modifier.weight(1f))
-                DataMetric("下行", formatBytes(stats.down), Modifier.weight(1f))
-                DataMetric("DNS 拦截", stats.dnsBlocked.toString(), Modifier.weight(1f))
-            }
-            SpeedLegend(
-                Modifier
-                    .fillMaxWidth()
-                    .padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 4.dp),
-            )
-            SpeedSparkline(
-                samples = state.stats.speedSamples,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(58.dp)
-                    .padding(horizontal = 16.dp),
-            )
-            Text(
-                "实时 ↑ ${formatBytes(state.stats.upRate)}/s   ↓ ${formatBytes(state.stats.downRate)}/s" +
-                    if (state.stats.sessionActive) "" else "（本次会话已结束）",
-                modifier = Modifier.padding(bottom = 8.dp),
-                fontSize = 11.sp,
-                color = NamuColors.TextSub,
-                textAlign = TextAlign.Center,
-            )
-            Text(
-                "TUN 发送：队列丢包 ${stats.tunTxDrop} · 背压 ${stats.tunTxBackpressure} · " +
-                    "backlog 溢出 ${stats.tunPendingDrop} · 写阻塞 ${stats.tunWriteWouldBlock} · 峰值 ${stats.tunPendingPeak}",
-                modifier = Modifier.padding(bottom = 8.dp),
-                fontSize = 11.sp,
-                color = if (stats.tunTxDrop > 0 || stats.tunPendingDrop > 0) NamuColors.Orange else NamuColors.TextSub,
-                textAlign = TextAlign.Center,
-            )
-            Text(
-                "判别：接收满 ${msToText(stats.tcpRecvFull)} · 发送停滞 ${msToText(stats.tcpSendStalled)} · " +
-                    "QUIC 黑洞 ${stats.quicBlackholed} · 丢弃 ${stats.quicFallback} · " +
-                    "大档 ${stats.bigTierInUse}/128 · 缓冲拒绝 ${stats.tcpBufferDenied}",
-                modifier = Modifier.padding(bottom = 8.dp),
-                fontSize = 11.sp,
-                color = if (stats.tcpRecvFull > 0 || stats.tcpSendStalled > 0) NamuColors.Orange else NamuColors.TextSub,
-                textAlign = TextAlign.Center,
-            )
-            Row(Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
-                DataMetric("活跃连接", stats.activeConns.toString(), Modifier.weight(1f))
-                DataMetric("运行时长", formatUptime(stats.uptime), Modifier.weight(1f))
-                DataMetric("总连接", stats.totalConns.toString(), Modifier.weight(1f))
-            }
-        }
-
-        SectionHeader("DNS")
-        GroupCard {
-            Row(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
-                DataMetric("查询", stats.dnsQueries.toString(), Modifier.weight(1f))
-                DataMetric("缓存命中", stats.dnsCached.toString(), Modifier.weight(1f))
-                DataMetric("上游平均", "${stats.dnsAvgMs} ms", Modifier.weight(1f))
-            }
-            val cacheLookups = stats.dnsCacheLookups
-            val cacheRate = if (cacheLookups > 0) stats.dnsCached * 100.0 / cacheLookups else 0.0
-            Text(
-                "缓存查询命中率：${String.format(java.util.Locale.US, "%.1f", cacheRate)}%（${stats.dnsCached}/$cacheLookups）",
-                fontSize = 11.sp,
-                color = NamuColors.TextSub,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
-            )
-            Text(
-                "本地拦截/缓存平均：${stats.dnsLocalAvgMs} ms · DoT/DoQ 853 拦截：${stats.dotBlocked} 次 · AAAA 拦截：${stats.dnsAaaaBlocked}",
-                fontSize = 11.sp,
-                color = NamuColors.TextSub,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
-            )
-            Text(
-                "stale ${stats.dnsStale} · 负缓存 ${stats.dnsNegative} · 并发合并 ${stats.dnsCoalesced} · " +
-                    "rebind ${stats.dnsRebind} · 回落 ${stats.dnsFallback}（失败 ${stats.dnsFallbackFail} / 熔断 ${stats.dnsFallbackBreaker}）",
-                fontSize = 11.sp,
-                color = NamuColors.TextSub,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
-            )
-            DnsLatencyBars(stats)
-            if (stats.dnsFallback > 0) {
+            SectionHeader("DNS")
+            GroupCard {
+                Row(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
+                    DataMetric("查询", stats.dnsQueries.toString(), Modifier.weight(1f))
+                    DataMetric("缓存命中", stats.dnsCached.toString(), Modifier.weight(1f))
+                    DataMetric("上游平均", "${stats.dnsAvgMs} ms", Modifier.weight(1f))
+                }
+                val cacheLookups = stats.dnsCacheLookups
+                val cacheRate = if (cacheLookups > 0) stats.dnsCached * 100.0 / cacheLookups else 0.0
                 Text(
-                    "备用查询：${stats.dnsFallback}（失败 ${stats.dnsFallbackFail} / 熔断 ${stats.dnsFallbackBreaker} / " +
-                        "竞速 ${stats.dnsFallbackRace} / 复核 ${stats.dnsFallbackReview}）",
+                    "缓存查询命中率：${String.format(java.util.Locale.US, "%.1f", cacheRate)}%（${stats.dnsCached}/$cacheLookups）",
                     fontSize = 11.sp,
                     color = NamuColors.TextSub,
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
                 )
-            }
-            val privateDnsBypass = remember(runtime.connected) { PrivateDnsController.bypassing(ctx) }
-            if (runtime.connected && stats.dnsQueries == 0L && stats.uptime > 30_000) {
                 Text(
-                    if (privateDnsBypass) {
-                        "已拦截 DoT 853，但 30 秒内仍无 DNS 进入内核。strict 模式不会回落，需手动关闭私人 DNS；opportunistic 可再等几秒或重连。"
-                    } else {
-                        "已连接但没有任何 DNS 查询进入内核，应用可能在用 DoH / HTTPDNS 绕过，或 DoT 仍在重试。"
-                    },
-                    fontSize = 12.sp,
-                    color = NamuColors.Orange,
-                    modifier = Modifier
-                        .clickable {
-                            scope.launch {
-                                val ok = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                                    PrivateDnsController.disable(ctx.applicationContext)
-                                }
-                                if (ok) {
-                                    vm.showMessage("已关闭私人 DNS，正在重连")
-                                    onRestart()
-                                } else {
-                                    vm.showMessage("Root 授权失败，已打开系统私人 DNS 设置")
-                                    runCatching {
-                                        ctx.startActivity(
-                                            Intent("android.settings.PRIVATE_DNS_SETTINGS")
-                                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                                        )
+                    "本地拦截/缓存平均：${stats.dnsLocalAvgMs} ms · DoT/DoQ 853 拦截：${stats.dotBlocked} 次 · AAAA 拦截：${stats.dnsAaaaBlocked}",
+                    fontSize = 11.sp,
+                    color = NamuColors.TextSub,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
+                )
+                Text(
+                    "stale ${stats.dnsStale} · 负缓存 ${stats.dnsNegative} · 并发合并 ${stats.dnsCoalesced} · " +
+                        "rebind ${stats.dnsRebind} · 回落 ${stats.dnsFallback}（失败 ${stats.dnsFallbackFail} / 熔断 ${stats.dnsFallbackBreaker}）",
+                    fontSize = 11.sp,
+                    color = NamuColors.TextSub,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
+                )
+                DnsLatencyBars(stats)
+                if (stats.dnsFallback > 0) {
+                    Text(
+                        "备用查询：${stats.dnsFallback}（失败 ${stats.dnsFallbackFail} / 熔断 ${stats.dnsFallbackBreaker} / " +
+                            "竞速 ${stats.dnsFallbackRace} / 复核 ${stats.dnsFallbackReview}）",
+                        fontSize = 11.sp,
+                        color = NamuColors.TextSub,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
+                    )
+                }
+                val privateDnsBypass = remember(runtime.connected) { PrivateDnsController.bypassing(ctx) }
+                if (runtime.connected && stats.dnsQueries == 0L && stats.uptime > 30_000) {
+                    Text(
+                        if (privateDnsBypass) {
+                            "已拦截 DoT 853，但 30 秒内仍无 DNS 进入内核。strict 模式不会回落，需手动关闭私人 DNS；opportunistic 可再等几秒或重连。"
+                        } else {
+                            "已连接但没有任何 DNS 查询进入内核，应用可能在用 DoH / HTTPDNS 绕过，或 DoT 仍在重试。"
+                        },
+                        fontSize = 12.sp,
+                        color = NamuColors.Orange,
+                        modifier = Modifier
+                            .clickable {
+                                scope.launch {
+                                    val ok = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                                        PrivateDnsController.disable(ctx.applicationContext)
+                                    }
+                                    if (ok) {
+                                        vm.showMessage("已关闭私人 DNS，正在重连")
+                                        onRestart()
+                                    } else {
+                                        vm.showMessage("Root 授权失败，已打开系统私人 DNS 设置")
+                                        runCatching {
+                                            ctx.startActivity(
+                                                Intent("android.settings.PRIVATE_DNS_SETTINGS")
+                                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                                            )
+                                        }
                                     }
                                 }
                             }
-                        }
-                        .padding(horizontal = 16.dp, vertical = 10.dp),
-                )
-            }
-        }
-
-        if (cfg.mitm.enabled || stats.mitmConns > 0) {
-            SectionHeader("MITM 去广告")
-            GroupCard {
-                Row(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
-                    DataMetric("解密连接", stats.mitmConns.toString(), Modifier.weight(1f))
-                    DataMetric("拒绝请求", stats.mitmRejected.toString(), Modifier.weight(1f))
-                    DataMetric("改写响应", stats.mitmRewritten.toString(), Modifier.weight(1f))
-                }
-                Text(
-                    "握手失败放行 ${stats.mitmFailed} · QUIC 拦截回落 TCP ${stats.mitmQuicBlocked} · " +
-                        "正文提前直通 ${stats.mitmBodyBypassed} · " +
-                        if (cfg.mitm.enabled) "MITM 已启用" else "MITM 未启用",
-                    fontSize = 11.sp,
-                    color = NamuColors.TextSub,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
-                )
-                SettingsRow("运行详情", chevron = true, showDivider = false, onClick = onOpenMitmDetails)
-            }
-        }
-
-        if (cfg.rules.any { AppUidResolver.isAppRule(it) } || stats.uidResolved > 0 || stats.uidUnknown > 0) {
-            SectionHeader("按 App 分流")
-            GroupCard {
-                Row(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
-                    DataMetric("已识别归属", stats.uidResolved.toString(), Modifier.weight(1f))
-                    DataMetric("归属未知", stats.uidUnknown.toString(), Modifier.weight(1f))
-                    DataMetric("下发条目", UidTablePublisher.lastCount.toString(), Modifier.weight(1f))
-                }
-                // 归属未知持续增长 = 规则不生效，必须让人看见原因而不是以为已经生效。
-                val hint = when {
-                    UidTablePublisher.lastError != null -> UidTablePublisher.lastError!!
-                    stats.uidUnknown > 0 -> "部分连接查不到归属：请确认已授予 Root，UID 规则只对查到的连接生效"
-                    else -> "规则只对归属识别成功的连接生效"
-                }
-                Text(
-                    hint,
-                    fontSize = 11.sp,
-                    color = NamuColors.TextSub,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
-                )
-            }
-        }
-
-        SectionHeader("诊断")
-        GroupCard {
-            SettingsRow(
-                title = "导出诊断报告",
-                subtitle = "日志、内核版本、运行时长、请求数、缓存命中率、DNS 延迟分布和内存统计",
-                chevron = true,
-                showDivider = false,
-                onClick = {
-                    scope.launch {
-                        try {
-                            val where = Diagnostics.export(ctx)
-                            vm.showMessage("诊断报告已导出：$where")
-                        } catch (e: Exception) {
-                            vm.showMessage(e.message ?: "导出诊断报告失败")
-                        }
-                    }
-                },
-            )
-        }
-
-        SectionHeader("连接")
-        GroupCard {
-            val net = NetworkStatus.current(ctx)
-            val observesConnections = cfg.mode != "dns_only" || cfg.dnsOnlyFullRoute
-            SettingsRow(
-                title = "实时连接",
-                subtitle = if (observesConnections) "查看连接、归属应用和命中规则"
-                    else "仅系统 DNS 模式不采集普通连接",
-                value = if (observesConnections) "${stats.activeConns} 活跃" else null,
-                chevron = observesConnections,
-                onClick = if (observesConnections) ({ showLive = true }) else null,
-            )
-            SettingsRow(
-                title = "当前网络",
-                subtitle = net.detail,
-                value = net.label,
-            )
-            SettingsRow(
-                title = "状态",
-                value = when {
-                    runtime.stopping -> "正在关闭…"
-                    runtime.connected -> "已连接"
-                    else -> "未连接"
-                },
-                valueColor = when {
-                    runtime.stopping -> NamuColors.Orange
-                    runtime.connected -> NamuColors.Green
-                    else -> NamuColors.TextSub
-                },
-            )
-            SettingsRow(
-                title = "服务器",
-                value = container.nodeLabel(),
-            )
-            SettingsRow(
-                title = "运行模式",
-                value = RoutingMode.fromConfig(cfg.mode).title,
-                showDivider = false,
-            )
-        }
-
-        SectionHeader("日志")
-        GroupCard {
-            SettingsRow(
-                title = "自动删除",
-                subtitle = "每次连接前清空上一次的运行日志与 DNS 记录",
-                icon = Icons.Outlined.History,
-                rightContent = {
-                    IosSwitch(
-                        checked = cfg.autoClearLogs,
-                        onCheckedChange = {
-                            vm.setAutoClearLogs(it)
-                        },
+                            .padding(horizontal = 16.dp, vertical = 10.dp),
                     )
-                },
-            )
-            SettingsRow(
-                title = "DNS 查询",
-                subtitle = "域名、拦截/放行、缓存或上游、耗时",
-                value = "${state.logs.dns.size} 条",
-                chevron = true,
-                showDivider = false,
-                onClick = onOpenDnsLogs,
-            )
-        }
+                }
+            }
 
-        FooterText("流量统计从本次 VPN 连接开始累计；断开后保留最后一次会话统计，下次连接时重置。")
+            SectionHeader("日志")
+            GroupCard {
+                SettingsRow(
+                    title = "DNS 查询",
+                    subtitle = "域名、拦截/放行、缓存或上游、耗时",
+                    value = "${state.logs.dns.size} 条",
+                    chevron = true,
+                    showDivider = false,
+                    onClick = onOpenDnsLogs,
+                )
+            }
+
+        } else {
+            SectionHeader("流量统计")
+            val observesConnections = cfg.mode != "dns_only" || cfg.dnsOnlyFullRoute || GlobalRuleStore.state.scope.enabled
+            val collected = observesConnections && (state.stats.sessionActive || stats.uptime > 0L)
+            if (collected) {
+                GroupCard {
+                    Row(Modifier.fillMaxWidth().padding(top = 16.dp, bottom = 6.dp)) {
+                        DataMetric("上行", formatBytes(stats.up), Modifier.weight(1f))
+                        DataMetric("下行", formatBytes(stats.down), Modifier.weight(1f))
+                    }
+                    SpeedLegend(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 4.dp),
+                    )
+                    SpeedSparkline(
+                        samples = state.stats.speedSamples,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(58.dp)
+                            .padding(horizontal = 16.dp),
+                    )
+                    Text(
+                        "实时 ↑ ${formatBytes(state.stats.upRate)}/s   ↓ ${formatBytes(state.stats.downRate)}/s" +
+                            if (state.stats.sessionActive) "" else "（本次会话已结束）",
+                        modifier = Modifier.padding(bottom = 8.dp),
+                        fontSize = 11.sp,
+                        color = NamuColors.TextSub,
+                        textAlign = TextAlign.Center,
+                    )
+                    Text(
+                        "TUN 发送：队列丢包 ${stats.tunTxDrop} · 背压 ${stats.tunTxBackpressure} · " +
+                            "backlog 溢出 ${stats.tunPendingDrop} · 写阻塞 ${stats.tunWriteWouldBlock} · 峰值 ${stats.tunPendingPeak}",
+                        modifier = Modifier.padding(bottom = 8.dp),
+                        fontSize = 11.sp,
+                        color = if (stats.tunTxDrop > 0 || stats.tunPendingDrop > 0) NamuColors.Orange else NamuColors.TextSub,
+                        textAlign = TextAlign.Center,
+                    )
+                    Text(
+                        "判别：接收满 ${msToText(stats.tcpRecvFull)} · 发送停滞 ${msToText(stats.tcpSendStalled)} · " +
+                            "QUIC 黑洞 ${stats.quicBlackholed} · 丢弃 ${stats.quicFallback} · " +
+                            "大档 ${stats.bigTierInUse}/128 · 缓冲拒绝 ${stats.tcpBufferDenied}",
+                        modifier = Modifier.padding(bottom = 8.dp),
+                        fontSize = 11.sp,
+                        color = if (stats.tcpRecvFull > 0 || stats.tcpSendStalled > 0) NamuColors.Orange else NamuColors.TextSub,
+                        textAlign = TextAlign.Center,
+                    )
+                    Row(Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
+                        DataMetric("活跃连接", stats.activeConns.toString(), Modifier.weight(1f))
+                        DataMetric("运行时长", formatUptime(stats.uptime), Modifier.weight(1f))
+                        DataMetric("总连接", stats.totalConns.toString(), Modifier.weight(1f))
+                    }
+                }
+            } else {
+                GroupCard {
+                    SettingsRow(
+                        title = "流量未采集",
+                        subtitle = if (observesConnections) "连接后查看实时流量" else "当前仅接管系统 DNS",
+                        showDivider = false,
+                    )
+                }
+            }
+
+            if (GlobalRuleStore.state.localRules.any { AppUidResolver.isAppRule(it) } || stats.uidResolved > 0 || stats.uidUnknown > 0) {
+                SectionHeader("按 App 分流")
+                GroupCard {
+                    Row(Modifier.fillMaxWidth().padding(vertical = 16.dp)) {
+                        DataMetric("已识别归属", stats.uidResolved.toString(), Modifier.weight(1f))
+                        DataMetric("归属未知", stats.uidUnknown.toString(), Modifier.weight(1f))
+                        DataMetric("下发条目", UidTablePublisher.lastCount.toString(), Modifier.weight(1f))
+                    }
+                    // 归属未知持续增长 = 规则不生效，必须让人看见原因而不是以为已经生效。
+                    val hint = when {
+                        UidTablePublisher.lastError != null -> UidTablePublisher.lastError!!
+                        stats.uidUnknown > 0 -> "部分连接查不到归属：请确认已授予 Root，UID 规则只对查到的连接生效"
+                        else -> "规则只对归属识别成功的连接生效"
+                    }
+                    Text(
+                        hint,
+                        fontSize = 11.sp,
+                        color = NamuColors.TextSub,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp),
+                    )
+                }
+            }
+
+            SectionHeader("连接")
+            GroupCard {
+                val net = NetworkStatus.current(ctx)
+                SettingsRow(
+                    title = "实时连接",
+                    subtitle = if (observesConnections) "查看连接、归属应用和命中规则"
+                        else "仅系统 DNS 模式不采集普通连接",
+                    value = if (observesConnections) "${stats.activeConns} 活跃" else null,
+                    chevron = observesConnections,
+                    onClick = if (observesConnections) ({ showLive = true }) else null,
+                )
+                SettingsRow(
+                    title = "当前网络",
+                    subtitle = net.detail,
+                    value = net.label,
+                )
+                SettingsRow(
+                    title = "状态",
+                    value = when {
+                        runtime.stopping -> "正在关闭…"
+                        runtime.connected -> "已连接"
+                        else -> "未连接"
+                    },
+                    valueColor = when {
+                        runtime.stopping -> NamuColors.Orange
+                        runtime.connected -> NamuColors.Green
+                        else -> NamuColors.TextSub
+                    },
+                )
+                SettingsRow(
+                    title = "服务器",
+                    value = container.nodeLabel(),
+                )
+                SettingsRow(
+                    title = "运行模式",
+                    value = RoutingMode.fromConfig(cfg.mode).title,
+                    showDivider = false,
+                )
+            }
+
+            FooterText("流量统计从本次 VPN 连接开始累计；断开后保留最后一次会话统计，下次连接时重置。")
+        }
         Spacer(Modifier.height(LocalDockClearance.current + 34.dp))
     }
 

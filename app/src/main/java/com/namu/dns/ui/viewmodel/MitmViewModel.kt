@@ -137,18 +137,6 @@ class MitmViewModel(
         viewModelScope.launch { applyPool(on) }
     }
 
-    /** generic 仅手动触发；返回启动条数，0 表示没有匹配脚本或 VPN 未运行。 */
-    fun triggerGeneric() {
-        val n = runCatching { com.namu.dns.NativeCore.nativeTriggerScripts("generic") }.getOrDefault(-1)
-        messages.show(
-            when {
-                n > 0 -> "已触发 $n 条 generic 脚本（后台串行执行）"
-                n == 0 -> "没有匹配的 generic 脚本"
-                else -> "内核未运行，无法触发脚本"
-            },
-        )
-    }
-
     /** 导出由 Magisk 管理的系统 CA 模块。 */
     fun generateTrustModule() = withExport { r ->
         val result = generateModule(r.pemPath, r.systemName)

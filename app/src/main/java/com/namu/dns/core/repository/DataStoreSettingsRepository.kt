@@ -136,6 +136,11 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
 
     override fun save() = synchronized(stateLock) { persist(_config.value) }
 
+    override fun restoreSilent(cfg: AppConfig) = synchronized(stateLock) {
+        _config.value = cfg
+        persist(cfg)
+    }
+
     private fun persist(cfg: AppConfig) {
         val json = cfg.toJson().toString()
         scope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {

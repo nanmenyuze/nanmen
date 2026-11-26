@@ -1,23 +1,14 @@
 package com.namu.dns.ui
 
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.rounded.Download
-import androidx.compose.material.icons.rounded.Info
-import androidx.compose.material.icons.rounded.Refresh
-import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -28,6 +19,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -40,6 +32,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.namu.dns.ui.viewmodel.MitmViewModel
 import com.namu.dns.ConfigStore
+import com.namu.dns.GlobalRuleStore
+import com.namu.dns.core.config.MitmConfig
 import com.namu.dns.MitmManager
 import com.namu.dns.RootCaManager
 import com.namu.dns.core.LocalAppContainer
@@ -84,12 +78,28 @@ fun MitmScreen(certificateOnly: Boolean) {
         RootCaManager.TrustState.INSTALLED_PENDING -> "请确认模块已启用，并在重启后重新核验"
         RootCaManager.TrustState.ACTIVE -> "已在 Zygote 的系统证书区核对到同一张 CA"
         RootCaManager.TrustState.CONFLICT -> "系统证书区存在其他覆盖层，请在 Magisk 中检查模块"
-        RootCaManager.TrustState.INJECT_FAILED -> "模块启动时未完成挂载，可导出安装日志查看原因"
+        RootCaManager.TrustState.INJECT_FAILED -> "模块启动时未完成挂载，可在「数据 → 日志与诊断」导出安装日志"
         RootCaManager.TrustState.REMOVED -> "已移除"
         RootCaManager.TrustState.RESIDUAL -> "仍能读到这张 CA，请检查 Magisk 模块和系统凭据"
         RootCaManager.TrustState.UNVERIFIABLE -> trust.detail.ifBlank { "当前无法核对系统证书区" }
     }
-    val mitm = cfg.mitm
+    val g = GlobalRuleStore.state
+    val mitm = MitmConfig(
+        enabled = g.scope.enabled,
+        hostnames = g.scope.hostnames,
+        skipHostnames = g.scope.skipHostnames,
+        urlRewrites = g.localMitm.urlRewrites,
+        headerRewrites = g.localMitm.headerRewrites,
+        loonRewrites = g.localMitm.loonRewrites,
+        bodyRewrites = g.localMitm.bodyRewrites,
+        wsRewrites = g.localMitm.wsRewrites,
+        scripts = g.localMitm.scripts,
+        scriptArguments = g.scriptArguments,
+        appMode = g.scope.appMode,
+        apps = g.scope.apps,
+        poolEnabled = g.scope.poolEnabled,
+        poolIdleSecs = g.scope.poolIdleSecs,
+    )
     var showScriptArgs by remember { mutableStateOf(false) }
     var showCaGuide by remember { mutableStateOf(false) }
 
@@ -105,7 +115,7 @@ fun MitmScreen(certificateOnly: Boolean) {
     }
 
     // 启用模块合并出的 MITM 域名 + 两类重写规则总数，每行算一条。
-    val moduleMitmCount = remember(mitm, cfg.moduleSources) {
+    val moduleMitmCount = remember(mitm, GlobalRuleStore.state) {
         runCatching {
             val o = JSONObject(ConfigStore.moduleMitmFile(ctx).readText())
             (o.optJSONArray("hostnames")?.length() ?: 0) +
@@ -114,7 +124,7 @@ fun MitmScreen(certificateOnly: Boolean) {
         }.getOrDefault(0)
     }
     // 参数编辑覆盖 active 脚本 + 启用模块脚本；键与内核 CompiledScriptRule.key 一致。
-    val scriptsForArgs = remember(mitm, cfg.moduleSources) {
+    val scriptsForArgs = remember(mitm, GlobalRuleStore.state) {
         val out = LinkedHashMap<String, com.namu.dns.core.config.ScriptConfig>()
         mitm.scripts.forEach { out[ConfigStore.scriptKey(it)] = it }
         runCatching {
@@ -127,12 +137,10 @@ fun MitmScreen(certificateOnly: Boolean) {
                 }
             }
         }
-        out.values.toList()
+        out.values.filter { it.arguments.isNotEmpty() }
     }
 
-    Column(
-        Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
-    ) {
+    DetailList {
         if (certificateOnly) {
             SectionHeader("证书状态")
             GroupCard {
@@ -172,7 +180,6 @@ fun MitmScreen(certificateOnly: Boolean) {
                 SettingsRow(
                     title = "重新核验",
                     subtitle = "重新检查 CA 指纹、Root 模块与系统证书区；从模块管理器返回也会自动核验",
-                    icon = Icons.Rounded.Refresh,
                     chevron = true,
                     showDivider = false,
                     onClick = {
@@ -189,24 +196,12 @@ fun MitmScreen(certificateOnly: Boolean) {
                 SettingsRow(
                     title = "安装与更新指引",
                     subtitle = "Magisk / KernelSU / APatch 的模块安装、更新、停用与重启步骤",
-                    icon = Icons.Rounded.Info,
                     chevron = true,
                     onClick = { showCaGuide = true },
                 )
-                if (trust.root.available) {
-                    SettingsRow(
-                        title = "导出安装日志",
-                        subtitle = "导出到「下载/NamuDNS」",
-                        icon = Icons.Rounded.Download,
-                        value = if (busy) "处理中…" else null,
-                        chevron = true,
-                        onClick = { vm.exportInjectionLog() },
-                    )
-                }
                 SettingsRow(
                     title = "导出 CA 模块 ZIP",
                     subtitle = "Magisk / KernelSU / APatch；导出到「下载/NamuDNS」，只包含公开 CA",
-                    icon = Icons.Rounded.Download,
                     value = if (busy) "处理中…" else null,
                     chevron = true,
                     onClick = { vm.generateTrustModule() },
@@ -214,7 +209,6 @@ fun MitmScreen(certificateOnly: Boolean) {
                 SettingsRow(
                     title = "仅导出证书文件",
                     subtitle = "PEM + DER 与模块 zip 使用同一出口：公共「下载/NamuDNS」；无存储权限也可在文件管理器打开",
-                    icon = Icons.Rounded.Download,
                     chevron = true,
                     showDivider = false,
                     onClick = { vm.exportOnly() },
@@ -224,19 +218,15 @@ fun MitmScreen(certificateOnly: Boolean) {
         } else {
             SectionHeader("脚本与规则")
             GroupCard {
-                SettingsRow(
-                    title = "脚本参数",
-                    value = if (scriptsForArgs.isEmpty()) "无脚本" else "${scriptsForArgs.size} 个",
-                    subtitle = "修改 \$argument 当前值，立即生效，不重编译脚本；number/boolean 按声明类型注入",
-                    chevron = true,
-                    onClick = { showScriptArgs = true },
-                )
-                SettingsRow(
-                    title = "手动触发 generic 脚本",
-                    subtitle = "仅手动执行 trigger=generic 的脚本，与 cron/network-changed 共用串行执行",
-                    chevron = true,
-                    onClick = { vm.triggerGeneric() },
-                )
+                if (scriptsForArgs.isNotEmpty()) {
+                    SettingsRow(
+                        title = "脚本参数",
+                        value = "${scriptsForArgs.size} 个",
+                        subtitle = "修改 \$argument 当前值，立即生效，不重编译脚本；number/boolean 按声明类型注入",
+                        chevron = true,
+                        onClick = { showScriptArgs = true },
+                    )
+                }
                 SettingsRow(
                     title = "模块 MITM 规则",
                     value = "$moduleMitmCount 条",
@@ -343,46 +333,29 @@ fun MitmScreen(certificateOnly: Boolean) {
  * subtitle，也不能靠整行暗点。复制按钮独立 48dp 命中区。
  */
 @Composable
-private fun FingerprintRow(
-    fingerprint: String?,
-    onCopy: () -> Unit,
-) {
-    Column(Modifier.fillMaxWidth()) {
-        Row(
-            Modifier
-                .fillMaxWidth()
-                .heightIn(min = 48.dp)
-                .padding(horizontal = 16.dp, vertical = 9.dp),
-            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
-        ) {
-            Column(Modifier.weight(1f)) {
-                Text("CA SHA-256 指纹", fontSize = 16.sp, color = NamuColors.TextMain)
-                Text(
-                    if (fingerprint == null) "生成 CA 后显示" else "与系统证书详情逐段核对",
-                    fontSize = 12.sp,
-                    color = NamuColors.TextSub,
-                )
-            }
-            MiniTextAction(
-                text = "复制",
-                enabled = fingerprint != null,
-                onClick = onCopy,
-            )
-        }
-        if (fingerprint != null) {
+private fun FingerprintRow(fingerprint: String?, onCopy: () -> Unit) {
+    Column(
+        Modifier.fillMaxWidth()
+            .clickable(enabled = fingerprint != null, role = Role.Button, onClickLabel = "复制指纹", onClick = onCopy)
+            .heightIn(min = 48.dp)
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+    ) {
+        Text("CA SHA-256 指纹", fontSize = 16.sp, color = NamuColors.TextMain)
+        if (fingerprint == null) {
+            Text("生成 CA 后显示", fontSize = 12.sp, color = NamuColors.TextSub)
+        } else {
+            Text("轻点复制", fontSize = 12.sp, color = NamuColors.TextSub)
+            Spacer(Modifier.height(6.dp))
             Text(
                 fingerprint,
                 fontSize = 12.sp,
                 lineHeight = 17.sp,
                 fontFamily = FontFamily.Monospace,
                 color = NamuColors.TextMain,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
             )
         }
-        RowDivider(16.dp)
     }
+    RowDivider()
 }
 
 private fun noRulePercent(row: com.namu.dns.MitmHostRow): String =

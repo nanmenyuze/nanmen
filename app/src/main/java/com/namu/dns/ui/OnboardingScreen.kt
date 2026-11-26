@@ -28,7 +28,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -36,7 +35,6 @@ import androidx.compose.ui.unit.sp
 /**
  * B4 首启引导：三页（VPN 授权 / 导入服务器 / 私人 DNS 与 Root）。
  * 首启显示，可跳过；完成/跳过后写 UiPrefs.onboardingDone，不再出现。
- * 设置页「重新查看引导」可重置。
  */
 @Composable
 fun OnboardingScreen(onFinish: () -> Unit) {
@@ -68,9 +66,14 @@ fun OnboardingScreen(onFinish: () -> Unit) {
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Spacer(Modifier.height(48.dp))
-        Icon(page.icon, contentDescription = null, tint = NamuColors.Blue, modifier = Modifier.size(64.dp))
+        Box(
+            Modifier.size(92.dp).clip(CircleShape).background(NamuColors.Card),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(page.icon, contentDescription = null, tint = NamuColors.Blue, modifier = Modifier.size(46.dp))
+        }
         Spacer(Modifier.height(24.dp))
-        Text(page.title, fontSize = 24.sp, fontWeight = FontWeight.Bold, color = NamuColors.TextMain)
+        Text(page.title, style = NamuTokens.Type.PageTitle, color = NamuColors.TextMain, textAlign = TextAlign.Center)
         Spacer(Modifier.height(14.dp))
         Text(
             page.body,

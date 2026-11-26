@@ -182,6 +182,12 @@ data class ConfigFile(
 }
 
 @Serializable
+data class DnsPolicyRule(
+    val pattern: String = "",
+    val servers: String = "",
+)
+
+@Serializable
 data class GeneralConfig(
     val mode: String = "dns_only",
     val dnsUpstream: String = "system",
@@ -189,6 +195,10 @@ data class GeneralConfig(
     val dnsBootstrap: String = "",
     val dnsHeaderName: String = "",
     val dnsHeaderValue: String = "",
+    /** Surge/Loon [DNS] 按域名策略：pattern 后缀语义，servers 逗号分隔上游。 */
+    val dnsPolicies: List<DnsPolicyRule> = emptyList(),
+    /** hijack-dns 本地显式值；null = 未设置（跟随模块/默认开）。 */
+    val dnsHijack: Boolean? = null,
     val dnsCacheTtl: Int = 600,
     val blockTtl: Int = 60,
     val fallbackFilter: Boolean = true,
@@ -210,6 +220,9 @@ data class GeneralConfig(
     val fakeIp: Boolean = false,
     val dnsOnlyFullRoute: Boolean? = null,
     val blockAaaa: Boolean = false,
+    val ipv6: Boolean? = null,
+    val preferIpv6: Boolean? = null,
+    val alwaysRealIp: List<String> = emptyList(),
     val sniff: Boolean = true,
     val autoSelectNode: Boolean = false,
     val autoClearLogs: Boolean = true,
@@ -229,6 +242,8 @@ data class GeneralConfig(
         dnsBootstrap = dnsBootstrap,
         dnsHeaderName = dnsHeaderName,
         dnsHeaderValue = dnsHeaderValue,
+        dnsPolicies = dnsPolicies,
+        dnsHijack = dnsHijack,
         dnsCacheTtl = dnsCacheTtl,
         blockTtl = blockTtl,
         fallbackFilter = fallbackFilter,
@@ -250,6 +265,9 @@ data class GeneralConfig(
         fakeIp = fakeIp,
         dnsOnlyFullRoute = dnsOnlyFullRoute ?: base.dnsOnlyFullRoute,
         blockAaaa = blockAaaa,
+        ipv6 = ipv6,
+        preferIpv6 = preferIpv6,
+        alwaysRealIp = alwaysRealIp,
         sniff = sniff,
         autoSelectNode = autoSelectNode,
         autoClearLogs = autoClearLogs,

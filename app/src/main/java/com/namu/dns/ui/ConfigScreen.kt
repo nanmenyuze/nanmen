@@ -13,21 +13,27 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.material3.IconButton
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.MoreVert
 import com.namu.dns.AppConfig
 import com.namu.dns.MitmManager
+import com.namu.dns.core.LocalDockClearance
 import com.namu.dns.core.config.ConfigFile
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -39,12 +45,16 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.namu.dns.Actions
+import com.namu.dns.GlobalRuleStore
+import com.namu.dns.normalizeAdsDomain
 import com.namu.dns.ConfigFileStore
 import com.namu.dns.ConfigStore
 import com.namu.dns.NamuVpnService
@@ -62,14 +72,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 @Composable
-fun ConfigScreen(onOpenPanel: (String) -> Unit) {
-    var copyFrom by remember { mutableStateOf<String?>(null) }
+fun ConfigScreen(onOpenPanel: (String) -> Unit, onOpenModules: () -> Unit) {
     var switching by remember { mutableStateOf(false) }
     var showCreate by remember { mutableStateOf(false) }
     var showImportLocal by remember { mutableStateOf(false) }
     var showImportUrl by remember { mutableStateOf(false) }
-    var infoFile by remember { mutableStateOf<ConfigFileStore.FileInfo?>(null) }
-    var deleteFile by remember { mutableStateOf<ConfigFileStore.FileInfo?>(null) }
+    var addMenu by remember { mutableStateOf(false) }
     var revision by remember { mutableIntStateOf(0) }
     val container = LocalAppContainer.current
     val settings = container.settings
@@ -119,13 +127,45 @@ fun ConfigScreen(onOpenPanel: (String) -> Unit) {
     Column(
         Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
     ) {
-        SectionHeader("配置文件")
-        GroupCard {
-            SettingsRow("新建配置", chevron = true, onClick = { showCreate = true })
-            SettingsRow("本地导入", chevron = true, onClick = { showImportLocal = true })
-            SettingsRow("URL 导入", chevron = true, showDivider = false, onClick = { showImportUrl = true })
+        MainPageTopBar("配置") {
+            Box {
+                Box(
+                    Modifier
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .background(NamuColors.Blue.copy(alpha = 0.12f))
+                        .clickable(onClickLabel = "新建或导入配置") { addMenu = true },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    NamuIcon(Icons.Outlined.Add, tint = NamuColors.Blue, size = 20.dp)
+                }
+                FloatingMenu(
+                    expanded = addMenu,
+                    onDismissRequest = { addMenu = false },
+                    modifier = Modifier.width(148.dp),
+                ) {
+                    DropdownMenuItem(
+                        text = { Text("新建配置", fontSize = 14.sp) },
+                        modifier = Modifier.height(44.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp),
+                        onClick = { addMenu = false; showCreate = true },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("本地导入", fontSize = 14.sp) },
+                        modifier = Modifier.height(44.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp),
+                        onClick = { addMenu = false; showImportLocal = true },
+                    )
+                    DropdownMenuItem(
+                        text = { Text("URL 导入", fontSize = 14.sp) },
+                        modifier = Modifier.height(44.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp),
+                        onClick = { addMenu = false; showImportUrl = true },
+                    )
+                }
+            }
         }
-        Spacer(Modifier.height(16.dp))
+        SectionHeader("配置方案")
         GroupCard {
             if (files.isEmpty()) {
                 SettingsRow(title = "暂无配置文件", showDivider = false)
@@ -141,7 +181,17 @@ fun ConfigScreen(onOpenPanel: (String) -> Unit) {
                 }
             }
         }
-        Spacer(Modifier.height(24.dp))
+        Spacer(Modifier.height(20.dp))
+        GroupCard {
+            SettingsRow(
+                title = "模块",
+                value = "${cfg.moduleSources.count { it.enabled }} 个已启用",
+                chevron = true,
+                showDivider = false,
+                onClick = onOpenModules,
+            )
+        }
+        Spacer(Modifier.height(LocalDockClearance.current + 24.dp))
     }
 
     if (showCreate) {
@@ -175,74 +225,6 @@ fun ConfigScreen(onOpenPanel: (String) -> Unit) {
             },
         )
     }
-    infoFile?.let { f ->
-        ConfigFileInfoDialog(
-            info = f.copy(active = f.name == activeName),
-            onActivate = {
-                infoFile = null
-                activate(f.name)
-            },
-            onEdit = {
-                infoFile = null
-                onOpenPanel(f.name)
-            },
-            onCopy = { copyFrom = f.name; infoFile = null },
-            onExport = {
-                scope.launch { exportProfile(f.name) }
-            },
-            onDelete = {
-                infoFile = null
-                deleteFile = f
-            },
-            onRestore = {
-                infoFile = null
-                if (ConfigFileStore.restore(context, f.name)) {
-                    // 当前 active 配置回退后，要把回退内容重新套回内存，不能只改磁盘。
-                    if (f.name == activeName) {
-                        ConfigFileStore.loadInto(context, f.name, settings.current())?.let { restored ->
-                            container.config.saveProfile(f.name) { restored }
-                        }
-                    }
-                    revision++
-                    messages.show("已回退到上一版 ${f.name}")
-                } else {
-                    messages.show("没有可回退的备份")
-                }
-            },
-            onDismiss = { infoFile = null },
-        )
-    }
-    copyFrom?.let { source ->
-        ConfigNameDialog(
-            title = "复制配置",
-            initial = source.removeSuffix(".conf") + "-副本.conf",
-            onConfirm = { target ->
-                if (container.config.copyProfile(source, target)) {
-                    copyFrom = null
-                    revision++
-                    messages.show("已复制配置")
-                } else messages.show("复制失败：检查配置名和存储空间")
-            },
-            onDismiss = { copyFrom = null },
-        )
-    }
-    deleteFile?.let { f ->
-        NamuDialog(
-            title = "删除配置？",
-            message = f.name,
-            confirmText = "删除",
-            onDismiss = { deleteFile = null },
-            onConfirm = {
-                deleteFile = null
-                if (container.config.delete(f.name)) {
-                    revision++
-                    messages.show("已删除 ${f.name}")
-                } else {
-                    messages.show("默认配置不能删除")
-                }
-            },
-        )
-    }
 }
 
 @Composable
@@ -259,6 +241,17 @@ private fun ConfigFileRow(
             .padding(start = 16.dp, end = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        // 蓝勾槽位固定宽度并前置：未激活的行也保留占位，名称与铅笔在所有行保持同一位置。
+        Box(Modifier.width(28.dp), contentAlignment = Alignment.Center) {
+            if (info.active) {
+                Box(
+                    Modifier.size(20.dp).clip(CircleShape).background(NamuColors.Blue),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(Icons.Filled.Check, contentDescription = "当前方案", tint = Color.White, modifier = Modifier.size(13.dp))
+                }
+            }
+        }
         Column(Modifier.weight(1f).clickable(onClick = onActivate).padding(vertical = 12.dp)) {
             Text(info.name, fontSize = 16.sp, color = NamuColors.TextMain)
             if (issue != null) {
@@ -267,11 +260,7 @@ private fun ConfigFileRow(
                 Text("默认配置", fontSize = 12.sp, color = NamuColors.TextSub)
             }
         }
-        // 未激活的行保留蓝勾槽位，所有文件右侧只显示面板入口。
-        Box(Modifier.width(28.dp), contentAlignment = Alignment.Center) {
-            if (info.active) CheckMark()
-        }
-        IconButton(onClick = onInfo) { NamuIcon(Icons.Outlined.Info, "管理 ${info.name}") }
+        IconButton(onClick = onInfo) { NamuIcon(Icons.Outlined.Edit, "编辑 ${info.name}") }
     }
     if (showDivider) RowDivider()
 }
@@ -305,23 +294,18 @@ fun ConfigDetailScreen(
     var showTest by remember { mutableStateOf(false) }
     var copyName by remember { mutableStateOf(false) }
     var confirmDelete by remember { mutableStateOf(false) }
+    var showResetDefault by remember { mutableStateOf(false) }
     var updating by remember { mutableStateOf(false) }
-    Column(Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState())) {
+    DetailList {
         SectionHeader("配置")
         GroupCard {
-            SettingsRow("通用", value = configDnsLabel(cfg.dnsUpstream), chevron = true, onClick = { onOpenSection(ConfigSection.General) })
-            SettingsRow("规则", value = "${cfg.rules.size} 条", chevron = true, onClick = { onOpenSection(ConfigSection.Rules) })
+            SettingsRow("DNS", value = configDnsLabel(cfg.dnsUpstream), chevron = true, onClick = { onOpenSection(ConfigSection.General) })
             SettingsRow("Hosts", value = "${cfg.mitm.hostMappings.size} 条", chevron = true, onClick = { onOpenSection(ConfigSection.Hosts) })
-            SettingsRow("URL 重写", value = "${cfg.mitm.urlRewrites.size} 条", chevron = true, onClick = { onOpenSection(ConfigSection.UrlRewrite) })
-            SettingsRow("头部重写", value = "${cfg.mitm.headerRewrites.size} 条", chevron = true, onClick = { onOpenSection(ConfigSection.HeaderRewrite) })
-            SettingsRow("正文重写", value = "${cfg.mitm.bodyRewrites.size} 条", chevron = true, onClick = { onOpenSection(ConfigSection.BodyRewrite) })
-            SettingsRow("HTTPS 解密", value = if (cfg.mitm.enabled) "已开启" else "已关闭", chevron = true, onClick = { onOpenSection(ConfigSection.Https) })
             SettingsRow("代理分组", value = "${cfg.proxyGroups.size} 个", chevron = true, onClick = { showGroups = true })
-            SettingsRow("高级设置", value = "6 项", chevron = true, showDivider = false, onClick = { onOpenSection(ConfigSection.Advanced) })
+            SettingsRow("连接与路由", chevron = true, showDivider = false, onClick = { onOpenSection(ConfigSection.Advanced) })
         }
         Spacer(Modifier.height(16.dp))
         GroupCard {
-            SettingsRow("规则集 URL", value = "${cfg.ruleSources.size} 个", chevron = true, onClick = { onOpenSection(ConfigSection.Sources) })
             if (cfg.remoteConfigUrl.isNotBlank()) {
                 SettingsRow(
                     "更新配置",
@@ -367,9 +351,27 @@ fun ConfigDetailScreen(
         }
         Spacer(Modifier.height(16.dp))
         GroupCard {
+            SettingsRow("恢复默认配置", valueColor = NamuColors.Orange, onClick = { showResetDefault = true })
             SettingsRow("删除配置", valueColor = NamuColors.Red, showDivider = false, onClick = { confirmDelete = true })
         }
         Spacer(Modifier.height(24.dp))
+    }
+    if (showResetDefault) {
+        NamuDialog(
+            title = "恢复默认配置",
+            message = "将「$name」恢复为出厂默认：解析、路由、拦截与 MITM 参数重置，节点、策略组与订阅清空；模块与全局规则不受影响。上一版自动备份在磁盘。",
+            confirmText = "恢复",
+            confirmColor = NamuColors.Orange,
+            onConfirm = {
+                showResetDefault = false
+                if (editor.update { AppConfig(dnsUpstream = "system", dnsFallback = "system") }) {
+                    container.messages.show("已恢复默认配置")
+                } else {
+                    container.messages.show("恢复失败，已保留原配置")
+                }
+            },
+            onDismiss = { showResetDefault = false },
+        )
     }
     if (showGroups) {
         ProxyGroupsDialog(
@@ -407,104 +409,57 @@ fun ConfigDetailScreen(
 }
 
 @Composable
-fun ConfigSectionScreen(section: ConfigSection, name: String, onOpenCertificate: () -> Unit) {
+fun ConfigSectionScreen(
+    section: ConfigSection,
+    name: String,
+    onOpenCertificate: () -> Unit,
+    onBack: () -> Unit,
+) {
     val editor = rememberProfileEditor(name) ?: return
     when (section) {
-        ConfigSection.General -> ConfigGeneralScreen(editor)
-        ConfigSection.Rules -> ConfigRulesScreen(editor)
+        ConfigSection.General -> ConfigDnsScreen(editor, onBack)
+        ConfigSection.Rules -> LocalRulesDetailScreen()
         ConfigSection.Sources -> ConfigSourcesScreen(editor)
         ConfigSection.Hosts -> ConfigHostsScreen(editor)
         ConfigSection.UrlRewrite -> ConfigRewriteScreen(editor, "URL 重写")
         ConfigSection.HeaderRewrite -> ConfigRewriteScreen(editor, "头部重写")
         ConfigSection.BodyRewrite -> ConfigRewriteScreen(editor, "正文重写")
-        ConfigSection.Https -> ConfigHttpsScreen(editor, onOpenCertificate)
+        ConfigSection.Https -> HttpsScopeSection(onOpenCertificate)
         ConfigSection.Advanced -> ConfigAdvancedScreen(editor)
     }
 }
 
 @Composable
-private fun ConfigGeneralScreen(settings: ProfileEditor) {
-    val container = LocalAppContainer.current
+private fun ConfigAdvancedScreen(settings: ProfileEditor) {
     val cfg = settings.current()
-    var showDns by remember { mutableStateOf(false) }
-    var showFallback by remember { mutableStateOf(false) }
+    var showFilterScope by remember { mutableStateOf(false) }
     var showSkip by remember { mutableStateOf(false) }
-
-    Column(
-        Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
-    ) {
-        SectionHeader("DNS")
+    val filterScope = DirectFilterScope.fromConfig(cfg.mode, cfg.dnsOnlyFullRoute)
+    DetailList {
+        SectionHeader("连接与路由")
         GroupCard {
+            SwitchRow("IPv6", subtitle = "管理 VPN 的 IPv6 地址和路由", checked = cfg.ipv6 ?: true) { enabled ->
+                settings.update { it.copy(ipv6 = enabled) }
+            }
+            SwitchRow("IPv6 优先", subtitle = "直连时优先尝试 IPv6", checked = cfg.preferIpv6 ?: false) { enabled ->
+                settings.update { it.copy(preferIpv6 = enabled) }
+            }
+            SwitchRow("TLS / HTTP 域名嗅探", checked = cfg.sniff) { enabled ->
+                settings.update { it.copy(sniff = enabled) }
+            }
             SettingsRow(
-                title = "DNS 上游",
-                value = configDnsLabel(cfg.dnsUpstream),
-                chevron = true,
-                onClick = { showDns = true },
-            )
-            if (cfg.dnsBootstrap.isNotBlank()) {
-                SettingsRow(
-                    title = "Bootstrap IP",
-                    value = cfg.dnsBootstrap,
-                )
-            }
-            if (cfg.dnsHeaderName.isNotBlank()) {
-                SettingsRow(
-                    title = "DoH 请求头",
-                    value = cfg.dnsHeaderName,
-                )
-            }
-            SettingsRow(title = "备用 DNS", value = configDnsLabel(cfg.dnsFallback), chevron = true, onClick = { showFallback = true })
-            SwitchRow(
-                title = "启用回退",
-                subtitle = "${configDnsLabel(cfg.dnsFallback)} · 关闭后禁止回退",
-                checked = cfg.allowDnsFallback,
-            ) {
-                settings.update { current -> current.copy(allowDnsFallback = it) }
-            }
-            SwitchRow(
-                title = "DNS 查询日志",
-                checked = cfg.dnsQueryLog,
-                showDivider = false,
-            ) {
-                settings.update { current -> current.copy(dnsQueryLog = it) }
-            }
-        }
-
-        SectionHeader("连接处理")
-        GroupCard {
-            SettingsRow(
-                title = "跳过代理",
-                subtitle = "匹配域名后缀的连接始终直连",
+                "跳过代理",
                 value = "${cfg.skipProxyHosts.size} 项",
                 chevron = true,
                 showDivider = false,
                 onClick = { showSkip = true },
             )
         }
+        SectionHeader("过滤")
+        GroupCard {
+            SettingsRow("过滤范围", value = filterScope.title, chevron = true, showDivider = false, onClick = { showFilterScope = true })
+        }
         Spacer(Modifier.height(24.dp))
-    }
-
-    if (showDns) {
-        DnsListDialog(
-            title = "DNS 覆写",
-            current = cfg.dnsUpstream,
-            onDismiss = { showDns = false },
-            onConfirm = { value ->
-                settings.update { it.copy(dnsUpstream = value) }
-                showDns = false
-            },
-        )
-    }
-    if (showFallback) {
-        DnsListDialog(
-            title = "备用 DNS",
-            current = cfg.dnsFallback,
-            onDismiss = { showFallback = false },
-            onConfirm = { value ->
-                settings.update { it.copy(dnsFallback = value) }
-                showFallback = false
-            },
-        )
     }
     if (showSkip) {
         StringListDialog(
@@ -517,38 +472,6 @@ private fun ConfigGeneralScreen(settings: ProfileEditor) {
                 showSkip = false
             },
         )
-    }
-}
-
-@Composable
-private fun ConfigAdvancedScreen(settings: ProfileEditor) {
-    val cfg = settings.current()
-    var showFilterScope by remember { mutableStateOf(false) }
-    val filterScope = DirectFilterScope.fromConfig(cfg.mode, cfg.dnsOnlyFullRoute)
-    Column(Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState())) {
-        SectionHeader("高级设置")
-        GroupCard {
-            SwitchRow("关闭 AAAA", subtitle = "只返回 IPv4 地址", checked = cfg.blockAaaa) {
-                settings.update { current -> current.copy(blockAaaa = it) }
-            }
-            SwitchRow("异常应答复核", subtitle = "使用备用 DNS 复核异常地址", checked = cfg.fallbackFilter) {
-                settings.update { current -> current.copy(fallbackFilter = it) }
-            }
-            SwitchRow("非 CN IP 复核", subtitle = "非中国大陆 IP 也交给备用 DNS 复核", checked = cfg.fallbackGeoCheck) {
-                settings.update { current -> current.copy(fallbackGeoCheck = it) }
-            }
-            SwitchRow("Fake-IP", subtitle = "仅在接管连接时生效", checked = cfg.fakeIp) {
-                settings.update { current -> current.copy(fakeIp = it) }
-            }
-            SwitchRow("TLS / HTTP 域名嗅探", subtitle = "从连接中识别域名", checked = cfg.sniff, showDivider = false) {
-                settings.update { current -> current.copy(sniff = it) }
-            }
-        }
-        SectionHeader("过滤")
-        GroupCard {
-            SettingsRow("过滤范围", value = filterScope.title, chevron = true, showDivider = false, onClick = { showFilterScope = true })
-        }
-        Spacer(Modifier.height(24.dp))
     }
     if (showFilterScope) {
         ChoiceDialog(
@@ -571,20 +494,36 @@ private fun ConfigAdvancedScreen(settings: ProfileEditor) {
 }
 
 @Composable
-private fun ConfigRulesScreen(settings: ProfileEditor) {
+internal fun LocalRulesDetailScreen() {
     val container = LocalAppContainer.current
     val scope = rememberCoroutineScope()
-    val cfg = settings.current()
+    val rules = GlobalRuleStore.state.localRules
+    val groups = container.settings.current().proxyGroups.map { it.name }
     var showAddRule by remember { mutableStateOf(false) }
     var editRuleIndex by remember { mutableStateOf<Int?>(null) }
     var ruleQuery by remember { mutableStateOf("") }
     var manageMode by remember { mutableStateOf(false) }
     var manageMenu by remember { mutableStateOf(false) }
     var selected by remember { mutableStateOf(setOf<Int>()) }
+    var showAds by remember { mutableStateOf(false) }
 
-    Column(Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState())) {
+    DetailList {
+        SectionHeader("本地规则")
+        GroupCard {
+            SwitchRow("启用本地规则", subtitle = "全局共享；置顶只影响显示，匹配顺序保持迁移前", checked = GlobalRuleStore.state.localRulesEnabled) { on ->
+                scope.launch { Actions.setLocalRulesEnabled(on) }
+            }
+            SettingsRow(
+                "本地拦截域名",
+                subtitle = "每行一个域名，写入 DNS 过滤",
+                value = "${GlobalRuleStore.state.localAds.size} 条",
+                chevron = true,
+                showDivider = false,
+                onClick = { showAds = true },
+            )
+        }
         SectionHeader(
-            "规则",
+            "分流规则",
             trailing = {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     if (manageMode) {
@@ -593,12 +532,12 @@ private fun ConfigRulesScreen(settings: ProfileEditor) {
                         TextAction("＋") { showAddRule = true }
                         Box {
                             IconButton(onClick = { manageMenu = true }) { NamuIcon(Icons.Outlined.MoreVert, "管理规则") }
-                            DropdownMenu(expanded = manageMenu, onDismissRequest = { manageMenu = false }) {
+                            FloatingMenu(expanded = manageMenu, onDismissRequest = { manageMenu = false }) {
                                 DropdownMenuItem(text = { Text("选择规则") }, onClick = {
                                     manageMenu = false; manageMode = true; selected = emptySet()
                                 })
                                 DropdownMenuItem(text = { Text("全选") }, onClick = {
-                                    manageMenu = false; manageMode = true; selected = cfg.rules.indices.toSet()
+                                    manageMenu = false; manageMode = true; selected = rules.indices.toSet()
                                 })
                             }
                         }
@@ -615,12 +554,12 @@ private fun ConfigRulesScreen(settings: ProfileEditor) {
         )
         Spacer(Modifier.height(8.dp))
         GroupCard {
-            val visibleRules = cfg.rules.withIndex().filter { (_, rule) ->
+            val visibleRules = rules.withIndex().filter { (_, rule) ->
                 ruleQuery.isBlank() || rule.type.contains(ruleQuery, true) ||
                     rule.value.contains(ruleQuery, true) || rule.action.contains(ruleQuery, true)
             }
             if (visibleRules.isEmpty()) {
-                SettingsRow(title = if (cfg.rules.isEmpty()) "暂无规则" else "没有匹配的规则", showDivider = false)
+                SettingsRow(title = if (rules.isEmpty()) "暂无规则" else "没有匹配的规则", showDivider = false)
             }
             visibleRules.forEachIndexed { index, (position, rule) ->
                 ConfigRuleRow(
@@ -646,7 +585,8 @@ private fun ConfigRulesScreen(settings: ProfileEditor) {
                     showDivider = false,
                     onClick = {
                         if (selected.isNotEmpty()) {
-                            settings.update { current -> current.copy(rules = current.rules.filterIndexed { i, _ -> i !in selected }) }
+                            val sel = selected
+                            scope.launch { Actions.updateLocalRules { list -> list.filterIndexed { i, _ -> i !in sel } } }
                             selected = emptySet()
                             manageMode = false
                         }
@@ -657,33 +597,44 @@ private fun ConfigRulesScreen(settings: ProfileEditor) {
         Spacer(Modifier.height(24.dp))
     }
 
+    if (showAds) {
+        StringListDialog(
+            title = "本地拦截域名",
+            message = "每行一个域名；与远端规则集相互独立。",
+            initial = GlobalRuleStore.state.localAds,
+            onDismiss = { showAds = false },
+            onConfirm = { list ->
+                scope.launch { Actions.updateLocalAds { list.mapNotNull { normalizeAdsDomain(it) }.distinct() } }
+                showAds = false
+            },
+        )
+    }
+
     if (showAddRule || editRuleIndex != null) {
         val targetIndex = editRuleIndex
         AddRuleDialog(
-            groups = cfg.proxyGroups.map { it.name },
-            initial = targetIndex?.let(cfg.rules::getOrNull),
+            groups = groups,
+            initial = targetIndex?.let(rules::getOrNull),
             onDismiss = { showAddRule = false; editRuleIndex = null },
             onAdd = { item ->
-                fun persist(): Boolean {
-                    val saved = settings.update { current ->
-                        val list = if (targetIndex == null) current.rules + item
-                        else current.rules.mapIndexed { index, old -> if (index == targetIndex) item else old }
-                        current.copy(rules = list)
-                    }
-                    if (saved) { showAddRule = false; editRuleIndex = null }
-                    return saved
-                }
-                if ((item.type == "RULE-SET" || item.type == "DOMAIN-SET") && item.value.startsWith("http")) {
-                    scope.launch {
+                scope.launch {
+                    if ((item.type == "RULE-SET" || item.type == "DOMAIN-SET") && item.value.startsWith("http")) {
                         try {
                             val content = Actions.fetchText(item.value, maxBytes = 8 * 1024 * 1024)
                             ConfigStore.ruleSetFile(container.context, item.value).writeText(content)
-                            if (persist()) container.messages.show("规则集已下载并保存")
+                            container.messages.show("规则集已下载并保存")
                         } catch (e: Exception) {
                             container.messages.show("规则集下载失败：${e.message ?: "网络错误"}")
+                            return@launch
                         }
                     }
-                } else persist()
+                    Actions.updateLocalRules { list ->
+                        if (targetIndex == null) list + item
+                        else list.mapIndexed { index, old -> if (index == targetIndex) item else old }
+                    }
+                    showAddRule = false
+                    editRuleIndex = null
+                }
             },
         )
     }
@@ -698,19 +649,36 @@ private fun ConfigRuleRow(
     onClick: () -> Unit,
 ) {
     Row(
-        Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 12.dp),
+        Modifier.fillMaxWidth().heightIn(min = 54.dp).clickable(onClick = onClick)
+            .padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(Modifier.weight(1f)) {
-            Text(rule.value, color = if (rule.enabled) NamuColors.TextMain else NamuColors.TextSub, fontSize = 16.sp)
+        Column(Modifier.weight(1f).padding(end = 12.dp)) {
             Text(
-                "${rule.type} · ${rule.action}" + (if (rule.extendedMatch) " · 扩展匹配" else "") + (if (rule.preMatch) " · 预匹配" else ""),
+                rule.value,
+                color = if (rule.enabled) NamuColors.TextMain else NamuColors.TextSub,
+                style = NamuTokens.Type.Body.copy(lineHeight = 20.sp),
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                rule.type + (if (rule.extendedMatch) " · 扩展匹配" else "") + (if (rule.preMatch) " · 预匹配" else ""),
                 color = NamuColors.TextSub,
                 fontSize = 12.sp,
             )
         }
         if (managing) Text(if (selected) "✓" else "○", color = if (selected) NamuColors.Blue else NamuColors.TextSub, fontSize = 20.sp)
-        else Text("›", color = NamuColors.TextSub, fontSize = 22.sp)
+        else {
+            Text(
+                rule.action.uppercase(),
+                modifier = Modifier.widthIn(max = 100.dp).padding(end = 8.dp),
+                style = NamuTokens.Type.Caption,
+                color = NamuColors.TextSub,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Chevron()
+        }
     }
     if (showDivider) RowDivider()
 }
@@ -749,7 +717,7 @@ private fun ConfigSourcesScreen(settings: ProfileEditor) {
         }
     }
 
-    Column(Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState())) {
+    DetailList {
         SectionHeader("规则来源", trailing = { TextAction("＋") { edit("规则集 URL", "") } })
         GroupCard {
             cfg.ruleSources.forEach { source ->
@@ -935,6 +903,7 @@ private fun RuleRow(
     SettingsRow(
         title = rule.value,
         subtitle = ruleTypeLabel(rule.type) + if (!rule.enabled) " · 已禁用" else "",
+        minHeight = 52.dp,
         showDivider = showDivider,
         chevron = true,
         onClick = onEdit,
@@ -942,7 +911,7 @@ private fun RuleRow(
             Text(actionLabel(rule.action), fontSize = 13.sp, color = if (rule.enabled) actionColor(rule.action) else NamuColors.TextTertiary)
             Box {
                 IconButton(onClick = { menu = true }) { NamuIcon(Icons.Outlined.MoreVert, "规则操作") }
-                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                FloatingMenu(expanded = menu, onDismissRequest = { menu = false }) {
                     DropdownMenuItem(text = { Text(if (rule.enabled) "停用" else "启用") }, onClick = { menu = false; onToggle() })
                     DropdownMenuItem(text = { Text("上移") }, enabled = canMoveUp, onClick = { menu = false; onMove(-1) })
                     DropdownMenuItem(text = { Text("下移") }, enabled = canMoveDown, onClick = { menu = false; onMove(1) })
@@ -962,6 +931,10 @@ private fun ruleTypeLabel(type: String): String = when (type) {
     "PORT" -> "端口"
     "APP", "PROCESS-NAME", "APP-NAME" -> "按应用"
     "UID" -> "UID"
+    "AND" -> "逻辑与"
+    "OR" -> "逻辑或"
+    "NOT" -> "逻辑非"
+    "SCRIPT" -> "脚本判定"
     "FINAL", "MATCH" -> "最终规则"
     else -> type
 }

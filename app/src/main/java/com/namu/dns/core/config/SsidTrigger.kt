@@ -52,7 +52,7 @@ object SsidTrigger {
                 ?.trim()
                 ?.trim('"')
                 .orEmpty()
-        }.getOrDefault("")
+        }.getOrDefault("").takeUnless { it.equals("<unknown ssid>", ignoreCase = true) }.orEmpty()
         val matched = matches(ssid, names)
         return SsidState(
             enabled = true,

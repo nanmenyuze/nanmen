@@ -53,7 +53,7 @@ object ConfigStore {
 
     fun baseConfigFile(context: Context): File = File(context.filesDir, "default.json")
 
-    fun ensureAssets(context: Context, settings: com.namu.dns.core.repository.SettingsRepository) {
+    fun ensureAssets(context: Context, settings: com.namu.dns.core.repository.SettingsRepository, config: com.namu.dns.core.repository.ConfigRepository) {
         val stamp = settings.assetStamp()
         val dir = context.filesDir
         if (!baseConfigFile(context).exists()) {
@@ -107,10 +107,12 @@ object ConfigStore {
         }
         File(dir, "ads_url.txt.tmp").delete()
         File(dir, "modules").mkdirs()
+        // 3.0.18：规则/模块全局化迁移（幂等），必须先于聚合重建。
+        GlobalRuleStore.migrateIfNeeded(context, config)
         // 多规则源同样在下载中断时保留上一份可用文件
         val cfg = settings.current()
         // 模块文件变化后重建合并规则；启动时也保证聚合文件存在。
-        if (cfg.moduleSources.isNotEmpty()) rebuildModules(context, cfg)
+        rebuildModules(context, cfg)
         val profileCacheMigration = File(dir, "profile_rule_cache_migrated")
         if (!profileCacheMigration.exists()) {
             runCatching {
@@ -125,8 +127,8 @@ object ConfigStore {
                 profileCacheMigration.writeText("1")
             }
         }
-        cfg.ruleSources.forEach { src ->
-            val target = ruleSourceFile(context, src, settings.activeConfigName())
+        GlobalRuleStore.state.ruleSets.forEach { src ->
+            val target = globalRuleSetFile(context, src.url)
             val backup = File(target.parentFile, target.name + ".bak")
             if (!target.exists() || target.length() == 0L) {
                 if (backup.exists() && backup.length() > 0) {
@@ -157,19 +159,15 @@ object ConfigStore {
         val dir = context.filesDir
         val ads = mutableListOf<File>()
         // 有远端 manifest 的多规则源时，以 manifest 为准；否则兼容旧的单 rulesUrl。
-        if (cfg.ruleSources.isEmpty()) {
-            val downloaded = rulesFile(context, cfg.rulesUrl, profileName)
-            if (cfg.rulesUrl.isNotBlank() && downloaded.exists() && downloaded.length() > 0) ads.add(downloaded)
-        } else {
-            cfg.ruleSources.filter { it.enabled }.forEach { src ->
-                val f = ruleSourceFile(context, src, profileName)
-                if (f.exists() && f.length() > 0) ads.add(f)
-            }
+        GlobalRuleStore.enabledRuleSets().forEach { src ->
+            val f = globalRuleSetFile(context, src.url)
+            if (f.exists() && f.length() > 0) ads.add(f)
         }
         // 手动维护的本地广告域名，与服务器 URL 规则相互独立。
         val custom = File(dir, "ads_custom.txt")
         custom.writeText(
-            cfg.customAds.mapNotNull { normalizeAdsDomain(it) }
+            (if (GlobalRuleStore.state.localRulesEnabled) GlobalRuleStore.state.localAds else emptyList())
+                .mapNotNull { normalizeAdsDomain(it) }
                 .distinct()
                 .joinToString("\n") { "||$it^" },
         )
@@ -177,13 +175,13 @@ object ConfigStore {
 
         // 小火箭式模块：启用中的模块规则合并到本地过滤/分流。
         val moduleBlock = moduleBlockFile(context)
-        if (cfg.moduleSources.any { it.enabled } && moduleBlock.exists() && moduleBlock.length() > 0) {
+        if (GlobalRuleStore.enabledModules().isNotEmpty() && moduleBlock.exists() && moduleBlock.length() > 0) {
             ads.add(moduleBlock)
         }
 
         val root = JSONObject()
         // MITM/Host 分区：active 配置 + 启用模块合并。DNS 也要读同一份 Host 映射。
-        val moduleMitm = if (cfg.moduleSources.any { it.enabled }) {
+        val moduleMitm = if (GlobalRuleStore.enabledModules().isNotEmpty()) {
             runCatching { JSONObject(moduleMitmFile(context).readText()) }.getOrNull()
         } else null
         val hostMeta = LinkedHashMap<String, RuleMeta>()
@@ -211,9 +209,24 @@ object ConfigStore {
         // D2/D3：轻量命中摘要与小时历史；关闭命中摘要后内核不写盘。
         root.put("hit_history_file", File(File(context.filesDir, "stats"), "history.json").absolutePath)
         root.put("sniff", cfg.sniff)
+        root.put(
+            "ipv6",
+            cfg.ipv6
+                ?: moduleMitm?.optJSONObject("generalOptions")?.takeIf { it.has("ipv6") }
+                    ?.let { it.optString("ipv6").equals("true", true) || it.optString("ipv6") == "1" }
+                ?: true,
+        )
+        root.put(
+            "prefer_ipv6",
+            cfg.preferIpv6
+                ?: moduleMitm?.optJSONObject("generalOptions")?.takeIf { it.has("prefer-ipv6") }
+                    ?.let { it.optString("prefer-ipv6").equals("true", true) || it.optString("prefer-ipv6") == "1" }
+                ?: false,
+        )
         root.put("skip_proxy", JSONArray().apply { cfg.skipProxyHosts.forEach { put(it) } })
         root.put("mtu", cfg.mtu.coerceIn(1280, 9000))
         root.put("bbr", cfg.bbr)
+        root.put("quicFallback", cfg.quicFallback)
         root.put("block_dot", true)
         // 「system」表示手机当前底层网络的 DNS；下发前转成内核可用的 UDP 地址。
         val sysDns = SystemDns.selection(context)
@@ -260,12 +273,47 @@ object ConfigStore {
                 put("fallback_geo_check", cfg.fallbackGeoCheck)
                 put("query_log", cfg.dnsQueryLog)
                 put("block_aaaa", cfg.blockAaaa)
+                // [DNS] 按域名策略：当前配置优先，模块只补未占用的 pattern。
+                put("policies", JSONArray().apply {
+                    val merged = LinkedHashMap<String, String>()
+                    cfg.dnsPolicies.forEach {
+                        if (it.pattern.isNotBlank() && it.servers.isNotBlank()) merged[it.pattern.trim().lowercase()] = it.servers.trim()
+                    }
+                    moduleMitm?.optJSONArray("dnsPolicies")?.let { arr ->
+                        for (i in 0 until arr.length()) {
+                            val o = arr.optJSONObject(i) ?: continue
+                            val k = o.optString("pattern").trim().lowercase()
+                            val v = o.optString("servers").trim()
+                            if (k.isNotBlank() && v.isNotBlank() && !merged.containsKey(k)) merged[k] = v
+                        }
+                    }
+                    merged.forEach { (k, v) -> put(JSONObject().put("pattern", k).put("servers", v)) }
+                })
+                // always-real-ip / fake-ip-filter：当前配置优先，模块只补未占用条目。
+                put("fake_ip_filter", JSONArray().apply {
+                    val merged = LinkedHashSet<String>()
+                    cfg.alwaysRealIp.forEach { if (it.isNotBlank()) merged += it.trim().lowercase() }
+                    moduleMitm?.optJSONArray("alwaysRealIp")?.let { arr ->
+                        for (i in 0 until arr.length()) {
+                            val v = arr.optString(i).trim().lowercase()
+                            if (v.isNotBlank()) merged += v
+                        }
+                    }
+                    merged.forEach { put(it) }
+                })
+                put(
+                    "hijack",
+                    cfg.dnsHijack
+                        ?: moduleMitm?.optJSONObject("generalOptions")?.takeIf { it.has("hijack-dns") }
+                            ?.let { com.namu.dns.core.config.parseHijackDns(it.optString("hijack-dns")) }
+                        ?: true,
+                )
                 // 缓存落盘（sing-box cache_file 同款）：重启后热域直接命中
                 put("cache_file", File(context.filesDir, "namu_cache.json").absolutePath)
             },
         )
         root.put("nodes", JSONArray().apply { cfg.nodes.forEach { put(it.toJson()) } })
-        val moduleRules = if (cfg.moduleSources.any { it.enabled }) {
+        val moduleRules = if (GlobalRuleStore.enabledModules().isNotEmpty()) {
             runCatching { JSONArray(moduleRulesFile(context).readText()) }.getOrNull()
         } else null
         root.put("proxy_groups", JSONArray().apply {
@@ -288,10 +336,11 @@ object ConfigStore {
             cfg.groupSelections.forEach { (k, v) -> if (k.isNotBlank() && v.isNotBlank()) put(k, v) }
         })
         root.put("rules", JSONArray().apply {
-            val routedRules = cfg.rules.filter { it.type !in setOf("URL-REGEX", "USER-AGENT") }.flatMap { rule ->
+            val localRules = if (GlobalRuleStore.state.localRulesEnabled) GlobalRuleStore.state.localRules else emptyList()
+            val routedRules = localRules.filter { it.type !in setOf("URL-REGEX", "USER-AGENT") }.flatMap { rule ->
                 if (rule.type != "RULE-SET" && rule.type != "DOMAIN-SET") return@flatMap listOf(rule)
-                val source = cfg.ruleSources.firstOrNull { it.id == rule.value || it.url == rule.value }
-                val file = if (source != null) ruleSourceFile(context, source, profileName) else ruleSetFile(context, rule.value)
+                val source = GlobalRuleStore.state.ruleSets.firstOrNull { it.id == rule.value || it.url == rule.value }
+                val file = if (source != null) globalRuleSetFile(context, source.url) else ruleSetFile(context, rule.value)
                 val content = runCatching { file.readText() }.getOrDefault("")
                 if (content.isBlank()) {
                     android.util.Log.w("NamuRules", "规则集尚无本地缓存：${rule.value}")
@@ -315,8 +364,8 @@ object ConfigStore {
                             if (rule.extendedMatch) append(",extended-matching")
                             if (rule.preMatch && rule.action == "block") append(",pre-matching")
                         },
-                        source = rule.source.ifBlank { "配置" },
-                        meta = rule.meta ?: configMeta("dns", key, order++),
+                        source = rule.source.ifBlank { "本地规则" },
+                        meta = rule.meta ?: makeMeta("dns", key, GlobalRuleStore.ID_LOCAL_RULES, "本地规则", order++),
                     ).toJson(),
                 )
             }
@@ -334,28 +383,42 @@ object ConfigStore {
             }
         }
         var mitmMetaOrder = (mitmMeta.values.maxOfOrNull { it.order } ?: -1L) + 1
-        fun putConfigMitmMeta(section: String, key: String) {
-            mitmMeta["$section|$key"] = configMeta(section, key, mitmMetaOrder++)
+        fun putLocalMitmMeta(section: String, key: String) {
+            mitmMeta["$section|$key"] = makeMeta(section, key, GlobalRuleStore.ID_LOCAL_MITM, "本地重写与脚本", mitmMetaOrder++)
         }
-        cfg.mitm.urlRewrites.forEach { putConfigMitmMeta("url", it) }
-        cfg.mitm.headerRewrites.forEach { putConfigMitmMeta("header", it) }
-        cfg.mitm.loonRewrites.forEach { putConfigMitmMeta("loon", it) }
-        cfg.mitm.bodyRewrites.forEach { putConfigMitmMeta("body", it) }
-        cfg.mitm.wsRewrites.forEach { putConfigMitmMeta("ws", it) }
-        cfg.mitm.scripts.forEach { putConfigMitmMeta("script", scriptKey(it)) }
+        val gm = GlobalRuleStore.state
+        val localForMeta = (if (gm.localMitmEnabled) listOf(gm.localMitm) else emptyList()) +
+            GlobalRuleStore.enabledExtraMitm().map { it.content }
+        localForMeta.forEach { c ->
+            c.urlRewrites.forEach { putLocalMitmMeta("url", it) }
+            c.headerRewrites.forEach { putLocalMitmMeta("header", it) }
+            c.loonRewrites.forEach { putLocalMitmMeta("loon", it) }
+            c.bodyRewrites.forEach { putLocalMitmMeta("body", it) }
+            c.wsRewrites.forEach { putLocalMitmMeta("ws", it) }
+            c.scripts.forEach { putLocalMitmMeta("script", scriptKey(it)) }
+        }
         root.put("mitm", JSONObject().apply {
-            val hosts = LinkedHashSet(cfg.mitm.hostnames)
-            val skips = LinkedHashSet(cfg.mitm.skipHostnames)
-            val urls = LinkedHashSet(cfg.mitm.urlRewrites)
-            val headers = LinkedHashSet(cfg.mitm.headerRewrites)
-            val loon = LinkedHashSet(cfg.mitm.loonRewrites)
-            val body = LinkedHashSet(cfg.mitm.bodyRewrites)
-            val wsRules = LinkedHashSet(cfg.mitm.wsRewrites)
+            val g = GlobalRuleStore.state
+            val localContents = (if (g.localMitmEnabled) listOf(g.localMitm) else emptyList()) +
+                GlobalRuleStore.enabledExtraMitm().map { it.content }
+            val hosts = LinkedHashSet(g.scope.hostnames)
+            val skips = LinkedHashSet(g.scope.skipHostnames)
+            val urls = LinkedHashSet<String>()
+            val headers = LinkedHashSet<String>()
+            val loon = LinkedHashSet<String>()
+            val body = LinkedHashSet<String>()
+            val wsRules = LinkedHashSet<String>()
             val scripts = LinkedHashMap<String, ScriptConfig>()
-            cfg.rules.filter { it.enabled && it.type == "URL-REGEX" }.forEach { rule ->
+            localContents.forEach { c ->
+                urls.addAll(c.urlRewrites); headers.addAll(c.headerRewrites); loon.addAll(c.loonRewrites)
+                body.addAll(c.bodyRewrites); wsRules.addAll(c.wsRewrites)
+                c.scripts.forEach { sc -> scripts.putIfAbsent(scriptKey(sc), sc) }
+            }
+            val mitmLocalRules = if (g.localRulesEnabled) g.localRules else emptyList()
+            mitmLocalRules.filter { it.enabled && it.type == "URL-REGEX" }.forEach { rule ->
                 loon.add("${rule.value} ${rule.action}")
             }
-            cfg.rules.filter { it.enabled && it.type == "USER-AGENT" }.forEach { rule ->
+            mitmLocalRules.filter { it.enabled && it.type == "USER-AGENT" }.forEach { rule ->
                 val regex = buildString {
                     append("(?i)^")
                     rule.value.forEach { c ->
@@ -370,9 +433,9 @@ object ConfigStore {
                 val quoted = regex.replace("\\", "\\\\").replace("\"", "\\\"")
                 loon.add("^.*$ ${rule.action} user-agent-regex \"$quoted\"")
             }
-            cfg.mitm.scripts.forEach { sc ->
+            scripts.values.toList().forEach { sc ->
                 val key = scriptKey(sc)
-                scripts[key] = sc.copy(meta = sc.meta ?: configMeta("script", key, 0))
+                if (sc.meta == null) scripts[key] = sc.copy(meta = makeMeta("script", key, GlobalRuleStore.ID_LOCAL_MITM, "本地重写与脚本", 0))
             }
             moduleMitm?.let { m ->
                 m.optJSONArray("hostnames")?.let { a -> for (i in 0 until a.length()) hosts.add(a.optString(i)) }
@@ -391,7 +454,7 @@ object ConfigStore {
                     }
                 }
             }
-            put("enabled", cfg.mitm.enabled)
+            put("enabled", g.scope.enabled)
             put("hostnames", JSONArray(hosts.toList()))
             put("skip_hostnames", JSONArray(skips.toList()))
             put("url_rewrites", JSONArray(urls.toList()))
@@ -403,7 +466,7 @@ object ConfigStore {
             // ScriptConfig.toJsonObject 使用 camelCase，Rust serde 已按 camelCase 对齐。
             // 参数当前值按脚本键覆盖模块默认值；只影响 $argument，不参与源码展开。
             put("scripts", JSONArray(scripts.values.map { sc ->
-                cfg.mitm.scriptArguments[scriptArgumentKey(sc)]?.let { sc.copy(argumentValues = it) } ?: sc
+                g.scriptArguments[scriptArgumentKey(sc)]?.let { sc.copy(argumentValues = it) } ?: sc
             }.map { it.toJsonObject() }))
             put("script_store_file", File(File(dir, "scripts"), "store.json").absolutePath)
             // Map Local 相对 data-path 的基准目录；`$notification` 队列供服务轮询发系统通知。
@@ -436,9 +499,10 @@ object ConfigStore {
             put("fail_open_ttl", 300)
             put("upstream_insecure", false)
             // 按 App MITM：配置里保留包名（可读、换机可重解析），下发前才展开成 UID。
-            val mitmUids = AppUidResolver.resolveUids(context, cfg.mitm.apps).first
-            put("app_mode", cfg.mitm.appMode)
+            val (mitmUids, unresolved) = AppUidResolver.resolveUids(context, g.scope.apps)
+            put("app_mode", g.scope.appMode)
             put("app_uids", JSONArray(mitmUids))
+            put("app_scope_incomplete", g.scope.appMode == "deny" && unresolved.isNotEmpty())
             // 金融保护：支付/银行连接在 MITM 判定之前排除，默认开启。
             put("finance", FinanceProtect.toJson(context, cfg.financeProtect))
         })
@@ -477,6 +541,10 @@ object ConfigStore {
 
     fun ruleSourceFile(context: Context, source: RuleSource, profileName: String = ConfigFileStore.activeName(context)): File =
         ruleSetFile(context, "rule-source:$profileName\n${source.url}")
+
+    /** 3.0.18：规则集缓存全局共享，不再随配置方案隔离。 */
+    fun globalRuleSetFile(context: Context, url: String): File =
+        ruleSetFile(context, "rule-source-global\n$url")
 
     private fun ruleSourceFile(context: Context, id: String): File {
         val safe = id.lowercase().replace(Regex("[^a-z0-9_-]"), "_").take(40)
@@ -528,6 +596,7 @@ object ConfigStore {
         val mitmHosts = LinkedHashSet<String>()
         val mitmSkips = LinkedHashSet<String>()
         val generalOptions = LinkedHashMap<String, String>()
+        val moduleDnsPolicies = mutableListOf<com.namu.dns.core.config.DnsPolicyRule>()
         val mitmOptions = LinkedHashMap<String, String>()
         val urlRewrites = LinkedHashSet<String>()
         val headerRewrites = LinkedHashSet<String>()
@@ -542,12 +611,12 @@ object ConfigStore {
         val scriptIssues = LinkedHashSet<String>()
         val ruleSetIssues = LinkedHashSet<String>()
         var ignored = 0
-        orderedModules(cfg).filter { it.enabled }.forEach { src ->
+        GlobalRuleStore.orderedModules().filter { it.enabled }.forEach { src ->
             val file = moduleFile(context, src.id)
             if (!file.exists() || file.length() == 0L) return@forEach
             val parsed = runCatching { ModuleParser.parse(file.readText()) }.getOrNull()
             if (parsed == null) {
-                ruleSetIssues.add("${src.name.ifBlank { "模块" }}：模块正文解析失败，整份模块不会生效")
+                ruleSetIssues.add("${src.name.ifBlank { "模块" }}｜模块正文解析失败，整份模块不会生效")
                 return@forEach
             }
             parsed.blockLines.forEach { line ->
@@ -574,7 +643,7 @@ object ConfigStore {
                 val cache = ruleSetFile(context, rs.url)
                 val label = rs.url.substringAfterLast('/').ifBlank { rs.url }.take(36)
                 if (!cache.exists() || cache.length() == 0L) {
-                    ruleSetIssues.add("${label}：内容未缓存，整个规则集不会生效（同步模块后重试）")
+                    ruleSetIssues.add("${src.name.ifBlank { "模块" }}｜${label}：内容未缓存，整个规则集不会生效（同步模块后重试）")
                     return@rsLoop
                 }
                 val content = runCatching { cache.readText() }.getOrDefault("")
@@ -599,14 +668,18 @@ object ConfigStore {
                 )
                 if (res.note != null || res.items.isEmpty()) {
                     ruleSetIssues.add(
-                        "$label：${res.format} 展开 ${res.items.size} 条" +
+                        "${src.name.ifBlank { "模块" }}｜$label：${res.format} 展开 ${res.items.size} 条" +
                             (res.note?.let { "，$it" } ?: ""),
                     )
                 }
             }
             mitmHosts.addAll(parsed.mitmHostnames)
             mitmSkips.addAll(parsed.mitmSkipHostnames)
-            parsed.generalOptions.forEach { (k, v) -> if (!generalOptions.containsKey(k)) generalOptions[k] = v }
+            // 3.0.18：模块附带 DNS 参数须经导入预览确认（dnsApproved）才合并。
+            if (src.dnsApproved) {
+                parsed.generalOptions.forEach { (k, v) -> if (!generalOptions.containsKey(k)) generalOptions[k] = v }
+                parsed.dnsPolicies.forEach { moduleDnsPolicies += it }
+            }
             parsed.mitmOptions.forEach { (k, v) -> if (!mitmOptions.containsKey(k)) mitmOptions[k] = v }
             parsed.urlRewrites.forEach { line ->
                 if (urlRewrites.add(line)) {
@@ -652,7 +725,7 @@ object ConfigStore {
                     }
                 }
                 if (body.isBlank()) {
-                    scriptIssues.add("${rule.name}: 脚本正文未缓存，不会执行")
+                    scriptIssues.add("${src.name.ifBlank { "模块" }}｜${rule.name}: 脚本正文未缓存，不会执行")
                 } else {
                     val key = scriptKey(rule)
                     if (!scripts.containsKey(key)) {
@@ -666,8 +739,36 @@ object ConfigStore {
                     }
                 }
             }
-            parsed.scriptIssues.forEach { scriptIssues.add(it) }
+            parsed.scriptIssues.forEach { scriptIssues.add("${src.name.ifBlank { "模块" }}｜$it") }
             ignored += parsed.ignored
+        }
+        // 3.0.18：本地重写与脚本（含其他方案启用项）并入同一聚合，归因到伪模块。
+        val localContents = (if (GlobalRuleStore.state.localMitmEnabled) listOf(GlobalRuleStore.state.localMitm) else emptyList()) +
+            GlobalRuleStore.enabledExtraMitm().map { it.content }
+        localContents.forEach { c ->
+            c.urlRewrites.forEach { line ->
+                if (urlRewrites.add(line)) mitmMeta["url|$line"] = makeMeta("url", line, GlobalRuleStore.ID_LOCAL_MITM, "本地重写与脚本", ruleOrder++)
+            }
+            c.headerRewrites.forEach { line ->
+                if (headerRewrites.add(line)) mitmMeta["header|$line"] = makeMeta("header", line, GlobalRuleStore.ID_LOCAL_MITM, "本地重写与脚本", ruleOrder++)
+            }
+            c.loonRewrites.forEach { line ->
+                if (loonRewrites.add(line)) mitmMeta["loon|$line"] = makeMeta("loon", line, GlobalRuleStore.ID_LOCAL_MITM, "本地重写与脚本", ruleOrder++)
+            }
+            c.bodyRewrites.forEach { line ->
+                if (bodyRewrites.add(line)) mitmMeta["body|$line"] = makeMeta("body", line, GlobalRuleStore.ID_LOCAL_MITM, "本地重写与脚本", ruleOrder++)
+            }
+            c.wsRewrites.forEach { line ->
+                if (wsRewrites.add(line)) mitmMeta["ws|$line"] = makeMeta("ws", line, GlobalRuleStore.ID_LOCAL_MITM, "本地重写与脚本", ruleOrder++)
+            }
+            c.scripts.forEach { rule ->
+                val key = scriptKey(rule)
+                if (!scripts.containsKey(key)) {
+                    val meta = makeMeta("script", key, GlobalRuleStore.ID_LOCAL_MITM, "本地重写与脚本", ruleOrder++)
+                    mitmMeta["script|$key"] = meta
+                    scripts[key] = rule.copy(meta = meta)
+                }
+            }
         }
         // S6：模块 General 里只影响壳行为的键在写盘前映射一次。
         val generalEffects = com.namu.dns.core.config.ModuleGeneral.parse(generalOptions)
@@ -687,6 +788,8 @@ object ConfigStore {
                 put("hostnames", JSONArray(mitmHosts.toList()))
                 put("skipHostnames", JSONArray(mitmSkips.toList()))
                 put("generalOptions", JSONObject(generalOptions as Map<*, *>))
+                put("dnsPolicies", JSONArray(moduleDnsPolicies.map { JSONObject().put("pattern", it.pattern).put("servers", it.servers) }))
+                put("alwaysRealIp", JSONArray(generalEffects.alwaysRealIp))
                 put("mitmOptions", JSONObject(mitmOptions as Map<*, *>))
                 put("urlRewrites", JSONArray(urlRewrites.toList()))
                 put("headerRewrites", JSONArray(headerRewrites.toList()))
@@ -738,18 +841,12 @@ object ConfigStore {
     /** 所有当前会参与本地过滤的规则文件。 */
     fun ruleFiles(context: Context, cfg: AppConfig): List<File> {
         val files = mutableListOf<File>()
-        if (cfg.ruleSources.isEmpty()) {
-            if (cfg.rulesUrl.isNotBlank()) {
-                rulesFile(context, cfg.rulesUrl).takeIf { it.exists() && it.length() > 0 }?.let { files.add(it) }
-            }
-        } else {
-            cfg.ruleSources.filter { it.enabled }.forEach { src ->
-                ruleSourceFile(context, src).takeIf { it.exists() && it.length() > 0 }?.let { files.add(it) }
-            }
+        GlobalRuleStore.enabledRuleSets().forEach { src ->
+            globalRuleSetFile(context, src.url).takeIf { it.exists() && it.length() > 0 }?.let { files.add(it) }
         }
         File(context.filesDir, "ads_custom.txt").takeIf { it.exists() && it.length() > 0 }?.let { files.add(it) }
         moduleBlockFile(context).takeIf {
-            cfg.moduleSources.any { m -> m.enabled } && it.exists() && it.length() > 0
+            GlobalRuleStore.enabledModules().isNotEmpty() && it.exists() && it.length() > 0
         }?.let { files.add(it) }
         return files
     }

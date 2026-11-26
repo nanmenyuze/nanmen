@@ -6,6 +6,20 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 
+thread_local! {
+    /// SCRIPT 规则专用 QuickJS 运行时：每线程一份，避免跨线程 Send 问题。
+    static RULE_JS_RT: std::cell::RefCell<Option<rquickjs::Runtime>> =
+        std::cell::RefCell::new(None);
+}
+
+fn kind_has_uid(kind: &RuleKind) -> bool {
+    match kind {
+        RuleKind::Uid(_) => true,
+        RuleKind::Logic(_, terms) => terms.iter().any(|t| kind_has_uid(&t.kind)),
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterDecision {
     Important,
@@ -708,7 +722,24 @@ enum RuleKind {
     /// UID：按 Android 应用 UID 匹配。包名/进程名规则由壳层先解析成 UID 再下发，
     /// 内核不持有包名表——包名到 UID 的映射随应用安装/卸载变化，属于壳层职责。
     Uid(u32),
+    /// AND/OR/NOT 逻辑组合：子项递归求值，NOT 恰好一个子项。
+    Logic(LogicOp, Vec<LogicTerm>),
+    /// SCRIPT：按脚本名引用 mitm.scripts 中的脚本，脚本内 match(ctx) 返回布尔。
+    Script(String),
     Final,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LogicOp {
+    And,
+    Or,
+    Not,
+}
+
+#[derive(Debug, Clone)]
+struct LogicTerm {
+    kind: RuleKind,
+    value: String,
 }
 
 /// 一条连接进入规则匹配时需要知道的全部信息。
@@ -749,6 +780,8 @@ pub struct RuleEngine {
     pub rule_count: usize,
     /// 配置里是否存在 UID 规则。用于「没 root 时提醒规则不生效」的统计与界面提示。
     has_uid: bool,
+    /// SCRIPT 规则引用的脚本正文（name → source），来自 mitm.scripts。
+    rule_scripts: HashMap<String, String>,
 }
 
 impl RuleEngine {
@@ -771,86 +804,44 @@ impl RuleEngine {
         let mut rules = Vec::new();
         for rc in &cfg.rules {
             // 规则值在加载期归一化（小写/去前导点），判定热路径不再重复分配。
-            let kind = match rc.kind.to_ascii_uppercase().as_str() {
-                "DOMAIN" => RuleKind::Domain,
-                "DOMAIN-SUFFIX" => RuleKind::DomainSuffix,
-                "DOMAIN-KEYWORD" => RuleKind::DomainKeyword,
-                "DOMAIN-REGEX" => match Regex::new(&rc.value) {
-                    Ok(re) => RuleKind::DomainRegex(re),
-                    Err(_) => continue,
-                },
-                "DOMAIN-WILDCARD" => match wildcard_regex(&rc.value) {
-                    Ok(re) => RuleKind::DomainWildcard(re),
-                    Err(_) => continue,
-                },
-                "GEOIP" => {
-                    let code = rc.value.trim().to_ascii_uppercase();
-                    // 当前只带 CN IP 库；没有 GeoIP 数据库时不能把其他地区猜成不匹配。
-                    if code != "CN" {
-                        logging::warn("rule", format!("跳过未实现 GEOIP {}（仅 CN 可用）", code));
+            let kind_upper = rc.kind.to_ascii_uppercase();
+            let kind = match kind_upper.as_str() {
+                "AND" | "OR" | "NOT" => {
+                    let op = match kind_upper.as_str() {
+                        "AND" => LogicOp::And,
+                        "OR" => LogicOp::Or,
+                        _ => LogicOp::Not,
+                    };
+                    match parse_logic_terms(&rc.value, 0) {
+                        Ok(terms)
+                            if !terms.is_empty()
+                                && (op != LogicOp::Not || terms.len() == 1) =>
+                        {
+                            RuleKind::Logic(op, terms)
+                        }
+                        _ => {
+                            logging::warn(
+                                "rule",
+                                format!("拒绝逻辑规则 {} {}：表达式格式非法", rc.kind, rc.value),
+                            );
+                            continue;
+                        }
+                    }
+                }
+                "SCRIPT" => {
+                    let name = rc.value.trim();
+                    if name.is_empty() || name.contains(char::is_whitespace) {
+                        logging::warn("rule", format!("拒绝 SCRIPT 规则值 {}：脚本名非法", rc.value));
                         continue;
                     }
-                    RuleKind::GeoIp(code)
+                    RuleKind::Script(name.to_string())
                 }
-                "IP-CIDR" | "IP-CIDR6" => match rc.value.parse::<IpNet>() {
-                    Ok(net) => RuleKind::IpCidr(net),
-                    Err(_) => continue,
+                _ => match parse_leaf_kind(&kind_upper, &rc.value) {
+                    Some(k) => k,
+                    None => continue,
                 },
-                "PORT" | "DST-PORT" => match rc.value.parse::<u16>() {
-                    Ok(p) => RuleKind::Port(p),
-                    Err(_) => continue,
-                },
-                "PROTOCOL" => match rc.value.trim().to_ascii_uppercase().as_str() {
-                    "TCP" => RuleKind::Protocol(ConnKind::Tcp),
-                    "UDP" => RuleKind::Protocol(ConnKind::Udp),
-                    other => {
-                        logging::warn(
-                            "rule",
-                            format!("拒绝 PROTOCOL 值 {}（仅支持 TCP/UDP）", other),
-                        );
-                        continue;
-                    }
-                },
-                "FINAL" | "MATCH" => RuleKind::Final,
-                // 这些规则依赖 Android 进程/UID 数据源。UID 数值规则可直接用；
-                // 包名类规则由壳层解析成 UID 后再下发，内核侧不再重复实现一套包名表。
-                "UID" => match rc.value.trim().parse::<u32>() {
-                    Ok(u) => RuleKind::Uid(u),
-                    Err(_) => {
-                        logging::warn(
-                            "rule",
-                            format!("拒绝 UID 规则值 {}：不是合法整数", rc.value),
-                        );
-                        continue;
-                    }
-                },
-                "PROCESS-NAME" | "PROCESS-PATH" | "APP" | "APP-NAME" => {
-                    logging::warn(
-                        "rule",
-                        format!(
-                            "拒绝 {} 规则 {}：包名类规则需先由壳层解析成 UID 规则",
-                            rc.kind, rc.value
-                        ),
-                    );
-                    continue;
-                }
-                _ => {
-                    logging::warn(
-                        "rule",
-                        format!("拒绝未实现规则类型 {}（值 {}）", rc.kind, rc.value),
-                    );
-                    continue;
-                }
             };
-            let value = match kind {
-                RuleKind::Domain => normalize_domain(&rc.value),
-                RuleKind::DomainSuffix => {
-                    rc.value.trim().trim_start_matches('.').to_ascii_lowercase()
-                }
-                RuleKind::DomainKeyword => rc.value.trim().to_ascii_lowercase(),
-                RuleKind::Protocol(_) => rc.value.trim().to_ascii_uppercase(),
-                _ => rc.value.clone(),
-            };
+            let value = normalize_leaf_value(&kind, &rc.value);
             let action_name = rc.action.split(',').next().unwrap_or("").trim();
             let extended_match = rc.action.split(',').any(|v| v.trim().eq_ignore_ascii_case("extended-matching"));
             let pre_match = rc.action.split(',').any(|v| v.trim().eq_ignore_ascii_case("pre-matching"));
@@ -922,7 +913,14 @@ impl RuleEngine {
             .unwrap_or_default();
 
         let rule_count = rules.len() + cn_domains.len();
-        let has_uid = rules.iter().any(|r| matches!(r.kind, RuleKind::Uid(_)));
+        let has_uid = rules.iter().any(|r| kind_has_uid(&r.kind));
+        let rule_scripts = cfg
+            .mitm
+            .scripts
+            .iter()
+            .filter(|sc| !sc.name.trim().is_empty())
+            .map(|sc| (sc.name.trim().to_string(), sc.source.clone()))
+            .collect();
         Self {
             rules,
             final_action,
@@ -932,7 +930,116 @@ impl RuleEngine {
             cn_ips,
             rule_count,
             has_uid,
+            rule_scripts,
         }
+    }
+
+    fn logic_matches(
+        &self,
+        op: LogicOp,
+        terms: &[LogicTerm],
+        input: &MatchInput<'_>,
+        dom: &Option<String>,
+    ) -> bool {
+        match op {
+            LogicOp::And => terms
+                .iter()
+                .all(|t| self.kind_matches(&t.kind, &t.value, input, dom)),
+            LogicOp::Or => terms
+                .iter()
+                .any(|t| self.kind_matches(&t.kind, &t.value, input, dom)),
+            LogicOp::Not => terms
+                .first()
+                .map(|t| !self.kind_matches(&t.kind, &t.value, input, dom))
+                .unwrap_or(false),
+        }
+    }
+
+    fn kind_matches(
+        &self,
+        kind: &RuleKind,
+        value: &str,
+        input: &MatchInput<'_>,
+        dom: &Option<String>,
+    ) -> bool {
+        match kind {
+            RuleKind::Domain => dom.as_ref().map(|d| d == value).unwrap_or(false),
+            RuleKind::DomainSuffix => dom
+                .as_ref()
+                .map(|d| {
+                    !value.is_empty()
+                        && (d == value
+                            || (d.len() > value.len()
+                                && d.ends_with(value)
+                                && d.as_bytes()[d.len() - value.len() - 1] == b'.'))
+                })
+                .unwrap_or(false),
+            RuleKind::DomainKeyword => dom
+                .as_ref()
+                .map(|d| !value.is_empty() && d.contains(value))
+                .unwrap_or(false),
+            RuleKind::DomainRegex(re) | RuleKind::DomainWildcard(re) => {
+                dom.as_ref().map(|d| re.is_match(d)).unwrap_or(false)
+            }
+            RuleKind::GeoIp(code) => {
+                code == "CN"
+                    && match input.ip {
+                        IpAddr::V4(v4) => self.cn_ip_contains(v4),
+                        IpAddr::V6(_) => false,
+                    }
+            }
+            RuleKind::IpCidr(net) => net.contains(&input.ip),
+            RuleKind::Port(p) => input.port == *p,
+            RuleKind::Protocol(k) => input.kind == *k,
+            RuleKind::Uid(u) => input.uid.map(|v| v == *u).unwrap_or(false),
+            RuleKind::Logic(op, terms) => self.logic_matches(*op, terms, input, dom),
+            RuleKind::Script(name) => self.script_matches(name, input, dom),
+            RuleKind::Final => false,
+        }
+    }
+
+    /// SCRIPT 规则求值：线程本地缓存 QuickJS 运行时，100ms 中断 + 8MB 内存上限。
+    /// 脚本契约：定义 `function match(ctx)` 返回布尔；ctx 含 domain/ip/port/protocol/uid。
+    fn script_matches(&self, name: &str, input: &MatchInput<'_>, dom: &Option<String>) -> bool {
+        let Some(source) = self.rule_scripts.get(name) else {
+            return false;
+        };
+        let ctx_json = serde_json::json!({
+            "domain": dom.as_deref(),
+            "ip": input.ip.to_string(),
+            "port": input.port,
+            "protocol": match input.kind {
+                ConnKind::Tcp => "TCP",
+                ConnKind::Udp => "UDP",
+            },
+            "uid": input.uid,
+        })
+        .to_string();
+        let program = format!(
+            "(function(){{var ctx={};{}\n;return typeof match==='function'?!!match(ctx):false;}})()",
+            ctx_json, source
+        );
+        RULE_JS_RT.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                *slot = rquickjs::Runtime::new().ok();
+            }
+            let Some(rt) = slot.as_ref() else {
+                return false;
+            };
+            rt.set_memory_limit(8 * 1024 * 1024);
+            rt.set_max_stack_size(256 * 1024);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            rt.set_interrupt_handler(Some(Box::new(move || {
+                std::time::Instant::now() >= deadline
+            })));
+            let Ok(context) = rquickjs::Context::full(rt) else {
+                return false;
+            };
+            let result = context.with(|ctx| ctx.eval::<bool, _>(program.as_str()));
+            rt.set_interrupt_handler(None);
+            result.unwrap_or(false)
+        })
     }
 
     /// 配置是否引用了 UID 规则（决定是否需要 UID 表、以及无 root 时是否提示）。
@@ -1045,12 +1152,15 @@ impl RuleEngine {
                 RuleKind::Protocol(k) => input.kind == *k,
                 // 归属未知时 UID 规则不命中：不能把 None 当成 0（0 是 root）去比。
                 RuleKind::Uid(u) => input.uid.map(|v| v == *u).unwrap_or(false),
+                RuleKind::Logic(op, terms) => self.logic_matches(*op, terms, input, &dom),
+                RuleKind::Script(name) => self.script_matches(name, input, &dom),
                 RuleKind::Final => false,
             };
             let domain_rule = matches!(
                 &r.kind,
                 RuleKind::Domain | RuleKind::DomainSuffix | RuleKind::DomainKeyword |
-                    RuleKind::DomainRegex(_) | RuleKind::DomainWildcard(_)
+                    RuleKind::DomainRegex(_) | RuleKind::DomainWildcard(_) |
+                    RuleKind::Logic(..) | RuleKind::Script(_)
             );
             let matched = if sniffed_domain && domain_rule {
                 let base_match = match &r.kind {
@@ -1062,6 +1172,8 @@ impl RuleEngine {
                     }).unwrap_or(false),
                     RuleKind::DomainKeyword => base_dom.as_ref().map(|d| !r.value.is_empty() && d.contains(r.value.as_str())).unwrap_or(false),
                     RuleKind::DomainRegex(re) | RuleKind::DomainWildcard(re) => base_dom.as_ref().map(|d| re.is_match(d)).unwrap_or(false),
+                    RuleKind::Logic(op, terms) => self.logic_matches(*op, terms, input, &base_dom),
+                    RuleKind::Script(name) => self.script_matches(name, input, &base_dom),
                     _ => false,
                 };
                 (r.extended_match && matched) || base_match
@@ -1184,8 +1296,188 @@ fn kind_name(kind: &RuleKind) -> &'static str {
         RuleKind::Port(_) => "PORT",
         RuleKind::Protocol(_) => "PROTOCOL",
         RuleKind::Uid(_) => "UID",
+        RuleKind::Logic(LogicOp::And, _) => "AND",
+        RuleKind::Logic(LogicOp::Or, _) => "OR",
+        RuleKind::Logic(LogicOp::Not, _) => "NOT",
+        RuleKind::Script(_) => "SCRIPT",
         RuleKind::Final => "FINAL",
     }
+}
+
+/// 叶子规则类型解析（不含逻辑/脚本）。未知类型告警并跳过，保持旧行为。
+fn parse_leaf_kind(kind: &str, value: &str) -> Option<RuleKind> {
+    Some(match kind {
+
+                "DOMAIN" => RuleKind::Domain,
+                "DOMAIN-SUFFIX" => RuleKind::DomainSuffix,
+                "DOMAIN-KEYWORD" => RuleKind::DomainKeyword,
+                "DOMAIN-REGEX" => match Regex::new(value) {
+                    Ok(re) => RuleKind::DomainRegex(re),
+                    Err(_) => return None,
+                },
+                "DOMAIN-WILDCARD" => match wildcard_regex(value) {
+                    Ok(re) => RuleKind::DomainWildcard(re),
+                    Err(_) => return None,
+                },
+                "GEOIP" => {
+                    let code = value.trim().to_ascii_uppercase();
+                    // 当前只带 CN IP 库；没有 GeoIP 数据库时不能把其他地区猜成不匹配。
+                    if code != "CN" {
+                        logging::warn("rule", format!("跳过未实现 GEOIP {}（仅 CN 可用）", code));
+                        return None;
+                    }
+                    RuleKind::GeoIp(code)
+                }
+                "IP-CIDR" | "IP-CIDR6" => match value.parse::<IpNet>() {
+                    Ok(net) => RuleKind::IpCidr(net),
+                    Err(_) => return None,
+                },
+                "PORT" | "DST-PORT" => match value.parse::<u16>() {
+                    Ok(p) => RuleKind::Port(p),
+                    Err(_) => return None,
+                },
+                "PROTOCOL" => match value.trim().to_ascii_uppercase().as_str() {
+                    "TCP" => RuleKind::Protocol(ConnKind::Tcp),
+                    "UDP" => RuleKind::Protocol(ConnKind::Udp),
+                    other => {
+                        logging::warn(
+                            "rule",
+                            format!("拒绝 PROTOCOL 值 {}（仅支持 TCP/UDP）", other),
+                        );
+                        return None;
+                    }
+                },
+                "FINAL" | "MATCH" => RuleKind::Final,
+                // 这些规则依赖 Android 进程/UID 数据源。UID 数值规则可直接用；
+                // 包名类规则由壳层解析成 UID 后再下发，内核侧不再重复实现一套包名表。
+                "UID" => match value.trim().parse::<u32>() {
+                    Ok(u) => RuleKind::Uid(u),
+                    Err(_) => {
+                        logging::warn(
+                            "rule",
+                            format!("拒绝 UID 规则值 {}：不是合法整数", value),
+                        );
+                        return None;
+                    }
+                },
+                "PROCESS-NAME" | "PROCESS-PATH" | "APP" | "APP-NAME" => {
+                    logging::warn(
+                        "rule",
+                        format!(
+                            "拒绝 {} 规则 {}：包名类规则需先由壳层解析成 UID 规则",
+                            kind, value
+                        ),
+                    );
+                    return None;
+                }
+                _ => {
+                    logging::warn(
+                        "rule",
+                        format!("拒绝未实现规则类型 {}（值 {}）", kind, value),
+                    );
+                    return None;
+                }
+                })
+}
+
+/// 叶子规则值归一化：与加载期旧逻辑一致，热路径不再重复分配。
+fn normalize_leaf_value(kind: &RuleKind, value: &str) -> String {
+    match kind {
+        RuleKind::Domain => normalize_domain(value),
+        RuleKind::DomainSuffix => value.trim().trim_start_matches('.').to_ascii_lowercase(),
+        RuleKind::DomainKeyword => value.trim().to_ascii_lowercase(),
+        RuleKind::Protocol(_) => value.trim().to_ascii_uppercase(),
+        RuleKind::Script(_) => value.trim().to_string(),
+        _ => value.to_string(),
+    }
+}
+
+/// 顶层逗号切分（尊重圆括号嵌套与双引号），用于逻辑表达式子项。
+fn split_top_level(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut quoted = false;
+    let mut cur = String::new();
+    for ch in s.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                cur.push(ch);
+            }
+            '(' if !quoted => {
+                depth += 1;
+                cur.push(ch);
+            }
+            ')' if !quoted => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            ',' if !quoted && depth == 0 => {
+                out.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
+/// 解析逻辑表达式值：`((KIND,v),(KIND,v),...)`，子项可再嵌套逻辑。
+fn parse_logic_terms(value: &str, depth: usize) -> Result<Vec<LogicTerm>, ()> {
+    if depth > 8 {
+        return Err(());
+    }
+    let v = value.trim();
+    if !v.starts_with('(') || !v.ends_with(')') {
+        return Err(());
+    }
+    let inner = &v[1..v.len() - 1];
+    let items = split_top_level(inner);
+    if items.is_empty() {
+        return Err(());
+    }
+    let mut terms = Vec::new();
+    for item in items {
+        if !item.starts_with('(') || !item.ends_with(')') {
+            return Err(());
+        }
+        let inner2 = &item[1..item.len() - 1];
+        let Some((k, rest)) = inner2.split_once(',') else {
+            return Err(());
+        };
+        let k = k.trim().to_ascii_uppercase();
+        let rest = rest.trim();
+        let kind = match k.as_str() {
+            "AND" | "OR" | "NOT" => {
+                let sub = parse_logic_terms(rest, depth + 1)?;
+                let op = match k.as_str() {
+                    "AND" => LogicOp::And,
+                    "OR" => LogicOp::Or,
+                    _ => LogicOp::Not,
+                };
+                if op == LogicOp::Not && sub.len() != 1 {
+                    return Err(());
+                }
+                if sub.is_empty() {
+                    return Err(());
+                }
+                RuleKind::Logic(op, sub)
+            }
+            "SCRIPT" => {
+                if rest.is_empty() || rest.contains(char::is_whitespace) {
+                    return Err(());
+                }
+                RuleKind::Script(rest.to_string())
+            }
+            _ => parse_leaf_kind(&k, rest).ok_or(())?,
+        };
+        let value = normalize_leaf_value(&kind, rest);
+        terms.push(LogicTerm { kind, value });
+    }
+    Ok(terms)
 }
 
 fn wildcard_regex(value: &str) -> Result<Regex, regex::Error> {
@@ -1692,4 +1984,106 @@ mod tests {
         let engine = RuleEngine::from_config(&cfg);
         assert!(matches!(engine.decide_input(&flagged_input("a.example.com")).0, Action::Direct));
     }
+    fn logic_cfg() -> Config {
+        let mut cfg = Config::default();
+        cfg.rules = vec![
+            crate::config::RuleConf {
+                kind: "AND".into(),
+                value: "((DOMAIN-SUFFIX,ads.com),(PORT,443))".into(),
+                action: "BLOCK".into(),
+                source: None,
+                meta: None,
+            },
+            crate::config::RuleConf {
+                kind: "OR".into(),
+                value: "((DOMAIN-KEYWORD,tracker),(DOMAIN-SUFFIX,analytics.io))".into(),
+                action: "BLOCK".into(),
+                source: None,
+                meta: None,
+            },
+            crate::config::RuleConf {
+                kind: "NOT".into(),
+                value: "((DOMAIN-SUFFIX,good.com))".into(),
+                action: "DIRECT".into(),
+                source: None,
+                meta: None,
+            },
+        ];
+        cfg
+    }
+
+    #[test]
+    fn logic_and_or_not_match() {
+        let engine = RuleEngine::from_config(&logic_cfg());
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let hit = MatchInput { domain: Some("x.ads.com"), ip, port: 443, kind: ConnKind::Tcp, uid: None };
+        assert!(matches!(engine.decide_input(&hit).0, Action::Block), "AND 两子项同时满足应拦截");
+        let miss_port = MatchInput { domain: Some("x.ads.com"), ip, port: 80, kind: ConnKind::Tcp, uid: None };
+        assert!(matches!(engine.decide_input(&miss_port).0, Action::Direct), "AND 端口不满足落到 NOT 直连");
+        let or_hit = MatchInput { domain: Some("t.analytics.io"), ip, port: 80, kind: ConnKind::Tcp, uid: None };
+        assert!(matches!(engine.decide_input(&or_hit).0, Action::Block), "OR 任一子项满足应拦截");
+        let good = MatchInput { domain: Some("a.good.com"), ip, port: 80, kind: ConnKind::Tcp, uid: None };
+        assert!(!matches!(engine.decide_input(&good).0, Action::Block), "NOT 命中 good.com 时不应拦截");
+        assert!(!matches!(engine.decide_input(&good).0, Action::Direct), "NOT 子项命中时整条不命中");
+    }
+
+    #[test]
+    fn logic_nested_expression() {
+        let mut cfg = Config::default();
+        cfg.rules = vec![crate::config::RuleConf {
+            kind: "AND".into(),
+            value: "((OR,((DOMAIN-SUFFIX,a.com),(DOMAIN-SUFFIX,b.com))),(NOT,((DOMAIN,skip.a.com))))".into(),
+            action: "BLOCK".into(),
+            source: None,
+            meta: None,
+        }];
+        let engine = RuleEngine::from_config(&cfg);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let hit = MatchInput { domain: Some("x.b.com"), ip, port: 443, kind: ConnKind::Tcp, uid: None };
+        assert!(matches!(engine.decide_input(&hit).0, Action::Block));
+        let skipped = MatchInput { domain: Some("skip.a.com"), ip, port: 443, kind: ConnKind::Tcp, uid: None };
+        assert!(!matches!(engine.decide_input(&skipped).0, Action::Block), "嵌套 NOT 应排除精确域名");
+    }
+
+    #[test]
+    fn logic_invalid_expression_skipped() {
+        let mut cfg = Config::default();
+        cfg.rules = vec![crate::config::RuleConf {
+            kind: "AND".into(),
+            value: "((DOMAIN,a.com)".into(),
+            action: "BLOCK".into(),
+            source: None,
+            meta: None,
+        }];
+        let engine = RuleEngine::from_config(&cfg);
+        assert_eq!(engine.rule_count, 1, "非法逻辑表达式整条跳过，只留自动 FINAL");
+    }
+
+    #[test]
+    fn script_rule_matches_via_match_fn() {
+        let mut cfg = Config::default();
+        cfg.mitm.scripts = vec![serde_json::from_value(serde_json::json!({
+            "name": "adjudge",
+            "source": "function match(ctx){return !!ctx.domain && ctx.domain.endsWith('ads.io');}"
+        })).unwrap()];
+        cfg.rules = vec![crate::config::RuleConf {
+            kind: "SCRIPT".into(),
+            value: "adjudge".into(),
+            action: "BLOCK".into(),
+            source: None,
+            meta: None,
+        }];
+        let engine = RuleEngine::from_config(&cfg);
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let hit = MatchInput { domain: Some("x.ads.io"), ip, port: 443, kind: ConnKind::Tcp, uid: None };
+        assert!(matches!(engine.decide_input(&hit).0, Action::Block), "脚本 match 返回 true 应拦截");
+        let miss = MatchInput { domain: Some("good.com"), ip, port: 443, kind: ConnKind::Tcp, uid: None };
+        assert!(!matches!(engine.decide_input(&miss).0, Action::Block), "脚本 match 返回 false 不拦截");
+        let no_script = MatchInput { domain: Some("x.ads.io"), ip, port: 443, kind: ConnKind::Tcp, uid: None };
+        let mut cfg2 = cfg.clone();
+        cfg2.mitm.scripts.clear();
+        let engine2 = RuleEngine::from_config(&cfg2);
+        assert!(!matches!(engine2.decide_input(&no_script).0, Action::Block), "脚本缺失时 SCRIPT 规则不命中");
+    }
+
 }

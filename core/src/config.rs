@@ -59,6 +59,12 @@ pub struct Config {
     /// 对 TCP 连接嗅探 TLS SNI / HTTP Host；443 优先使用 SNI，不依赖 DNS 反向映射。
     #[serde(default = "default_true")]
     pub sniff: bool,
+    /// IPv6 总开关：false 时壳层不建 v6 TUN 地址/路由，内核等效关闭 AAAA。
+    #[serde(default = "default_true")]
+    pub ipv6: bool,
+    /// prefer-ipv6：直连候选地址 v6 优先（默认 v4 优先保可达）。
+    #[serde(default)]
+    pub prefer_ipv6: bool,
     /// 当前配置的域名后缀绕过列表，优先于普通分流规则直连。
     #[serde(default)]
     pub skip_proxy: Vec<String>,
@@ -96,6 +102,8 @@ fn default_mtu() -> usize {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            ipv6: true,
+            prefer_ipv6: false,
             mode: default_mode(),
             dns: DnsConfig::default(),
             nodes: Vec::new(),
@@ -212,10 +220,20 @@ fn default_switch_interval() -> u64 {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DnsPolicyConf {
+    /// 后缀语义：裸域与 `*.` 前缀都匹配该域及其全部子域。
+    #[serde(default)]
+    pub pattern: String,
+    /// 逗号/换行分隔的上游列表，支持 udp/tcp/doh/dot 与 host:port。
+    #[serde(default)]
+    pub servers: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DnsConfig {
     #[serde(default = "default_upstream")]
     pub upstream: String,
-    #[serde(default = "default_fallback")]
+    #[serde(default)]
     pub fallback: String,
     #[serde(default)]
     pub bootstrap: String,
@@ -268,13 +286,16 @@ pub struct DnsConfig {
     /// 上游 NXDOMAIN 没有 SOA 时使用的保守负缓存 TTL，默认 30 秒。
     #[serde(default = "default_negative_ttl")]
     pub negative_ttl: u32,
+    /// Surge/Loon `[DNS]` 按域名策略：最长后缀命中者替换本次查询主上游（列表内有序重试）。
+    #[serde(default)]
+    pub policies: Vec<DnsPolicyConf>,
+    /// hijack-dns：TUN 内全部 :53（UDP+TCP）接管到本地解析；false 时 53 走正常路由。
+    #[serde(default = "default_true")]
+    pub hijack: bool,
 }
 
 fn default_upstream() -> String {
     "https://dns.alidns.com/dns-query".into()
-}
-fn default_fallback() -> String {
-    "223.5.5.5".into()
 }
 fn default_cache_ttl() -> u32 {
     600
@@ -292,8 +313,10 @@ fn default_negative_ttl() -> u32 {
 impl Default for DnsConfig {
     fn default() -> Self {
         Self {
+            policies: Vec::new(),
+            hijack: true,
             upstream: default_upstream(),
-            fallback: default_fallback(),
+            fallback: String::new(),
             bootstrap: String::new(),
             headers: Default::default(),
             hosts: Default::default(),

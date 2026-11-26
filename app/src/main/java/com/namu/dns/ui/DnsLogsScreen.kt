@@ -91,8 +91,8 @@ fun DnsLogsScreen() {
         Row(
             Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 6.dp)
-                .clip(RoundedCornerShape(NamuTokens.RadiusControl))
+                .padding(horizontal = NamuTokens.Space16, vertical = 6.dp)
+                .clip(RoundedCornerShape(NamuTokens.RadiusCard))
                 .background(NamuColors.Card)
                 .padding(horizontal = 14.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -156,7 +156,7 @@ fun DnsLogsScreen() {
                 state = listState,
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(horizontal = 12.dp)
+                    .padding(horizontal = NamuTokens.Space16)
                     .clip(RoundedCornerShape(NamuTokens.RadiusCard))
                     .background(NamuColors.Card),
                 contentPadding = PaddingValues(vertical = 4.dp),

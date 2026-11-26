@@ -575,7 +575,13 @@ data class RuleSource(
     val lastAttemptAt: Long = 0L,
     /** 本次同步失败但仍有上一份可用缓存时置 true。 */
     val stale: Boolean = false,
+    /** HTTP 304：本次同步未变化，复用本地缓存。 */
+    val notModified: Boolean = false,
     val cacheBytes: Long = 0L,
+    /** 3.0.18：迁移来源方案名；空 = 全局/当前方案导入。 */
+    val origin: String = "",
+    /** 3.0.18：全局显示/合并顺序；-1 = 旧数据按导入序兜底。 */
+    val order: Int = -1,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id)
@@ -589,7 +595,10 @@ data class RuleSource(
         put("lastModified", lastModified)
         put("lastAttemptAt", lastAttemptAt)
         put("stale", stale)
+        put("notModified", notModified)
         put("cacheBytes", cacheBytes)
+        if (origin.isNotBlank()) put("origin", origin)
+        if (order >= 0) put("order", order)
     }
 
     companion object {
@@ -605,7 +614,10 @@ data class RuleSource(
             lastModified = o.optString("lastModified", ""),
             lastAttemptAt = o.optLong("lastAttemptAt", 0L),
             stale = o.optBoolean("stale", false),
+            notModified = o.optBoolean("notModified", false),
             cacheBytes = o.optLong("cacheBytes", 0L),
+            origin = o.optString("origin", ""),
+            order = o.optInt("order", -1),
         )
     }
 }
@@ -639,6 +651,12 @@ data class ModuleSource(
     val order: Int = -1,
     /** null 表示旧记录，可从已缓存的模块原文读取。空字符串表示模块未声明图标。 */
     val iconUrl: String? = null,
+    /** 3.0.18：迁移来源方案名；空 = 全局/当前方案导入。 */
+    val origin: String = "",
+    /** 3.0.18：模块附带 DNS 参数经导入预览确认后才合并进 DNS 配置。 */
+    val dnsApproved: Boolean = false,
+    /** 3.0.18：最近一次同步命中 HTTP 304，列表显示「已是最新」。 */
+    val notModified: Boolean = false,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("id", id)
@@ -661,6 +679,9 @@ data class ModuleSource(
         put("cacheBytes", cacheBytes)
         if (order >= 0) put("order", order)
         iconUrl?.let { put("iconUrl", it) }
+        if (origin.isNotBlank()) put("origin", origin)
+        put("dnsApproved", dnsApproved)
+        put("notModified", notModified)
     }
 
     companion object {
@@ -685,6 +706,9 @@ data class ModuleSource(
             cacheBytes = o.optLong("cacheBytes", 0L),
             order = o.optInt("order", -1),
             iconUrl = if (o.isNull("iconUrl")) null else o.optString("iconUrl"),
+            origin = o.optString("origin", ""),
+            dnsApproved = o.optBoolean("dnsApproved", false),
+            notModified = o.optBoolean("notModified", false),
         )
     }
 }
@@ -731,6 +755,8 @@ data class AppConfig(
     var dnsBootstrap: String = "",
     var dnsHeaderName: String = "",
     var dnsHeaderValue: String = "",
+    var dnsPolicies: List<com.namu.dns.core.config.DnsPolicyRule> = emptyList(),
+    var dnsHijack: Boolean? = null,
     var dnsCacheTtl: Int = 600,
     /** 本地拦截 NXDOMAIN 的 SOA/缓存 TTL（秒）。 */
     var blockTtl: Int = 60,
@@ -762,6 +788,12 @@ data class AppConfig(
     var blockWhenNoNode: Boolean = true,
     var fakeIp: Boolean = false,
     var blockAaaa: Boolean = false,
+    /** IPv6 总开关；null = 未设置（跟随模块/默认开）。 */
+    var ipv6: Boolean? = null,
+    /** prefer-ipv6；null = 未设置（跟随模块/默认关）。 */
+    var preferIpv6: Boolean? = null,
+    /** always-real-ip / fake-ip-filter：Fake-IP 排除名单（后缀语义）。 */
+    var alwaysRealIp: List<String> = emptyList(),
     var sniff: Boolean = true,
     var autoSelectNode: Boolean = false,
     var autoClearLogs: Boolean = true,
@@ -821,6 +853,10 @@ data class AppConfig(
         put("dnsBootstrap", dnsBootstrap)
         put("dnsHeaderName", dnsHeaderName)
         put("dnsHeaderValue", dnsHeaderValue)
+        put("dnsPolicies", JSONArray().apply {
+            dnsPolicies.forEach { put(JSONObject().put("pattern", it.pattern).put("servers", it.servers)) }
+        })
+        dnsHijack?.let { put("dnsHijack", it) }
         put("dnsCacheTtl", dnsCacheTtl)
         put("blockTtl", blockTtl)
         put("fallbackFilter", fallbackFilter)
@@ -847,6 +883,9 @@ data class AppConfig(
         put("blockWhenNoNode", blockWhenNoNode)
         put("fakeIp", fakeIp)
         put("blockAaaa", blockAaaa)
+        ipv6?.let { put("ipv6", it) }
+        preferIpv6?.let { put("preferIpv6", it) }
+        put("alwaysRealIp", JSONArray(alwaysRealIp))
         put("dnsOnlyFullRoute", dnsOnlyFullRoute)
         put("quicFallback", quicFallback)
         put("mtu", mtu)
@@ -888,12 +927,12 @@ data class AppConfig(
     companion object {
         private val KNOWN_JSON_KEYS = setOf(
             "mode", "selected", "nodes", "dnsUpstream", "dnsFallback", "dnsBootstrap",
-            "dnsHeaderName", "dnsHeaderValue", "dnsCacheTtl", "blockTtl", "fallbackFilter",
+            "dnsHeaderName", "dnsHeaderValue", "dnsPolicies", "dnsHijack", "dnsCacheTtl", "blockTtl", "fallbackFilter",
             "fallbackGeoCheck", "dnsQueryLog", "skipProxyHosts", "remoteConfigUrl", "remoteConfigName",
             "remoteConfigUpdatedAt", "remoteConfigInterval", "ruleSources", "moduleSources",
             "blockEnabled", "blockMode", "cnDirect", "finalPolicy", "subscription", "rulesUrl",
             "customAds", "autoUpdateRules", "financeProtect", "rulesUpdatedAt", "allowDnsFallback", "blockWhenNoNode",
-            "fakeIp", "blockAaaa", "sniff", "autoSelectNode", "autoClearLogs",
+            "fakeIp", "blockAaaa", "ipv6", "preferIpv6", "alwaysRealIp", "sniff", "autoSelectNode", "autoClearLogs",
             "autoDisablePrivateDns", "themeMode", "autoConnect", "pingMethod", "subscriptionInfo",
             "hitHistoryEnabled", "ssidTriggerEnabled", "ssidTriggerNames", "ssidLocationOptIn",
             "caLastRemovalAt", "caLastRemovalCleared", "caLastRemovalFailed", "caLastRemovalFailedNs",
@@ -969,6 +1008,15 @@ data class AppConfig(
                     dnsBootstrap = o.optString("dnsBootstrap", def.dnsBootstrap),
                     dnsHeaderName = o.optString("dnsHeaderName", def.dnsHeaderName),
                     dnsHeaderValue = o.optString("dnsHeaderValue", def.dnsHeaderValue),
+                    dnsPolicies = o.optJSONArray("dnsPolicies")?.let { arr ->
+                        (0 until arr.length()).mapNotNull { i ->
+                            val po = arr.optJSONObject(i) ?: return@mapNotNull null
+                            val pp = po.optString("pattern").trim()
+                            val ps = po.optString("servers").trim()
+                            if (pp.isBlank() || ps.isBlank()) null else com.namu.dns.core.config.DnsPolicyRule(pp, ps)
+                        }
+                    } ?: def.dnsPolicies,
+                    dnsHijack = if (o.has("dnsHijack")) o.optBoolean("dnsHijack") else def.dnsHijack,
                     dnsCacheTtl = o.optInt("dnsCacheTtl", def.dnsCacheTtl).coerceIn(30, 86400),
                     blockTtl = o.optInt("blockTtl", def.blockTtl).coerceIn(5, 600),
                     fallbackFilter = o.optBoolean("fallbackFilter", true),
@@ -998,6 +1046,11 @@ data class AppConfig(
                     blockWhenNoNode = o.optBoolean("blockWhenNoNode", true),
                     fakeIp = o.optBoolean("fakeIp", false),
                     blockAaaa = o.optBoolean("blockAaaa", false),
+                    ipv6 = if (o.has("ipv6")) o.optBoolean("ipv6") else def.ipv6,
+                    preferIpv6 = if (o.has("preferIpv6")) o.optBoolean("preferIpv6") else def.preferIpv6,
+                    alwaysRealIp = o.optJSONArray("alwaysRealIp")?.let { arr ->
+                        (0 until arr.length()).map { arr.optString(it).trim() }.filter { it.isNotBlank() }
+                    } ?: def.alwaysRealIp,
                     dnsOnlyFullRoute = o.optBoolean("dnsOnlyFullRoute", true),
                     quicFallback = o.optBoolean("quicFallback", true),
                     mtu = o.optInt("mtu", 9000).coerceIn(1280, 9000),
@@ -1054,4 +1107,69 @@ private fun parseMitmHosts(arr: JSONArray?): List<MitmHostRow> {
         )
     }
     return out
+}
+
+/** 逻辑规则类型集合（AND/OR/NOT），壳层解析/编辑/校验共用。 */
+internal val ruleLogicKinds = setOf("AND", "OR", "NOT")
+
+private val logicLeafKinds = setOf(
+    "DOMAIN", "DOMAIN-SUFFIX", "DOMAIN-KEYWORD", "DOMAIN-REGEX", "DOMAIN-WILDCARD",
+    "IP-CIDR", "IP-CIDR6", "GEOIP", "PORT", "DST-PORT", "PROTOCOL", "UID",
+)
+
+/** 顶层逗号切分：尊重圆括号嵌套与双引号，与内核 split_top_level 同语义。 */
+internal fun splitLogicTopLevel(s: String): List<String> {
+    val out = mutableListOf<String>()
+    var depth = 0
+    var quoted = false
+    val cur = StringBuilder()
+    for (ch in s) {
+        when {
+            ch == '"' -> { quoted = !quoted; cur.append(ch) }
+            ch == '(' && !quoted -> { depth++; cur.append(ch) }
+            ch == ')' && !quoted -> { depth--; cur.append(ch) }
+            ch == ',' && !quoted && depth == 0 -> { out.add(cur.toString().trim()); cur.clear() }
+            else -> cur.append(ch)
+        }
+    }
+    if (cur.toString().trim().isNotEmpty()) out.add(cur.toString().trim())
+    return out
+}
+
+/** 按规则类型校验逻辑值：表达式合法且 NOT 顶层恰好一个子项（与内核加载期一致）。 */
+internal fun ruleLogicValueOk(type: String, raw: String): Boolean {
+    if (!ruleLogicExprOk(raw)) return false
+    if (type != "NOT") return true
+    val v = raw.trim()
+    return splitLogicTopLevel(v.substring(1, v.length - 1)).size == 1
+}
+
+/** 逻辑表达式校验：`((KIND,值),...)`，子项可嵌套逻辑/SCRIPT；深度 ≤ 8，NOT 恰好一个子项。 */
+internal fun ruleLogicExprOk(raw: String, depth: Int = 0): Boolean {
+    if (depth > 8) return false
+    val v = raw.trim()
+    if (!v.startsWith("(") || !v.endsWith(")")) return false
+    val items = splitLogicTopLevel(v.substring(1, v.length - 1))
+    if (items.isEmpty()) return false
+    for (item in items) {
+        if (!item.startsWith("(") || !item.endsWith(")")) return false
+        val inner = item.substring(1, item.length - 1)
+        val idx = inner.indexOf(',')
+        if (idx <= 0) return false
+        val k = inner.substring(0, idx).trim().uppercase()
+        val rest = inner.substring(idx + 1).trim()
+        when {
+            k in ruleLogicKinds -> {
+                if (!rest.startsWith("(") || !rest.endsWith(")")) return false
+                val sub = splitLogicTopLevel(rest.substring(1, rest.length - 1))
+                if (sub.isEmpty()) return false
+                if (k == "NOT" && sub.size != 1) return false
+                if (!ruleLogicExprOk(rest, depth + 1)) return false
+            }
+            k == "SCRIPT" -> if (rest.isEmpty() || rest.any { it.isWhitespace() }) return false
+            k in logicLeafKinds -> if (rest.isEmpty()) return false
+            else -> return false
+        }
+    }
+    return true
 }

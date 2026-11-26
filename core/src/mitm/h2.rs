@@ -1065,65 +1065,55 @@ async fn copy_response(
             .engine
             .scripts
             .has_phase(&script_url, ScriptPhase::Response);
-    let has_body_ops =
-        !body_rules.is_empty() || (!grpc_body && !response_body_ops.is_empty()) || response_scripts;
-    let would_rewrite = has_body_ops
+    let wants_rewrite = (response_body_rewrite || response_scripts)
+        && !streaming
         && !is_head
-        && (parts.status == http::StatusCode::OK || response_scripts)
-        && (grpc_body || text_like);
-    // 大响应提前直通：非文本且没有二进制脚本、或 Content-Length 超过 2 MiB。
-    let early_bypass = if would_rewrite && !grpc_body {
-        super::body_bypass_reason(text_like, binary_response_scripts, content_length, limit)
-    } else {
-        None
-    };
-    if let Some(reason) = early_bypass {
+        && (parts.status == http::StatusCode::OK || response_scripts);
+    let bypass = |reason| {
         ctx.stats.mitm_body_bypassed.fetch_add(1, Ordering::Relaxed);
         logging::info(
             "mitm",
-            format!(
-                "#{} {} {} h2 正文提前直通（{}，{} 字节）",
-                conn_id,
-                host,
-                http1_redact(path),
-                match reason {
-                    super::BodyBypass::NonText => "非文本",
-                    super::BodyBypass::TooLarge => "超过 2MiB",
-                },
-                content_length
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "chunked".into())
-            ),
+            format!("#{} {} {} h2 正文直通（{}）", conn_id, host, http1_redact(path), reason),
         );
-        let head = response_head(parts.status, &parts.headers)?;
-        let mut send = responder.send(head, false)?;
-        stream_response_body(body, &mut send).await?;
-        return Ok(());
-    }
-    let can_rewrite = would_rewrite
-        && content_length
-            .map(|n| n <= limit.min(super::BODY_PASSTHROUGH_LIMIT))
-            .unwrap_or(true);
-    // 多流同时改写会叠加「原文 + 解压 + 改写」三份缓冲区；额度不足时直接流式透传。
-    let rewrite_permit = if can_rewrite {
-        // gRPC 需要帧重组 + protobuf 递归，按完整三份上限预留；
-        // 普通文本响应按实际未压缩长度预留，允许更多小响应并行。
-        let reservation = if grpc_body {
-            limit.saturating_mul(super::REWRITE_BUFFER_COPIES)
-        } else {
-            rewrite_reservation(content_length, &encoding, limit)
-        };
-        state.rewrite_budget.try_acquire(reservation)
+    };
+    let rewrite_permit = if wants_rewrite {
+        match super::body_bypass_reason(
+            text_like || grpc_body,
+            response_scripts && binary_response_scripts,
+            content_length,
+            limit,
+        ) {
+            Some(super::BodyBypass::NonText) => {
+                bypass("非文本");
+                None
+            }
+            Some(super::BodyBypass::TooLarge) => {
+                bypass("原始正文超限");
+                None
+            }
+            None => {
+                let reservation = if grpc_body {
+                    limit.saturating_mul(super::REWRITE_BUFFER_COPIES)
+                } else {
+                    rewrite_reservation(content_length, &encoding, limit)
+                };
+                let permit = state.rewrite_budget.try_acquire(reservation);
+                if permit.is_none() {
+                    bypass("并行改写内存预算不足");
+                }
+                permit
+            }
+        }
     } else {
         None
     };
-    let can_rewrite = can_rewrite && rewrite_permit.is_some();
-    if !can_rewrite {
+    let Some(rewrite_permit) = rewrite_permit else {
         let head = response_head(parts.status, &parts.headers)?;
         let mut send = responder.send(head, false)?;
         stream_response_body(body, &mut send).await?;
         return Ok(());
-    }
+    };
+    let limit = limit.min(super::BODY_PASSTHROUGH_LIMIT);
 
     // DATA 帧重组：只对命中 body 规则的小响应缓冲，超过 limit 立即
     // 回退为「已收原始字节 + 剩余流式转发」，不把正文读进无界内存。
@@ -1145,7 +1135,7 @@ async fn copy_response(
     if overflow {
         // 已决定回退流式透传，立即释放改写额度，别让长响应占着预算。
         drop(rewrite_permit);
-        ctx.stats.mitm_body_bypassed.fetch_add(1, Ordering::Relaxed);
+        bypass("原始正文超限");
         let head = response_head(parts.status, &parts.headers)?;
         let mut send = responder.send(head, false)?;
         send_chunked(&mut send, Bytes::from(raw)).await?;
@@ -1163,6 +1153,7 @@ async fn copy_response(
             Some((body, changed)) => (body, changed, true),
             None => {
                 drop(rewrite_permit);
+                bypass("无法改写 gRPC 帧或改写后超限");
                 let head = response_head(parts.status, &parts.headers)?;
                 let mut send = responder.send(head, false)?;
                 send_buffered(&mut send, Bytes::from(raw), trailers).await?;
@@ -1171,47 +1162,24 @@ async fn copy_response(
         }
     } else {
         // 普通文本响应：解压 + 复用 rewrite 引擎。br/zstd 或解压超限时原样透传。
-        let plain = match super::http1::decode_content_limited(&raw, &encoding, limit) {
-            Some(v) => v,
-            None => {
-                drop(rewrite_permit);
-                let head = response_head(parts.status, &parts.headers)?;
-                let mut send = responder.send(head, false)?;
-                send_buffered(&mut send, Bytes::from(raw), trailers).await?;
-                return Ok(());
-            }
+        let Some(plain) = super::http1::decode_content_limited(&raw, &encoding, limit) else {
+            drop(rewrite_permit);
+            bypass("无法解码正文或解压后超限");
+            let head = response_head(parts.status, &parts.headers)?;
+            let mut send = responder.send(head, false)?;
+            send_buffered(&mut send, Bytes::from(raw), trailers).await?;
+            return Ok(());
         };
-        let surge_out = if body_rules.is_empty() {
-            Some((plain.clone(), false))
-        } else {
-            super::rewrite::apply_body_rules_limited(&plain, body_rules, limit)
+        let Some((new_body, changed)) =
+            super::rewrite_response_body(plain, body_rules, &response_body_ops, limit)
+        else {
+            drop(rewrite_permit);
+            bypass("改写后正文超限");
+            let head = response_head(parts.status, &parts.headers)?;
+            let mut send = responder.send(head, false)?;
+            send_buffered(&mut send, Bytes::from(raw), trailers).await?;
+            return Ok(());
         };
-        let loon_out = if response_body_ops.is_empty() {
-            Some((
-                surge_out
-                    .as_ref()
-                    .map(|(b, _)| b.clone())
-                    .unwrap_or_default(),
-                false,
-            ))
-        } else {
-            let base = surge_out
-                .as_ref()
-                .map(|(b, _)| b.as_slice())
-                .unwrap_or(&plain);
-            loon::apply_body_ops(base, &response_body_ops.iter().collect::<Vec<_>>(), limit)
-        };
-        let (new_body, loon_changed) = match loon_out {
-            Some(v) => v,
-            None => {
-                drop(rewrite_permit);
-                let head = response_head(parts.status, &parts.headers)?;
-                let mut send = responder.send(head, false)?;
-                send_buffered(&mut send, Bytes::from(raw), trailers).await?;
-                return Ok(());
-            }
-        };
-        let changed = surge_out.map(|(_, c)| c).unwrap_or(false) || loon_changed;
         (new_body, changed, false)
     };
     let mut status_out = parts.status;

@@ -131,11 +131,12 @@ internal object UidTablePublisher {
  * 金融保护里的整包排除依赖静态 UID，但微信/支付宝这类 mixed 包的关键字排除
  * 仍要动态 client_uid，所以 MITM 开启且金融保护开启时算真实消费者。
  */
-internal fun needsUidMap(cfg: AppConfig): Boolean {
-    val appRules = cfg.rules.any { AppUidResolver.isAppRule(it) }
-    val perAppMitm = cfg.mitm.enabled &&
-        cfg.mitm.appMode != "all" &&
-        cfg.mitm.apps.isNotEmpty()
-    val financeUid = cfg.mitm.enabled && cfg.financeProtect
+internal fun needsUidMap(cfg: AppConfig, global: GlobalRuleStore.State = GlobalRuleStore.state): Boolean {
+    val scope = global.scope
+    val appRules = global.localRulesEnabled && global.localRules.any {
+        it.enabled && AppUidResolver.isAppRule(it)
+    }
+    val perAppMitm = scope.enabled && scope.appMode != "all" && scope.apps.isNotEmpty()
+    val financeUid = scope.enabled && cfg.financeProtect
     return appRules || perAppMitm || financeUid
 }

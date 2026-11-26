@@ -310,7 +310,8 @@ async fn direct(target: &Target, dns: Option<&Arc<DnsEngine>>) -> io::Result<Box
                 .ok_or_else(|| io_err(format!("直连解析 {} 失败", domain)))?,
             None => resolve_all(domain, target.port).await?,
         };
-        connect_any(&addrs).await?
+        let prefer = dns.map(|d| d.prefer_ipv6()).unwrap_or(false);
+        connect_any_with_pref(&addrs, prefer).await?
     } else {
         // 已有真实 IP 就直接连该地址，不再重复解析（避免连到 CDN 的另一个节点）
         connect_any(&[SocketAddr::new(target.ip, target.port)]).await?
@@ -541,11 +542,20 @@ async fn race_two(a: SocketAddr, b: SocketAddr) -> io::Result<TcpStream> {
 }
 
 pub async fn connect_any(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
-    // v4 优先（stable sort，同族内保持原顺序）：竞速名额只有两个，
-    // 若按 getaddrinfo 原序取前两个，可能全是不可达 v6（含污染结果），
-    // 可用 v4 被挤在名额外，只能白等超时后失败。
+    connect_any_with_pref(addrs, false).await
+}
+
+/// 候选地址排序：默认 v4 优先（stable sort，同族内保持原顺序）——竞速名额只有两个，
+/// 若按 getaddrinfo 原序取前两个，可能全是不可达 v6（含污染结果），
+/// 可用 v4 被挤在名额外，只能白等超时后失败。prefer-ipv6 开启时反转族优先级。
+pub fn order_candidates(addrs: &[SocketAddr], prefer_v6: bool) -> Vec<SocketAddr> {
     let mut ordered: Vec<SocketAddr> = addrs.to_vec();
-    ordered.sort_by_key(|a| a.is_ipv6());
+    ordered.sort_by_key(|a| if prefer_v6 { !a.is_ipv6() } else { a.is_ipv6() });
+    ordered
+}
+
+pub async fn connect_any_with_pref(addrs: &[SocketAddr], prefer_v6: bool) -> io::Result<TcpStream> {
+    let ordered = order_candidates(addrs, prefer_v6);
     let cands: Vec<SocketAddr> = ordered.iter().take(2).copied().collect();
     match cands.as_slice() {
         [] => Err(io_err("没有可用地址")),
@@ -1044,5 +1054,21 @@ mod keepalive_tests {
         assert!(UPSTREAM_KEEPALIVE_PROBES >= 3);
         // 判死不能拖回默认 TCP 的 15 分钟：手机切网后中继必须尽快释放。
         assert!(UPSTREAM_USER_TIMEOUT_MS <= 180_000);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn order_candidates_respects_prefer_ipv6() {
+        let v4: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let v6: SocketAddr = "[2606:4700::1111]:443".parse().unwrap();
+        let addrs = [v6, v4];
+        assert_eq!(order_candidates(&addrs, false)[0], v4, "默认 v4 优先");
+        assert_eq!(order_candidates(&addrs, true)[0], v6, "prefer-ipv6 时 v6 优先");
+        let same = [v4, "8.8.8.8:443".parse().unwrap()];
+        assert_eq!(order_candidates(&same, true), same.to_vec(), "同族保持原序");
     }
 }

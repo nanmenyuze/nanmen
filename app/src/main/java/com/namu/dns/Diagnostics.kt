@@ -50,6 +50,9 @@ object Diagnostics {
         sb.appendLine("设备名：${runCatching { Build.DEVICE }.getOrDefault("")}")
         sb.appendLine()
 
+        sb.appendLine("===== 内核实际状态 =====")
+        ApplyCoordinator.kernelStateSummary(context).forEach { sb.appendLine(it) }
+        sb.appendLine()
         sb.appendLine("===== 运行状态 =====")
         sb.appendLine(
             when {
@@ -185,7 +188,8 @@ object Diagnostics {
             sb.appendLine(
                 "动态 UDP 目标：${statsJson.optLong("udpTargets")} 个（普通+DNS 合计数），" +
                     "预分配缓冲容量 ${formatBytes(statsJson.optLong("udpTargetBufKb") * 1024)}（物理页按实际流量提交）；" +
-                    "DNS 旧回包按 generation 丢弃 ${statsJson.optLong("dnsStaleReply")} 次",
+                    "DNS 旧回包按 generation 丢弃 ${statsJson.optLong("dnsStaleReply")} 次，" +
+                    "UDP DNS 并发已满丢弃 ${statsJson.optLong("dnsOverloadDropped")} 次",
             )
             sb.appendLine(
                 "TUN 发送：队列表满丢包 ${statsJson.optLong("tunTxDrop")}，backlog 溢出 ${statsJson.optLong("tunPendingDrop")}，" +

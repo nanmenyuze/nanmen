@@ -7,6 +7,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import com.namu.dns.ConfigFileStore
+import com.namu.dns.ApplyCoordinator
 import com.namu.dns.ConfigStore
 import com.namu.dns.DnsDefaultsMigration
 import com.namu.dns.MigrationReportStore
@@ -44,13 +45,11 @@ class AppContainer(val context: Context) {
         files = AndroidConfigFileGateway(context),
         onApplied = { cfg ->
             ConfigStore.rebuildModules(context, cfg)
-            if (NamuVpnService.isRunning()) NamuVpnService.reload(context)
+            ApplyCoordinator.requestApply(context, "配置保存")
         },
         onSwitched = { oldName, oldConfig, next ->
             ConfigStore.rebuildModules(context, next)
-            if (NamuVpnService.isRunning()) {
-                NamuVpnService.reloadProfile(context, settings.activeConfigName(), oldName, oldConfig)
-            }
+            ApplyCoordinator.requestProfileSwitch(context, settings.activeConfigName(), oldName, oldConfig)
         },
     )
     val nodes: NodeRepository = DefaultNodeRepository(settings)
@@ -75,7 +74,7 @@ class AppContainer(val context: Context) {
             ConfigFileStore.loadInto(context, active, settings.current())?.let { settings.set(it) }
         }
         DnsDefaultsMigration.apply(context, settings)
-        ConfigStore.ensureAssets(context, settings)
+        ConfigStore.ensureAssets(context, settings, config)
     }
 
     /** 服务状态切换后立即补一帧；JNI/JSON 解析始终在 IO，调用方可以在主线程安全触发。 */
