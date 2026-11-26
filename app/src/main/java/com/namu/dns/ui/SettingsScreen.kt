@@ -17,7 +17,6 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -34,16 +33,12 @@ import com.namu.dns.ConfigStore
 import com.namu.dns.GlobalRuleStore
 import com.namu.dns.CrashGuard
 import com.namu.dns.MigrationReportStore
-import com.namu.dns.MitmManager
 import com.namu.dns.NativeCore
 import com.namu.dns.core.LocalAppContainer
 import com.namu.dns.core.config.MitmConfig
 import com.namu.dns.core.config.ModuleGeneral
 import com.namu.dns.core.config.SsidTrigger
 import com.namu.dns.ui.viewmodel.SettingsViewModel
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import java.io.File
 import org.json.JSONObject
 
 
@@ -60,43 +55,12 @@ fun SettingsScreen(
     var showTheme by remember { mutableStateOf(false) }
     var showBackup by remember { mutableStateOf(false) }
     val context = LocalContext.current
-    // 与首页旧证书卡同款核验：只读系统证书目录比对 DER，不写任何状态。
-    val certificateStatus by produceState("读取中", context, GlobalRuleStore.state.scope.enabled) {
-        value = withContext(Dispatchers.IO) {
-            val caExists = MitmManager.caFile(context).exists()
-            val der = MitmManager.caDer(context)
-            val trusted = der != null && listOf(
-                File("/apex/com.android.conscrypt/cacerts"),
-                File("/system/etc/security/cacerts"),
-            ).any { dir ->
-                dir.listFiles()?.any { file ->
-                    file.isFile && file.name.endsWith(".0") &&
-                        MitmManager.systemCertDerMatches(file, der)
-                } == true
-            }
-            when {
-                trusted -> "已就绪"
-                caExists -> "未信任"
-                else -> "未生成"
-            }
-        }
-    }
 
     Column(
         Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
     ) {
         MainPageTopBar("设置")
         Spacer(Modifier.height(6.dp))
-        GroupCard {
-            SettingsRow(
-                title = "MITM 证书",
-                value = certificateStatus,
-                valueColor = if (certificateStatus == "已就绪") NamuColors.Green else NamuColors.TextSub,
-                chevron = true,
-                showDivider = false,
-                onClick = onOpenMitm,
-            )
-        }
         HttpsScopeSection(onOpenCertificate = onOpenMitm)
         Spacer(Modifier.height(20.dp))
         GroupCard {

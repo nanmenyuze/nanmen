@@ -44,9 +44,7 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.CornerRadius
@@ -54,7 +52,6 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.RoundRect
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.ClipOp
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
@@ -62,16 +59,12 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.graphics.drawscope.scale
-import androidx.compose.ui.graphics.drawscope.translate
-import androidx.compose.ui.graphics.layer.GraphicsLayer
 import androidx.compose.ui.graphics.layer.drawLayer
 import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.semantics.Role
@@ -93,11 +86,8 @@ import kotlinx.coroutines.launch
 internal fun GlassDock(
     tabs: List<MainTab>,
     selected: MainTab,
-    pageLayer: GraphicsLayer,
-    pageOrigin: () -> Offset,
     onSelect: (MainTab) -> Unit,
 ) {
-    var dockOrigin by remember { mutableStateOf(Offset.Zero) }
     val shape = RoundedCornerShape(32.dp)
     val labelsLayer = rememberGraphicsLayer()
     val currentSelect by rememberUpdatedState(onSelect)
@@ -166,7 +156,6 @@ internal fun GlassDock(
         Box(
             Modifier.widthIn(max = 340.dp).fillMaxWidth()
                 .shadow(8.dp, shape)
-                .onGloballyPositioned { dockOrigin = it.positionInRoot() }
                 .pointerInput(tabs, rtl) {
                     awaitEachGesture {
                         awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
@@ -212,24 +201,11 @@ internal fun GlassDock(
                     )
                 },
         ) {
-            Spacer(Modifier.matchParentSize().clip(shape).blur(2.5.dp).drawBehind {
-                val offset = pageOrigin() - dockOrigin
-                val dockCenter = Offset(size.width / 2, size.height / 2)
-                translate(offset.x, offset.y) {
-                    scale(1.04f, 1.04f, pivot = dockCenter) { drawLayer(pageLayer) }
-                }
-            })
+            // 实色表面：不再采样页面层，避免内容透过 Dock 形成穿影。
             Spacer(
                 Modifier.matchParentSize()
-                    .background(
-                        if (NamuColors.isDark) surface.copy(alpha = .20f) else Color.White.copy(alpha = .40f),
-                        shape,
-                    )
-                    .border(
-                        .5.dp,
-                        if (NamuColors.isDark) rim.copy(alpha = .35f) else Color.White.copy(alpha = .72f),
-                        shape,
-                    ),
+                    .background(surface, shape)
+                    .border(.5.dp, rim.copy(alpha = if (NamuColors.isDark) .35f else .72f), shape),
             )
 
             Row(
@@ -260,43 +236,11 @@ internal fun GlassDock(
                     val topLeft = center - Offset(lensSize.width / 2, lensSize.height / 2)
                     val radius = CornerRadius(lensSize.height / 2)
                     val lens = Path().apply { addRoundRect(RoundRect(Rect(topLeft, lensSize), radius)) }
-                    val pageOffset = pageOrigin() - dockOrigin
 
-                    if (!dragging && travel > .01f && progress < .999f) {
-                        val fromVisual = if (rtl) tabs.lastIndex - liquidFrom else liquidFrom
-                        val toVisual = if (rtl) tabs.lastIndex - liquidTo else liquidTo
-                        val orbRadius = baseHeight * .42f * (.86f + .18f * wave)
-                        drawGlassOrb(
-                            pageLayer = pageLayer,
-                            pageOffset = pageOffset,
-                            center = Offset((fromVisual + .5f) * cell, size.height / 2),
-                            radius = orbRadius,
-                            alpha = (1f - progress) * .55f,
-                            surface = surface,
-                        )
-                        drawGlassOrb(
-                            pageLayer = pageLayer,
-                            pageOffset = pageOffset,
-                            center = Offset((toVisual + .5f) * cell, size.height / 2),
-                            radius = orbRadius * (.92f + .10f * progress),
-                            alpha = progress * .55f,
-                            surface = surface,
-                        )
-                    }
-
+                    // 选中 lens 改实色主色浅底，保留拉伸/squash 动效但不再放大页面内容。
                     clipPath(lens) {
-                        translate(pageOffset.x, pageOffset.y) {
-                            scale(1.28f, 1.28f, pivot = center) { drawLayer(pageLayer) }
-                        }
                         drawRoundRect(
-                            brush = Brush.verticalGradient(
-                                if (NamuColors.isDark) {
-                                    listOf(surface.copy(alpha = .30f), surface.copy(alpha = .08f))
-                                } else {
-                                    listOf(Color.White.copy(alpha = .32f), Color(0xFFD7DCE5).copy(alpha = .10f))
-                                },
-                                startY = topLeft.y, endY = topLeft.y + lensSize.height,
-                            ),
+                            color = accent.copy(alpha = if (NamuColors.isDark) .16f else .10f),
                             topLeft = topLeft, size = lensSize, cornerRadius = radius,
                         )
                     }
@@ -355,34 +299,6 @@ internal fun GlassDock(
             }
         }
     }
-}
-
-private fun DrawScope.drawGlassOrb(
-    pageLayer: GraphicsLayer,
-    pageOffset: Offset,
-    center: Offset,
-    radius: Float,
-    alpha: Float,
-    surface: Color,
-) {
-    if (alpha <= .01f || radius <= .5f) return
-    val strength = (alpha / .55f).coerceIn(0f, 1f)
-    val circle = Path().apply { addOval(Rect(center, radius)) }
-    clipPath(circle) {
-        translate(pageOffset.x, pageOffset.y) {
-            scale(1.18f, 1.18f, pivot = center) { drawLayer(pageLayer) }
-        }
-        drawCircle(surface.copy(alpha = .10f + .46f * (1f - strength)), radius, center)
-    }
-    drawCircle(Color.White.copy(alpha = .12f * strength), radius, center)
-    drawCircle(
-        color = NamuColors.Brand.copy(alpha = .20f * strength),
-        radius = radius, center = center, style = Stroke(1.dp.toPx()),
-    )
-    drawCircle(
-        color = NamuColors.GlassRim.copy(alpha = .18f * strength),
-        radius = radius + .7.dp.toPx(), center = center, style = Stroke(.7.dp.toPx()),
-    )
 }
 
 @Composable

@@ -233,7 +233,6 @@ private fun DataCardSparkline(samples: List<Long>, modifier: Modifier = Modifier
 @Composable
 fun DataAnalyticsScreen(
     section: DataSection,
-    onOpenDnsLogs: () -> Unit,
     onRestart: () -> Unit,
     onStartVpn: () -> Unit = {},
 ) {
@@ -332,18 +331,6 @@ fun DataAnalyticsScreen(
                             .padding(horizontal = 16.dp, vertical = 10.dp),
                     )
                 }
-            }
-
-            SectionHeader("日志")
-            GroupCard {
-                SettingsRow(
-                    title = "DNS 查询",
-                    subtitle = "域名、拦截/放行、缓存或上游、耗时",
-                    value = "${state.logs.dns.size} 条",
-                    chevron = true,
-                    showDivider = false,
-                    onClick = onOpenDnsLogs,
-                )
             }
 
         } else {

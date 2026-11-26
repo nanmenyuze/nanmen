@@ -41,12 +41,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
-import androidx.compose.ui.draw.drawWithContent
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.layer.drawLayer
-import androidx.compose.ui.graphics.rememberGraphicsLayer
-import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -140,8 +134,6 @@ fun NamuAppShell(
             container.messages.messages.collect { snackbar.showSnackbar(it) }
         }
 
-        val pageLayer = rememberGraphicsLayer()
-        var pageOrigin by remember { mutableStateOf(Offset.Zero) }
         Scaffold(
             containerColor = NamuColors.Bg,
             snackbarHost = {
@@ -167,8 +159,6 @@ fun NamuAppShell(
                     GlassDock(
                         tabs = tabs,
                         selected = currentTab,
-                        pageLayer = pageLayer,
-                        pageOrigin = { pageOrigin },
                         onSelect = navController::openMainTab,
                     )
                 }
@@ -176,12 +166,6 @@ fun NamuAppShell(
         ) { padding ->
             val direction = LocalLayoutDirection.current
             val hasDock = currentTab != null
-            val capture = if (hasDock) Modifier
-                .onGloballyPositioned { pageOrigin = it.positionInRoot() }
-                .drawWithContent {
-                    pageLayer.record { this@drawWithContent.drawContent() }
-                    drawLayer(pageLayer)
-                } else Modifier
             Box(
                 Modifier.fillMaxSize().padding(
                     start = padding.calculateStartPadding(direction),
@@ -197,7 +181,7 @@ fun NamuAppShell(
                         navController = navController,
                         onToggle = onToggle,
                         onRestart = onRestart,
-                        modifier = Modifier.fillMaxHeight().widthIn(max = 640.dp).fillMaxWidth().then(capture),
+                        modifier = Modifier.fillMaxHeight().widthIn(max = 640.dp).fillMaxWidth(),
                     )
                 }
             }
@@ -258,7 +242,6 @@ fun NamuNavHost(
         detail<DataAnalyticsRoute>(navController) { entry ->
             DataAnalyticsScreen(
                 section = entry.toRoute<DataAnalyticsRoute>().section,
-                onOpenDnsLogs = { navController.navigate(LogsRoute(LogKind.Dns)) },
                 onRestart = onRestart,
                 onStartVpn = onToggle,
             )
@@ -270,7 +253,10 @@ fun NamuNavHost(
             )
         }
         detail<DiagnosticsRoute>(navController) {
-            DiagnosticsScreen(onOpenRuntimeLogs = { navController.navigate(LogsRoute(LogKind.Runtime)) })
+            DiagnosticsScreen(
+                onOpenRuntimeLogs = { navController.navigate(LogsRoute(LogKind.Runtime)) },
+                onOpenDnsLogs = { navController.navigate(LogsRoute(LogKind.Dns)) },
+            )
         }
         detail<AdvancedSettingsRoute>(navController) {
             AdvancedSettingsScreen(onRestart = onRestart)

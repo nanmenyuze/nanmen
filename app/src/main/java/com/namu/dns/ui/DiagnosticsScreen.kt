@@ -27,6 +27,7 @@ import kotlinx.coroutines.launch
 @Composable
 fun DiagnosticsScreen(
     onOpenRuntimeLogs: () -> Unit,
+    onOpenDnsLogs: () -> Unit,
 ) {
     val container = LocalAppContainer.current
     val vm: DataViewModel = viewModel(factory = DataViewModel.factory(container))
@@ -56,6 +57,13 @@ fun DiagnosticsScreen(
                 value = "${state.logs.runtime.size} 条",
                 chevron = true,
                 onClick = onOpenRuntimeLogs,
+            )
+            SettingsRow(
+                title = "DNS 查询日志",
+                subtitle = "域名、拦截/放行、缓存或上游、耗时",
+                value = "${state.logs.dns.size} 条",
+                chevron = true,
+                onClick = onOpenDnsLogs,
             )
             SettingsRow(
                 title = "连接前清空日志",
