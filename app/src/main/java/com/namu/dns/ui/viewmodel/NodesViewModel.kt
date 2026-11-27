@@ -9,36 +9,67 @@ import com.namu.dns.NodeInfo
 import com.namu.dns.core.AppContainer
 import com.namu.dns.core.repository.SettingsRepository
 import com.namu.dns.core.runtime.MessageRepository
+import com.namu.dns.testIdentity
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
-/** 单节点测速状态放到 ViewModel，切到首页/数据页再回来仍在转圈。 */
 class NodesViewModel(
     private val settings: SettingsRepository,
     private val messages: MessageRepository,
-    private val ping: suspend (NodeInfo) -> Long? = { node ->
-        Actions.probeNodes(listOf(node), settings.current().pingUrl).firstOrNull()?.second
-    },
+    private val probe: suspend (List<NodeInfo>) -> List<Pair<String, Long?>> = { Actions.probeNodes(it) },
 ) : ViewModel() {
-    private val _testing = MutableStateFlow<String?>(null)
-    val testing: StateFlow<String?> = _testing.asStateFlow()
+    private val _testing = MutableStateFlow<Set<String>>(emptySet())
+    val testing: StateFlow<Set<String>> = _testing.asStateFlow()
+    private val _failed = MutableStateFlow<Set<NodeInfo>>(emptySet())
+    val failed: StateFlow<Set<NodeInfo>> = _failed.asStateFlow()
 
-    fun test(node: NodeInfo) {
-        if (_testing.value != null) return
+    fun testAll() = testNodes(settings.current().nodes)
+
+    fun test(node: NodeInfo) = testNodes(listOf(node))
+
+    private fun testNodes(nodes: List<NodeInfo>) {
+        if (nodes.isEmpty() || _testing.value.isNotEmpty()) return
+        val profile = settings.activeConfigName()
+        val snapshot = nodes.distinctBy { it.name }
+        _testing.value = snapshot.mapTo(HashSet()) { it.name }
         viewModelScope.launch {
-            _testing.value = node.name
-            val ms = ping(node)
-            settings.update { current ->
-                current.copy(
-                    nodes = current.nodes.map {
-                        if (it == node.copy(latency = it.latency, testing = it.testing)) it.copy(latency = ms) else it
-                    },
-                )
+            var succeeded = 0
+            var failedCount = 0
+            try {
+                // 内核每次最多并发六个，分批返回结果，可以边测边更新列表。
+                for (batch in snapshot.chunked(6)) {
+                    val results = probe(batch).toMap()
+                    if (settings.activeConfigName() != profile) return@launch
+                    val tested = batch.associateBy { it.name }
+                    val accepted = settings.update { current ->
+                        current.copy(nodes = Actions.applyNodeLatencies(current.nodes, tested, results))
+                    }.nodes.filter { node ->
+                        node.name in results && tested[node.name]?.testIdentity() == node.testIdentity()
+                    }
+                    val identities = accepted.map { it.testIdentity() }
+                    _failed.value = (_failed.value - identities.toSet()) +
+                        accepted.filter { results[it.name] == null }.map { it.testIdentity() }
+                    succeeded += accepted.count { results[it.name] != null }
+                    failedCount += accepted.count { results[it.name] == null }
+                    _testing.value = _testing.value - tested.keys
+                }
+                val message = when {
+                    succeeded + failedCount == 0 -> "未取得测速结果"
+                    snapshot.size == 1 && succeeded == 1 -> "${snapshot.first().name} 测速完成"
+                    snapshot.size == 1 -> "${snapshot.first().name} 测速失败"
+                    else -> "测速完成，可用 ${succeeded} 个，失败 ${failedCount} 个"
+                }
+                messages.show(message)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                messages.show("测速失败，请重试")
+            } finally {
+                _testing.value = emptySet()
             }
-            messages.show(if (ms == null) "${node.name} 测速失败" else "${node.name}：${ms}ms")
-            _testing.value = null
         }
     }
 

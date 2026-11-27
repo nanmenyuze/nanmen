@@ -47,7 +47,7 @@ class HomeViewModel(
     private val messages: MessageRepository,
     private val hits: HitRepository? = null,
     private val ping: suspend (NodeInfo) -> Long? = { node ->
-        Actions.probeNodes(listOf(node), settings.current().pingUrl).firstOrNull()?.second
+        Actions.probeNodes(listOf(node)).firstOrNull()?.second
     },
 ) : ViewModel() {
     private val emptyHits = MutableStateFlow(HitsUiState())

@@ -253,7 +253,7 @@ fun ChoiceChip(text: String, selected: Boolean, modifier: Modifier = Modifier, o
 }
 
 @Composable
-fun SubscriptionDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
+fun SubscriptionDialog(onDismiss: () -> Unit, onDone: () -> Unit, onManualAdd: () -> Unit) {
     var text by remember { mutableStateOf(uiSettings.current().subscription) }
     var append by remember { mutableStateOf(false) }
     var loading by remember { mutableStateOf(false) }
@@ -263,8 +263,7 @@ fun SubscriptionDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
     val clipboard = LocalClipboardManager.current
 
     NamuDialog(
-        title = "导入订阅",
-        message = "粘贴 Clash 订阅链接，或直接粘贴 Base64 / 节点链接内容",
+        title = "导入节点",
         confirmText = "导入",
         loading = loading,
         confirmEnabled = text.isNotBlank(),
@@ -309,8 +308,9 @@ fun SubscriptionDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
             }
             IosSwitch(checked = append, onCheckedChange = { append = it })
         }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-            MiniTextAction("从剪贴板粘贴") {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            MiniTextAction("手动填写", enabled = !loading, onClick = onManualAdd)
+            MiniTextAction("粘贴", enabled = !loading) {
                 clipboard.getText()?.text?.let { text = it }
             }
         }
@@ -1022,7 +1022,6 @@ fun ChoiceDialog(
 fun NodeInfoDialog(
     node: NodeInfo,
     selected: Boolean,
-    onSelect: () -> Unit,
     onDelete: () -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -1043,8 +1042,6 @@ fun NodeInfoDialog(
             InfoLine("延迟", node.latency?.let { "$it ms" } ?: "未测试")
             if (selected) InfoLine("状态", "当前使用")
             Spacer(Modifier.height(6.dp))
-            Box(Modifier.fillMaxWidth().height(0.5.dp).background(NamuColors.Separator))
-            DialogAction("设为当前服务器", NamuColors.Blue) { onSelect() }
             Box(Modifier.fillMaxWidth().height(0.5.dp).background(NamuColors.Separator))
             DialogAction("复制分享链接", NamuColors.Blue) {
                 clipboard.setText(AnnotatedString(node.shareLink()))

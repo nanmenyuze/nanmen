@@ -37,5 +37,5 @@ class DefaultNodeRepository(
 
     override fun update(config: (AppConfig) -> AppConfig): AppConfig = settings.update(config)
 
-    override suspend fun testAll(): Int = Actions.autoTestNodes()
+    override suspend fun testAll(): Int = Actions.testAllNodes()
 }

@@ -1313,7 +1313,7 @@ object Actions {
 
     /** 端到端测速：内核经真实代理协议转发 GET，返回 name→延迟ms（失败 null）。
      *  并发与超时都在内核侧控制；内核不可用时返回空表，调用方按未测速处理。 */
-    suspend fun probeNodes(nodes: List<NodeInfo>, url: String): List<Pair<String, Long?>> =
+    suspend fun probeNodes(nodes: List<NodeInfo>, url: String = ""): List<Pair<String, Long?>> =
         withContext(Dispatchers.IO) {
             if (nodes.isEmpty()) return@withContext emptyList()
             val payload = JSONObject().apply {
@@ -1330,34 +1330,31 @@ object Actions {
                 val name = r.optString("name")
                 map[name] = if (r.optBoolean("ok")) r.optLong("ms") else null
             }
-            nodes.map { it.name to map[it.name] }
+            nodes.mapNotNull { node ->
+                if (node.name in map) node.name to map[node.name] else null
+            }
         }
 
-    /** 仅使用端到端探测成功的节点参加自动选择。 */
-    suspend fun autoTestNodes(): Int = withContext(Dispatchers.IO) {
-        val snapshot = settings.current()
-        if (snapshot.nodes.isEmpty()) return@withContext 0
-        val results = probeNodes(snapshot.nodes, snapshot.pingUrl).toMap()
-        val testedNodes = snapshot.nodes.associateBy { it.name }
-        withContext(Dispatchers.Main) applyResults@{
-            val current = settings.current()
-            if (current.pingUrl != snapshot.pingUrl) return@applyResults
-            val matching = current.nodes.filter { node ->
-                val tested = testedNodes[node.name]
-                node.name in results && tested?.copy(latency = node.latency, testing = node.testing) == node
-            }.mapTo(HashSet()) { it.name }
-            val updated = current.nodes.map { node ->
-                if (node.name in matching) node.copy(latency = results[node.name]) else node
-            }
-            val best = updated.filter { it.name in matching && it.latency != null }.minByOrNull { it.latency!! }
-            val nextSelected = if (current.autoSelectNode && current.selected == snapshot.selected) {
-                best?.name ?: current.selected
-            } else {
-                current.selected
-            }
-            settings.update { it.copy(nodes = updated, selected = nextSelected) }
-            if (nextSelected != current.selected && runtime.current().connected) {
-                ApplyCoordinator.requestApply(App.context, "配置变更")
+    internal fun applyNodeLatencies(
+        current: List<NodeInfo>,
+        tested: Map<String, NodeInfo>,
+        results: Map<String, Long?>,
+    ): List<NodeInfo> = current.map { node ->
+        if (node.name in results && tested[node.name]?.testIdentity() == node.testIdentity()) {
+            node.copy(latency = results[node.name])
+        } else node
+    }
+
+    /** 手动测试全部节点，仅更新测得的延迟。 */
+    suspend fun testAllNodes(): Int = withContext(Dispatchers.IO) {
+        val profile = settings.activeConfigName()
+        val snapshot = settings.current().nodes
+        val results = probeNodes(snapshot).toMap()
+        if (results.isEmpty()) return@withContext 0
+        val tested = snapshot.associateBy { it.name }
+        withContext(Dispatchers.Main) {
+            if (settings.activeConfigName() == profile) {
+                settings.update { it.copy(nodes = applyNodeLatencies(it.nodes, tested, results)) }
             }
         }
         results.count { it.value != null }

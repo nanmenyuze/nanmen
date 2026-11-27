@@ -11,7 +11,9 @@ import com.namu.dns.core.runtime.DefaultMessageRepository
 import com.namu.dns.core.runtime.DefaultRuntimeRepository
 import com.namu.dns.ui.viewmodel.DataViewModel
 import com.namu.dns.ui.viewmodel.HomeViewModel
+import com.namu.dns.ui.viewmodel.NodesViewModel
 import com.namu.dns.ui.viewmodel.SettingsViewModel
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -70,6 +72,34 @@ class ViewModelStateTest {
         override fun poll() = Unit
         override fun clearRuntime() = Unit
         override fun clearDns() = Unit
+    }
+
+    @Test
+    fun `one tap probes every node without switching the selected node`() = runTest {
+        val nodes = (0..6).map { NodeInfo("node-$it", "ss", "example.com", 443) }
+        val settings = FakeSettingsRepository(AppConfig(nodes = nodes, selected = "node-0", autoSelectNode = true))
+        val release = CompletableDeferred<Unit>()
+        val batches = mutableListOf<List<String>>()
+        val vm = NodesViewModel(settings, DefaultMessageRepository()) { batch ->
+            batches += batch.map { it.name }
+            release.await()
+            batch.map { it.name to when (it.name) {
+                "node-6" -> 5L
+                "node-1" -> null
+                else -> 80L
+            } }
+        }
+        vm.testAll()
+        assertEquals(nodes.map { it.name }.toSet(), vm.testing.value)
+        vm.test(nodes.first())
+        release.complete(Unit)
+        advanceUntilIdle()
+        assertEquals(listOf(6, 1), batches.map { it.size })
+        assertEquals(nodes.map { it.name }, batches.flatten())
+        assertEquals("node-0", settings.current().selected)
+        assertEquals(listOf(80L, null, 80L, 80L, 80L, 80L, 5L), settings.current().nodes.map { it.latency })
+        assertEquals(setOf(nodes[1]), vm.failed.value)
+        assertEquals(emptySet<String>(), vm.testing.value)
     }
 
     @Test

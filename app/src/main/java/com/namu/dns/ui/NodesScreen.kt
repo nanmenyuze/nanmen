@@ -54,9 +54,7 @@ import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalHapticFeedback
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -69,6 +67,7 @@ import com.namu.dns.core.LocalAppContainer
 import com.namu.dns.core.config.RoutingMode
 import com.namu.dns.NodeInfo
 import com.namu.dns.ui.viewmodel.NodesViewModel
+import com.namu.dns.testIdentity
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -78,21 +77,18 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
     val vm: NodesViewModel = viewModel(factory = NodesViewModel.factory(container))
     val settings = container.settings
     val cfg by settings.config.collectAsStateWithLifecycle()
-    val testingOne by vm.testing.collectAsStateWithLifecycle()
+    val testing by vm.testing.collectAsStateWithLifecycle()
+    val failed by vm.failed.collectAsStateWithLifecycle()
     val runtime = container.runtime
     val messages = container.messages
     val context = LocalContext.current
-    val clipboard = LocalClipboardManager.current
     val haptic = LocalHapticFeedback.current
     var showSub by remember { mutableStateOf(false) }
     var showAddNode by remember { mutableStateOf(false) }
-    var showPingMethod by remember { mutableStateOf(false) }
-    var pingUrlDraft by remember { mutableStateOf("") }
     var query by remember { mutableStateOf("") }
     var refreshing by remember { mutableStateOf(false) }
     var selectionMode by remember { mutableStateOf(false) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
-    var showDeleteAllConfirm by remember { mutableStateOf(false) }
     var detailNode by remember { mutableStateOf<NodeInfo?>(null) }
     val selected = remember { mutableStateMapOf<String, Boolean>() }
     val scope = rememberCoroutineScope()
@@ -137,7 +133,7 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
         reloadIfUsingProxy()
     }
 
-    val sortMode = UiPrefs.nodeSort
+    val sortMode = if (UiPrefs.nodeSort == "latency") "latency" else "default"
     val filtered = remember(cfg.nodes, query, sortMode) { sortNodes(filterNodes(cfg.nodes, query), sortMode) }
     val duplicateNames = remember(cfg.nodes) {
         cfg.nodes.groupingBy { it.name }.eachCount().filterValues { it > 1 }.keys
@@ -146,236 +142,160 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
         filtered.groupBy { it.group.ifBlank { "未分组" } }
     }
 
-    PullToRefreshBox(
-        isRefreshing = refreshing,
-        onRefresh = {
-            if (!refreshing) {
-                scope.launch {
-                    refreshing = true
-                    try {
-                        val result = Actions.refreshSubscription()
-                        messages.show(Actions.subscriptionRefreshMessage(result))
-                    } catch (e: Exception) {
-                        messages.show(e.message ?: "订阅刷新失败")
-                    } finally {
-                        refreshing = false
-                    }
-                }
+    Column(Modifier.fillMaxSize().background(NamuColors.Bg)) {
+        SecondaryTopBar("代理", onBack = onBack, actions = {
+            if (cfg.nodes.isNotEmpty() || testing.isNotEmpty()) {
+                TextAction(
+                    if (testing.isEmpty()) "一键测速" else "测速中 · 剩 ${testing.size}",
+                    enabled = testing.isEmpty() && !refreshing,
+                    onClick = vm::testAll,
+                )
             }
-        },
-        modifier = Modifier.fillMaxSize(),
-    ) {
-        LazyColumn(
-            Modifier.fillMaxSize().background(NamuColors.Bg),
-            contentPadding = PaddingValues(bottom = 34.dp),
-        ) {
-            item {
-                SecondaryTopBar("代理", onBack = onBack)
-                SectionHeader("订阅")
-                GroupCard {
-                    SettingsRow(
-                        title = "导入 / 更新订阅",
-                        subtitle = if (cfg.nodes.isEmpty()) "支持 Clash 配置和 Base64 节点链接" else "当前共 ${cfg.nodes.size} 个服务器",
-                        chevron = true,
-                        showDivider = true,
-                        onClick = { showSub = true },
-                    )
-                    SettingsRow(
-                        title = "手动添加节点",
-                        subtitle = "按协议逐项填写；SS / Trojan / VLESS / VMess / SOCKS5",
-                        chevron = true,
-                        onClick = { showAddNode = true },
-                    )
-                    SettingsRow(
-                        title = "导出节点",
-                        subtitle = "复制可分享的节点链接",
-                        onClick = {
-                            val links = settings.current().nodes.mapNotNull { it.shareLink().takeIf(String::isNotBlank) }
-                            if (links.isEmpty()) {
-                                messages.show("还没有可导出的节点")
-                            } else {
-                                clipboard.setText(AnnotatedString(links.joinToString("\n")))
-                                messages.show("已复制 ${links.size} 个节点链接")
-                            }
-                        },
-                    )
-                    SettingsRow(
-                        title = "删除所有节点",
-                        showDivider = false,
-                        onClick = {
-                            if (settings.current().nodes.isEmpty()) messages.show("当前没有节点")
-                            else showDeleteAllConfirm = true
-                        },
-                    )
-                }
-            }
-            cfg.subscriptionInfo?.let { info ->
-                item { SubscriptionCard(info) }
-            }
-            item {
-                SectionHeader("测速与自动选择")
-                GroupCard {
-                    SettingsRow(
-                        title = "测速 URL",
-                        value = runCatching { java.net.URI(cfg.pingUrl).host }.getOrNull() ?: cfg.pingUrl,
-                        chevron = true,
-                        onClick = {
-                            pingUrlDraft = cfg.pingUrl
-                            showPingMethod = true
-                        },
-                    )
-                    SwitchRow(
-                        title = "自动选择最快节点",
-                        subtitle = "WorkManager 每 15 分钟测速，按端到端转发延迟选择；也可手动点测速",
-                        checked = cfg.autoSelectNode,
-                        showDivider = false,
-                    ) {
-                        settings.update { current -> current.copy(autoSelectNode = it) }
-                    }
-                }
-            }
-            item {
-                Column(Modifier.padding(horizontal = NamuTokens.Space16, vertical = 8.dp)) {
-                    NamuTextField(
-                        value = query,
-                        onChange = { query = it },
-                        placeholder = "搜索名称、地址或分组",
-                        singleLine = true,
-                    )
-                }
-            }
-            item {
-                Row(
-                    Modifier.fillMaxWidth().padding(horizontal = 16.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text("排序", fontSize = 12.sp, color = NamuColors.TextSub)
-                    Spacer(Modifier.width(4.dp))
-                    listOf("default" to "默认", "latency" to "延迟", "name" to "名称", "group" to "分组").forEach { (mode, label) ->
-                        MiniTextAction(
-                            if (UiPrefs.nodeSort == mode) "● $label" else label,
-                            color = if (UiPrefs.nodeSort == mode) NamuColors.Blue else NamuColors.TextSub,
-                        ) { UiPrefs.setNodeSort(mode) }
-                    }
-                }
-            }
-            if (selectionMode) {
-                item {
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = NamuTokens.Space16, vertical = 4.dp)
-                            .clip(RoundedCornerShape(NamuTokens.RadiusCard))
-                            .background(NamuColors.Card)
-                            .padding(horizontal = 14.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text("已选 ${selected.size} 个", fontSize = 13.sp, color = NamuColors.TextMain)
-                        Spacer(Modifier.weight(1f))
-                        TextAction("删除", color = NamuColors.Red) {
-                            if (selected.isNotEmpty()) showDeleteConfirm = true
+        })
+        PullToRefreshBox(
+            isRefreshing = refreshing,
+            onRefresh = {
+                if (!refreshing) {
+                    scope.launch {
+                        refreshing = true
+                        try {
+                            val result = Actions.refreshSubscription()
+                            messages.show(Actions.subscriptionRefreshMessage(result))
+                        } catch (e: Exception) {
+                            messages.show(e.message ?: "订阅刷新失败")
+                        } finally {
+                            refreshing = false
                         }
-                        Spacer(Modifier.width(10.dp))
-                        TextAction("取消") { clearSelection() }
                     }
                 }
-            }
-            if (filtered.isEmpty()) {
+            },
+            modifier = Modifier.weight(1f).fillMaxSize(),
+        ) {
+            LazyColumn(
+                Modifier.fillMaxSize().background(NamuColors.Bg),
+                contentPadding = PaddingValues(bottom = 34.dp),
+            ) {
                 item {
-                    EmptyState(
-                        title = if (cfg.nodes.isEmpty()) "还没有服务器" else "没有匹配的服务器",
-                        subtitle = if (cfg.nodes.isEmpty()) {
-                            "点击上方「导入 / 更新订阅」，导入 Clash 或 Base64 节点链接。"
-                        } else {
-                            "换一个名称、地址或分组关键词试试。"
-                        },
-                        icon = if (cfg.nodes.isEmpty()) Icons.Rounded.CloudOff else Icons.Rounded.SearchOff,
-                    )
-                }
-            } else {
-                groups.forEach { (group, list) ->
-                    val open = query.isNotBlank() || group !in collapsed
-                    item(key = "group:$group") {
-                        NodeGroupHeader(
-                            title = group,
-                            count = list.size,
-                            expanded = open,
-                            onToggle = { toggleGroup(group) },
+                    GroupCard {
+                        SettingsRow(
+                            title = "导入节点",
+                            subtitle = cfg.subscriptionInfo?.let(::subscriptionSummary),
+                            chevron = true,
+                            showDivider = false,
+                            onClick = { showSub = true },
                         )
                     }
-                    if (open) {
-                        itemsIndexed(
-                            list,
-                            key = { index, node ->
-                                if (node.name in duplicateNames) "legacy-node:$index:$group"
-                                else "node:${node.name}"
-                            },
-                        ) { index, node ->
-                            NodeRow(
-                                node = node,
-                                selected = node.name == cfg.selected,
-                                testing = testingOne == node.name,
-                                selectionMode = selectionMode,
-                                checked = selected[node.name] == true,
-                                showDivider = index != list.lastIndex,
-                                onClick = {
-                                    haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                                    if (selectionMode) {
-                                        if (selected[node.name] == true) selected.remove(node.name)
-                                        else selected[node.name] = true
-                                    } else selectNode(node.name)
-                                },
-                                onLongPress = {
-                                    selectionMode = true
-                                    selected[node.name] = true
-                                },
-                                onTest = { vm.test(node) },
-                                onInfo = { detailNode = node },
+                }
+                if (cfg.nodes.isNotEmpty()) {
+                    item {
+                        Row(
+                            Modifier.fillMaxWidth().padding(horizontal = NamuTokens.Space16, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            NamuTextField(
+                                value = query,
+                                onChange = { query = it },
+                                placeholder = "搜索节点",
+                                modifier = Modifier.weight(1f),
+                                singleLine = true,
                             )
+                            if (cfg.nodes.size > 1) {
+                                Spacer(Modifier.width(8.dp))
+                                MiniTextAction(
+                                    if (sortMode == "latency") "恢复默认" else "按延迟排序",
+                                ) {
+                                    UiPrefs.setNodeSort(if (sortMode == "latency") "default" else "latency")
+                                }
+                            }
                         }
                     }
                 }
-            }
-            item {
-                if (cfg.nodes.isNotEmpty()) {
-                    Row(
-                        Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        FooterText("长按服务器多选删除；搜索时分组会自动展开。延迟图例：<150ms 绿 · <400ms 橙 · 其余红 · — 未测速。")
+                if (selectionMode) {
+                    item {
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = NamuTokens.Space16, vertical = 4.dp)
+                                .clip(RoundedCornerShape(NamuTokens.RadiusCard))
+                                .background(NamuColors.Card)
+                                .padding(horizontal = 14.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text("已选 ${selected.size} 个", fontSize = 13.sp, color = NamuColors.TextMain)
+                            Spacer(Modifier.weight(1f))
+                            TextAction("删除", color = NamuColors.Red) {
+                                if (selected.isNotEmpty()) showDeleteConfirm = true
+                            }
+                            Spacer(Modifier.width(10.dp))
+                            TextAction("取消") { clearSelection() }
+                        }
+                    }
+                }
+                if (filtered.isEmpty()) {
+                    item {
+                        EmptyState(
+                            title = if (cfg.nodes.isEmpty()) "还没有服务器" else "没有匹配的服务器",
+                            subtitle = if (cfg.nodes.isEmpty()) "" else "换个关键词试试。",
+                            icon = if (cfg.nodes.isEmpty()) Icons.Rounded.CloudOff else Icons.Rounded.SearchOff,
+                        )
+                    }
+                } else {
+                    groups.forEach { (group, list) ->
+                        val open = query.isNotBlank() || group !in collapsed
+                        item(key = "group:$group") {
+                            NodeGroupHeader(
+                                title = group,
+                                count = list.size,
+                                expanded = open,
+                                onToggle = { toggleGroup(group) },
+                            )
+                        }
+                        if (open) {
+                            itemsIndexed(
+                                list,
+                                key = { index, node ->
+                                    if (node.name in duplicateNames) "legacy-node:$index:$group"
+                                    else "node:${node.name}"
+                                },
+                            ) { index, node ->
+                                NodeRow(
+                                    node = node,
+                                    selected = node.name == cfg.selected,
+                                    testing = node.name in testing,
+                                    testFailed = node.testIdentity() in failed,
+                                    canTest = testing.isEmpty() && !refreshing,
+                                    selectionMode = selectionMode,
+                                    checked = selected[node.name] == true,
+                                    showDivider = index != list.lastIndex,
+                                    onClick = {
+                                        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                                        if (selectionMode) {
+                                            if (selected[node.name] == true) selected.remove(node.name)
+                                            else selected[node.name] = true
+                                        } else selectNode(node.name)
+                                    },
+                                    onLongPress = {
+                                        selectionMode = true
+                                        selected[node.name] = true
+                                    },
+                                    onTest = { vm.test(node) },
+                                    onInfo = { detailNode = node },
+                                )
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    if (showPingMethod) {
-        NamuDialog(
-            title = "测速 URL",
-            message = "经代理协议真实转发一个 GET 请求，确认收到有效的 HTTP 响应。入口握手快但转发不通的节点不会被误选。",
-            confirmText = "保存",
-            onConfirm = {
-                val u = pingUrlDraft.trim()
-                if (u.startsWith("http://") || u.startsWith("https://")) {
-                    settings.update { current -> current.copy(pingUrl = u) }
-                }
-                showPingMethod = false
-            },
-            onDismiss = { showPingMethod = false },
-        ) {
-            NamuTextField(
-                value = pingUrlDraft,
-                onChange = { pingUrlDraft = it },
-                placeholder = "https://www.gstatic.com/generate_204",
-                singleLine = true,
-            )
-        }
-    }
     if (showSub) {
         SubscriptionDialog(
             onDismiss = { showSub = false },
-            onDone = {
+            onDone = { showSub = false },
+            onManualAdd = {
                 showSub = false
+                showAddNode = true
             },
         )
     }
@@ -411,10 +331,6 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
         NodeInfoDialog(
             node = node,
             selected = cfg.selected == node.name,
-            onSelect = {
-                detailNode = null
-                selectNode(node.name)
-            },
             onDelete = {
                 detailNode = null
                 settings.update { current ->
@@ -429,22 +345,7 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
             onDismiss = { detailNode = null },
         )
     }
-    if (showDeleteAllConfirm) {
-        NamuDialog(
-            title = "删除所有节点？",
-            message = "将清空设备中的 ${cfg.nodes.size} 个节点，保留订阅链接和规则配置。",
-            confirmText = "删除",
-            confirmColor = NamuColors.Red,
-            onConfirm = {
-                showDeleteAllConfirm = false
-                settings.update { it.copy(nodes = emptyList(), selected = null) }
-                clearSelection()
-                reloadIfUsingProxy()
-                messages.show("已删除所有节点")
-            },
-            onDismiss = { showDeleteAllConfirm = false },
-        ) {}
-    }
+
 }
 
 @Composable
@@ -488,6 +389,8 @@ private fun NodeRow(
     node: NodeInfo,
     selected: Boolean,
     testing: Boolean,
+    testFailed: Boolean,
+    canTest: Boolean,
     selectionMode: Boolean,
     checked: Boolean,
     showDivider: Boolean,
@@ -571,34 +474,33 @@ private fun NodeRow(
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-            if (testing) {
-                CircularProgressIndicator(Modifier.size(17.dp), color = NamuColors.TextSub, strokeWidth = 2.dp)
-            } else {
+            if (!selectionMode) {
                 val latency = node.latency
-                if (latency != null) {
-                    Text(
-                        "$latency ms",
-                        fontSize = 12.sp,
-                        color = when {
-                            latency < 150 -> NamuColors.Green
-                            latency < 400 -> NamuColors.Orange
-                            else -> NamuColors.Red
-                        },
-                    )
-                } else {
-                    Text("—", fontSize = 12.sp, color = NamuColors.TextTertiary)
+                val label = when {
+                    latency != null -> "$latency ms"
+                    testFailed -> "失败"
+                    else -> "—"
                 }
-                Spacer(Modifier.width(8.dp))
+                val latencyColor = when {
+                    testFailed -> NamuColors.Red
+                    latency == null -> NamuColors.TextTertiary
+                    latency < 150 -> NamuColors.Green
+                    latency < 400 -> NamuColors.Orange
+                    else -> NamuColors.Red
+                }
                 Box(
                     Modifier
                         .heightIn(min = 48.dp)
                         .widthIn(min = 48.dp)
-                        .clip(RoundedCornerShape(NamuTokens.RadiusControl))
-                        .background(NamuColors.Blue.copy(alpha = 0.10f))
-                        .clickable { onTest() },
+                        .clickable(enabled = canTest, onClickLabel = "测试节点延迟", onClick = onTest)
+                        .padding(horizontal = 4.dp),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Text("测", fontSize = 12.sp, color = NamuColors.Blue)
+                    if (testing) {
+                        CircularProgressIndicator(Modifier.size(17.dp), color = NamuColors.TextSub, strokeWidth = 2.dp)
+                    } else {
+                        Text(label, fontSize = 12.sp, color = latencyColor)
+                    }
                 }
             }
             if (!selectionMode) {

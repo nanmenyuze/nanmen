@@ -136,8 +136,6 @@ fun NamuAppShell(
         val tabs = MainTab.entries
         val currentTab = tabs.firstOrNull { destination.matches(it.route::class) }
 
-        // 规则更新/自动测速已交给 WorkManager（RuleUpdateWorker / NodeTestWorker），
-        // 不再绑在 Activity 的 LaunchedEffect 上，划掉界面也不会停。
         LaunchedEffect(Unit) {
             container.messages.messages.collect { snackbar.showSnackbar(it) }
         }

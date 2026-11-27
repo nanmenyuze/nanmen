@@ -915,8 +915,10 @@ fun EmptyState(
             Spacer(Modifier.height(16.dp))
         }
         Text(title, fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = NamuColors.TextMain)
-        Spacer(Modifier.height(6.dp))
-        Text(subtitle, fontSize = 13.sp, color = NamuColors.TextSub, lineHeight = 18.sp)
+        if (subtitle.isNotBlank()) {
+            Spacer(Modifier.height(6.dp))
+            Text(subtitle, fontSize = 13.sp, color = NamuColors.TextSub, lineHeight = 18.sp)
+        }
         if (buttonText != null && onButton != null) {
             Spacer(Modifier.height(18.dp))
             IosButton(buttonText, onButton, modifier = Modifier.widthIn(max = 240.dp))
@@ -1005,7 +1007,12 @@ fun hostOf(url: String): String {
 
 /** 二级页顶栏：左侧返回，标题与主页面统一使用系统无衬线字。 */
 @Composable
-fun SecondaryTopBar(title: String, subtitle: String = "", onBack: (() -> Unit)? = null) {
+fun SecondaryTopBar(
+    title: String,
+    subtitle: String = "",
+    onBack: (() -> Unit)? = null,
+    actions: (@Composable () -> Unit)? = null,
+) {
     Column(
         Modifier.fillMaxWidth()
             .background(NamuColors.Bg)
@@ -1015,17 +1022,21 @@ fun SecondaryTopBar(title: String, subtitle: String = "", onBack: (() -> Unit)? 
         if (onBack != null) {
             TextAction("‹ 返回", color = NamuColors.TextSub) { onBack() }
         }
-        Column(Modifier.padding(start = 12.dp, top = 2.dp)) {
-            Text(
-                title,
-                modifier = Modifier.semantics { heading() },
-                style = NamuTokens.Type.PageTitle,
-                fontFamily = FontFamily.SansSerif,
-                color = NamuColors.TextMain,
-            )
-            if (subtitle.isNotEmpty()) {
-                Text(subtitle, fontSize = 12.sp, color = NamuColors.TextSub, modifier = Modifier.padding(top = 2.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f).padding(start = 12.dp, top = 2.dp)) {
+                Text(
+                    title,
+                    modifier = Modifier.semantics { heading() },
+                    style = NamuTokens.Type.PageTitle,
+                    fontFamily = FontFamily.SansSerif,
+                    color = NamuColors.TextMain,
+                )
+                if (subtitle.isNotEmpty()) {
+                    Text(subtitle, fontSize = 12.sp, color = NamuColors.TextSub, modifier = Modifier.padding(top = 2.dp))
+                }
             }
+            actions?.invoke()
         }
     }
 }
+

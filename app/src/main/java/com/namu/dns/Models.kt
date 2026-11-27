@@ -11,6 +11,8 @@ internal fun subscriptionSourceId(url: String): String {
     return "sub:" + digest.joinToString("") { "%02x".format(java.util.Locale.ROOT, it) }
 }
 
+internal fun NodeInfo.testIdentity(): NodeInfo = copy(latency = null, testing = false)
+
 data class NodeInfo(
     val name: String,
     val type: String,

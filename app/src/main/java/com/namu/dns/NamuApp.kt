@@ -1,6 +1,7 @@
 package com.namu.dns
 
 import android.app.Application
+import androidx.work.WorkManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -17,7 +18,7 @@ class NamuApp : Application() {
         SubscriptionUpdateWorker.schedule(this)
         RuleUpdateWorker.schedule(this)
         ModuleUpdateWorker.schedule(this)
-        NodeTestWorker.schedule(this)
+        WorkManager.getInstance(this).cancelUniqueWork("namu_node_test")
         scope.launch { PrivateDnsController.restore(this@NamuApp) }
     }
 }

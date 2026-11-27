@@ -38,6 +38,22 @@ class NodeSortTest {
         val list = listOf(node("b"), node("a"))
         assertEquals(list, sortNodes(list, "whatever"))
     }
+
+    @Test
+    fun probeResultsUpdateOnlyMatchingNodesAndExplicitFailures() {
+        val a = node("success", 200)
+        val b = node("failed", 200)
+        val c = node("missing", 200)
+        val d = node("replaced", 200)
+        val updatedD = d.copy(server = "new.example.com")
+        val latencies = Actions.applyNodeLatencies(
+            listOf(a, b, c, updatedD),
+            listOf(a, b, c, d).associateBy { it.name },
+            mapOf(a.name to 45L, b.name to null, d.name to 1L),
+        )
+        assertEquals(listOf(45L, null, 200L, 200L), latencies.map { it.latency })
+        assertEquals(listOf(a.name, b.name, c.name, d.name), latencies.map { it.name })
+    }
 }
 
 /** B3 规则单条启用开关：模型兼容性（TDD：先于实现编写）。 */
