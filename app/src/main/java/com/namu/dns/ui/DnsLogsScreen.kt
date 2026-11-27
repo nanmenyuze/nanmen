@@ -110,7 +110,7 @@ fun DnsLogsScreen() {
                             "${timeFmt.format(Date(it.ts))} ${it.domain} ${it.qtype} ${it.action} ${it.detail} " +
                                 "x${it.count} ${it.ms}ms"
                         }
-                        val where = Actions.exportText(ctx, "namu_log_$ts.txt", body)
+                        val where = Actions.exportText(ctx, "namu_dns_log_$ts.txt", body)
                         messages.show("已导出：$where")
                     } catch (e: Exception) {
                         messages.show(e.message ?: "导出失败")
@@ -119,11 +119,6 @@ fun DnsLogsScreen() {
             }
             Spacer(Modifier.width(6.dp))
             MiniTextAction(if (autoScroll) "暂停滚动" else "回到最新") { autoScroll = !autoScroll }
-            Spacer(Modifier.width(6.dp))
-            MiniTextAction(
-                "清空",
-                enabled = logs.isNotEmpty(),
-            ) { container.logs.clearDns() }
         }
 
         LogFilterBar(

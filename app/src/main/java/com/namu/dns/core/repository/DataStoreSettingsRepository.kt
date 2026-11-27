@@ -8,6 +8,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import com.namu.dns.Actions
 import com.namu.dns.AppConfig
 import com.namu.dns.ConfigFileStore
 import com.namu.dns.ConfigStore
@@ -91,7 +92,8 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
             val base = if (p[Keys.PROFILE_DEVICE_PREFS] == true) stored else {
                 activeProfile?.general?.restoreLegacyDevicePreferences(stored) ?: stored
             }
-            _config.value = activeProfile?.toAppConfig(base) ?: base
+            val loaded = activeProfile?.toAppConfig(base) ?: base
+            _config.value = loaded.copy(nodes = Actions.nameSubscriptionNodes(loaded.nodes))
             if (p[Keys.PROFILE_DEVICE_PREFS] != true) {
                 dataStore.edit {
                     it[Keys.CONFIG] = base.toJson().toString()

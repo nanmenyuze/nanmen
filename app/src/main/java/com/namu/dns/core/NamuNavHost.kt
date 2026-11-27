@@ -7,7 +7,9 @@ import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
@@ -41,6 +43,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.layer.drawLayer
+import androidx.compose.ui.graphics.rememberGraphicsLayer
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -133,6 +141,8 @@ fun NamuAppShell(
         LaunchedEffect(Unit) {
             container.messages.messages.collect { snackbar.showSnackbar(it) }
         }
+        val pageLayer = rememberGraphicsLayer()
+        var pageOrigin by remember { mutableStateOf(Offset.Zero) }
 
         Scaffold(
             containerColor = NamuColors.Bg,
@@ -142,10 +152,16 @@ fun NamuAppShell(
                         Modifier.fillMaxWidth().padding(horizontal = 28.dp, vertical = 8.dp),
                         contentAlignment = Alignment.Center,
                     ) {
-                        Surface(shape = RoundedCornerShape(NamuTokens.RadiusCard), color = Color(0xEE1C1C1E)) {
+                        val snackbarShape = RoundedCornerShape(NamuTokens.RadiusMenu)
+                        Surface(
+                            shape = snackbarShape,
+                            color = NamuColors.Floating,
+                            shadowElevation = 4.dp,
+                            modifier = Modifier.border(.5.dp, NamuColors.GlassRim.copy(alpha = .38f), snackbarShape),
+                        ) {
                             Text(
                                 data.visuals.message,
-                                color = Color.White,
+                                color = NamuColors.TextMain,
                                 fontSize = 13.sp,
                                 lineHeight = 17.sp,
                                 modifier = Modifier.padding(horizontal = 18.dp, vertical = 11.dp),
@@ -159,6 +175,8 @@ fun NamuAppShell(
                     GlassDock(
                         tabs = tabs,
                         selected = currentTab,
+                        pageLayer = pageLayer,
+                        pageOrigin = { pageOrigin },
                         onSelect = navController::openMainTab,
                     )
                 }
@@ -175,13 +193,23 @@ fun NamuAppShell(
                 ).consumeWindowInsets(PaddingValues(top = padding.calculateTopPadding())),
                 contentAlignment = Alignment.TopCenter,
             ) {
+                val capture = if (hasDock) {
+                    Modifier
+                        .onGloballyPositioned { pageOrigin = it.positionInRoot() }
+                        .drawWithContent {
+                            pageLayer.record { this@drawWithContent.drawContent() }
+                            drawLayer(pageLayer)
+                        }
+                } else {
+                    Modifier
+                }
                 CompositionLocalProvider(LocalDockClearance provides
                     (if (hasDock) padding.calculateBottomPadding() else 0.dp)) {
                     NamuNavHost(
                         navController = navController,
                         onToggle = onToggle,
                         onRestart = onRestart,
-                        modifier = Modifier.fillMaxHeight().widthIn(max = 640.dp).fillMaxWidth(),
+                        modifier = Modifier.fillMaxHeight().widthIn(max = 640.dp).fillMaxWidth().then(capture),
                     )
                 }
             }
@@ -203,20 +231,44 @@ fun NamuNavHost(
         startDestination = HomeRoute,
         modifier = modifier.clipToBounds(),
         enterTransition = {
-            if (targetState.destination.isMainTab()) fadeIn(tween(160))
-            else slideInHorizontally(tween(300)) { direction * it }
+            val mainTransition = initialState.destination.isMainTab() && targetState.destination.isMainTab()
+            if (mainTransition) {
+                val forward = (targetState.destination.mainTabIndex() - initialState.destination.mainTabIndex()) * direction > 0
+                slideInHorizontally(spring(dampingRatio = .86f, stiffness = 360f)) { if (forward) it else -it } +
+                    fadeIn(tween(120))
+            } else {
+                slideInHorizontally(tween(300)) { direction * it }
+            }
         },
         exitTransition = {
-            if (targetState.destination.isMainTab()) fadeOut(tween(140))
-            else slideOutHorizontally(tween(300)) { -direction * it / 4 }
+            val mainTransition = initialState.destination.isMainTab() && targetState.destination.isMainTab()
+            if (mainTransition) {
+                val forward = (targetState.destination.mainTabIndex() - initialState.destination.mainTabIndex()) * direction > 0
+                slideOutHorizontally(spring(dampingRatio = .86f, stiffness = 360f)) { if (forward) -it / 8 else it / 8 } +
+                    fadeOut(tween(180))
+            } else {
+                slideOutHorizontally(tween(300)) { -direction * it / 4 }
+            }
         },
         popEnterTransition = {
-            if (initialState.destination.isMainTab()) fadeIn(tween(160))
-            else slideInHorizontally(tween(280)) { -direction * it / 4 }
+            val mainTransition = initialState.destination.isMainTab() && targetState.destination.isMainTab()
+            if (mainTransition) {
+                val forward = (targetState.destination.mainTabIndex() - initialState.destination.mainTabIndex()) * direction > 0
+                slideInHorizontally(spring(dampingRatio = .86f, stiffness = 360f)) { if (forward) it else -it } +
+                    fadeIn(tween(120))
+            } else {
+                slideInHorizontally(tween(280)) { -direction * it / 4 }
+            }
         },
         popExitTransition = {
-            if (initialState.destination.isMainTab()) fadeOut(tween(140))
-            else slideOutHorizontally(tween(280)) { direction * it }
+            val mainTransition = initialState.destination.isMainTab() && targetState.destination.isMainTab()
+            if (mainTransition) {
+                val forward = (targetState.destination.mainTabIndex() - initialState.destination.mainTabIndex()) * direction > 0
+                slideOutHorizontally(spring(dampingRatio = .86f, stiffness = 360f)) { if (forward) -it / 8 else it / 8 } +
+                    fadeOut(tween(180))
+            } else {
+                slideOutHorizontally(tween(280)) { direction * it }
+            }
         },
     ) {
         composable<HomeRoute> {
@@ -326,7 +378,9 @@ fun NamuNavHost(
     }
 }
 
-private fun NavDestination.isMainTab(): Boolean = MainTab.entries.any { matches(it.route::class) }
+private fun NavDestination.mainTabIndex(): Int = MainTab.entries.indexOfFirst { matches(it.route::class) }
+
+private fun NavDestination.isMainTab(): Boolean = mainTabIndex() >= 0
 
 private inline fun <reified T : Any> NavGraphBuilder.detail(
     navController: NavHostController,

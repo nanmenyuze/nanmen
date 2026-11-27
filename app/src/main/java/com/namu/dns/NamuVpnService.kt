@@ -402,7 +402,8 @@ class NamuVpnService : VpnService() {
                 }
                 if (!ok) {
                     pfd.close()
-                    messages.show("内核启动失败，请查看日志")
+                    App.container.logs.poll()
+                    messages.show("内核启动失败，请查看运行日志")
                     runtime.markStartFailed()
                     mainHandler.post { ServiceCompat.stopForeground(this@NamuVpnService, ServiceCompat.STOP_FOREGROUND_REMOVE); stopSelf() }
                     return@Thread
@@ -478,7 +479,9 @@ class NamuVpnService : VpnService() {
                         0
                     }
                 }
-                if (result == NativeCore.RELOAD_CA_UNAVAILABLE) {
+                if (result == NativeCore.RELOAD_INVALID_CONFIG) {
+                    rejectInvalidConfig(profileName)
+                } else if (result == NativeCore.RELOAD_CA_UNAVAILABLE) {
                     val reason = "MITM 证书加载失败，仍在使用上一版配置"
                     ApplyCoordinator.onServiceResult(this, false, reason, null)
                     if (!finishProfileSwitch(profileName, success = false)) messages.show(reason)
@@ -528,7 +531,7 @@ class NamuVpnService : VpnService() {
             try {
                 when (NativeCore.nativeReloadRules(prev)) {
                     NativeCore.RELOAD_OK -> true
-                    NativeCore.RELOAD_CA_UNAVAILABLE -> false
+                    NativeCore.RELOAD_CA_UNAVAILABLE, NativeCore.RELOAD_INVALID_CONFIG -> false
                     else -> NativeCore.nativeStart(pfd.fd, prev)
                 }
             } catch (_: Throwable) {
@@ -709,18 +712,37 @@ class NamuVpnService : VpnService() {
         mainHandler.postDelayed(rebuildRunnable, 500)
     }
 
+    private fun rejectInvalidConfig(profileName: String) {
+        App.container.logs.poll()
+        val reason = "新配置校验失败，仍在使用上一版配置"
+        ApplyCoordinator.onServiceResult(this, false, reason, null)
+        if (!finishProfileSwitch(profileName, success = false)) messages.show(reason)
+    }
+
     /** Wi-Fi/蜂窝切换后重建 TUN，避免旧会话被内核挂死。 */
     private fun rebuildTunnel() {
         if (!running || stopping || rebuilding) return
         rebuilding = true
         Thread {
             var success = false
+            var configRejected = false
             var profileName = ""
             try {
                 synchronized(nativeLock) {
                     if (!running || stopping) return@synchronized
                     profileName = settings.activeConfigName()
                     val cfg = settings.current()
+                    val candidate = try {
+                        ConfigStore.buildNative(this, cfg, profileName)
+                    } catch (e: Exception) {
+                        android.util.Log.w("NamuVpn", "无法生成重建配置", e)
+                        configRejected = true
+                        return@synchronized
+                    }
+                    if (!NativeCore.nativeValidateConfig(candidate)) {
+                        configRejected = true
+                        return@synchronized
+                    }
                     try {
                         NativeCore.nativeStop()
                     } catch (_: Throwable) {
@@ -736,18 +758,18 @@ class NamuVpnService : VpnService() {
                     val applied = establishTun(cfg)
                     if (applied != null) {
                         val pfd = applied.pfd
-                        val rebuiltJson = try {
-                            ConfigStore.buildNative(this, settings.current(), profileName)
-                        } catch (_: Throwable) {
-                            null
+                        val rebuiltJson = if (applied.spec.mtu == tunnelSpec(cfg).mtu) {
+                            candidate
+                        } else {
+                            // 重建回退到 1500 时，只更新已验证快照里的 MTU。
+                            JSONObject(candidate).put("mtu", applied.spec.mtu).toString()
                         }
                         val ok = try {
-                            if (stopping || !running || rebuiltJson == null) false
-                            else NativeCore.nativeStart(pfd.fd, rebuiltJson)
+                            !stopping && running && NativeCore.nativeStart(pfd.fd, rebuiltJson)
                         } catch (_: Throwable) {
                             false
                         }
-                        if (ok && rebuiltJson != null && running && !stopping) {
+                        if (ok && running && !stopping) {
                             tun = pfd
                             activeTunnel = applied.spec
                             lastGoodJson = rebuiltJson
@@ -763,15 +785,13 @@ class NamuVpnService : VpnService() {
             } finally {
                 rebuilding = false
             }
-            if (success) {
+            if (configRejected && running && !stopping) {
+                rejectInvalidConfig(profileName)
+            } else if (success) {
                 finishProfileSwitch(profileName, success = true)
                 rebuildRetried = false
                 runtime.markConnected(0L)
                 App.container.refreshRuntime()
-                if (pendingReload) {
-                    pendingReload = false
-                    reloadConfig()
-                }
             } else if (running && !stopping && !finishProfileSwitch(profileName, success = false)) {
                 if (!rebuildRetried) {
                     // 自动重试一次：切网瞬间 establish 偶发失败，第二次通常即成。
@@ -785,6 +805,10 @@ class NamuVpnService : VpnService() {
                     messages.show("网络已切换，但隧道重建连续失败，已自动停止，请重新连接")
                     stopVpn()
                 }
+            }
+            if ((success || configRejected) && pendingReload) {
+                pendingReload = false
+                reloadConfig()
             }
             if (pendingNetworkRebuild) {
                 pendingNetworkRebuild = false

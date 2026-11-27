@@ -6,6 +6,7 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.namu.dns.Actions
 import com.namu.dns.AppConfig
+import com.namu.dns.NodeInfo
 import com.namu.dns.core.AppContainer
 import com.namu.dns.core.repository.HitRepository
 import com.namu.dns.core.repository.HitsUiState
@@ -45,8 +46,8 @@ class HomeViewModel(
     private val nodes: NodeRepository,
     private val messages: MessageRepository,
     private val hits: HitRepository? = null,
-    private val ping: suspend (String, Int, String) -> Long? = { host, port, method ->
-        Actions.ping(host, port, method)
+    private val ping: suspend (NodeInfo) -> Long? = { node ->
+        Actions.probeNodes(listOf(node), settings.current().pingUrl).firstOrNull()?.second
     },
 ) : ViewModel() {
     private val emptyHits = MutableStateFlow(HitsUiState())
@@ -71,7 +72,7 @@ class HomeViewModel(
         if (settings.current().mode == mode) return
         settings.update {
             // 纯过滤不代理：final 必须落到直连，否则无节点时会把流量判成代理再兜底拦截。
-            if (mode == "filter_only") it.copy(mode = mode, finalPolicy = "direct")
+            if (mode == "filter_only") it.copy(mode = mode, finalPolicy = "direct", finalPolicySource = "")
             else it.copy(mode = mode)
         }
     }
@@ -98,13 +99,13 @@ class HomeViewModel(
         }
         viewModelScope.launch {
             _testState.value = HomeTestState(testing = true)
-            val ms = ping(node.server, node.port, cfg.pingMethod)
-            if (ms != null) {
-                settings.update { latest ->
-                    latest.copy(nodes = latest.nodes.map { if (it.name == node.name) it.copy(latency = ms) else it })
-                }
+            val ms = ping(node)
+            settings.update { latest ->
+                latest.copy(nodes = latest.nodes.map {
+                    if (it == node.copy(latency = it.latency, testing = it.testing)) it.copy(latency = ms) else it
+                })
             }
-            _testState.value = HomeTestState(testing = false, result = ms?.let { "$it ms" } ?: "超时")
+            _testState.value = HomeTestState(testing = false, result = ms?.let { "$it ms" } ?: "测速失败")
         }
     }
 

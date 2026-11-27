@@ -1,6 +1,8 @@
 use once_cell::sync::Lazy;
 use serde_json::json;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// UDP 截断转 TCP 次数（无引擎上下文的全局计数）
 pub static STATS_TCP: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(0));
@@ -106,6 +108,12 @@ pub struct Stats {
     pub tun_pending_drop: AtomicU64,
     pub tun_pending_peak: AtomicU64,
     pub tun_tx_backpressure: AtomicU64,
+    /// 吞吐时间线：每 500ms 记一次聚合下行速率（KB/s），保留最近 120 拍（约 60s）。
+    /// 诊断里按时间顺序输出，用来一眼看出「掉速再恢复」是锯齿状（自己饿死 ACK）
+    /// 还是随链路抖动（Wi-Fi/拨号侧），不必再靠单点平均速率猜。
+    pub down_rate_hist: Mutex<VecDeque<u64>>,
+    /// 上一拍的聚合下行字节，供速率差分使用。
+    pub down_rate_prev: AtomicU64,
     pub tun_write_would_block: AtomicU64,
     pub tun_write_error: AtomicU64,
     /// TCP 回收：空闲兜底回收 / 达到并发上限时淘汰最久空闲连接。
@@ -122,12 +130,23 @@ pub struct Stats {
     pub quic_blackholed: AtomicU64,
     /// TCP 缓冲预算不足被拒绝的新连接数（水位守卫兜底）。
     pub tcp_buffer_denied: AtomicU64,
+    /// 半开堆积触发的入场小档次数（区别于大档名额耗尽的 tcpBufferDenied）。
+    pub tcp_halfopen_downgrade: AtomicU64,
+    /// 无进展告警次数（未确认队列不缩短且上行不增长 ≥20s，一个停滞期计一次）。
+    pub tcp_unacked_stall: AtomicU64,
+    /// 半开连接当前占用的大档名额数（仪表，500ms 刷新；大档全局上限 128）。
+    pub tcp_halfopen_big_tier: AtomicU64,
     /// QUIC 假活回落：累计判为黑洞的目标数。
     pub quic_fallback: AtomicU64,
     pub tcp_limit_evicted: AtomicU64,
     /// 主循环处理耗时（select 返回到下一轮 select 前）：last / max，毫秒。
     pub loop_round_ms_last: AtomicU64,
     pub loop_round_ms_max: AtomicU64,
+    /// 主循环单轮 CPU 微秒（区别于墙钟：差值大 = 轮内有阻塞等待）。
+    pub loop_cpu_us_last: AtomicU64,
+    pub loop_cpu_us_max: AtomicU64,
+    /// 主循环所在 worker 线程 CPU 占比（每秒采样，含同 worker 其他任务）。
+    pub loop_thread_cpu_pct: AtomicU64,
     /// 直连拨号熔断：冷却期内被抑制拨号的连接数。
     pub dial_breaker_rejected: AtomicU64,
     /// IP 级熔断：同一地址多端口轮番超时后被整体抑制的拨号数。
@@ -158,6 +177,20 @@ pub struct Stats {
 }
 
 impl Stats {
+    /// 记录一拍聚合下行速率（KB/s）。首拍没有基线直接跳过，避免开机瞬间的
+    /// 累计字节被当成「一个 500ms 窗口内的流量」算成假的峰值。
+    pub fn push_down_rate(&self, kbs: u64, has_baseline: bool) {
+        if !has_baseline {
+            return;
+        }
+        if let Ok(mut g) = self.down_rate_hist.lock() {
+            if g.len() >= 120 {
+                g.pop_front();
+            }
+            g.push_back(kbs);
+        }
+    }
+
     /// 记录一次上游往返耗时，用于界面显示平均 DNS 延迟。
     pub fn record_dns_ms(&self, ms: u64) {
         self.dns_ms_sum.fetch_add(ms, Ordering::Relaxed);
@@ -303,12 +336,21 @@ impl Stats {
             "tunPendingDrop": self.tun_pending_drop.load(Ordering::Relaxed),
             "tunPendingPeak": self.tun_pending_peak.load(Ordering::Relaxed),
             "tunTxBackpressure": self.tun_tx_backpressure.load(Ordering::Relaxed),
+            "downKBs": self
+                .down_rate_hist
+                .lock()
+                .map(|g| g.iter().copied().collect::<Vec<u64>>())
+                .unwrap_or_default(),
             "tunWriteWouldBlock": self.tun_write_would_block.load(Ordering::Relaxed),
             "tunWriteError": self.tun_write_error.load(Ordering::Relaxed),
             "tcpIdleReaped": self.tcp_idle_reaped.load(Ordering::Relaxed),
             "tcpRecvFull": self.tcp_recv_full.load(Ordering::Relaxed),
             "tcpSendStalled": self.tcp_send_stalled.load(Ordering::Relaxed),
             "tcpBufferDenied": self.tcp_buffer_denied.load(Ordering::Relaxed),
+            "tcpHalfOpenDowngrade": self.tcp_halfopen_downgrade.load(Ordering::Relaxed),
+            "tcpUnackedStall": self.tcp_unacked_stall.load(Ordering::Relaxed),
+            "tcpHalfOpenBigTier": self.tcp_halfopen_big_tier.load(Ordering::Relaxed),
+            "tcpTopSlow": crate::netstack::top_slow_json(),
             "quicFallback": self.quic_fallback.load(Ordering::Relaxed),
             "quicBlackholed": self.quic_blackholed.load(Ordering::Relaxed),
             "bigTierInUse": self.big_tier_in_use.load(Ordering::Relaxed),
@@ -334,6 +376,9 @@ impl Stats {
             "tunPoolMissTx": crate::netstack::pool_misses().2,
             "loopRoundMsLast": self.loop_round_ms_last.load(Ordering::Relaxed),
             "loopRoundMsMax": self.loop_round_ms_max.load(Ordering::Relaxed),
+            "loopCpuUsLast": self.loop_cpu_us_last.load(Ordering::Relaxed),
+            "loopCpuUsMax": self.loop_cpu_us_max.load(Ordering::Relaxed),
+            "loopThreadCpuPct": self.loop_thread_cpu_pct.load(Ordering::Relaxed),
             "uptime": uptime,
         });
         v["mitmBypassHosts"] = json!(bypass_hosts);

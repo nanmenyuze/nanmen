@@ -79,7 +79,7 @@ class ViewModelStateTest {
         val stats = FakeStats()
         val vm = HomeViewModel(
             settings, runtime, stats, DefaultNodeRepository(settings), DefaultMessageRepository(),
-            ping = { _, _, _ -> 42L },
+            ping = { _ -> 42L },
         )
         vm.state.test {
             assertEquals(AppConfig(), awaitItem().config)
@@ -99,7 +99,7 @@ class ViewModelStateTest {
         val vm = HomeViewModel(
             settings, DefaultRuntimeRepository(), FakeStats(),
             DefaultNodeRepository(settings), DefaultMessageRepository(),
-            ping = { _, _, _ -> 42L },
+            ping = { _ -> 42L },
         )
         vm.setMode("filter_only")
         val cfg = settings.current()
@@ -114,7 +114,7 @@ class ViewModelStateTest {
         val vm = HomeViewModel(
             settings, DefaultRuntimeRepository(), FakeStats(),
             DefaultNodeRepository(settings), DefaultMessageRepository(),
-            ping = { _, _, _ -> 42L },
+            ping = { _ -> 42L },
         )
         vm.setMode("rule")
         assertEquals("rule", settings.current().mode)
@@ -125,7 +125,7 @@ class ViewModelStateTest {
     }
 
     @Test
-    fun `home test state is kept in view model and uses configured method`() = runTest {
+    fun `home test state is kept in view model and probes selected node`() = runTest {
         val settings = FakeSettingsRepository(
             AppConfig(
                 nodes = listOf(NodeInfo("n1", "ss", "1.1.1.1", 443)),
@@ -133,11 +133,11 @@ class ViewModelStateTest {
                 pingMethod = "tls",
             ),
         )
-        var methodUsed: String? = null
+        var nodeUsed: String? = null
         val vm = HomeViewModel(
             settings, DefaultRuntimeRepository(), FakeStats(), DefaultNodeRepository(settings), DefaultMessageRepository(),
-            ping = { _, _, method ->
-                methodUsed = method
+            ping = { node ->
+                nodeUsed = node.name
                 42L
             },
         )
@@ -145,7 +145,7 @@ class ViewModelStateTest {
         advanceUntilIdle()
         assertEquals("42 ms", vm.testState.value.result)
         assertEquals(false, vm.testState.value.testing)
-        assertEquals("tls", methodUsed)
+        assertEquals("n1", nodeUsed)
         assertEquals(42L, settings.current().nodes.single().latency)
     }
 

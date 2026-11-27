@@ -21,6 +21,20 @@ class LogRepositoryTest {
     }
 
     @Test
+    fun explicitPollKeepsStartupFailureBeforeVpnConnects() {
+        val entry = LogEntry(1, 1, "E", "core", "配置解析失败")
+        val repo = DefaultLogRepository(
+            DefaultRuntimeRepository(),
+            FakeSource(runtimeBatch = listOf(entry)),
+            autoPoll = false,
+        )
+
+        repo.poll()
+
+        assertEquals(listOf(entry), repo.current().runtime)
+    }
+
+    @Test
     fun `poll appends only ids after sinceId and caps history`() {
         val runtime = DefaultRuntimeRepository()
         runtime.markConnected(0)

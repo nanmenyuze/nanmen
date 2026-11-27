@@ -191,6 +191,27 @@ object Diagnostics {
                     "缓冲池未命中 ${statsJson.optLong("tunPoolMiss")} 次（rx ${statsJson.optLong("tunPoolMissRx")} / tx ${statsJson.optLong("tunPoolMissTx")}）",
             )
             sb.appendLine(
+                "主循环 CPU：上轮 ${statsJson.optLong("loopCpuUsLast")} µs，峰值 ${statsJson.optLong("loopCpuUsMax")} µs；" +
+                    "worker 线程占用 ${statsJson.optLong("loopThreadCpuPct")}%（墙钟远大于 CPU = 轮内阻塞，持续高位 = 算力瓶颈）",
+            )
+            sb.appendLine(
+                "半开入场降档 ${statsJson.optLong("tcpHalfOpenDowngrade")} 次，" +
+                    "半开当前占大档 ${statsJson.optLong("tcpHalfOpenBigTier")}/128；" +
+                    "疑似重传超时告警 ${statsJson.optLong("tcpUnackedStall")} 次",
+            )
+            val topSlow = statsJson.optJSONArray("tcpTopSlow")
+            if (topSlow != null && topSlow.length() > 0) {
+                val parts = mutableListOf<String>()
+                for (i in 0 until topSlow.length()) {
+                    val o = topSlow.optJSONObject(i) ?: continue
+                    parts += "#${o.optLong("id")} 停滞${o.optLong("stallMs") / 1000}s " +
+                        "积压${formatBytes(o.optLong("pendingBytes"))} 未确认${formatBytes(o.optLong("unackedBytes"))}"
+                }
+                if (parts.isNotEmpty()) {
+                    sb.appendLine("慢连接 top${parts.size}：${parts.joinToString(" · ")}")
+                }
+            }
+            sb.appendLine(
                 "动态 UDP 目标：${statsJson.optLong("udpTargets")} 个（普通+DNS 合计数），" +
                     "预分配缓冲容量 ${formatBytes(statsJson.optLong("udpTargetBufKb") * 1024)}（物理页按实际流量提交）；" +
                     "DNS 旧回包按 generation 丢弃 ${statsJson.optLong("dnsStaleReply")} 次，" +

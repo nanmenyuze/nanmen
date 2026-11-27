@@ -106,7 +106,6 @@ class DefaultLogRepository(
     override fun current(): LogsUiState = _state.value
 
     override fun poll() {
-        if (!runtime.current().connected) return
         synchronized(lock) {
             runCatching {
                 val newRuntime = source.logs(lastRuntimeId)

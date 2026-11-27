@@ -124,10 +124,9 @@ fun ConfigScreen(onOpenPanel: (String) -> Unit, onOpenModules: () -> Unit) {
         }
     }
 
-    Column(
-        Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
-    ) {
-        MainPageTopBar("配置") {
+    MainPageChrome(
+        title = "配置",
+        trailing = {
             Box {
                 Box(
                     Modifier
@@ -164,7 +163,8 @@ fun ConfigScreen(onOpenPanel: (String) -> Unit, onOpenModules: () -> Unit) {
                     )
                 }
             }
-        }
+        },
+    ) {
         SectionHeader("配置方案")
         GroupCard {
             if (files.isEmpty()) {
@@ -269,10 +269,12 @@ internal fun SettingsRepository.applyRouting(mode: String, fullRoute: Boolean): 
     val current = current()
     if (current.mode == mode && current.dnsOnlyFullRoute == fullRoute) return false
     update {
+        val resetFinal = mode == DirectFilterScope.Connections.mode && it.mode != mode
         it.copy(
             mode = mode,
             dnsOnlyFullRoute = fullRoute,
-            finalPolicy = if (mode == DirectFilterScope.Connections.mode && it.mode != mode) "direct" else it.finalPolicy,
+            finalPolicy = if (resetFinal) "direct" else it.finalPolicy,
+            finalPolicySource = if (resetFinal) "" else it.finalPolicySource,
         )
     }
     return true
@@ -485,7 +487,13 @@ private fun ConfigAdvancedScreen(settings: ProfileEditor) {
                 val current = settings.current()
                 val fullRoute = if (selected == DirectFilterScope.Connections) current.dnsOnlyFullRoute else selected.fullRoute
                 settings.update {
-                    it.copy(mode = selected.mode, dnsOnlyFullRoute = fullRoute, finalPolicy = if (selected.mode == DirectFilterScope.Connections.mode && it.mode != selected.mode) "direct" else it.finalPolicy)
+                    val resetFinal = selected == DirectFilterScope.Connections && it.mode != selected.mode
+                    it.copy(
+                        mode = selected.mode,
+                        dnsOnlyFullRoute = fullRoute,
+                        finalPolicy = if (resetFinal) "direct" else it.finalPolicy,
+                        finalPolicySource = if (resetFinal) "" else it.finalPolicySource,
+                    )
                 }
             },
             onDismiss = { showFilterScope = false },

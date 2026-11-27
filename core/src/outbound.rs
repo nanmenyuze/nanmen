@@ -527,7 +527,12 @@ fn apply_bbr(fd: std::os::fd::RawFd) {
 /// 串行等首个地址会让「双栈首个地址不可达」白等整个超时，慢启动正是这么来的。
 async fn race_two(a: SocketAddr, b: SocketAddr) -> io::Result<TcpStream> {
     let mut fa = Box::pin(connect_one(a));
-    let mut fb = Box::pin(connect_one(b));
+    // b 是非首选族：短暂让位，首选族先通就不必等它（两条都发时 select 仍会
+    // 在 a 成功后立即丢弃 b 的连接尝试）。
+    let mut fb = Box::pin(async {
+        tokio::time::sleep(DIAL_HEAD_START).await;
+        connect_one(b).await
+    });
     tokio::select! {
         r = fa.as_mut() => match r {
             Ok(s) => Ok(s),
@@ -545,23 +550,66 @@ pub async fn connect_any(addrs: &[SocketAddr]) -> io::Result<TcpStream> {
     connect_any_with_pref(addrs, false).await
 }
 
-/// 候选地址排序：默认 v4 优先（stable sort，同族内保持原顺序）——竞速名额只有两个，
-/// 若按 getaddrinfo 原序取前两个，可能全是不可达 v6（含污染结果），
-/// 可用 v4 被挤在名额外，只能白等超时后失败。prefer-ipv6 开启时反转族优先级。
+/// 候选地址排序：两族交错（首选族领先），同族内保持原顺序。
+/// 旧实现按族排序后取前两个：首选族 ≥2 个地址时另一族永远进不了竞速名单，
+/// 首选族全被污染/不可达时，明明可用的另一族只能干等失败。
+/// 交错后前两名必然覆盖两族（只要两族都有地址）。prefer-ipv6 反转领先族。
 pub fn order_candidates(addrs: &[SocketAddr], prefer_v6: bool) -> Vec<SocketAddr> {
-    let mut ordered: Vec<SocketAddr> = addrs.to_vec();
-    ordered.sort_by_key(|a| if prefer_v6 { !a.is_ipv6() } else { a.is_ipv6() });
-    ordered
+    let (pref, rest): (Vec<SocketAddr>, Vec<SocketAddr>) = addrs
+        .iter()
+        .copied()
+        .partition(|a| if prefer_v6 { a.is_ipv6() } else { a.is_ipv4() });
+    let mut out = Vec::with_capacity(addrs.len());
+    let (mut i, mut j) = (0, 0);
+    while i < pref.len() || j < rest.len() {
+        if i < pref.len() {
+            out.push(pref[i]);
+            i += 1;
+        }
+        if j < rest.len() {
+            out.push(rest[j]);
+            j += 1;
+        }
+    }
+    out
 }
+
+/// 整次拨号总时限：前两名竞速（各 2s）+ 剩余候选顺序补试，全部圈在 4s 内。
+/// 没有总时限的话，N 个候选顺序补试最坏 2s×N，App 侧表现为长时间转圈。
+const DIAL_TOTAL_BUDGET: Duration = Duration::from_secs(4);
+/// 非首选族短暂领先让位（Happy Eyeballs 同款）：首选族通常 10~50ms 就通，
+/// 让 250ms 能避免大多数「v4 明明可用却多开一条 v6」的浪费。
+const DIAL_HEAD_START: Duration = Duration::from_millis(250);
 
 pub async fn connect_any_with_pref(addrs: &[SocketAddr], prefer_v6: bool) -> io::Result<TcpStream> {
     let ordered = order_candidates(addrs, prefer_v6);
-    let cands: Vec<SocketAddr> = ordered.iter().take(2).copied().collect();
-    match cands.as_slice() {
-        [] => Err(io_err("没有可用地址")),
-        [one] => connect_one(*one).await,
-        [a, b] => race_two(*a, *b).await,
-        _ => unreachable!("take(2) 保证最多两个候选地址"),
+    if ordered.is_empty() {
+        return Err(io_err("没有可用地址"));
+    }
+    let race = async {
+        let mut it = ordered.iter().copied();
+        let a = it.next().expect("非空已判");
+        let Some(b) = it.next() else {
+            return connect_one(a).await;
+        };
+        let first = race_two(a, b).await;
+        if first.is_ok() {
+            return first;
+        }
+        // 前两名都失败：剩余候选继续顺序补试（各自仍带 2s 单拨超时），
+        // 总时限兜底，不会无限试下去。
+        let mut last = first.unwrap_err();
+        for c in it {
+            match connect_one(c).await {
+                Ok(s) => return Ok(s),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    };
+    match tokio::time::timeout(DIAL_TOTAL_BUDGET, race).await {
+        Ok(r) => r,
+        Err(_) => Err(io_err("直连总时限超时（4s，候选全部未通）")),
     }
 }
 
@@ -1070,5 +1118,21 @@ mod tests {
         assert_eq!(order_candidates(&addrs, true)[0], v6, "prefer-ipv6 时 v6 优先");
         let same = [v4, "8.8.8.8:443".parse().unwrap()];
         assert_eq!(order_candidates(&same, true), same.to_vec(), "同族保持原序");
+    }
+
+    #[test]
+    fn order_candidates_interleaves_families() {
+        // 首选族有多个地址时，前两名必须覆盖两族——否则另一族永远进不了竞速。
+        let v4a: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let v4b: SocketAddr = "8.8.8.8:443".parse().unwrap();
+        let v6a: SocketAddr = "[2606:4700::1111]:443".parse().unwrap();
+        let v6b: SocketAddr = "[2001:4860::8888]:443".parse().unwrap();
+        let got = order_candidates(&[v4a, v4b, v6a, v6b], false);
+        assert_eq!(got, vec![v4a, v6a, v4b, v6b]);
+        let got = order_candidates(&[v4a, v4b, v6a, v6b], true);
+        assert_eq!(got, vec![v6a, v4a, v6b, v4b]);
+        // 只有一族时退化为原序。
+        let got = order_candidates(&[v4a, v4b], false);
+        assert_eq!(got, vec![v4a, v4b]);
     }
 }

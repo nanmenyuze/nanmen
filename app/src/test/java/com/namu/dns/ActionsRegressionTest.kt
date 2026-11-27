@@ -27,6 +27,43 @@ class ActionsRegressionTest {
     }
 
     @Test
+    fun refreshReplacesOnlyNodesFromThatSubscription() {
+        val source = subscriptionSourceId("https://example.test/sub?token=local-test")
+        val original = NodeInfo("同名", "ss", "example.test", 16648, udp = false)
+        val old = original.copy(source = source)
+        val manual = original.copy(server = "manual.test")
+        val another = original.copy(name = "另一订阅", source = subscriptionSourceId("https://other.test/sub"))
+
+        assertEquals(listOf(manual, another), Actions.nodesRetainedOnRefresh(listOf(old, manual, another), source))
+        assertEquals("同名 (2)", Actions.nameSubscriptionNodes(listOf(old), setOf(manual.name)).single().name)
+        assertEquals(old, NodeInfo.fromJson(old.toJson()))
+        assertEquals(false, old.toJson(includeSource = false).get("udp"))
+        assertFalse(old.toJson(includeSource = false).has("source"))
+        assertFalse(source.contains("local-test"))
+        assertEquals(source, NodeInfo.fromJson(old.toJson().put("source", "https://example.test/sub?token=local-test")).source)
+    }
+
+    @Test
+    fun importedPortStaysNumericForDialingAndStringInScriptEnvironment() {
+        val node = NodeInfo("测试节点", "ss", "example.test", 16648)
+        val environment = JSONObject(ConfigStore.scriptNodeEnvironment(node))
+
+        assertEquals(16648, node.toJson().get("port"))
+        assertEquals("16648", environment.get("nodePort"))
+    }
+
+    @Test
+    fun duplicateSubscriptionNamesPreserveNodesAndOriginalReferences() {
+        fun node(name: String, port: Int) = NodeInfo(name, "ss", "example.test", port)
+        val nodes = listOf(node("节点", 1), node("节点", 2), node("节点 (2)", 3), node("节点", 4))
+
+        val imported = Actions.nameSubscriptionNodes(nodes)
+
+        assertEquals(listOf("节点", "节点 (3)", "节点 (2)", "节点 (4)"), imported.map { it.name })
+        assertEquals(nodes.map { it.port }, imported.map { it.port })
+    }
+
+    @Test
     fun `conditional fetch returns not modified without requiring a location`() {
         ServerSocket(0, 2, InetAddress.getByName("127.0.0.1")).use { server ->
             server.soTimeout = 5_000

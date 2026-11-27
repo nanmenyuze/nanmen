@@ -44,6 +44,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -292,6 +293,8 @@ fun ModulesScreen(
                 Spacer(Modifier.height(12.dp))
             }
             ordered.forEachIndexed { index, entry ->
+                // 排序后按模块身份移动组合，避免相邻行继承图片、按压和动画状态。
+                key(entry.id) {
                 val module = (entry as? GlobalRuleStore.Entry.Remote)?.module
                 val warning = when (entry) {
                     is GlobalRuleStore.Entry.Remote -> buildList {
@@ -394,6 +397,7 @@ fun ModulesScreen(
                     )
                 }
                 if (index != ordered.lastIndex) Spacer(Modifier.height(12.dp))
+                }
             }
         }
 

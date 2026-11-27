@@ -6,6 +6,11 @@ import com.namu.dns.core.config.MitmConfig
 import android.util.Base64
 import org.json.JSONObject
 
+internal fun subscriptionSourceId(url: String): String {
+    val digest = java.security.MessageDigest.getInstance("SHA-256").digest(url.trim().toByteArray(Charsets.UTF_8))
+    return "sub:" + digest.joinToString("") { "%02x".format(java.util.Locale.ROOT, it) }
+}
+
 data class NodeInfo(
     val name: String,
     val type: String,
@@ -23,6 +28,8 @@ data class NodeInfo(
     val group: String = "",
     var latency: Long? = null,
     var testing: Boolean = false,
+    val udp: Boolean? = null,
+    val source: String = "",
 ) {
     private fun enc(s: String): String =
         java.net.URLEncoder.encode(s, "UTF-8").replace("+", "%20")
@@ -109,7 +116,7 @@ data class NodeInfo(
         }
     }
 
-    fun toJson(): JSONObject = JSONObject().apply {
+    fun toJson(includeSource: Boolean = true): JSONObject = JSONObject().apply {
         put("name", name)
         put("type", type)
         put("server", server)
@@ -124,6 +131,8 @@ data class NodeInfo(
         wsHost?.let { put("ws_host", it) }
         flow?.let { put("flow", it) }
         if (group.isNotBlank()) put("group", group)
+        udp?.let { put("udp", it) }
+        if (includeSource && source.isNotBlank()) put("source", source)
     }
 
     val typeLabel: String
@@ -153,6 +162,10 @@ data class NodeInfo(
             wsHost = if (o.has("ws_host") && !o.isNull("ws_host")) o.optString("ws_host") else null,
             flow = if (o.has("flow") && !o.isNull("flow")) o.optString("flow") else null,
             group = o.optString("group", ""),
+            udp = if (o.has("udp") && !o.isNull("udp")) o.optBoolean("udp") else null,
+            source = o.optString("source").let {
+                if (it.startsWith("http://") || it.startsWith("https://")) subscriptionSourceId(it) else it
+            },
         )
     }
 }
@@ -212,6 +225,7 @@ data class RuleItem(
     val preMatch: Boolean = false,
     /** D0 归因身份；模块规则在重建时生成，手写配置在 nativeJson 时补默认身份。 */
     @kotlinx.serialization.Transient val meta: RuleMeta? = null,
+    val subscriptionSource: String = "",
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("type", type)
@@ -222,19 +236,29 @@ data class RuleItem(
         if (extendedMatch) put("extendedMatch", true)
         if (preMatch) put("preMatch", true)
         meta?.let { put("meta", it.toJson()) }
+        if (subscriptionSource.isNotBlank()) put("subscriptionSource", subscriptionSource)
     }
 
     companion object {
         fun fromJson(o: JSONObject) = RuleItem(
             o.optString("type", "DOMAIN-SUFFIX"),
             o.optString("value"),
-            o.optString("action", "proxy"),
+            // org.json optString 对 JSON null 返回字符串 "null"（fallback 只在键
+            // 缺失时生效）。显式 null / 空串 / "null" 都是解析残留，按直连兜底，
+            // 避免下发内核落成 Missing→Block 把正常流量误拦成重试风暴。
+            sanitizeRuleAction(o.optString("action", "proxy")),
             o.optString("source", ""),
             o.optBoolean("enabled", true),
             o.optBoolean("extendedMatch", false),
             o.optBoolean("preMatch", false),
             if (o.has("meta") && !o.isNull("meta")) RuleMeta.fromJson(o.getJSONObject("meta")) else null,
+            o.optString("subscriptionSource", ""),
         )
+
+        private fun sanitizeRuleAction(raw: String): String {
+            val t = raw.trim()
+            return if (t.isEmpty() || t.equals("null", ignoreCase = true)) "direct" else t
+        }
     }
 }
 
@@ -508,6 +532,7 @@ data class ProxyGroup(
     val lbMode: String = "consistent-hash",
     /** 自动切换最短间隔，秒；当前节点不可用时立即切换。 */
     val switchInterval: Int = 30,
+    val subscriptionSource: String = "",
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("name", name)
@@ -522,6 +547,7 @@ data class ProxyGroup(
         put("noNodeAction", noNodeAction)
         put("lbMode", lbMode)
         put("switchInterval", switchInterval)
+        if (subscriptionSource.isNotBlank()) put("subscriptionSource", subscriptionSource)
     }
 
     companion object {
@@ -555,6 +581,7 @@ data class ProxyGroup(
                     if (it == "round-robin" || it == "roundrobin" || it == "rr") "round-robin" else "consistent-hash"
                 },
                 switchInterval = o.optInt("switchInterval", 30).coerceIn(1, 86_400),
+                subscriptionSource = o.optString("subscriptionSource", ""),
             )
         }
     }
@@ -777,6 +804,7 @@ data class AppConfig(
     var blockMode: String = "nxdomain",
     var cnDirect: Boolean = true,
     var finalPolicy: String = "proxy",
+    val finalPolicySource: String = "",
     var subscription: String = "",
     var rulesUrl: String = "",
     var customAds: List<String> = emptyList(),
@@ -814,12 +842,15 @@ data class AppConfig(
     var mtu: Int = 9000,
     /** 上游 per-socket BBR（WAN 腿）；内核不支持时静默回退 cubic。 */
     var bbr: Boolean = true,
+    /** TUN 收包校验和验收：默认关（内核生成的报文校验和必然正确）；开=恢复逐包验收做 A/B。 */
+    var tunRxChecksumVerify: Boolean = false,
     /** system / light / dark；仅影响外壳配色，不进入内核配置。 */
     var themeMode: String = "system",
     /** 开机或默认网络恢复时自动启动 VPN。 */
     var autoConnect: Boolean = false,
     /** tcp / tls：首页测速和自动选节点共用。 */
     var pingMethod: String = "tcp",
+    var pingUrl: String = "https://www.gstatic.com/generate_204",
     /** D2 轻量命中摘要开关：默认开；关闭后不再写盘，内存快照仍可用于本会话诊断。 */
     var hitHistoryEnabled: Boolean = true,
     /** S6：SSID 触发默认关；开启前必须由用户显式同意定位权限（opt-in）。 */
@@ -873,6 +904,7 @@ data class AppConfig(
         put("blockMode", blockMode)
         put("cnDirect", cnDirect)
         put("finalPolicy", finalPolicy)
+        if (finalPolicySource.isNotBlank()) put("finalPolicySource", finalPolicySource)
         put("subscription", subscription)
         put("rulesUrl", rulesUrl)
         put("customAds", JSONArray().apply { customAds.forEach { put(it) } })
@@ -890,6 +922,7 @@ data class AppConfig(
         put("quicFallback", quicFallback)
         put("mtu", mtu)
         put("bbr", bbr)
+        put("tunRxChecksumVerify", tunRxChecksumVerify)
         put("sniff", sniff)
         put("autoSelectNode", autoSelectNode)
         put("autoClearLogs", autoClearLogs)
@@ -897,6 +930,7 @@ data class AppConfig(
         put("themeMode", themeMode)
         put("autoConnect", autoConnect)
         put("pingMethod", pingMethod)
+        put("pingUrl", pingUrl)
         put("hitHistoryEnabled", hitHistoryEnabled)
         put("ssidTriggerEnabled", ssidTriggerEnabled)
         put("ssidTriggerNames", JSONArray().apply { ssidTriggerNames.forEach { put(it) } })
@@ -930,10 +964,10 @@ data class AppConfig(
             "dnsHeaderName", "dnsHeaderValue", "dnsPolicies", "dnsHijack", "dnsCacheTtl", "blockTtl", "fallbackFilter",
             "fallbackGeoCheck", "dnsQueryLog", "skipProxyHosts", "remoteConfigUrl", "remoteConfigName",
             "remoteConfigUpdatedAt", "remoteConfigInterval", "ruleSources", "moduleSources",
-            "blockEnabled", "blockMode", "cnDirect", "finalPolicy", "subscription", "rulesUrl",
+            "blockEnabled", "blockMode", "cnDirect", "finalPolicy", "finalPolicySource", "subscription", "rulesUrl",
             "customAds", "autoUpdateRules", "financeProtect", "rulesUpdatedAt", "allowDnsFallback", "blockWhenNoNode",
             "fakeIp", "blockAaaa", "ipv6", "preferIpv6", "alwaysRealIp", "sniff", "autoSelectNode", "autoClearLogs",
-            "autoDisablePrivateDns", "themeMode", "autoConnect", "pingMethod", "subscriptionInfo",
+            "autoDisablePrivateDns", "themeMode", "autoConnect", "pingMethod", "pingUrl", "subscriptionInfo",
             "hitHistoryEnabled", "ssidTriggerEnabled", "ssidTriggerNames", "ssidLocationOptIn",
             "caLastRemovalAt", "caLastRemovalCleared", "caLastRemovalFailed", "caLastRemovalFailedNs",
             "rules", "proxyGroups", "groupSelections", "mitm", "mtu", "bbr", "quicFallback",
@@ -1036,6 +1070,7 @@ data class AppConfig(
                     blockMode = o.optString("blockMode", def.blockMode),
                     cnDirect = o.optBoolean("cnDirect", true),
                     finalPolicy = o.optString("finalPolicy", def.finalPolicy),
+                    finalPolicySource = o.optString("finalPolicySource", ""),
                     subscription = o.optString("subscription", ""),
                     rulesUrl = o.optString("rulesUrl", def.rulesUrl),
                     customAds = customAds.distinct(),
@@ -1055,6 +1090,7 @@ data class AppConfig(
                     quicFallback = o.optBoolean("quicFallback", true),
                     mtu = o.optInt("mtu", 9000).coerceIn(1280, 9000),
                     bbr = o.optBoolean("bbr", true),
+                    tunRxChecksumVerify = o.optBoolean("tunRxChecksumVerify", false),
                     sniff = o.optBoolean("sniff", true),
                     autoSelectNode = o.optBoolean("autoSelectNode", false),
                     autoClearLogs = o.optBoolean("autoClearLogs", true),
@@ -1064,6 +1100,7 @@ data class AppConfig(
                     },
                     autoConnect = o.optBoolean("autoConnect", false),
                     pingMethod = o.optString("pingMethod", "tcp").let { if (it == "tls") "tls" else "tcp" },
+                    pingUrl = o.optString("pingUrl").ifBlank { "https://www.gstatic.com/generate_204" },
                     hitHistoryEnabled = o.optBoolean("hitHistoryEnabled", true),
                     ssidTriggerEnabled = o.optBoolean("ssidTriggerEnabled", false),
                     ssidTriggerNames = o.optJSONArray("ssidTriggerNames")?.let { a ->

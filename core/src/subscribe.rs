@@ -478,6 +478,31 @@ fn clash_diagnostic(v: &serde_yaml::Value, line: usize) -> NodeDiagnostic {
     }
 }
 
+/// 订阅里同名节点很常见（同一条目被多个分组引用、服务商复用名称）。
+/// 重名会让内核策略校验判全局错误拒绝启动，壳层列表按名字做 key 也会
+/// 在滚动渲染到重名项时崩溃。解析层统一加数字后缀重命名，节点全部保留。
+fn dedup_node_names(nodes: &mut [Node]) -> Vec<String> {
+    let mut seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut renamed = Vec::new();
+    for n in nodes.iter_mut() {
+        let base = n.name.clone();
+        let count = seen.get(&base).copied().unwrap_or(0) + 1;
+        seen.insert(base.clone(), count);
+        if count > 1 {
+            let mut c = count;
+            let mut candidate = format!("{} {}", base, c);
+            while seen.contains_key(&candidate) {
+                c += 1;
+                candidate = format!("{} {}", base, c);
+            }
+            seen.insert(candidate.clone(), 1);
+            n.name = candidate.clone();
+            renamed.push(candidate);
+        }
+    }
+    renamed
+}
+
 fn parse_clash(value: &serde_yaml::Value) -> ParseResult {
     let mut nodes = Vec::new();
     let mut diagnostics: Vec<NodeDiagnostic> = Vec::new();
@@ -491,6 +516,9 @@ fn parse_clash(value: &serde_yaml::Value) -> ParseResult {
                 None => diagnostics.push(clash_diagnostic(item, idx + 1)),
             }
         }
+    }
+    for r in dedup_node_names(&mut nodes) {
+        warnings.push(format!("重复节点名，已重命名为 {}", r));
     }
     let node_names: std::collections::HashSet<String> =
         nodes.iter().map(|n| n.name.clone()).collect();
@@ -862,7 +890,10 @@ fn parse_uri_list(text: &str) -> ParseResult {
         }
     }
     let counts = count_diagnostics(&diagnostics);
-    let warnings = diagnostic_warnings(&diagnostics, &counts);
+    let mut warnings = diagnostic_warnings(&diagnostics, &counts);
+    for r in dedup_node_names(&mut nodes) {
+        warnings.push(format!("重复节点名，已重命名为 {}", r));
+    }
     ParseResult {
         nodes,
         rules: vec![],
@@ -1398,6 +1429,26 @@ mod tests {
         let yaml = "proxies:\n  - {name: t, type: trojan, server: example.com, port: 443, password: pw, udp: false}\n";
         let parsed: Value = serde_json::from_str(&parse_to_json(yaml)).unwrap();
         assert_eq!(parsed["nodes"][0]["udp"], false);
+    }
+
+    #[test]
+    fn duplicate_node_names_are_renamed_not_dropped() {
+        // 重名节点会让内核策略校验拒绝启动、壳层列表 key 碰撞崩溃；
+        // 解析层必须加后缀保留全部节点。
+        let text = "ss://YWVzLTEyOC1nY206cHc=@1.2.3.4:8388#dup\nss://YWVzLTEyOC1nY206cHc=@1.2.3.5:8388#dup\nss://YWVzLTEyOC1nY206cHc=@1.2.3.6:8388#dup";
+        let v: Value = serde_json::from_str(&parse_to_json(text)).unwrap();
+        let names: Vec<&str> = v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["dup", "dup 2", "dup 3"]);
+        // Clash 订阅同样去重。
+        let yaml = "proxies:\n  - {name: n, type: trojan, server: a.com, port: 443, password: pw}\n  - {name: n, type: trojan, server: b.com, port: 443, password: pw}\n";
+        let v: Value = serde_json::from_str(&parse_to_json(yaml)).unwrap();
+        assert_eq!(v["nodes"][0]["name"], "n");
+        assert_eq!(v["nodes"][1]["name"], "n 2");
     }
 
     #[test]

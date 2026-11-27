@@ -108,7 +108,7 @@ fun LogsScreen() {
                     try {
                         val ts = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(java.util.Date())
                         val body = logs.joinToString("\n") { "${timeFmt.format(Date(it.ts))} [${it.level}] ${it.tag}: ${it.msg}" }
-                        val where = Actions.exportText(ctx, "namu_log_$ts.txt", body)
+                        val where = Actions.exportText(ctx, "namu_runtime_log_$ts.txt", body)
                         messages.show("已导出：$where")
                     } catch (e: Exception) {
                         messages.show(e.message ?: "导出失败")
@@ -117,11 +117,6 @@ fun LogsScreen() {
             }
             Spacer(Modifier.width(6.dp))
             MiniTextAction(if (autoScroll) "暂停滚动" else "回到最新") { autoScroll = !autoScroll }
-            Spacer(Modifier.width(6.dp))
-            MiniTextAction(
-                "清空",
-                enabled = logs.isNotEmpty(),
-            ) { container.logs.clearRuntime() }
         }
 
         LogFilterBar(

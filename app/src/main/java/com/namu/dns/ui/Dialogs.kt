@@ -1,6 +1,7 @@
 package com.namu.dns.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import android.content.Intent
 import androidx.compose.foundation.layout.Arrangement
@@ -29,6 +30,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -100,22 +102,34 @@ fun NamuDialog(
     scrollContent: Boolean = false,
     content: @Composable ColumnScope.() -> Unit = {},
 ) {
-    Dialog(onDismissRequest = { if (!loading) onDismiss() }) {
-        var shown by remember { mutableStateOf(false) }
+    var shown by remember { mutableStateOf(false) }
+    var closing by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    fun dismissWithMotion() {
+        if (closing) return
+        closing = true
+        shown = false
+        scope.launch {
+            delay(160)
+            onDismiss()
+        }
+    }
+    Dialog(onDismissRequest = { if (!loading) dismissWithMotion() }) {
         LaunchedEffect(Unit) { shown = true }
         val scale by animateFloatAsState(
-            if (shown) 1f else .96f,
-            spring(dampingRatio = NamuTokens.PressDamping, stiffness = NamuTokens.PressStiffness),
+            if (shown) 1f else .92f,
+            spring(dampingRatio = .80f, stiffness = 460f),
             label = "dialog-scale",
         )
-        val opacity by animateFloatAsState(if (shown) 1f else 0f, label = "dialog-opacity")
+        val opacity by animateFloatAsState(if (shown) 1f else 0f, tween(160), label = "dialog-opacity")
         val shape = RoundedCornerShape(NamuTokens.RadiusDialog)
         Column(
             Modifier
                 .widthIn(max = if (scrollContent) 380.dp else 320.dp)
                 .fillMaxWidth()
                 .graphicsLayer { scaleX = scale; scaleY = scale; alpha = opacity }
-                .shadow(14.dp, shape)
+                .shadow(6.dp, shape)
+                .border(.5.dp, NamuColors.GlassRim.copy(alpha = .42f), shape)
                 .clip(shape)
                 .background(NamuColors.Floating),
         ) {
@@ -151,7 +165,7 @@ fun NamuDialog(
             ) {
                 if (showDismiss) {
                     TextButton(
-                        onClick = onDismiss,
+                        onClick = { dismissWithMotion() },
                         enabled = !loading,
                         modifier = Modifier.weight(1f).heightIn(min = 48.dp),
                         shape = CircleShape,
@@ -261,9 +275,10 @@ fun SubscriptionDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
                 error = null
                 try {
                     val result = Actions.importSubscription(text, append = append)
-                    uiSettings.update { current -> current.copy(
-                        subscription = if (text.trim().startsWith("http")) text.trim() else current.subscription,
-                    ) }
+                    if (result.nodes == 0) {
+                        report = result
+                        return@launch
+                    }
                     val skipped = if (result.skipped > 0) "，跳过 ${result.skipped} 个节点" else ""
                     uiMessages.show("已导入 ${result.nodes} 个节点、${result.rules} 条规则$skipped")
                     if (result.diagnostics.isEmpty() && result.warnings.isEmpty()) {
@@ -287,7 +302,7 @@ fun SubscriptionDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
             Column(Modifier.weight(1f)) {
                 Text("追加到现有节点", fontSize = 13.sp, color = NamuColors.TextMain)
                 Text(
-                    if (append) "保留已有分组，同名节点用新的覆盖" else "清空现有节点，只保留本次导入",
+                    if (append) "保留已有节点，新导入的同名节点会自动加后缀" else "清空现有节点，只保留本次导入",
                     fontSize = 11.sp,
                     color = NamuColors.TextSub,
                 )
@@ -326,8 +341,11 @@ fun SubscriptionDialog(onDismiss: () -> Unit, onDone: () -> Unit) {
             message = message,
             confirmText = "知道了",
             showDismiss = false,
-            onConfirm = onDone,
-            onDismiss = {},
+            onConfirm = {
+                report = null
+                if (result.nodes > 0) onDone()
+            },
+            onDismiss = { report = null },
         ) {}
     }
 }
@@ -1356,6 +1374,7 @@ private fun ProxyGroupEditorDialog(
         noNodeAction = noNodeAction,
         lbMode = lbMode,
         switchInterval = switchInterval.toIntOrNull() ?: 30,
+        subscriptionSource = initial?.subscriptionSource.orEmpty(),
     )
     val baseOthers = groups.filter { it.name != (initial?.name ?: "") }
     val candidateGroups = if (isNew) groups + candidate else baseOthers + candidate

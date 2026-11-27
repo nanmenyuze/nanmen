@@ -284,6 +284,30 @@ internal fun aggregate(snap: HitsSnapshot, hours: Int): HitsWindow {
     )
 }
 
+internal data class HitModuleStat(val name: String, val hits: Long)
+
+/**
+ * 同一模块的 DNS/URL/脚本命中行按 sourceId 合并，并优先使用模块当前名称。
+ * 旧快照里可能只有 `script|mod_x` 这类内部键，直接展示会把内部 ID 露给用户。
+ */
+internal fun hitModuleDistribution(
+    rows: List<HitSourceStat>,
+    knownNames: Map<String, String>,
+): List<HitModuleStat> = rows.groupBy { row ->
+    row.sourceId.takeUnless { it.isBlank() || it == "unknown" }.orEmpty()
+}.map { (id, rowsForSource) ->
+    val displayName = knownNames[id]?.takeIf { it.isNotBlank() }
+        ?: rowsForSource.firstNotNullOfOrNull { row ->
+            row.sourceName.takeUnless {
+                it.isBlank() || it == "未归因" || it == row.key || it == row.sourceId
+            }
+        }
+        ?: "未归因"
+    HitModuleStat(displayName, rowsForSource.sumOf { it.windowHits })
+}.groupBy { it.name }.flatMap { (name, rowsForName) ->
+    if (name == "未归因") listOf(HitModuleStat(name, rowsForName.sumOf { it.hits })) else rowsForName
+}.sortedByDescending { it.hits }
+
 /** 7d 图按设备本地自然日聚合 7 个点；24h 图直接使用 24 个小时点。 */
 data class DayPoint(val label: String, val blocked: Long, val queries: Long)
 

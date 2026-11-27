@@ -18,8 +18,8 @@ import kotlinx.coroutines.launch
 class NodesViewModel(
     private val settings: SettingsRepository,
     private val messages: MessageRepository,
-    private val ping: suspend (String, Int, String) -> Long? = { host, port, method ->
-        Actions.ping(host, port, method)
+    private val ping: suspend (NodeInfo) -> Long? = { node ->
+        Actions.probeNodes(listOf(node), settings.current().pingUrl).firstOrNull()?.second
     },
 ) : ViewModel() {
     private val _testing = MutableStateFlow<String?>(null)
@@ -29,15 +29,15 @@ class NodesViewModel(
         if (_testing.value != null) return
         viewModelScope.launch {
             _testing.value = node.name
-            val ms = ping(node.server, node.port, settings.current().pingMethod)
+            val ms = ping(node)
             settings.update { current ->
                 current.copy(
                     nodes = current.nodes.map {
-                        if (it.name == node.name) it.copy(latency = ms) else it
+                        if (it == node.copy(latency = it.latency, testing = it.testing)) it.copy(latency = ms) else it
                     },
                 )
             }
-            messages.show(if (ms == null) "${node.name} 测速超时" else "${node.name}：${ms}ms")
+            messages.show(if (ms == null) "${node.name} 测速失败" else "${node.name}：${ms}ms")
             _testing.value = null
         }
     }

@@ -100,6 +100,35 @@ fn to_jstring(env: &mut JNIEnv, text: String) -> jstring {
     }
 }
 
+/// Validate the same payload accepted by nativeStart without changing the running engine.
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeValidateConfig<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    config_json: JString<'local>,
+) -> jboolean {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let Some(json) = read_string(&mut env, &config_json) else {
+            return false;
+        };
+        match config::parse_lenient(&json) {
+            Ok(_) => true,
+            Err(e) => {
+                logging::error(
+                    "core",
+                    format!(
+                        "配置校验失败: {} {}",
+                        e,
+                        config::error_context(&json, &e)
+                    ),
+                );
+                false
+            }
+        }
+    }));
+    matches!(result, Ok(true)) as jboolean
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStart<'local>(
     mut env: JNIEnv<'local>,
@@ -112,10 +141,17 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeStart<'local>(
             Some(s) => s,
             None => return false,
         };
-        let cfg: Config = match serde_json::from_str(&json) {
+        let cfg: Config = match config::parse_lenient(&json) {
             Ok(c) => c,
             Err(e) => {
-                logging::error("core", format!("配置解析失败: {}", e));
+                logging::error(
+                    "core",
+                    format!(
+                        "配置解析失败: {} {}",
+                        e,
+                        config::error_context(&json, &e)
+                    ),
+                );
                 return false;
             }
         };
@@ -483,6 +519,73 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeParseSubscription<'loc
     to_jstring(&mut env, json)
 }
 
+/// 端到端节点测速：经真实代理协议转发一个测速 URL 的 GET，量到首个响应字节。
+/// 壳层旧测速只对入口做 TCP/TLS 握手——入口快但转发不通的节点会被误选。
+/// 入参 {"nodes":[Node...],"url":"...","timeoutMs":5000}；
+/// 出参 {"results":[{"name","ok","ms","error"}]}。并发上限 6，独立小运行时，
+/// 不依赖 VPN 是否已启动。
+#[no_mangle]
+pub extern "system" fn Java_com_namu_dns_NativeCore_nativeProbeNodes<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    payload: JString<'local>,
+) -> jstring {
+    let json = catch_unwind(AssertUnwindSafe(
+        || -> Result<String, Box<dyn std::error::Error>> {
+            let raw = read_string(&mut env, &payload).unwrap_or_default();
+            let v: serde_json::Value = serde_json::from_str(&raw)?;
+            let nodes: Vec<config::Node> = serde_json::from_value(v["nodes"].clone())?;
+            let url = v["url"]
+                .as_str()
+                .unwrap_or("https://www.gstatic.com/generate_204")
+                .to_string();
+            let timeout_ms = v["timeoutMs"].as_u64().unwrap_or(5000).clamp(500, 15000);
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()?;
+            let results = rt.block_on(async move {
+                let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(6));
+                let mut set = tokio::task::JoinSet::new();
+                for node in nodes {
+                    let sem = sem.clone();
+                    let url = url.clone();
+                    set.spawn(async move {
+                        let _permit = sem.acquire().await.ok();
+                        let start = std::time::Instant::now();
+                        let r = outbound::probe_node(
+                            &node,
+                            &url,
+                            std::time::Duration::from_millis(timeout_ms),
+                        )
+                        .await;
+                        let ms = start.elapsed().as_millis() as u64;
+                        match r {
+                            Ok(_) => serde_json::json!({
+                                "name": node.name, "ok": true, "ms": ms, "error": "",
+                            }),
+                            Err(e) => serde_json::json!({
+                                "name": node.name, "ok": false, "ms": ms, "error": e.to_string(),
+                            }),
+                        }
+                    });
+                }
+                let mut out = Vec::new();
+                while let Some(joined) = set.join_next().await {
+                    if let Ok(v) = joined {
+                        out.push(v);
+                    }
+                }
+                out
+            });
+            Ok(serde_json::json!({ "results": results }).to_string())
+        },
+    ))
+    .unwrap_or_else(|_| Ok("{\"results\":[]}".to_string()))
+    .unwrap_or_else(|_| "{\"results\":[]}".to_string());
+    to_jstring(&mut env, json)
+}
+
 /// 壳层下发「五元组 → 归属 UID」整表。返回接受的条数，-1 表示参数错误。
 /// 无 root 时壳层下发空表，等价于关闭 UID 规则（不会退化成按 UID 0 匹配）。
 #[no_mangle]
@@ -580,11 +683,18 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeReloadRules<'local>(
             Some(s) => s,
             None => return 0,
         };
-        let cfg: Config = match serde_json::from_str(&json) {
+        let cfg: Config = match config::parse_lenient(&json) {
             Ok(c) => c,
             Err(e) => {
-                logging::error("core", format!("热重载配置解析失败: {}", e));
-                return 0;
+                logging::error(
+                    "core",
+                    format!(
+                        "热重载配置解析失败: {} {}",
+                        e,
+                        config::error_context(&json, &e)
+                    ),
+                );
+                return -2;
             }
         };
         let guard = match ENGINE.lock() {
@@ -788,7 +898,7 @@ fn node_udp_supported(cfg: &Config, name: &str) -> Option<bool> {
     cfg.nodes
         .iter()
         .find(|n| n.name == name)
-        .map(|n| matches!(n.kind.as_str(), "ss" | "socks5"))
+        .map(|n| n.udp_supported())
 }
 
 /// 规则测试按传输层分别展开；TCP 的结果不会替 UDP 背书。
@@ -932,7 +1042,7 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeTestRule<'local>(
         else {
             return r#"{"action":"错误","detail":"读取参数失败"}"#.to_string();
         };
-        let cfg: Config = match serde_json::from_str(&cfg_text) {
+        let cfg: Config = match config::parse_lenient(&cfg_text) {
             Ok(c) => c,
             Err(e) => {
                 return serde_json::json!({"action": "错误", "detail": format!("配置解析失败: {}", e)}).to_string();
@@ -1040,13 +1150,13 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeVersion<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
-    to_jstring(&mut env, "1.13.35".into())
+    to_jstring(&mut env, "1.13.38".into())
 }
 
 /// 给发布产物做独立校验用：即使 JNI 入口被裁剪，`llvm-strings` 仍能在
-/// libnanmen_core.so 里读到 `nanmen_core-1.13.35`，不必只信清单文件。
+/// libnanmen_core.so 里读到 `nanmen_core-1.13.38`，不必只信清单文件。
 #[no_mangle]
-pub static NAMU_CORE_VERSION: [u8; 19] = *b"nanmen_core-1.13.35";
+pub static NAMU_CORE_VERSION: [u8; 19] = *b"nanmen_core-1.13.38";
 
 #[cfg(test)]
 mod rule_test_transport_tests {

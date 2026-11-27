@@ -5,8 +5,12 @@ import com.namu.dns.AppUidResolver
 import com.namu.dns.GlobalRuleStore
 import com.namu.dns.UidTablePublisher
 
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
@@ -39,6 +43,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -57,6 +62,7 @@ import com.namu.dns.core.LocalAppContainer
 import com.namu.dns.core.config.RoutingMode
 import com.namu.dns.core.repository.HitsUiState
 import com.namu.dns.core.repository.ShellPhase
+import com.namu.dns.core.repository.hitModuleDistribution
 import com.namu.dns.core.repository.windowPoints
 import com.namu.dns.ui.viewmodel.DataViewModel
 import kotlinx.coroutines.launch
@@ -91,10 +97,7 @@ fun DataScreen(
     val dnsBlocked = if (useWindow) hits.window.blocked else stats.dnsBlocked
     val dnsCollected = useWindow || sessionSampled
     val trafficCollected = observesConnections && sessionSampled
-    Column(
-        Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
-    ) {
-        MainPageTopBar("数据")
+    MainPageChrome(title = "数据") {
         DataOverviewCard(
             title = "DNS 与拦截",
             period = dnsPeriod,
@@ -150,8 +153,23 @@ private fun DataOverviewCard(
     onClick: () -> Unit,
 ) {
     GroupCard(radius = NamuTokens.RadiusDataCard) {
+        val interaction = remember { MutableInteractionSource() }
+        val pressed by interaction.collectIsPressedAsState()
+        val scale by animateFloatAsState(
+            if (pressed) .985f else 1f,
+            spring(dampingRatio = NamuTokens.PressDamping, stiffness = NamuTokens.PressStiffness),
+            label = "data-card-press",
+        )
         Column(
-            Modifier.fillMaxWidth().clickable(onClickLabel = "查看${title}详情", onClick = onClick).padding(18.dp),
+            Modifier.fillMaxWidth()
+                .graphicsLayer { scaleX = scale; scaleY = scale }
+                .clickable(
+                    interactionSource = interaction,
+                    indication = null,
+                    onClickLabel = "查看${title}详情",
+                    onClick = onClick,
+                )
+                .padding(18.dp),
         ) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Text(title, Modifier.weight(1f), style = NamuTokens.Type.Title, color = NamuColors.TextMain)
@@ -243,6 +261,7 @@ fun DataAnalyticsScreen(
     val cfg = state.config
     val runtime = state.runtime
     var showLive by remember { mutableStateOf(false) }
+    var confirmClearHits by remember { mutableStateOf(false) }
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -256,7 +275,7 @@ fun DataAnalyticsScreen(
                     onRetry = { vm.repairHits() },
                     onStartVpn = onStartVpn,
                     onHistoryEnabled = { vm.setHitHistoryEnabled(it) },
-                    onClear = { vm.clearHits() },
+                    onClear = { confirmClearHits = true },
                 )
             }
 
@@ -464,6 +483,20 @@ fun DataAnalyticsScreen(
         Spacer(Modifier.height(LocalDockClearance.current + 34.dp))
     }
 
+    if (confirmClearHits) {
+        NamuDialog(
+            title = "清空命中历史？",
+            message = "将删除已记录的命中摘要和历史统计，且无法恢复。",
+            confirmText = "清空",
+            confirmColor = NamuColors.Red,
+            onConfirm = {
+                vm.clearHits()
+                confirmClearHits = false
+            },
+            onDismiss = { confirmClearHits = false },
+        ) {}
+    }
+
     if (showLive) {
         LiveConnectionsDialog(
             stats = stats,
@@ -554,8 +587,8 @@ private fun HitAnalytics(
             val win = state.window
             val points = windowPoints(state.snapshot, win, days = state.windowHours >= 168)
             Row(Modifier.fillMaxWidth().padding(top = 16.dp, bottom = 8.dp)) {
-                DataMetric(win.queries.toString(), "查询", Modifier.weight(1f))
-                DataMetric(win.blocked.toString(), "已拦截", Modifier.weight(1f))
+                DataMetric("查询", "%,d".format(win.queries), Modifier.weight(1f))
+                DataMetric("已拦截", "%,d".format(win.blocked), Modifier.weight(1f))
             }
             Row(
                 Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
@@ -608,21 +641,34 @@ private fun HitAnalytics(
                     modifier = Modifier.padding(top = 6.dp),
                 )
             }
-            if (win.perSource.isNotEmpty()) {
+            val global = GlobalRuleStore.state
+            val knownNames = remember(global.modules, global.extraMitm) {
+                buildMap {
+                    global.modules.forEach { put(it.id, it.name) }
+                    global.extraMitm.forEach { put(it.id, it.name) }
+                    put("config", "当前配置")
+                    put(GlobalRuleStore.ID_LOCAL_RULES, "本地规则")
+                    put(GlobalRuleStore.ID_LOCAL_MITM, "本地重写与脚本")
+                }
+            }
+            val distribution = remember(win.perSource, knownNames) {
+                hitModuleDistribution(win.perSource, knownNames)
+            }
+            if (distribution.isNotEmpty()) {
                 RowDivider(16.dp)
                 Text(
                     "按模块分布",
                     modifier = Modifier.padding(start = 16.dp, top = 12.dp, bottom = 4.dp),
                     fontSize = 12.sp, color = NamuColors.TextSub,
                 )
-                val max = win.perSource.maxOfOrNull { it.windowHits }?.coerceAtLeast(1L) ?: 1L
-                win.perSource.take(6).forEach { row ->
+                val max = distribution.first().hits.coerceAtLeast(1L)
+                distribution.take(6).forEach { row ->
                     Row(
                         Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 5.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
-                            row.sourceName.ifBlank { "未归因" },
+                            row.name,
                             fontSize = 12.sp, color = NamuColors.TextMain,
                             maxLines = 1, overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.width(120.dp),
@@ -632,13 +678,13 @@ private fun HitAnalytics(
                                 .background(NamuColors.Fill),
                         ) {
                             Box(
-                                Modifier.fillMaxWidth((row.windowHits.toFloat() / max).coerceIn(0.02f, 1f))
+                                Modifier.fillMaxWidth((row.hits.toFloat() / max).coerceIn(0.02f, 1f))
                                     .height(5.dp).clip(RoundedCornerShape(50))
                                     .background(NamuColors.Brand),
                             )
                         }
                         Spacer(Modifier.width(8.dp))
-                        Text("${row.windowHits}", fontSize = 11.sp, color = NamuColors.TextSub)
+                        Text("${row.hits}", fontSize = 11.sp, color = NamuColors.TextSub)
                     }
                 }
             }

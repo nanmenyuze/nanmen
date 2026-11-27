@@ -14,6 +14,72 @@ object ConfigStore {
             .sortedWith(compareBy({ if (it.value.order >= 0) it.value.order else Int.MAX_VALUE / 2 + it.index }, { it.index }))
             .map { it.value }
 
+    internal fun scriptNodeEnvironment(node: NodeInfo): Map<String, String> = mapOf(
+        "nodeName" to node.name,
+        "nodeType" to node.type,
+        "nodeServer" to node.server,
+        "nodePort" to node.port.toString(),
+    )
+
+    internal fun profileRoutingRules(cfg: AppConfig): List<RuleItem> =
+        if (cfg.mode == "rule") cfg.rules.filter {
+            it.enabled && isImportedRoutingRule(it) &&
+                it.type !in NON_ROUTING_TYPES && it.type !in FINAL_RULE_TYPES
+        } else emptyList()
+
+    internal fun routingRules(
+        cfg: AppConfig,
+        global: GlobalRuleStore.State,
+        modules: List<RuleItem> = emptyList(),
+        expand: (List<RuleItem>) -> List<RuleItem>,
+    ): List<RuleItem> {
+        val local = if (global.localRulesEnabled) {
+            global.localRules.filter { it.enabled && it.type !in NON_ROUTING_TYPES }
+        } else emptyList()
+        val seen = local.mapTo(HashSet()) { routingRuleKey(it) }
+        val profile = profileRoutingRules(cfg).filter { seen.add(routingRuleKey(it)) }
+        val (subscriptions, config) = profile.partition(::isSubscriptionRoutingRule)
+        var order = 0L
+        return expand(local).map { rule ->
+            prepareRoutingRule(rule, "本地规则", GlobalRuleStore.ID_LOCAL_RULES, "dns", order++)
+        } + expand(config).map { rule ->
+            prepareRoutingRule(rule, "当前配置", "config", "route", order++)
+        } + modules + expand(subscriptions).map { rule ->
+            prepareRoutingRule(rule, "订阅", rule.subscriptionSource.ifBlank { "config" }, "route", order++)
+        }
+    }
+
+    private val PROFILE_RULE_SOURCES = setOf("Clash 导入", "[Rule]")
+    private val NON_ROUTING_TYPES = setOf("URL-REGEX", "USER-AGENT")
+    private val FINAL_RULE_TYPES = setOf("FINAL", "MATCH")
+
+    private fun isSubscriptionRoutingRule(rule: RuleItem): Boolean =
+        rule.subscriptionSource.isNotBlank() || rule.source == "订阅"
+
+    internal fun isImportedRoutingRule(rule: RuleItem): Boolean =
+        isSubscriptionRoutingRule(rule) || rule.source in PROFILE_RULE_SOURCES
+
+    private fun routingRuleKey(rule: RuleItem): String =
+        "${rule.type}|${rule.value}|${rule.action}|${rule.extendedMatch}|${rule.preMatch}"
+
+    private fun prepareRoutingRule(
+        rule: RuleItem,
+        sourceName: String,
+        sourceId: String,
+        section: String,
+        order: Long,
+    ): RuleItem = rule.copy(
+        action = buildString {
+            append(rule.action)
+            if (rule.extendedMatch) append(",extended-matching")
+            if (rule.preMatch && rule.action == "block") append(",pre-matching")
+        },
+        source = rule.source.ifBlank { sourceName },
+        meta = rule.meta ?: makeMeta(
+            section, "${rule.type}|${rule.value}|${rule.action}", sourceId, sourceName, order,
+        ),
+    )
+
     private fun shortRuleId(vararg parts: String): String {
         val digest = java.security.MessageDigest.getInstance("SHA-256")
             .digest(parts.joinToString("|").toByteArray())
@@ -197,7 +263,10 @@ object ConfigStore {
             if (key.isNotBlank()) hostMeta[key] = configMeta("host", key, hostMetaOrder++)
         }
         root.put("mode", cfg.mode)
-        root.put("selected", cfg.selected ?: "")
+        // 仅过滤/DNS-only 全部直连，节点不参与转发：不下发节点表，
+        // 节点表的问题（重名、坏字段、订阅残留）不再拖累这两种模式的启动。
+        val nodelessMode = cfg.mode == "filter_only" || cfg.mode == "dns_only"
+        root.put("selected", if (nodelessMode) "" else cfg.selected ?: "")
         root.put("final_policy", cfg.finalPolicy)
         root.put("block_enabled", cfg.blockEnabled)
         root.put("block_mode", cfg.blockMode)
@@ -226,6 +295,7 @@ object ConfigStore {
         root.put("skip_proxy", JSONArray().apply { cfg.skipProxyHosts.forEach { put(it) } })
         root.put("mtu", cfg.mtu.coerceIn(1280, 9000))
         root.put("bbr", cfg.bbr)
+        root.put("tun_rx_checksum_verify", cfg.tunRxChecksumVerify)
         root.put("quicFallback", cfg.quicFallback)
         root.put("block_dot", true)
         // 「system」表示手机当前底层网络的 DNS；下发前转成内核可用的 UDP 地址。
@@ -312,12 +382,14 @@ object ConfigStore {
                 put("cache_file", File(context.filesDir, "namu_cache.json").absolutePath)
             },
         )
-        root.put("nodes", JSONArray().apply { cfg.nodes.forEach { put(it.toJson()) } })
+        root.put("nodes", JSONArray().apply {
+            if (!nodelessMode) cfg.nodes.forEach { put(it.toJson(includeSource = false)) }
+        })
         val moduleRules = if (GlobalRuleStore.enabledModules().isNotEmpty()) {
             runCatching { JSONArray(moduleRulesFile(context).readText()) }.getOrNull()
         } else null
         root.put("proxy_groups", JSONArray().apply {
-            cfg.proxyGroups.forEach { g ->
+            if (!nodelessMode) cfg.proxyGroups.forEach { g ->
                 put(JSONObject().apply {
                     put("name", g.name)
                     put("type", g.type)
@@ -329,6 +401,8 @@ object ConfigStore {
                     put("failure_threshold", g.failureThreshold)
                     put("recovery_threshold", g.recoveryThreshold)
                     put("no_node_action", g.noNodeAction)
+                    put("lb_mode", g.lbMode)
+                    put("switch_interval", g.switchInterval)
                 })
             }
         })
@@ -336,42 +410,27 @@ object ConfigStore {
             cfg.groupSelections.forEach { (k, v) -> if (k.isNotBlank() && v.isNotBlank()) put(k, v) }
         })
         root.put("rules", JSONArray().apply {
-            val localRules = if (GlobalRuleStore.state.localRulesEnabled) GlobalRuleStore.state.localRules else emptyList()
-            val routedRules = localRules.filter { it.type !in setOf("URL-REGEX", "USER-AGENT") }.flatMap { rule ->
-                if (rule.type != "RULE-SET" && rule.type != "DOMAIN-SET") return@flatMap listOf(rule)
-                val source = GlobalRuleStore.state.ruleSets.firstOrNull { it.id == rule.value || it.url == rule.value }
-                val file = if (source != null) globalRuleSetFile(context, source.url) else ruleSetFile(context, rule.value)
-                val content = runCatching { file.readText() }.getOrDefault("")
-                if (content.isBlank()) {
-                    android.util.Log.w("NamuRules", "规则集尚无本地缓存：${rule.value}")
-                    emptyList()
-                } else RuleSetExpander.expand(rule.type, content, rule.action, "规则集 ${rule.value}")
-                    .map { it.copy(extendedMatch = rule.extendedMatch, preMatch = rule.preMatch) }
+            val modules = (0 until (moduleRules?.length() ?: 0)).mapNotNull { i ->
+                moduleRules?.optJSONObject(i)?.let(RuleItem::fromJson)
             }
-            // 包名类规则在这里展开成 UID：内核只认数值 UID，包名映射属于壳层职责。
-            // 未安装的包会解析不到 uid，此时跳过该条并记日志，避免下发一条永远不命中的规则。
-            val (expanded, unresolved) = AppUidResolver.expand(context, routedRules.filter { it.enabled })
-            if (unresolved.isNotEmpty()) {
-                android.util.Log.w("NamuUid", "包名规则未解析（应用可能未安装）：$unresolved")
-            }
-            var order = 0L
-            expanded.forEach { rule ->
-                val key = "${rule.type}|${rule.value}|${rule.action}"
-                put(
-                    rule.copy(
-                        action = buildString {
-                            append(rule.action)
-                            if (rule.extendedMatch) append(",extended-matching")
-                            if (rule.preMatch && rule.action == "block") append(",pre-matching")
-                        },
-                        source = rule.source.ifBlank { "本地规则" },
-                        meta = rule.meta ?: makeMeta("dns", key, GlobalRuleStore.ID_LOCAL_RULES, "本地规则", order++),
-                    ).toJson(),
-                )
-            }
-            if (moduleRules != null) {
-                for (i in 0 until moduleRules.length()) put(moduleRules.get(i))
-            }
+            routingRules(cfg, GlobalRuleStore.state, modules) { rules ->
+                val routed = rules.flatMap { rule ->
+                    if (rule.type != "RULE-SET" && rule.type != "DOMAIN-SET") return@flatMap listOf(rule)
+                    val source = GlobalRuleStore.state.ruleSets.firstOrNull { it.id == rule.value || it.url == rule.value }
+                    val file = if (source != null) globalRuleSetFile(context, source.url) else ruleSetFile(context, rule.value)
+                    val content = runCatching { file.readText() }.getOrDefault("")
+                    if (content.isBlank()) {
+                        android.util.Log.w("NamuRules", "规则集尚无本地缓存：${rule.value}")
+                        emptyList()
+                    } else RuleSetExpander.expand(rule.type, content, rule.action, "规则集 ${rule.value}")
+                        .map { it.copy(extendedMatch = rule.extendedMatch, preMatch = rule.preMatch) }
+                }
+                val (expanded, unresolved) = AppUidResolver.expand(context, routed)
+                if (unresolved.isNotEmpty()) {
+                    android.util.Log.w("NamuUid", "包名规则未解析（应用可能未安装）：$unresolved")
+                }
+                expanded
+            }.forEach { put(it.toJson()) }
         })
         // MITM 分区：active 配置 + 启用模块合并。内核 1.11 消费；
         // url_rewrites/header_rewrites 下发原始模块规则行，由内核统一解析成结构化规则。
@@ -455,6 +514,10 @@ object ConfigStore {
                 }
             }
             put("enabled", g.scope.enabled)
+            // 上游复用属于 MITM 配置的一部分：备份/导出必须一起带上，
+            // 否则恢复后连接池会退回默认关闭，和备份前的行为不一致。
+            put("pool_enabled", g.scope.poolEnabled)
+            put("pool_idle_secs", g.scope.poolIdleSecs)
             put("hostnames", JSONArray(hosts.toList()))
             put("skip_hostnames", JSONArray(skips.toList()))
             put("url_rewrites", JSONArray(urls.toList()))
@@ -486,10 +549,7 @@ object ConfigStore {
                 // S5 NodeInfo：脚本可读取当前节点摘要；不含密码/UUID 等凭据。
                 val node = cfg.nodes.firstOrNull { it.name == cfg.selected } ?: cfg.nodes.firstOrNull()
                 if (node != null) {
-                    put("nodeName", node.name)
-                    put("nodeType", node.type)
-                    put("nodeServer", node.server)
-                    put("nodePort", node.port)
+                    scriptNodeEnvironment(node).forEach { (key, value) -> put(key, value) }
                 }
             })
             put("rule_meta", JSONArray(mitmMeta.values.map { it.toJson() }))

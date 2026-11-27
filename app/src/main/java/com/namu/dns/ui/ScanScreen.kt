@@ -117,8 +117,13 @@ fun ScanScreen(onDone: () -> Unit) {
             importing = true
             try {
                 val result = Actions.importSubscription(raw.trim(), append = true)
-                container.messages.show("已导入 ${result.nodes} 个节点")
-                onDone()
+                if (result.nodes > 0) {
+                    container.messages.show("已导入 ${result.nodes} 个节点")
+                    onDone()
+                } else {
+                    container.messages.show(Actions.subscriptionRefreshMessage(result))
+                    handled.set(false)
+                }
             } catch (e: Exception) {
                 container.messages.show(e.message ?: "二维码内容不是可用的节点或订阅")
                 handled.set(false)

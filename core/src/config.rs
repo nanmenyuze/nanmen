@@ -81,6 +81,11 @@ pub struct Config {
     /// 上游（WAN 腿）per-socket TCP_CONGESTION=bbr；内核不支持时静默回退 cubic。
     #[serde(default = "default_true")]
     pub bbr: bool,
+    /// TUN 收包校验和验收。默认关：RX 报文全部由本机内核协议栈生成，
+    /// 校验和必然正确，逐包验收是纯开销。设 true 恢复逐包验收，
+    /// 用于真机 A/B 对照（配合 loopCpuUs / loopThreadCpuPct 指标）。
+    #[serde(default)]
+    pub tun_rx_checksum_verify: bool,
 }
 
 fn default_mode() -> String {
@@ -131,6 +136,7 @@ impl Default for Config {
             mitm: crate::mitm::MitmConfig::default(),
             mtu: default_mtu(),
             bbr: true,
+            tun_rx_checksum_verify: false,
         }
     }
 }
@@ -409,4 +415,230 @@ pub struct Target {
     pub ip: std::net::IpAddr,
     pub port: u16,
     pub domain: Option<String>,
+}
+
+/// 配置桥字符串字段路径：壳层经 JSONObject 序列化，个别路径可能把数字/布尔
+/// 写进字符串字段（如 PORT 规则值、节点凭据）。严格 serde 会整份拒绝、内核
+/// 无法启动。解析前按这些路径把标量统一转字符串；数字字段（port/mtu/超时等）
+/// 不在表内，不受影响。`[]`=数组每项，`*`=对象每个值。
+const STRING_PATHS: &[&str] = &[
+    "mode",
+    "final_policy",
+    "block_mode",
+    "selected",
+    "dns.upstream",
+    "dns.fallback",
+    "dns.bootstrap",
+    "dns.hosts.*",
+    "dns.headers.*",
+    "rules[].type",
+    "rules[].value",
+    "rules[].action",
+    "rules[].source",
+    "rules[].meta.section",
+    "rules[].meta.key",
+    "rules[].meta.rule_id",
+    "rules[].meta.source_type",
+    "rules[].meta.source_id",
+    "rules[].meta.source_name",
+    "nodes[].name",
+    "nodes[].server",
+    "nodes[].method",
+    "nodes[].password",
+    "nodes[].uuid",
+    "nodes[].sni",
+    "nodes[].ws_path",
+    "nodes[].ws_host",
+    "nodes[].flow",
+    "proxy_groups[].name",
+    "proxy_groups[].type",
+    "proxy_groups[].members[]",
+    "proxy_groups[].test_url",
+    "proxy_groups[].no_node_action",
+    "proxy_groups[].lb_mode",
+    "group_selections.*",
+    "ads_files[]",
+    "skip_proxy[]",
+    "cn_domains_file",
+    "cn_ip_file",
+    "fake_ip_file",
+    "hit_history_file",
+    "mitm.ca_file",
+    "mitm.hostnames[]",
+    "mitm.skip[]",
+    "mitm.url_rewrites[]",
+    "mitm.header_rewrites[]",
+    "mitm.loon_rewrites[]",
+    "mitm.body_rewrites[]",
+    "mitm.websocket_rewrites[]",
+    "mitm.script_store_file",
+    "mitm.mock_base_dir",
+    "mitm.notification_file",
+    "mitm.environment.*",
+    "mitm.app_mode",
+    "mitm.rules[].pattern",
+    "mitm.rules[].action",
+    "mitm.rules[].body_pattern",
+    "mitm.rules[].replacement",
+    "mitm.rules[].header_field",
+    "mitm.rules[].source",
+    "mitm.rules[].raw",
+    "mitm.scripts[].name",
+    "mitm.scripts[].phase",
+    "mitm.scripts[].pattern",
+    "mitm.scripts[].condition",
+    "mitm.scripts[].source",
+    "mitm.scripts[].arguments.*",
+    "mitm.scripts[].argument_types.*",
+    "mitm.scripts[].argument_values.*",
+    "mitm.scripts[].cron",
+    "mitm.scripts[].trigger",
+    "mitm.scripts[].argument_text",
+    "mitm.rule_meta[].section",
+    "mitm.rule_meta[].key",
+    "mitm.rule_meta[].rule_id",
+    "mitm.rule_meta[].source_type",
+    "mitm.rule_meta[].source_id",
+    "mitm.rule_meta[].source_name",
+    "dns.host_meta[].section",
+    "dns.host_meta[].key",
+    "dns.host_meta[].rule_id",
+    "dns.host_meta[].source_type",
+    "dns.host_meta[].source_id",
+    "dns.host_meta[].source_name",
+    "rules[].meta.updated_at",
+    "rules[].meta.expiry",
+    "mitm.rule_meta[].updated_at",
+    "mitm.rule_meta[].expiry",
+    "dns.host_meta[].updated_at",
+    "dns.host_meta[].expiry",
+    "scripts[].name",
+    "scripts[].file",
+    "scripts[].args",
+    "nodes[].type",
+];
+
+fn coerce_string_at(v: &mut serde_json::Value, path: &[&str]) {
+    if path.is_empty() {
+        match v {
+            serde_json::Value::Number(n) => *v = serde_json::Value::String(n.to_string()),
+            serde_json::Value::Bool(b) => *v = serde_json::Value::String(b.to_string()),
+            _ => {}
+        }
+        return;
+    }
+    match path[0] {
+        "[]" => {
+            if let serde_json::Value::Array(a) = v {
+                for it in a.iter_mut() {
+                    coerce_string_at(it, &path[1..]);
+                }
+            }
+        }
+        "*" => {
+            if let serde_json::Value::Object(m) = v {
+                for (_, it) in m.iter_mut() {
+                    coerce_string_at(it, &path[1..]);
+                }
+            }
+        }
+        k => {
+            if let serde_json::Value::Object(m) = v {
+                if let Some(it) = m.get_mut(k) {
+                    coerce_string_at(it, &path[1..]);
+                }
+            }
+        }
+    }
+}
+
+/// 壳层下发配置的统一入口：先按字符串字段路径宽容化标量，再严格反序列化。
+pub fn parse_lenient(json: &str) -> Result<Config, String> {
+    let mut v: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    // 字符串 "null"/"NULL" 由 engine 归一化；但真正的 JSON null 会让 String
+    // 字段反序列化失败（整份拒绝→内核启动失败）。final_policy 为 JSON null
+    // 时按缺省值 proxy 处理，与「字段缺省」一致，避免代理配置兜底落空。
+    if let Some(fp) = v.get_mut("final_policy") {
+        if fp.is_null() {
+            *fp = serde_json::Value::String(default_final());
+        }
+    }
+    for path in STRING_PATHS {
+        // 表里数组段写作 "rules[]"，统一成 "rules.[]" 再按点分割
+        let norm = if path.contains(".[]") {
+            (*path).to_string()
+        } else {
+            path.replace("[]", ".[]")
+        };
+        let segs: Vec<&str> = norm.split('.').collect();
+        coerce_string_at(&mut v, &segs);
+    }
+    serde_json::from_value(v).map_err(|e| e.to_string())
+}
+
+/// 解析失败时截取报错列附近的 JSON 片段，日志能直接看到是哪个键写错了类型。
+pub fn error_context(json: &str, err: &str) -> String {
+    let col = err
+        .rsplit("column ")
+        .next()
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse::<usize>().ok());
+    match col {
+        Some(c) if c > 0 => {
+            let start = c.saturating_sub(80);
+            let end = (c + 40).min(json.len());
+            if start < end {
+                format!("…{}…", &json[start..end])
+            } else {
+                String::new()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod lenient_tests {
+    use super::*;
+
+    #[test]
+    fn numeric_scalars_in_string_fields_are_coerced() {
+        // 回归：壳层某路径把 PORT 规则值/节点凭据写成数字，严格 serde 整份拒绝
+        // 导致「内核启动失败」。宽容解析必须转字符串后正常启动，数字字段不受影响。
+        let json = r#"{
+            "mode": "filter_only",
+            "rules": [{"type": "PORT", "value": 16648, "action": "direct"}],
+            "nodes": [{"name": "n", "type": "ss", "server": "1.2.3.4", "port": 443, "password": 123456}],
+            "mtu": 9000,
+            "dns": {"hosts": {"a.example.com": 16648}}
+        }"#;
+        let cfg = parse_lenient(json).expect("数字标量应被宽容转字符串");
+        assert_eq!(cfg.rules[0].value, "16648");
+        assert_eq!(cfg.nodes[0].password.as_deref(), Some("123456"));
+        assert_eq!(cfg.nodes[0].port, 443);
+        assert_eq!(cfg.mtu, 9000);
+        assert_eq!(cfg.dns.hosts.get("a.example.com").map(String::as_str), Some("16648"));
+    }
+
+    #[test]
+    fn json_null_final_policy_defaults_to_proxy() {
+        // 真正的 JSON null（非字符串 "null"）会让 String 反序列化失败；
+        // 配置解析层必须按缺省值 proxy 兜底，避免代理配置最终策略落空。
+        let cfg = parse_lenient(r#"{"mode":"rule","final_policy":null}"#)
+            .expect("JSON null final_policy 应被宽容处理");
+        assert_eq!(cfg.final_policy, "proxy");
+        let cfg2 = parse_lenient(r#"{"mode":"rule"}"#).unwrap();
+        assert_eq!(cfg2.final_policy, "proxy");
+        // 字符串 "null" 原样保留，交由 engine 归一化。
+        let cfg3 = parse_lenient(r#"{"final_policy":"null"}"#).unwrap();
+        assert_eq!(cfg3.final_policy, "null");
+    }
+
+    #[test]
+    fn error_context_shows_offending_key() {
+        let json = r#"{"rules":[{"type":"PORT","value":16648,"action":"direct"}]}"#;
+        let err = "invalid type: integer `16648`, expected a string at line 1 column 33";
+        let ctx = error_context(json, err);
+        assert!(ctx.contains("value"), "上下文应包含出错键: {}", ctx);
+    }
 }

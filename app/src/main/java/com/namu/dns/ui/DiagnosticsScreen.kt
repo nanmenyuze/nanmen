@@ -37,6 +37,7 @@ fun DiagnosticsScreen(
     val mitmVm: MitmViewModel = viewModel(factory = MitmViewModel.factory(container, ctx))
     val mitmBusy by mitmVm.busy.collectAsStateWithLifecycle()
     var showClearLogs by remember { mutableStateOf(false) }
+    var clearScope by remember { mutableStateOf("all") }
 
     val cfg = state.config
     LaunchedEffect(Unit) { mitmVm.refresh() }
@@ -77,9 +78,12 @@ fun DiagnosticsScreen(
             )
             SettingsRow(
                 title = "清空当前日志",
-                subtitle = "清空当前运行日志与 DNS 记录，不影响命中历史",
+                subtitle = "可选择只清运行日志或 DNS 记录，不影响命中历史",
                 chevron = true,
-                onClick = { showClearLogs = true },
+                onClick = {
+                    clearScope = "all"
+                    showClearLogs = true
+                },
             )
             SettingsRow(
                 title = "导出诊断报告",
@@ -114,14 +118,26 @@ fun DiagnosticsScreen(
     if (showClearLogs) {
         NamuDialog(
             title = "清空日志？",
-            message = "将清空当前运行日志与 DNS 记录；命中历史与统计不受影响。",
+            message = "请选择要清空的日志。",
             confirmText = "清空",
             confirmColor = NamuColors.Red,
             onConfirm = {
-                vm.clearLogsNow()
+                when (clearScope) {
+                    "runtime" -> container.logs.clearRuntime()
+                    "dns" -> container.logs.clearDns()
+                    else -> vm.clearLogsNow()
+                }
                 showClearLogs = false
             },
             onDismiss = { showClearLogs = false },
-        ) {}
+        ) {
+            listOf("all" to "全部日志", "runtime" to "运行日志", "dns" to "DNS 查询日志").forEach { (key, label) ->
+                SettingsRow(
+                    title = label,
+                    value = if (clearScope == key) "已选" else null,
+                    onClick = { clearScope = key },
+                )
+            }
+        }
     }
 }

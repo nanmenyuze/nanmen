@@ -56,10 +56,7 @@ fun SettingsScreen(
     var showBackup by remember { mutableStateOf(false) }
     val context = LocalContext.current
 
-    Column(
-        Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
-    ) {
-        MainPageTopBar("设置")
+    MainPageChrome(title = "设置") {
         Spacer(Modifier.height(6.dp))
         HttpsScopeSection(onOpenCertificate = onOpenMitm)
         Spacer(Modifier.height(20.dp))

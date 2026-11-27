@@ -113,24 +113,21 @@ fun HomeScreen(
         else -> "已连接 · 过滤关闭"
     }
 
-    Column(
-        Modifier.fillMaxSize().background(NamuColors.Bg).verticalScroll(rememberScrollState()),
-        horizontalAlignment = Alignment.CenterHorizontally,
+    MainPageChrome(
+        title = "南门 DNS",
+        trailing = {
+            HomeRoutingPicker(
+                mode = mode,
+                enabled = !starting && !stopping,
+                onModeChange = { selected ->
+                    val current = container.settings.current()
+                    if (container.settings.applyRouting(selected.modeFor(current.mode), current.dnsOnlyFullRoute) &&
+                        container.runtime.current().connected
+                    ) onRestart()
+                },
+            )
+        },
     ) {
-        Column(Modifier.widthIn(max = 560.dp).fillMaxWidth()) {
-            MainPageTopBar("南门 DNS") {
-                HomeRoutingPicker(
-                    mode = mode,
-                    enabled = !starting && !stopping,
-                    onModeChange = { selected ->
-                        val current = container.settings.current()
-                        if (container.settings.applyRouting(selected.modeFor(current.mode), current.dnsOnlyFullRoute) &&
-                            container.runtime.current().connected
-                        ) onRestart()
-                    },
-                )
-            }
-
             val sessionActive = connected && state.stats.sessionActive
             WorkbenchStatusCard(
                 status = status,
@@ -200,7 +197,6 @@ fun HomeScreen(
             }
 
             Spacer(Modifier.height(LocalDockClearance.current + 20.dp))
-        }
     }
 }
 

@@ -25,7 +25,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -87,6 +87,7 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
     var showSub by remember { mutableStateOf(false) }
     var showAddNode by remember { mutableStateOf(false) }
     var showPingMethod by remember { mutableStateOf(false) }
+    var pingUrlDraft by remember { mutableStateOf("") }
     var query by remember { mutableStateOf("") }
     var refreshing by remember { mutableStateOf(false) }
     var selectionMode by remember { mutableStateOf(false) }
@@ -138,6 +139,9 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
 
     val sortMode = UiPrefs.nodeSort
     val filtered = remember(cfg.nodes, query, sortMode) { sortNodes(filterNodes(cfg.nodes, query), sortMode) }
+    val duplicateNames = remember(cfg.nodes) {
+        cfg.nodes.groupingBy { it.name }.eachCount().filterValues { it > 1 }.keys
+    }
     val groups = remember(filtered) {
         filtered.groupBy { it.group.ifBlank { "未分组" } }
     }
@@ -212,14 +216,17 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
                 SectionHeader("测速与自动选择")
                 GroupCard {
                     SettingsRow(
-                        title = "延迟测试方法",
-                        value = pingMethodLabel(cfg.pingMethod),
+                        title = "测速 URL",
+                        value = runCatching { java.net.URI(cfg.pingUrl).host }.getOrNull() ?: cfg.pingUrl,
                         chevron = true,
-                        onClick = { showPingMethod = true },
+                        onClick = {
+                            pingUrlDraft = cfg.pingUrl
+                            showPingMethod = true
+                        },
                     )
                     SwitchRow(
                         title = "自动选择最快节点",
-                        subtitle = "WorkManager 每 15 分钟测速，按 ${pingMethodLabel(cfg.pingMethod)} 延迟选择；也可手动点测速",
+                        subtitle = "WorkManager 每 15 分钟测速，按端到端转发延迟选择；也可手动点测速",
                         checked = cfg.autoSelectNode,
                         showDivider = false,
                     ) {
@@ -297,14 +304,20 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
                         )
                     }
                     if (open) {
-                        items(list, key = { "node:${it.name}" }) { node ->
+                        itemsIndexed(
+                            list,
+                            key = { index, node ->
+                                if (node.name in duplicateNames) "legacy-node:$index:$group"
+                                else "node:${node.name}"
+                            },
+                        ) { index, node ->
                             NodeRow(
                                 node = node,
                                 selected = node.name == cfg.selected,
                                 testing = testingOne == node.name,
                                 selectionMode = selectionMode,
                                 checked = selected[node.name] == true,
-                                showDivider = node != list.last(),
+                                showDivider = index != list.lastIndex,
                                 onClick = {
                                     haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
                                     if (selectionMode) {
@@ -337,29 +350,32 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
     }
 
     if (showPingMethod) {
-        ChoiceDialog(
-            title = "延迟测试方法",
-            message = "TCP 握手兼容所有节点；TLS 握手只适合 TLS 节点，能额外发现端口可连但握手失败的情况。自动选节点也使用这里的方法。",
-            options = listOf(
-                "tcp" to "TCP 握手（推荐）",
-                "tls" to "TLS 握手",
-            ),
-            selected = cfg.pingMethod,
-            onSelect = { method ->
-                if (method == "tcp" || method == "tls") {
-                    settings.update { current -> current.copy(pingMethod = method) }
+        NamuDialog(
+            title = "测速 URL",
+            message = "经代理协议真实转发一个 GET 请求，确认收到有效的 HTTP 响应。入口握手快但转发不通的节点不会被误选。",
+            confirmText = "保存",
+            onConfirm = {
+                val u = pingUrlDraft.trim()
+                if (u.startsWith("http://") || u.startsWith("https://")) {
+                    settings.update { current -> current.copy(pingUrl = u) }
                 }
                 showPingMethod = false
             },
             onDismiss = { showPingMethod = false },
-        )
+        ) {
+            NamuTextField(
+                value = pingUrlDraft,
+                onChange = { pingUrlDraft = it },
+                placeholder = "https://www.gstatic.com/generate_204",
+                singleLine = true,
+            )
+        }
     }
     if (showSub) {
         SubscriptionDialog(
             onDismiss = { showSub = false },
             onDone = {
                 showSub = false
-                reloadIfUsingProxy()
             },
         )
     }
@@ -367,17 +383,16 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
         AddNodeDialog(
             onDismiss = { showAddNode = false },
             onDone = { node ->
-                val unique = if (cfg.nodes.any { it.name == node.name }) {
-                    node.copy(name = "${node.name} 2")
-                } else node
-                settings.update { current ->
+                val saved = settings.update { current ->
+                    val existing = current.nodes.mapTo(HashSet()) { it.name }
+                    val unique = Actions.nameSubscriptionNodes(listOf(node.copy(source = "local://manual")), existing).single()
                     current.copy(
                         nodes = current.nodes + unique,
                         selected = current.selected ?: unique.name,
                     )
                 }
                 showAddNode = false
-                messages.show("已添加 ${unique.name}")
+                messages.show("已添加 ${saved.nodes.last().name}")
                 reloadIfUsingProxy()
             },
         )

@@ -20,6 +20,7 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
@@ -68,18 +69,28 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.graphics.drawscope.translate
+import androidx.compose.ui.graphics.layer.drawLayer
+import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.semantics.Role
@@ -101,7 +112,7 @@ import androidx.compose.ui.unit.sp
 /** U0：3.0 壳的设计令牌；页面不再各自散落 13/14/16/28sp 与随手圆角。 */
 object NamuTokens {
     /** 操作蓝：操作与选中统一取色；品牌橙只用于品牌字。 */
-    val Brand = Color(0xFF0057D9)
+    val Brand = Color(0xFF007AFF)
     val BrandOrange = Color(0xFFC54F00)
     val Ink = Color(0xFF151B25)
     val Sub = Color(0xFF606773)
@@ -127,13 +138,13 @@ object NamuTokens {
     val Space24 = 24.dp
     val Space32 = 32.dp
 
-    val RadiusCard = 26.dp
-    val RadiusRunCard = 34.dp
-    val RadiusDataCard = 30.dp
-    val RadiusRow = 18.dp
-    val RadiusControl = 16.dp
-    val RadiusMenu = 24.dp
-    val RadiusDialog = 32.dp
+    val RadiusCard = 24.dp
+    val RadiusRunCard = 30.dp
+    val RadiusDataCard = 26.dp
+    val RadiusRow = 16.dp
+    val RadiusControl = 14.dp
+    val RadiusMenu = 22.dp
+    val RadiusDialog = 30.dp
 
     /** 20dp / 2px 线性图标；新页面统一走 NamuIcon。 */
     val IconSize = 20.dp
@@ -159,20 +170,21 @@ object NamuColors {
         if (darkState.value != dark) darkState.value = dark
     }
 
-    val Bg: Color get() = if (isDark) Color(0xFF101418) else NamuTokens.Bg
+    val Bg: Color get() = if (isDark) Color.Black else NamuTokens.Bg
     val Card: Color get() = if (isDark) Color(0xFF1C1C1E) else NamuTokens.Card
-    val Floating: Color get() = if (isDark) Color(0xFA28282D) else Color(0xFCFFFFFF)
+    val Floating: Color get() = if (isDark) Color(0xD928282D) else Color(0xD9FFFFFF)
+    val GlassSurface: Color get() = if (isDark) Color(0x5228282D) else Color(0x61FFFFFF)
     val GlassRim: Color get() = if (isDark) Color(0xFF707079) else Color.White
     val CardSoft: Color get() = if (isDark) Color(0xFF1C1C1E) else NamuTokens.CardSoft
     val CardPressed: Color get() = if (isDark) Color(0xFF2C2C2E) else Color(0xFFF1F2F7)
     val Separator: Color get() = if (isDark) Color(0xFF38383A) else NamuTokens.Border
     val Fill: Color get() = if (isDark) Color(0xFF303036) else Color(0xFFF0F0F6)
     val FillPressed: Color get() = if (isDark) Color(0xFF2C2C2E) else Color(0xFFE8E8ED)
-    val Blue: Color get() = NamuTokens.Brand
-    /** 品牌主色 #1663FF：叶标识与选中态使用；绿色只表达运行状态。 */
-    val Brand: Color get() = NamuTokens.Brand
+    val Blue: Color get() = Brand
+    /** 浅色采用系统蓝，深色提高亮度；绿色只表达运行状态。 */
+    val Brand: Color get() = if (isDark) Color(0xFF0A84FF) else NamuTokens.Brand
     /** 选中态统一走品牌色，绿色不再承担导航/品牌装饰。 */
-    val Accent: Color get() = NamuTokens.Brand
+    val Accent: Color get() = Brand
     /** 品牌橙：仅品牌字使用；深色沿用暖橙。 */
     val BrandOrange: Color get() = if (isDark) Color(0xFFFFA45E) else NamuTokens.BrandOrange
     val Green: Color get() = if (isDark) Color(0xFF30D158) else NamuTokens.Success
@@ -259,7 +271,7 @@ fun LargeTitle(title: String, subtitle: String? = null, trailing: @Composable ((
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(Modifier.weight(1f)) {
-            Text(title, fontSize = 28.sp, fontWeight = FontWeight.Bold, color = NamuColors.TextMain, letterSpacing = (-0.5).sp)
+            Text(title, style = NamuTokens.Type.PageTitle, fontFamily = FontFamily.SansSerif, color = NamuColors.TextMain)
             if (subtitle != null) {
                 Spacer(Modifier.height(2.dp))
                 Text(subtitle, fontSize = 12.sp, color = NamuColors.TextSub)
@@ -299,9 +311,7 @@ fun PrimaryTopBar(title: String, subtitle: String = "") {
         Text(
             title,
             modifier = Modifier.semantics { heading() },
-            fontSize = 30.sp,
-            lineHeight = 37.sp,
-            fontWeight = FontWeight.Bold,
+            style = NamuTokens.Type.PageTitle,
             fontFamily = FontFamily.SansSerif,
             color = NamuColors.TextMain,
         )
@@ -352,6 +362,104 @@ fun MainPageTopBar(
         }
         Box(Modifier.height(44.dp), contentAlignment = Alignment.Center) {
             trailing?.invoke()
+        }
+    }
+}
+
+/**
+ * 主页面统一外壳：正文与顶栏分层捕获，支持大标题折叠和真实背景模糊。
+ * 顶栏不会捕获自身，避免递归采样造成文字重影。
+ */
+@Composable
+fun MainPageChrome(
+    title: String,
+    titleColor: Color = NamuColors.TextMain,
+    trailing: @Composable (() -> Unit)? = null,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    val scrollState = rememberScrollState()
+    val collapseRange = with(LocalDensity.current) { 56.dp.toPx() }
+    val collapse = (scrollState.value / collapseRange).coerceIn(0f, 1f)
+    val contentLayer = rememberGraphicsLayer()
+    var contentOrigin by remember { mutableStateOf(Offset.Zero) }
+    var topBarOrigin by remember { mutableStateOf(Offset.Zero) }
+
+    Box(Modifier.fillMaxSize().background(NamuColors.Bg)) {
+        Column(
+            Modifier.fillMaxSize()
+                .onGloballyPositioned { contentOrigin = it.positionInRoot() }
+                .drawWithContent {
+                    contentLayer.record { this@drawWithContent.drawContent() }
+                    drawLayer(contentLayer)
+                }
+                .verticalScroll(scrollState)
+                .statusBarsPadding()
+                .padding(top = 78.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Column(Modifier.widthIn(max = 560.dp).fillMaxWidth(), content = content)
+        }
+
+        Box(Modifier.fillMaxWidth().onGloballyPositioned { topBarOrigin = it.positionInRoot() }) {
+            Spacer(
+                Modifier.matchParentSize().clipToBounds().blur(18.dp).drawBehind {
+                    val offset = contentOrigin - topBarOrigin
+                    translate(offset.x, offset.y) { drawLayer(contentLayer) }
+                },
+            )
+            Spacer(
+                Modifier.matchParentSize().drawBehind {
+                    drawRect(NamuColors.Bg.copy(alpha = .26f + .40f * collapse))
+                    drawRect(
+                        Brush.verticalGradient(
+                            listOf(NamuColors.GlassRim.copy(alpha = .10f), Color.Transparent),
+                        ),
+                    )
+                },
+            )
+            Column(Modifier.fillMaxWidth().statusBarsPadding()) {
+                Box(
+                    Modifier.fillMaxWidth().height(72.dp).padding(start = 22.dp, end = 16.dp),
+                ) {
+                    Text(
+                        title,
+                        style = NamuTokens.Type.PageTitle,
+                        fontFamily = FontFamily.SansSerif,
+                        color = titleColor,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.align(Alignment.CenterStart)
+                            .padding(end = 112.dp)
+                            .alpha(1f - collapse)
+                            .graphicsLayer {
+                                val scale = 1f - .06f * collapse
+                                scaleX = scale
+                                scaleY = scale
+                            }
+                            .semantics { heading() },
+                    )
+                    Text(
+                        title,
+                        style = NamuTokens.Type.NavigationTitle,
+                        fontFamily = FontFamily.SansSerif,
+                        color = titleColor,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.align(Alignment.Center).alpha(collapse),
+                    )
+                    if (trailing != null) {
+                        Box(
+                            Modifier.align(Alignment.CenterEnd)
+                                .clip(CircleShape)
+                                .background(NamuColors.GlassSurface),
+                        ) { trailing() }
+                    }
+                }
+                Box(
+                    Modifier.fillMaxWidth().height(.5.dp)
+                        .background(NamuColors.Separator.copy(alpha = collapse * .65f)),
+                )
+            }
         }
     }
 }
@@ -409,16 +517,34 @@ internal fun FloatingMenu(
     modifier: Modifier = Modifier,
     content: @Composable ColumnScope.() -> Unit,
 ) {
+    val menuShape = RoundedCornerShape(NamuTokens.RadiusMenu)
     DropdownMenu(
         expanded = expanded,
         onDismissRequest = onDismissRequest,
-        modifier = modifier,
+        modifier = modifier.border(.5.dp, NamuColors.GlassRim.copy(alpha = .38f), menuShape),
         offset = DpOffset(0.dp, 6.dp),
-        shape = RoundedCornerShape(NamuTokens.RadiusMenu),
+        shape = menuShape,
         containerColor = NamuColors.Floating,
-        shadowElevation = 12.dp,
-        content = content,
-    )
+        shadowElevation = 4.dp,
+    ) {
+        var shown by remember { mutableStateOf(false) }
+        LaunchedEffect(Unit) { shown = true }
+        val scale by animateFloatAsState(
+            if (shown) 1f else .92f,
+            spring(dampingRatio = .80f, stiffness = 460f),
+            label = "glass-menu-scale",
+        )
+        val opacity by animateFloatAsState(if (shown) 1f else 0f, tween(140), label = "glass-menu-alpha")
+        Column(
+            Modifier.graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+                alpha = opacity
+                transformOrigin = TransformOrigin(.5f, 0f)
+            },
+            content = content,
+        )
+    }
 }
 
 /** 二级页共用返回栏。 */
@@ -429,7 +555,7 @@ fun ShadowTopBar(
     right: @Composable () -> Unit = {},
 ) {
     val scroll = LocalDetailScroll.current
-    val surface = lerp(NamuColors.Bg, NamuColors.Floating, scroll * 0.70f)
+    val surface = lerp(NamuColors.GlassSurface, NamuColors.Floating, scroll * 0.70f)
     Column(
         Modifier.fillMaxWidth().background(
             Brush.verticalGradient(listOf(NamuColors.Bg, surface)),
@@ -444,7 +570,7 @@ fun ShadowTopBar(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Box(
-                Modifier.size(44.dp).background(NamuColors.Card, CircleShape),
+                Modifier.size(44.dp).background(NamuColors.GlassSurface, CircleShape),
                 contentAlignment = Alignment.Center,
             ) { left() }
             Text(
@@ -877,7 +1003,7 @@ fun hostOf(url: String): String {
     }
 }
 
-/** 二级页顶栏：左侧返回，标题与首页同一套衬线字。 */
+/** 二级页顶栏：左侧返回，标题与主页面统一使用系统无衬线字。 */
 @Composable
 fun SecondaryTopBar(title: String, subtitle: String = "", onBack: (() -> Unit)? = null) {
     Column(
@@ -893,10 +1019,8 @@ fun SecondaryTopBar(title: String, subtitle: String = "", onBack: (() -> Unit)? 
             Text(
                 title,
                 modifier = Modifier.semantics { heading() },
-                fontSize = 28.sp,
-                lineHeight = 34.sp,
-                fontWeight = FontWeight.SemiBold,
-                fontFamily = FontFamily.Serif,
+                style = NamuTokens.Type.PageTitle,
+                fontFamily = FontFamily.SansSerif,
                 color = NamuColors.TextMain,
             )
             if (subtitle.isNotEmpty()) {

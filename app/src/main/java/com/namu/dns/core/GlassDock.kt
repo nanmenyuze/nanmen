@@ -28,10 +28,10 @@ import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.BarChart
-import androidx.compose.material.icons.outlined.Home
-import androidx.compose.material.icons.outlined.Layers
-import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.rounded.BarChart
+import androidx.compose.material.icons.rounded.Home
+import androidx.compose.material.icons.rounded.Layers
+import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -44,7 +44,9 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.CornerRadius
@@ -52,19 +54,26 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.RoundRect
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.ClipOp
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Paint
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipPath
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.drawscope.scale
+import androidx.compose.ui.graphics.drawscope.translate
+import androidx.compose.ui.graphics.layer.GraphicsLayer
 import androidx.compose.ui.graphics.layer.drawLayer
 import androidx.compose.ui.graphics.rememberGraphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.semantics.Role
@@ -86,8 +95,11 @@ import kotlinx.coroutines.launch
 internal fun GlassDock(
     tabs: List<MainTab>,
     selected: MainTab,
+    pageLayer: GraphicsLayer,
+    pageOrigin: () -> Offset,
     onSelect: (MainTab) -> Unit,
 ) {
+    var dockOrigin by remember { mutableStateOf(Offset.Zero) }
     val shape = RoundedCornerShape(32.dp)
     val labelsLayer = rememberGraphicsLayer()
     val currentSelect by rememberUpdatedState(onSelect)
@@ -147,7 +159,7 @@ internal fun GlassDock(
     )
     val surface = NamuColors.Card
     val accent = NamuColors.Accent
-    val rim = NamuColors.Separator
+    val rim = NamuColors.GlassRim
 
     Box(
         Modifier.fillMaxWidth().navigationBarsPadding().padding(horizontal = 20.dp, vertical = 12.dp),
@@ -155,7 +167,8 @@ internal fun GlassDock(
     ) {
         Box(
             Modifier.widthIn(max = 340.dp).fillMaxWidth()
-                .shadow(8.dp, shape)
+                .shadow(3.dp, shape, ambientColor = Color(0x33000000), spotColor = Color(0x33000000))
+                .onGloballyPositioned { dockOrigin = it.positionInRoot() }
                 .pointerInput(tabs, rtl) {
                     awaitEachGesture {
                         awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
@@ -201,11 +214,17 @@ internal fun GlassDock(
                     )
                 },
         ) {
-            // 实色表面：不再采样页面层，避免内容透过 Dock 形成穿影。
+            // 先模糊背后的页面，再覆盖薄 tint；不要直接绘制未模糊页面，避免文字穿影。
+            Spacer(
+                Modifier.matchParentSize().clip(shape).blur(22.dp).drawBehind {
+                    val offset = pageOrigin() - dockOrigin
+                    translate(offset.x, offset.y) { drawLayer(pageLayer) }
+                },
+            )
             Spacer(
                 Modifier.matchParentSize()
-                    .background(surface, shape)
-                    .border(.5.dp, rim.copy(alpha = if (NamuColors.isDark) .35f else .72f), shape),
+                    .background(NamuColors.GlassSurface, shape)
+                    .border(.6.dp, rim.copy(alpha = if (NamuColors.isDark) .30f else .68f), shape),
             )
 
             Row(
@@ -236,46 +255,63 @@ internal fun GlassDock(
                     val topLeft = center - Offset(lensSize.width / 2, lensSize.height / 2)
                     val radius = CornerRadius(lensSize.height / 2)
                     val lens = Path().apply { addRoundRect(RoundRect(Rect(topLeft, lensSize), radius)) }
+                    val backdropOffset = pageOrigin() - dockOrigin
 
-                    // 选中 lens 改实色主色浅底，保留拉伸/squash 动效但不再放大页面内容。
-                    clipPath(lens) {
-                        drawRoundRect(
-                            color = accent.copy(alpha = if (NamuColors.isDark) .16f else .10f),
-                            topLeft = topLeft, size = lensSize, cornerRadius = radius,
-                        )
+                    if (wave > .01f && travel > .01f) {
+                        val satelliteSize = Size(baseHeight * .90f, baseHeight * .90f)
+                        val satelliteRadius = CornerRadius(satelliteSize.height / 2)
+                        listOf(liquidFrom, liquidTo).forEach { endpoint ->
+                            val endpointVisualSlot = if (rtl) tabs.lastIndex - endpoint else endpoint
+                            val satelliteCenter = Offset((endpointVisualSlot + .5f) * cell, size.height / 2)
+                            val satelliteTopLeft = satelliteCenter - Offset(satelliteSize.width / 2, satelliteSize.height / 2)
+                            val satellite = Path().apply {
+                                addRoundRect(RoundRect(Rect(satelliteTopLeft, satelliteSize), satelliteRadius))
+                            }
+                            drawRefractiveLens(
+                                pageLayer = pageLayer,
+                                backdropOffset = backdropOffset,
+                                path = satellite,
+                                topLeft = satelliteTopLeft,
+                                lensSize = satelliteSize,
+                                radius = satelliteRadius,
+                                center = satelliteCenter,
+                                surface = surface,
+                                rim = rim,
+                                alpha = .58f * wave,
+                                surfaceAlpha = .24f,
+                                zoom = 1.10f,
+                                fringe = .9.dp.toPx() * wave,
+                            )
+                        }
                     }
-                    drawRoundRect(
-                        color = if (NamuColors.isDark) rim.copy(alpha = .45f) else Color.White.copy(alpha = .62f),
-                        topLeft = topLeft, size = lensSize, cornerRadius = radius,
-                        style = Stroke(.6.dp.toPx()),
+
+                    drawRefractiveLens(
+                        pageLayer = pageLayer,
+                        backdropOffset = backdropOffset,
+                        path = lens,
+                        topLeft = topLeft,
+                        lensSize = lensSize,
+                        radius = radius,
+                        center = center,
+                        surface = surface,
+                        rim = rim,
+                        alpha = 1f,
+                        surfaceAlpha = (if (NamuColors.isDark) .34f else .52f) - .16f * wave,
+                        zoom = 1.025f + .035f * wave,
+                        fringe = (if (dragging) .45f else wave) * 1.dp.toPx(),
                     )
-                    val dispersion = if (dragging) .16f else .34f * wave * travel
-                    if (dispersion > .01f) {
-                        val shift = .65.dp.toPx()
-                        drawRoundRect(
-                            color = accent.copy(alpha = dispersion * .85f),
-                            topLeft = topLeft - Offset(shift, shift * .35f),
-                            size = lensSize, cornerRadius = radius,
-                            style = Stroke(1.dp.toPx()),
-                        )
-                        drawRoundRect(
-                            color = NamuColors.GlassRim.copy(alpha = dispersion * .58f),
-                            topLeft = topLeft + Offset(shift, shift * .35f),
-                            size = lensSize, cornerRadius = radius,
-                            style = Stroke(.9.dp.toPx()),
-                        )
-                    }
                     drawLine(
-                        color = accent.copy(alpha = .14f + .10f * raised),
+                        color = rim.copy(alpha = .18f + .10f * raised),
                         start = Offset(topLeft.x + radius.x, topLeft.y + lensSize.height - 1.dp.toPx()),
                         end = Offset(topLeft.x + lensSize.width - radius.x, topLeft.y + lensSize.height - 1.dp.toPx()),
-                        strokeWidth = 1.5.dp.toPx(),
+                        strokeWidth = 1.dp.toPx(),
                     )
-                    if (raised > .01f || wave > .06f) {
+
+                    val labelsZoom = 1f + .18f * raised + .055f * wave
+                    if (labelsZoom > 1.001f) {
                         clipPath(lens, ClipOp.Difference) { drawLayer(labelsLayer) }
                         clipPath(lens) {
-                            val zoom = 1f + .18f * raised + .06f * wave
-                            scale(zoom, zoom, pivot = center) { drawLayer(labelsLayer) }
+                            scale(labelsZoom, labelsZoom, pivot = center) { drawLayer(labelsLayer) }
                         }
                     } else {
                         drawLayer(labelsLayer)
@@ -287,10 +323,10 @@ internal fun GlassDock(
                         selected = item == selected,
                         highlighted = if (dragging) index == fingerSlot.roundToInt() else item == selected,
                         icon = when (item) {
-                            MainTab.Home -> Icons.Outlined.Home
-                            MainTab.Config -> Icons.Outlined.Layers
-                            MainTab.Data -> Icons.Outlined.BarChart
-                            MainTab.Settings -> Icons.Outlined.Settings
+                            MainTab.Home -> Icons.Rounded.Home
+                            MainTab.Config -> Icons.Rounded.Layers
+                            MainTab.Data -> Icons.Rounded.BarChart
+                            MainTab.Settings -> Icons.Rounded.Settings
                         },
                         label = item.label,
                         modifier = Modifier.weight(1f),
@@ -299,6 +335,72 @@ internal fun GlassDock(
             }
         }
     }
+}
+
+private fun DrawScope.drawRefractiveLens(
+    pageLayer: GraphicsLayer,
+    backdropOffset: Offset,
+    path: Path,
+    topLeft: Offset,
+    lensSize: Size,
+    radius: CornerRadius,
+    center: Offset,
+    surface: Color,
+    rim: Color,
+    alpha: Float,
+    surfaceAlpha: Float,
+    zoom: Float,
+    fringe: Float,
+) {
+    if (alpha <= 0f) return
+    clipPath(path) {
+        scale(zoom, zoom, pivot = center) {
+            translate(backdropOffset.x, backdropOffset.y) {
+                drawIntoCanvas { canvas ->
+                    canvas.saveLayer(Rect(Offset.Zero, size), Paint().apply { this.alpha = alpha })
+                    drawLayer(pageLayer)
+                    canvas.restore()
+                }
+            }
+        }
+    }
+    drawRoundRect(
+        brush = Brush.verticalGradient(
+            listOf(surface.copy(alpha = surfaceAlpha), surface.copy(alpha = surfaceAlpha * .62f)),
+            startY = topLeft.y,
+            endY = topLeft.y + lensSize.height,
+        ),
+        topLeft = topLeft,
+        size = lensSize,
+        cornerRadius = radius,
+        alpha = alpha,
+    )
+    if (fringe > .01f) {
+        drawRoundRect(
+            color = Color(0xFF72D7FF),
+            topLeft = topLeft - Offset(fringe * .65f, fringe * .22f),
+            size = lensSize,
+            cornerRadius = radius,
+            alpha = .28f * alpha,
+            style = Stroke(.65.dp.toPx()),
+        )
+        drawRoundRect(
+            color = Color(0xFFFF8C9A),
+            topLeft = topLeft + Offset(fringe * .65f, fringe * .22f),
+            size = lensSize,
+            cornerRadius = radius,
+            alpha = .20f * alpha,
+            style = Stroke(.65.dp.toPx()),
+        )
+    }
+    drawRoundRect(
+        color = rim.copy(alpha = .82f),
+        topLeft = topLeft,
+        size = lensSize,
+        cornerRadius = radius,
+        alpha = alpha,
+        style = Stroke(.65.dp.toPx()),
+    )
 }
 
 @Composable

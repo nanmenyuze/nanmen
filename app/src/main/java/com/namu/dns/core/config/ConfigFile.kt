@@ -83,7 +83,7 @@ data class ConfigFile(
         const val SOURCE_SHADOWROCKET = "shadowrocket-conf"
 
         private val DEVICE_GENERAL_KEYS = setOf(
-            "themeMode", "autoConnect", "pingMethod", "autoDisablePrivateDns",
+            "themeMode", "autoConnect", "pingMethod", "pingUrl", "autoDisablePrivateDns",
             "ssidTriggerEnabled", "ssidTriggerNames", "ssidLocationOptIn",
             "financeProtect", "nodes", "selected", "subscription",
         )
@@ -212,6 +212,7 @@ data class GeneralConfig(
     val blockMode: String = "nxdomain",
     val cnDirect: Boolean = true,
     val finalPolicy: String = "proxy",
+    val finalPolicySource: String = "",
     val rulesUrl: String = "",
     val autoUpdateRules: Boolean = true,
     val rulesUpdatedAt: Long = 0L,
@@ -257,6 +258,7 @@ data class GeneralConfig(
         blockMode = blockMode,
         cnDirect = cnDirect,
         finalPolicy = finalPolicy,
+        finalPolicySource = finalPolicySource,
         rulesUrl = rulesUrl,
         autoUpdateRules = autoUpdateRules,
         rulesUpdatedAt = rulesUpdatedAt,
@@ -305,6 +307,7 @@ data class GeneralConfig(
             blockMode = cfg.blockMode,
             cnDirect = cfg.cnDirect,
             finalPolicy = cfg.finalPolicy,
+            finalPolicySource = cfg.finalPolicySource,
             rulesUrl = cfg.rulesUrl,
             autoUpdateRules = cfg.autoUpdateRules,
             rulesUpdatedAt = cfg.rulesUpdatedAt,

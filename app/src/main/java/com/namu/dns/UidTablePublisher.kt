@@ -138,5 +138,5 @@ internal fun needsUidMap(cfg: AppConfig, global: GlobalRuleStore.State = GlobalR
     }
     val perAppMitm = scope.enabled && scope.appMode != "all" && scope.apps.isNotEmpty()
     val financeUid = scope.enabled && cfg.financeProtect
-    return appRules || perAppMitm || financeUid
+    return appRules || ConfigStore.profileRoutingRules(cfg).any(AppUidResolver::isAppRule) || perAppMitm || financeUid
 }

@@ -351,7 +351,7 @@ object GlobalRuleStore {
             listOf(RuleSource(id = "legacy-ads-url", url = active.rulesUrl))
         } else active.ruleSources
         val ruleSets = baseRuleSets.map { it.copy(origin = "") }.toMutableList()
-        val localRules = active.rules.toMutableList()
+        val localRules = active.rules.filterNot(ConfigStore::isImportedRoutingRule).toMutableList()
         val localAds = active.customAds.toMutableList()
         val localMitm = MitmContent.fromMitm(active.mitm)
         val extra = mutableListOf<ExtraMitm>()
@@ -360,7 +360,7 @@ object GlobalRuleStore {
         val setIds = ruleSets.map { it.id }.toMutableSet()
         var extraOrder = 100000
         others.forEach { (name, cfg) ->
-            cfg.rules.forEach { r ->
+            cfg.rules.filterNot(ConfigStore::isImportedRoutingRule).forEach { r ->
                 val key = "${r.type}|${r.value}|${r.action}"
                 if (ruleKeys.add(key)) localRules.add(r.copy(enabled = false, source = "方案 $name"))
             }

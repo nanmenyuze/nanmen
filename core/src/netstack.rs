@@ -107,6 +107,8 @@ struct TunDevice {
     pending_cap: usize,
     write_burst: usize,
     stats: Arc<Stats>,
+    /// 收包校验和验收开关（配置 tun_rx_checksum_verify，A/B 对照用）。
+    rx_verify: bool,
 }
 
 /// smoltcp 的延迟 ACK 时长。默认 10ms 会让下行 ACK 回填慢半拍，
@@ -170,11 +172,12 @@ const MAX_TUN_PACKET: usize = 9216;
 /// RTT 抖一下下载就掉」的主因，只放宽 TUN 队列治不了它（积压只是从 pending
 /// 挪回 socket 缓冲，窗口该关的时候照样关）。
 const TCP_SOCKET_BUFFER: usize = 512 * 1024;
-/// 大档发送方向（smoltcp→App，本机腿）单独缩到 256K：这条腿 RTT 亚毫秒，
-/// 256K 的突发吸收绰绰有余；下游真正的突发吸收由 TCP_PENDING_CAP(2MB)＋滞回承担。
-/// 接收方向不缩：它是上行对调度抖动的突发闸门（单轮循环搬多少受 recv 缓冲约束），
-/// 对称缩会把「调度尖刺→上行掉速」的老病 reintroduce。
-const TCP_SOCKET_BUFFER_TX: usize = 256 * 1024;
+/// 大档发送方向（smoltcp→App，本机腿）与接收同档 512K。
+/// 旧值 256K 的理由是「本机腿 RTT 亚毫秒」，但 ACK 也要等主循环读 TUN 才回填：
+/// 调度尖刺（实测单轮峰值 9ms）会把有效 RTT 拉到毫秒级，256K/9ms≈28MB/s
+/// 正好压住单流极限。512K 把尖刺吸收翻倍；空闲连接不填 tx 缓冲，
+/// 惰性零页下 PSS 只随真实流量涨，最坏虚拟口径仍在水位守卫预算内。
+const TCP_SOCKET_BUFFER_TX: usize = 512 * 1024;
 /// 内存水位降级档：活跃 TCP socket 超过 `TCP_BUFFER_HIGH_TIER_MAX` 后新建的用 128K。
 /// 不设这条守卫，1024 条连接每条双向 1MB，最坏会顶到 1GB，VPN 进程会被 LMK 直接杀。
 const TCP_SOCKET_BUFFER_MIN: usize = 128 * 1024;
@@ -203,6 +206,67 @@ fn next_tcp_buffer_bytes() -> (usize, bool) {
     } else {
         (TCP_SOCKET_BUFFER_MIN, true)
     }
+}
+
+/// 当前线程累计 CPU 时间（纳秒）。CLOCK_THREAD_CPUTIME_ID 走 vDSO，
+/// 每轮两次的开销是纳秒级，不构成负担。
+fn thread_cpu_ns() -> Option<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } != 0 {
+        return None;
+    }
+    Some(ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64)
+}
+
+fn current_tid() -> i64 {
+    unsafe { libc::gettid() as i64 }
+}
+
+/// 半开入场分档阈值：已 accept 但还没完成首包判定的连接堆到这个数，
+/// 新建 listener 一律小档。512 条半开 × 大档(recv 512K+tx 512K) 最坏 ~512MB
+/// 纯「还没发一个字节」的占用；分档后压到 512×256K=128MB 封顶。
+/// smoltcp 缓冲建后不可扩，所以只能在入场时定档——复用大档名额耗尽的
+/// 同一套降级机制（本机腿亚毫秒 RTT，128K 窗口不构成实际吞吐瓶颈）。
+const TCP_HALFOPEN_SMALL_TIER_AT: usize = 128;
+
+/// 无进展告警阈值：未确认队列既不缩短、上行字节也不增长持续这么久，
+/// 记一条 warn（ACK 丢失/重传黑洞/对端静默——零窗口告警覆盖不了这些）。
+/// 20s 远大于正常 RTO 退避的单轮间隔，又远早于 180s 判死，能在判死前留下证据。
+const TCP_UNACKED_WARN_SECS: u64 = 20;
+
+/// 无进展判据（B6）：队列缩短（ACK 前进）或上行字节增长任一成立即有进展。
+/// sq==0 视为无积压；「队列变长但上行也在涨」说明数据在流动，不算停滞。
+fn unacked_progressed(
+    sq: usize,
+    prev_sq: usize,
+    up: u64,
+    prev_up: u64,
+    down: u64,
+    prev_down: u64,
+) -> bool {
+    sq == 0 || sq < prev_sq || up > prev_up || down > prev_down
+}
+
+/// 慢连接 top5 快照（诊断用）：(id, 停滞毫秒, 下行积压字节, 未确认字节)。
+static TOP_SLOW: Mutex<Vec<(u64, u64, u64, u64)>> = Mutex::new(Vec::new());
+
+pub fn top_slow_json() -> serde_json::Value {
+    let g = TOP_SLOW.lock().unwrap_or_else(|p| p.into_inner());
+    serde_json::Value::Array(
+        g.iter()
+            .map(|(id, stall, pending, unacked)| {
+                serde_json::json!({
+                    "id": id,
+                    "stallMs": stall,
+                    "pendingBytes": pending,
+                    "unackedBytes": unacked,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// 所有 TCP socket 的销毁都必须走这里：abort + remove + 归还计数。
@@ -263,6 +327,19 @@ const MAX_PENDING_ACCEPT: usize = 512;
 const TCP_PENDING_CAP: usize = 2 * 1024 * 1024;
 /// 滞回恢复水位：暂停后必须排空到 ≤1MB 才恢复搬运，避免阈值处振荡。
 const TCP_PENDING_RESUME: usize = 1024 * 1024;
+/// 全部连接暂存合计预算：单流 2MB 封顶只约束一条流，1024 条慢连接理论上
+/// 能叠出 2GB。合计 ≥32MB 全局停搬（所有通道填满 → 上游窗口集体收紧），
+/// ≤24MB 恢复；滞回防振荡，与单流同口径。
+const TCP_PENDING_TOTAL_CAP: usize = 32 * 1024 * 1024;
+const TCP_PENDING_TOTAL_RESUME: usize = 24 * 1024 * 1024;
+/// 单轮搬运配额（块数，16KB/块）：**每连接独立**，不是全局共享。
+/// 全局共享会饿死后面的连接——11 条并发时前 4 条各吃满 128 块就耗光 512，
+/// 其余连接整轮拿不到一个块，极限下载速度直接掉一个档。
+/// 每连接 128 块（≈2MB/轮）已足够限制重流量连接拉长单轮。
+const ROUND_DRAIN_PER_CONN: usize = 128;
+/// 全局软上限（块数，≈32MB/轮）：只在连接数极多时兜底，
+/// 正常十几条连接不会触发，避免它变成实际的逐连接配额。
+const ROUND_DRAIN_TOTAL: usize = 2048;
 
 struct TunRxToken {
     data: Option<Vec<u8>>,
@@ -318,7 +395,7 @@ fn pool_put(pool: &Mutex<Vec<Vec<u8>>>, buf: Vec<u8>) {
 }
 
 impl TunDevice {
-    fn new(mtu: usize, stats: Arc<Stats>) -> Self {
+    fn new(mtu: usize, stats: Arc<Stats>, rx_verify: bool) -> Self {
         let (queue_cap, pending_cap, write_burst) = queue_caps(mtu);
         Self {
             rx: VecDeque::with_capacity(MAX_RX_BURST),
@@ -330,6 +407,7 @@ impl TunDevice {
             pending_cap,
             write_burst,
             stats,
+            rx_verify,
         }
     }
 
@@ -430,7 +508,19 @@ impl Device for TunDevice {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
         caps.max_transmission_unit = self.mtu;
-        caps.checksum = ChecksumCapabilities::default();
+        // TUN 是本地虚拟设备：RX 报文全部由内核协议栈生成（VpnService 不暴露
+        // vnet_hdr，不存在部分校验和 offload），校验和必然正确，逐包验收是纯开销。
+        // 默认只算发：TX 仍必须计算——内核从 tun fd 读包时会校验，错的直接丢。
+        // 配置 tun_rx_checksum_verify=true 恢复逐包验收，做真机 A/B 对照。
+        let mut ck = ChecksumCapabilities::default();
+        if !self.rx_verify {
+            ck.ipv4 = smoltcp::phy::Checksum::Tx;
+            ck.udp = smoltcp::phy::Checksum::Tx;
+            ck.tcp = smoltcp::phy::Checksum::Tx;
+            ck.icmpv4 = smoltcp::phy::Checksum::Tx;
+            ck.icmpv6 = smoltcp::phy::Checksum::Tx;
+        }
+        caps.checksum = ck;
         caps
     }
 }
@@ -610,9 +700,23 @@ struct TcpConn {
     send_stall_since: Option<Instant>,
     /// 停滞告警是否已经打过（>3s 只打一条，不刷屏）。
     send_stall_logged: bool,
-    /// 上次速率采样时的累计字节（10s 差分用）。
+    /// 上次速率采样时的累计字节（≥10s 差分用）。
     rate_prev_up: u64,
     rate_prev_down: u64,
+    /// 上次速率采样时刻。每连接独立 10s 窗口、错峰摊销：
+    /// 旧实现每 10s 一轮把全部连接扫一遍（持写锁 + 逐条查缓冲档位），
+    /// 1024 条时这一轮就是长轮尖刺来源；现在每轮最多结算一批到期连接。
+    rate_last: Instant,
+    /// 无进展观测（B6）：上次仪表采样时的未确认队列长度与上行累计字节。
+    /// 「队列在缩短」或「上行字节在增长」任一成立即算有进展；
+    /// 两者都不动才是真停滞（只对端零窗口告警覆盖不了 ACK 丢失/重传黑洞）。
+    stall_prev_sq: usize,
+    stall_prev_up: u64,
+    stall_prev_down: u64,
+    /// 最近一次确认「有进展」的时刻；停滞时长按它算。
+    stall_progress_at: Instant,
+    /// 无进展告警是否已打过（一个停滞期只打一条）。
+    stall_logged: bool,
 }
 
 /// 是否还有出站数据躺在 relay 通道里没搬进 smoltcp。
@@ -629,7 +733,8 @@ fn has_relay_backlog(conns: &[TcpConn]) -> bool {
 /// 把下行数据从 relay 通道搬入 pending，受 TCP_PENDING_CAP 字节上限约束。
 /// 返回是否搬到了数据（调用方据此更新活跃时间）。搬到数据即唤醒 relay：
 /// 通道腾出了容量，它可以恢复读上游了。
-fn drain_relay_to_pending(conn: &mut TcpConn) -> bool {
+/// `budget` 是本轮全局剩余搬运块数：用完即停，防止重流量连接拉长单轮。
+fn drain_relay_to_pending(conn: &mut TcpConn, budget: &mut usize) -> bool {
     // 滞回：≥2MB 暂停、≤1MB 恢复。暂停期间不搬也不唤醒 relay，
     // 让通道保持满、上游窗口保持收紧，直到 pending 真正排空到低水位。
     if !conn.relay_paused && conn.pending_bytes >= TCP_PENDING_CAP {
@@ -638,14 +743,15 @@ fn drain_relay_to_pending(conn: &mut TcpConn) -> bool {
     if conn.relay_paused && conn.pending_bytes <= TCP_PENDING_RESUME {
         conn.relay_paused = false;
     }
-    if conn.relay_paused {
+    if conn.relay_paused || *budget == 0 {
         return false;
     }
     let mut drained = false;
-    while conn.pending_bytes < TCP_PENDING_CAP {
+    while conn.pending_bytes < TCP_PENDING_CAP && *budget > 0 {
         match conn.from_relay.try_recv() {
             Ok(data) => {
                 drained = true;
+                *budget -= 1;
                 conn.pending_bytes += data.len();
                 conn.pending.push_back(data);
                 if conn.pending.len() >= RELAY_DRAIN_BURST {
@@ -1227,17 +1333,41 @@ fn udp_payload(pkt: &[u8]) -> Option<&[u8]> {
     }
 }
 
+/// 半开强制小档判据：半开堆积达到阈值「且」大档名额已用掉一半以上才触发。
+/// 名额充足时即使半开偏高也不降级——真实传输（测速/视频多开）不该被误伤；
+/// 内存上限始终由 BIG_TIER_IN_USE 名额守卫兜底，与是否半开降级无关。
+fn half_open_downgrade(half_open: usize, big_used: usize) -> bool {
+    half_open >= TCP_HALFOPEN_SMALL_TIER_AT && big_used >= TCP_BUFFER_HIGH_TIER_MAX / 2
+}
+
 fn add_listener(
     sockets: &mut SocketSet<'_>,
     addr: IpAddress,
     port: u16,
     stats: &crate::stats::Stats,
+    half_open: usize,
 ) -> Option<SocketHandle> {
-    let (buf_bytes, downgraded) = next_tcp_buffer_bytes();
-    if downgraded {
+    let (buf_bytes, tier_denied) = next_tcp_buffer_bytes();
+    // 半开堆积「且」大档名额已吃紧才强制小档。只看半开数会把正常并发突发
+    // （测速/视频多开）里的真实传输也压成 128K，单流窗口被腰斩；名额充足时
+    // 内存本就有 BIG_TIER_IN_USE 上限兜底，无需再牺牲吞吐。
+    let half_open_forced =
+        half_open_downgrade(half_open, BIG_TIER_IN_USE.load(Ordering::Relaxed));
+    let downgraded = tier_denied || half_open_forced;
+    let buf_bytes = if half_open_forced {
+        TCP_SOCKET_BUFFER_MIN
+    } else {
+        buf_bytes
+    };
+    if tier_denied {
         stats.tcp_buffer_denied.fetch_add(1, Ordering::Relaxed);
     }
-    // 非对称缓冲：recv 512K 保住上行突发闸门；tx 大档 256K（本机腿足够），
+    if half_open_forced {
+        stats
+            .tcp_halfopen_downgrade
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    // 缓冲：大档 recv/tx 同 512K（tx 吸收 ACK 回填的调度尖刺），
     // 降级档双向同 128K。
     let tx_bytes = if downgraded {
         buf_bytes
@@ -1558,6 +1688,39 @@ fn resolve_group_action(ctx: &Ctx, name: &str, kind: ConnKind, target: Option<&s
     }
 }
 
+/// 依次写空上行缓冲：一次唤醒内连续 write 到 Pending 为止，
+/// 写完一块立刻接预取槽里的下一块（流水），把每块的调度往返压到最少。
+/// 返回 Ok(()) 表示当前已无待写数据（up_next 也为空），调用方把 up_active 置 false。
+async fn write_up_flow<W>(
+    w: &mut W,
+    up_buf: &mut Vec<u8>,
+    up_off: &mut usize,
+    up_next: &mut Option<Vec<u8>>,
+) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        if *up_off >= up_buf.len() {
+            match up_next.take() {
+                Some(next) => {
+                    *up_buf = next;
+                    *up_off = 0;
+                }
+                None => return Ok(()),
+            }
+        }
+        let n = w.write(&up_buf[*up_off..]).await?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "relay upstream write returned 0",
+            ));
+        }
+        *up_off += n;
+    }
+}
+
 async fn relay_stream(
     stream: BoxStream,
     mut client_rx: mpsc::Receiver<Vec<u8>>,
@@ -1570,6 +1733,18 @@ async fn relay_stream(
     // 半关闭语义：客户端停止发送（channel 关闭）只关出站写侧，
     // 服务端方向的响应必须继续读完，否则半关闭客户端会丢响应。
     let mut client_done = false;
+    // 上行暂存：数据 + 已写偏移。旧实现在 select 处理器里 write_all().await，
+    // 上游写不动时整个循环被挂住，下行读取跟着停摆（双向互卡）。
+    // 改为独立 write 分支按偏移推进：两个方向在同一个 select 里各自独立，
+    // 任一方向阻塞只挂起自己的分支。
+    let mut up_buf: Vec<u8> = Vec::new();
+    let mut up_off = 0usize;
+    let mut up_active = false;
+    // 预取槽（流水深度 2）：写当前块的同时允许 recv 分支收取下一块。
+    // 没有它时上行严格串行——每块都要「写完 → 回 select → 再收 → 再写」，
+    // TLS 写缓冲接近满时每块要多次 Pending 往返，上传速度既慢又抖。
+    let mut up_next: Option<Vec<u8>> = None;
+    let mut up_shutdown = false;
     // 下行背压：通道满时绝不能阻塞在 send().await——select 会卡在发送分支，
     // 上传方向跟着一起停摆（双向流互卡）。改为把读到的块暂存 staged、
     // 禁用读分支，等主循环搬走数据后 read_wake 唤醒；上传分支全程可服务。
@@ -1586,16 +1761,37 @@ async fn relay_stream(
                 Err(mpsc::error::TrySendError::Closed(_)) => break,
             }
         }
+        // 客户端 FIN 且上行尾部全部写完，才关出站写侧；
+        // 提前 shutdown 会把还没写出去的上传末尾截掉。
+        if client_done && !up_active && up_next.is_none() && !up_shutdown {
+            let _ = w.shutdown().await;
+            up_shutdown = true;
+        }
         tokio::select! {
-            msg = client_rx.recv(), if !client_done => {
+            // 预取：只要槽是空的就收下一块，不与「正在写」互斥，
+            // 写块 N 的同时把块 N+1 拿到手。
+            msg = client_rx.recv(), if !client_done && up_next.is_none() => {
                 match msg {
                     Some(data) => {
-                        if w.write_all(&data).await.is_err() { break; }
+                        if up_active {
+                            up_next = Some(data);
+                        } else {
+                            up_buf = data;
+                            up_off = 0;
+                            up_active = true;
+                        }
                     }
                     None => {
                         client_done = true;
-                        let _ = w.shutdown().await;
                     }
+                }
+            }
+            // 一次唤醒连续写到 Pending 为止，减少 TLS 写缓冲的往返次数；
+            // 写完当前块立刻接预取槽里的下一块，流水不中断。
+            res = write_up_flow(&mut w, &mut up_buf, &mut up_off, &mut up_next), if up_active => {
+                match res {
+                    Ok(()) => up_active = false,
+                    Err(_) => break,
                 }
             }
             res = r.read(&mut buf), if staged.is_none() && server_tx.capacity() > 0 => {
@@ -1798,7 +1994,12 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
         .mtu
         .clamp(1280, 9000);
     ctx.stats.tun_mtu.store(mtu as i64, Ordering::Relaxed);
-    let mut device = TunDevice::new(mtu, ctx.stats.clone());
+    let rx_verify = ctx
+        .cfg
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .tun_rx_checksum_verify;
+    let mut device = TunDevice::new(mtu, ctx.stats.clone(), rx_verify);
     let mut iface_cfg = IfaceConfig::new(HardwareAddress::Ip);
     iface_cfg.random_seed = rand::random();
     let mut iface = Interface::new(iface_cfg, &mut device, smol_now(Instant::now()));
@@ -1889,6 +2090,10 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
     let mut last_meter = Instant::now();
     // 每连接速率采样节拍：10s 一次（太短会被瞬时抖动放大）。
     let mut last_rate_sample = Instant::now();
+    // 摊销批大小：1024 条连接 × 各自 10s 窗口 → 稳态每 10s 约 1024 条到期，
+    // 每轮 64 条在 1ms 轮询下 16ms 内就能消化完，远快于到期速度。
+    const RATE_BATCH: usize = 64;
+    let mut rate_top: Vec<(u64, u64, &'static str)> = Vec::new();
     // 出站数据唤醒：relay 读到上游数据后 notify，主循环立刻排空，
     // 而不是只能等兜底定时器；否则单连接稳态吞吐被「每轮块数 / 轮询间隔」卡死。
     let relay_wake = Arc::new(Notify::new());
@@ -1901,6 +2106,8 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
     let mut pending_out: VecDeque<Vec<u8>> = VecDeque::new();
     let mut write_blocked = false;
     let mut last_sweep = Instant::now();
+    // 全局暂存停搬标志（合计 ≥32MB 置位、≤24MB 清零，滞回防振荡）。
+    let mut global_drain_paused = false;
     // 直连拨号失败冷却表：主循环判定 + 拨号任务记录，跨任务共享。
     let dial_fails: Arc<Mutex<DialFails>> = Arc::new(Mutex::new(DialFails::default()));
     let start = Instant::now();
@@ -1913,6 +2120,12 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
     // 主循环耗时仪表：结算「select 返回 → 本轮处理完、下一轮 select 前」的时间。
     // 长轮会饿死同循环里的其他连接，这个数比主观体感可靠。
     let mut round_started: Option<Instant> = None;
+    // 每轮 CPU 结算基线：(tid, 线程CPU纳秒)。tokio worker 会迁移 task，
+    // 轮首尾 tid 不一致时本轮 CPU 样本作废（墙钟毫秒不受影响）。
+    let mut round_cpu: Option<(i64, u64)> = None;
+    // 每秒 CPU 占比采样基线：(tid, CPU纳秒, 墙钟)。口径 = 主循环所在 worker
+    // 的整线程占用（含同 worker 的拨号/DNS 任务），用于判定「阻塞还是算力」。
+    let mut cpu_pct_base: Option<(i64, u64, Instant)> = None;
     loop {
         if ctx.shutdown.load(Ordering::Relaxed) {
             break;
@@ -1921,6 +2134,31 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             let ms = t.elapsed().as_millis() as u64;
             ctx.stats.loop_round_ms_last.store(ms, Ordering::Relaxed);
             ctx.stats.loop_round_ms_max.fetch_max(ms, Ordering::Relaxed);
+            let tid = current_tid();
+            let cpu = thread_cpu_ns();
+            if let (Some(cpu1), Some((tid0, cpu0))) = (cpu, round_cpu.take()) {
+                if tid0 == tid {
+                    let us = cpu1.saturating_sub(cpu0) / 1_000;
+                    ctx.stats.loop_cpu_us_last.store(us, Ordering::Relaxed);
+                    ctx.stats.loop_cpu_us_max.fetch_max(us, Ordering::Relaxed);
+                }
+            }
+            if let Some(cpu1) = cpu {
+                match cpu_pct_base {
+                    Some((tid0, cpu0, t0)) if tid0 == tid => {
+                        let wall = t0.elapsed();
+                        if wall >= Duration::from_secs(1) {
+                            let wall_us = (wall.as_micros() as u64).max(1);
+                            let pct =
+                                (cpu1.saturating_sub(cpu0) / 1_000 * 100 / wall_us).min(100);
+                            ctx.stats.loop_thread_cpu_pct.store(pct, Ordering::Relaxed);
+                            cpu_pct_base = Some((tid, cpu1, Instant::now()));
+                        }
+                    }
+                    // worker 迁移或首次采样：重置基线，占比保持上一次有效值。
+                    _ => cpu_pct_base = Some((tid, cpu1, Instant::now())),
+                }
+            }
         }
         // 切网（蜂窝↔Wi-Fi）后旧网络的 QUIC 假活结论必须失效：壳层置位，这里整表清空。
         if ctx.quic_clear.swap(false, Ordering::Relaxed) {
@@ -1935,11 +2173,16 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
         // 空闲时降低唤醒频率；有 tx backlog 或写阻塞时保持 1ms 兜底。
         // 新报文到达、TUN 可写、出站数据入队都会立即唤醒，这里的兜底只防漏唤醒。
         let idle = conns.is_empty() && udp_clients.is_empty();
-        let backlogged = pending_out.len() >= device.pending_cap;
+        // 高水位不再停读 TUN：停读会把客户端 ACK 一起饿死——ACK 进不来，
+        // smoltcp 的 tx 缓冲不释放，中继 pending 到顶后暂停读上游，表现就是
+        // 「下载中途掉速再恢复」的锯齿。所有入队点（device.transmit / ICMP /
+        // UDP / DNS）各自按 pending_cap 封顶，读取本身不会让队列无界增长。
+        // 只在极端失控（4 倍上限）时兜底停读。
+        let read_starved = pending_out.len() >= device.pending_cap.saturating_mul(4);
         let wait = if write_blocked
             || !pending_out.is_empty()
             || !dns_pending.is_empty()
-            || has_relay_backlog(&conns)
+            || (!global_drain_paused && has_relay_backlog(&conns))
         {
             Duration::from_millis(1)
         } else if idle {
@@ -1948,12 +2191,12 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             Duration::from_millis(IDLE_SAFETY_WAIT_MS)
         };
         // 事件驱动：TUN 可读、TUN 可写、UDP 响应、DNS 响应任一到达即唤醒。
-        // backlog 达到高水位时暂停读 TUN，背压回内核，避免 pending_out 无界增长。
+        // 高水位不再停读（ACK 必须持续回填）；只有 read_starved 极端失控才兜底。
         tokio::select! {
             // readable 只负责唤醒并清掉就绪位；真正的读取在下方固定步骤执行，
             // 不再「赌 select 选中这个分支」——边沿触发或漏唤醒会把 RX 停住，
             // RX 一停 ACK 回填就慢，下行窗口跟着被压。
-            r = async_fd.readable(), if !backlogged => {
+            r = async_fd.readable(), if !read_starved => {
                 if let Ok(mut g) = r {
                     g.clear_ready();
                 }
@@ -1992,10 +2235,11 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
         }
 
         round_started = Some(Instant::now());
+        round_cpu = thread_cpu_ns().map(|c| (current_tid(), c));
         claimed.clear();
         // 读 TUN 是每轮固定步骤：非阻塞读到 WouldBlock 即止，单轮最多 MAX_RX_BURST 包。
-        // backlog 到高水位时仍然跳过，把背压留给上行（避免 pending_out 无界增长）。
-        if !backlogged {
+        // 只有 read_starved（极端失控）才跳过；普通高水位照读，ACK 必须持续回填。
+        if !read_starved {
             let mut rounds = 0;
             loop {
                 rounds += 1;
@@ -2033,7 +2277,14 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             let handle = match reuse {
                                 Some(h) => Some(h),
                                 None => {
-                                    add_listener(&mut sockets, addr, port, &ctx.stats).map(|h| {
+                                    add_listener(
+                                        &mut sockets,
+                                        addr,
+                                        port,
+                                        &ctx.stats,
+                                        pending_accept.len(),
+                                    )
+                                    .map(|h| {
                                         listeners.entry(key).or_default().push((h, Instant::now()));
                                         h
                                     })
@@ -2389,6 +2640,12 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                     send_stall_logged: false,
                                     rate_prev_up: 0,
                                     rate_prev_down: 0,
+                                    rate_last: Instant::now(),
+                                    stall_prev_sq: 0,
+                                    stall_prev_up: 0,
+                                    stall_prev_down: 0,
+                                    stall_progress_at: Instant::now(),
+                                    stall_logged: false,
                                 });
                                 ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                                 ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
@@ -2507,6 +2764,12 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 send_stall_logged: false,
                                 rate_prev_up: 0,
                                 rate_prev_down: 0,
+                                    rate_last: Instant::now(),
+                                    stall_prev_sq: 0,
+                                    stall_prev_up: 0,
+                                    stall_prev_down: 0,
+                                    stall_progress_at: Instant::now(),
+                                    stall_logged: false,
                             });
                             ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                             ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
@@ -2631,6 +2894,12 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             send_stall_logged: false,
                             rate_prev_up: 0,
                             rate_prev_down: 0,
+                                    rate_last: Instant::now(),
+                                    stall_prev_sq: 0,
+                                    stall_prev_up: 0,
+                                    stall_prev_down: 0,
+                                    stall_progress_at: Instant::now(),
+                                    stall_logged: false,
                         });
                         ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                         ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
@@ -2668,6 +2937,12 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             send_stall_logged: false,
                             rate_prev_up: 0,
                             rate_prev_down: 0,
+                                    rate_last: Instant::now(),
+                                    stall_prev_sq: 0,
+                                    stall_prev_up: 0,
+                                    stall_prev_down: 0,
+                                    stall_progress_at: Instant::now(),
+                                    stall_logged: false,
                         });
                         ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                         ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
@@ -2814,6 +3089,12 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                             send_stall_logged: false,
                             rate_prev_up: 0,
                             rate_prev_down: 0,
+                                    rate_last: Instant::now(),
+                                    stall_prev_sq: 0,
+                                    stall_prev_up: 0,
+                                    stall_prev_down: 0,
+                                    stall_progress_at: Instant::now(),
+                                    stall_logged: false,
                         });
                         ctx.stats.active_conns.fetch_add(1, Ordering::Relaxed);
                         ctx.stats.total_conns.fetch_add(1, Ordering::Relaxed);
@@ -2828,6 +3109,22 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             }
         }
         pending_accept = still_pending;
+
+        // 全局暂存预算：合计字节超上限本轮全体停搬（通道填满 → 上游窗口收紧），
+        // 排空到低水位恢复。搬运配额按连接发放（见 ROUND_DRAIN_PER_CONN），
+        // 这里只留一个全局软上限兜底极端连接数。
+        let total_pending: usize = conns.iter().map(|c| c.pending_bytes).sum();
+        if !global_drain_paused && total_pending >= TCP_PENDING_TOTAL_CAP {
+            global_drain_paused = true;
+        }
+        if global_drain_paused && total_pending <= TCP_PENDING_TOTAL_RESUME {
+            global_drain_paused = false;
+        }
+        let mut round_drain_total = if global_drain_paused {
+            0
+        } else {
+            ROUND_DRAIN_TOTAL
+        };
 
         // TCP 连接数据（scratch 复用，避免每个报文都新建 16KB）
         let mut dead: Vec<usize> = Vec::new();
@@ -2875,13 +3172,23 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
             }
             // 客户端半关闭（FIN）：只停止 client->server 方向——drop to_relay
             // 让中继关闭出站写侧；服务端响应要继续收到 relay EOF，不能整条关闭。
-            if conn.client_closed && conn.to_relay.is_some() {
+            // 必须等接收缓冲里的尾部数据全部搬进中继通道再 drop：
+            // FIN 前的上传末尾可能还躺在 smoltcp 缓冲里（通道满时搬运暂停），
+            // 提前 drop 会把这段字节直接丢掉。
+            if conn.client_closed && conn.to_relay.is_some() && !sock.can_recv() {
                 conn.to_relay = None;
             }
 
             // 下行背压：pending 到上限就停止搬运，让通道填满、relay 停读上游。
-            if drain_relay_to_pending(conn) {
-                touched = true;
+            // 配额按连接发放：每条连接每轮最多 ROUND_DRAIN_PER_CONN 块，
+            // 全局软上限只兜底连接数极多的情况，不再是逐连接额度。
+            if round_drain_total > 0 {
+                let mut conn_budget = ROUND_DRAIN_PER_CONN.min(round_drain_total);
+                let before = conn_budget;
+                if drain_relay_to_pending(conn, &mut conn_budget) {
+                    touched = true;
+                }
+                round_drain_total -= before - conn_budget;
             }
             // best-fit：send_slice 返回实际入队字节数，头块写不完就部分写入、
             // 剩余留在队头下轮续写——字节流顺序不变，也不因单块装不下而整环停摆。
@@ -2949,13 +3256,15 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
         // 主循环 wait 在 1ms/空闲之间切换，轮数换算出来会失真；毫秒口径可以直接
         // 换算成「这段时间里有多少比例在等」。
         if last_meter.elapsed() >= Duration::from_millis(METER_TICK_MS) {
+            // 实际拍长：空闲期兜底等待会把拍拉长到 500~750ms，按固定 500ms
+            // 换算会低估速率；用真实经过时长算，曲线才可信。
+            let tick_ms = last_meter.elapsed().as_millis().max(1) as u64;
             last_meter = Instant::now();
             let now_m = Instant::now();
             for conn in conns.iter_mut() {
                 let sock = sockets.get::<tcp::Socket>(conn.handle);
                 let rc = sock.recv_capacity();
                 let rq = sock.recv_queue();
-                let sc = sock.send_capacity();
                 let sq = sock.send_queue();
                 // H1 实锤：本地接收缓冲满，并且 relay 侧还有积压（上游数据已经躺在通道里）。
                 // 只满足前者可能是对端在灌包而我们正在搬；两个同时成立才是「收不下」。
@@ -2971,8 +3280,32 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         .tcp_recv_full
                         .fetch_add(METER_TICK_MS, Ordering::Relaxed);
                 }
-                // 发送侧：待发队列非空、对端通告窗口为 0 → 对端不收。
-                if sq > 0 && sc == 0 {
+                // 发送停滞判据：未确认队列非空且本拍无进展。
+                // 旧判据 `sc == 0` 是死代码——send_capacity() 返回的是本地
+                // tx 缓冲容量（恒 >0），不是对端通告窗口；smoltcp 0.14 不公开
+                // remote_win，零窗口无法直接观测。零窗口/重传/对端静默都表现
+                // 为「无进展」，统一按此计，20s 档再单独给疑似重传告警。
+                let up_now = conn
+                    .meter
+                    .as_ref()
+                    .map(|m| m.up.load(Ordering::Relaxed))
+                    .unwrap_or(0);
+                // 下行字节也算进展：稳态下载时未确认队列会被 ACK 和补发互相抵消
+                // （sq 几乎不变），只按 sq 判会把「满速下载」全记成停滞，仪表因此失真。
+                let down_now = conn
+                    .meter
+                    .as_ref()
+                    .map(|m| m.down.load(Ordering::Relaxed))
+                    .unwrap_or(0);
+                let progressed = unacked_progressed(
+                    sq,
+                    conn.stall_prev_sq,
+                    up_now,
+                    conn.stall_prev_up,
+                    down_now,
+                    conn.stall_prev_down,
+                );
+                if sq > 0 && !progressed {
                     ctx.stats
                         .tcp_send_stalled
                         .fetch_add(METER_TICK_MS, Ordering::Relaxed);
@@ -2988,7 +3321,7 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                         logging::warn(
                             "tun",
                             format!(
-                                "发送停滞超过 3s：{} 对端零窗口，待发 {}B（本地接收队列 {}/{}B）",
+                                "发送停滞超过 3s：{} 未确认队列无进展，待发 {}B（零窗口/重传/对端静默，本地接收队列 {}/{}B）",
                                 ep, sq, rq, rc
                             ),
                         );
@@ -2997,27 +3330,89 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                     conn.send_stall_since = None;
                     conn.send_stall_logged = false;
                 }
+                // B6 无进展观测：队列缩短（ACK 前进）或上行字节增长任一成立
+                // 即有进展；两者都不动才是真停滞。纯观测，不改任何转发决策。
+                if progressed {
+                    conn.stall_progress_at = now_m;
+                    conn.stall_logged = false;
+                } else if !conn.stall_logged
+                    && now_m.duration_since(conn.stall_progress_at)
+                        >= Duration::from_secs(TCP_UNACKED_WARN_SECS)
+                {
+                    conn.stall_logged = true;
+                    ctx.stats.tcp_unacked_stall.fetch_add(1, Ordering::Relaxed);
+                    let ep = sock
+                        .remote_endpoint()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "-".into());
+                    logging::warn(
+                        "tun",
+                        format!(
+                            "疑似重传超时：#{} {} 未确认队列 {}s 无进展（{}B），下行积压 {}B；也可能是对端静默，非确诊",
+                            conn.snap.map(|id| id.to_string()).unwrap_or_else(|| "-".into()),
+                            ep,
+                            TCP_UNACKED_WARN_SECS,
+                            sq,
+                            conn.pending_bytes
+                        ),
+                    );
+                }
+                conn.stall_prev_sq = sq;
+                conn.stall_prev_up = up_now;
+                conn.stall_prev_down = down_now;
             }
+            // B4 观测：半开连接（已 accept、还没完成首包判定）当前占用的
+            // 大档名额数。大档全局上限 128，这个数直接回答「探测/风暴流量
+            // 是否挤占真实连接的大档配额」，是入场分档阈值的调参依据。
+            let half_open_big = pending_accept
+                .iter()
+                .filter(|(_, _, h, _)| {
+                    sockets.get::<tcp::Socket>(*h).recv_capacity() == TCP_SOCKET_BUFFER
+                })
+                .count();
+            ctx.stats
+                .tcp_halfopen_big_tier
+                .store(half_open_big as u64, Ordering::Relaxed);
+
+            // 吞吐时间线：每拍差分一次聚合下行字节，换算成 KB/s 存进环形缓冲。
+            // 这是「掉速再恢复」的唯一客观证据来源——锯齿（本机饿死 ACK）与
+            // 链路抖动（Wi-Fi 争用）在这条曲线上形状完全不同。
+            let down_total = ctx.stats.down_bytes.load(Ordering::Relaxed);
+            let prev_total = ctx.stats.down_rate_prev.swap(down_total, Ordering::Relaxed);
+            let has_baseline = prev_total > 0;
+            let kbs = down_total.saturating_sub(prev_total) * 1000 / tick_ms / 1024;
+            ctx.stats.push_down_rate(kbs, has_baseline);
         }
 
-        // 每连接速率：10s 采样一次，用累计字节差分写进连接快照；诊断再打 top-N。
-        if last_rate_sample.elapsed() >= Duration::from_secs(10) {
-            last_rate_sample = Instant::now();
-            let secs = 10.0f64;
-            let mut top: Vec<(u64, u64, &'static str)> = Vec::new();
-            let mut table = ctx.conns.write().unwrap_or_else(|p| p.into_inner());
+        // 每连接速率：各自 ≥10s 窗口错峰结算，每轮最多 RATE_BATCH 条到期连接。
+        // 旧实现每 10s 全量扫（1024 条持写锁 + 逐条查档位）是长轮尖刺来源；
+        // 摊销后单轮成本封顶，写锁只圈住表更新，速率差分按每条自己的窗口算。
+        // top5 日志节奏不变：候选随批次累积，每 10s 打一条后清空。
+        {
+            let mut updates: Vec<(u64, u64, u64)> = Vec::new();
+            let mut settled = 0usize;
             for conn in conns.iter_mut() {
+                if settled >= RATE_BATCH {
+                    break;
+                }
+                let elapsed = conn.rate_last.elapsed();
+                if elapsed < Duration::from_secs(10) {
+                    continue;
+                }
                 let Some(id) = conn.snap else { continue };
                 let Some(m) = conn.meter.as_ref() else {
                     continue;
                 };
+                settled += 1;
+                let secs = elapsed.as_secs_f64().max(1.0);
                 let up = m.up.load(Ordering::Relaxed);
                 let down = m.down.load(Ordering::Relaxed);
                 let up_bps = ((up.saturating_sub(conn.rate_prev_up)) as f64 / secs) as u64;
                 let down_bps = ((down.saturating_sub(conn.rate_prev_down)) as f64 / secs) as u64;
                 conn.rate_prev_up = up;
                 conn.rate_prev_down = down;
-                table.set_rates(id, up_bps, down_bps);
+                conn.rate_last = Instant::now();
+                updates.push((id, up_bps, down_bps));
                 if down_bps > 0 {
                     // 档位标签：诊断时要能一眼看出这条流是不是被降到了 128K。
                     let tier = if sockets.get::<tcp::Socket>(conn.handle).recv_capacity()
@@ -3027,24 +3422,53 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                     } else {
                         "128K"
                     };
-                    top.push((id, down_bps, tier));
+                    rate_top.push((id, down_bps, tier));
                 }
             }
-            drop(table);
-            top.sort_by(|a, b| b.1.cmp(&a.1));
-            if !top.is_empty() {
-                logging::info(
-                    "tun",
-                    format!(
-                        "连接速率 top{}：{}",
-                        top.len().min(5),
-                        top.iter()
-                            .take(5)
-                            .map(|(id, bps, tier)| format!("#{} {} {}KB/s", id, tier, bps / 1024))
-                            .collect::<Vec<_>>()
-                            .join(" · ")
-                    ),
-                );
+            if !updates.is_empty() {
+                let mut table = ctx.conns.write().unwrap_or_else(|p| p.into_inner());
+                for (id, up, down) in updates {
+                    table.set_rates(id, up, down);
+                }
+            }
+            if last_rate_sample.elapsed() >= Duration::from_secs(10) {
+                last_rate_sample = Instant::now();
+                rate_top.sort_by(|a, b| b.1.cmp(&a.1));
+                rate_top.truncate(5);
+                if !rate_top.is_empty() {
+                    logging::info(
+                        "tun",
+                        format!(
+                            "连接速率 top{}：{}",
+                            rate_top.len(),
+                            rate_top
+                                .iter()
+                                .map(|(id, bps, tier)| format!(
+                                    "#{} {} {}KB/s",
+                                    id,
+                                    tier,
+                                    bps / 1024
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(" · ")
+                        ),
+                    );
+                }
+                rate_top.clear();
+                // 慢连接 top5 快照：按无进展时长排序，只收确有积压/未确认数据的。
+                // 3s 起步过滤掉正常突发间隙；与速率日志同节拍，10s 刷新一次。
+                let mut slow: Vec<(u64, u64, u64, u64)> = Vec::new();
+                for conn in conns.iter() {
+                    let Some(id) = conn.snap else { continue };
+                    let stall_ms = conn.stall_progress_at.elapsed().as_millis() as u64;
+                    let sq = sockets.get::<tcp::Socket>(conn.handle).send_queue() as u64;
+                    if stall_ms >= 3_000 && (sq > 0 || conn.pending_bytes > 0) {
+                        slow.push((id, stall_ms, conn.pending_bytes as u64, sq));
+                    }
+                }
+                slow.sort_by(|a, b| b.1.cmp(&a.1));
+                slow.truncate(5);
+                *TOP_SLOW.lock().unwrap_or_else(|p| p.into_inner()) = slow;
             }
         }
 
@@ -3543,6 +3967,79 @@ mod tests {
     }
 
     #[test]
+    fn tun_checksum_is_tx_only() {
+        // A1：默认 RX 验收关、TX 保留（内核读 tun 时校验）；
+        // 配置开关可恢复逐包验收做真机 A/B。
+        let dev = TunDevice::new(1500, test_stats(), false);
+        let ck = dev.capabilities().checksum;
+        for c in [ck.ipv4, ck.udp, ck.tcp, ck.icmpv4, ck.icmpv6] {
+            assert!(!c.rx(), "RX 校验必须关闭");
+            assert!(c.tx(), "TX 校验必须保留");
+        }
+        let dev = TunDevice::new(1500, test_stats(), true);
+        let ck = dev.capabilities().checksum;
+        for c in [ck.ipv4, ck.udp, ck.tcp, ck.icmpv4, ck.icmpv6] {
+            assert!(c.rx(), "开关打开后 RX 验收必须恢复");
+            assert!(c.tx());
+        }
+    }
+
+    #[test]
+    fn thread_cpu_probe_works() {
+        // A2：CLOCK_THREAD_CPUTIME_ID 可用且单调；tid 合法。
+        let a = thread_cpu_ns().expect("线程 CPU 时钟不可用");
+        let b = thread_cpu_ns().expect("线程 CPU 时钟不可用");
+        assert!(b >= a);
+        assert!(current_tid() > 0);
+    }
+
+    #[test]
+    fn half_open_pressure_forces_small_tier() {
+        // B4：半开堆积「且」大档名额吃紧才强制小档。只半开高、名额充足时
+        // 不降级（保护测速/视频多开的真实传输）；名额耗尽走 tier_denied 另一条路。
+        assert!(half_open_downgrade(
+            TCP_HALFOPEN_SMALL_TIER_AT,
+            TCP_BUFFER_HIGH_TIER_MAX / 2
+        ));
+        assert!(half_open_downgrade(
+            TCP_HALFOPEN_SMALL_TIER_AT + 1,
+            TCP_BUFFER_HIGH_TIER_MAX
+        ));
+        // 半开高但名额充足：不误伤。
+        assert!(!half_open_downgrade(TCP_HALFOPEN_SMALL_TIER_AT, 0));
+        assert!(!half_open_downgrade(
+            TCP_HALFOPEN_SMALL_TIER_AT,
+            TCP_BUFFER_HIGH_TIER_MAX / 2 - 1
+        ));
+        // 半开低于阈值：无论名额都不触发半开降级。
+        assert!(!half_open_downgrade(0, TCP_BUFFER_HIGH_TIER_MAX));
+        assert!(!half_open_downgrade(
+            TCP_HALFOPEN_SMALL_TIER_AT - 1,
+            TCP_BUFFER_HIGH_TIER_MAX
+        ));
+        // 阈值必须远低于半开上限，否则封顶形同虚设；也不能太小误伤正常并发。
+        assert!(TCP_HALFOPEN_SMALL_TIER_AT >= 64);
+        assert!(TCP_HALFOPEN_SMALL_TIER_AT < MAX_PENDING_ACCEPT);
+    }
+
+    #[test]
+    fn unacked_progress_judgement() {
+        // B6：空队列 / 队列缩短 / 上行增长 / 下行增长任一成立即有进展。
+        assert!(unacked_progressed(0, 0, 100, 100, 100, 100));
+        assert!(unacked_progressed(500, 1000, 100, 100, 100, 100));
+        assert!(unacked_progressed(1000, 1000, 200, 100, 100, 100));
+        // 下行字节增长也算进展（稳态下载时 sq 会被 ACK 与补发互相抵消）。
+        assert!(unacked_progressed(1000, 1000, 100, 100, 200, 100));
+        // 队列不动、上下行都不动：真停滞。
+        assert!(!unacked_progressed(1000, 1000, 100, 100, 100, 100));
+        // 队列变长但上下行都没动（对端不回 ACK、本地还在灌）：同样停滞。
+        assert!(!unacked_progressed(2000, 1000, 100, 100, 100, 100));
+        // 告警阈值必须落在「正常 RTO 退避」和「180s 判死」之间。
+        assert!(TCP_UNACKED_WARN_SECS >= 10);
+        assert!(TCP_UNACKED_WARN_SECS < TCP_DEAD_TIMEOUT_SECS);
+    }
+
+    #[test]
     fn victim_rank_prefers_idle_and_oldest() {
         // 有堆积的连接排后面：正在传输的连接要优先保留。
         assert!(
@@ -3572,15 +4069,14 @@ mod tests {
 
     #[test]
     fn buffer_plan_uses_512k_tcp_and_memory_guard() {
-        // recv 512K 保住上行突发闸门（窗口缩放 shift=3）；tx 大档 256K，
-        // 本机腿亚毫秒 RTT 足够，下游突发吸收交给 pending 2MB＋滞回。
+        // recv 512K 保住上行突发闸门（窗口缩放 shift=3）；tx 大档同 512K：
+        // ACK 回填受主循环节奏约束，调度尖刺下 256K 会压住单流极限。
         assert_eq!(TCP_SOCKET_BUFFER, 512 * 1024);
-        assert_eq!(TCP_SOCKET_BUFFER_TX, 256 * 1024);
-        assert!(TCP_SOCKET_BUFFER_TX < TCP_SOCKET_BUFFER);
+        assert_eq!(TCP_SOCKET_BUFFER_TX, 512 * 1024);
         // 水位守卫：大档只给当前并发前 128 条 socket，其余降级 128K。
         assert_eq!(TCP_SOCKET_BUFFER_MIN, 128 * 1024);
         assert!(TCP_BUFFER_HIGH_TIER_MAX >= 64);
-        // 最坏内存：128×(512K+256K) + (1024-128)×256K ≈ 352MB 虚拟口径，
+        // 最坏内存：128×(512K+512K) + (1024-128)×256K ≈ 352MB 虚拟口径，
         // 远低于「裸提 1024 条全 512K 双向」的 1GB；惰性零页下 PSS 只随真实流量涨。
         assert!(
             TCP_BUFFER_HIGH_TIER_MAX * (TCP_SOCKET_BUFFER + TCP_SOCKET_BUFFER_TX)
@@ -3668,6 +4164,12 @@ mod tests {
             send_stall_logged: false,
             rate_prev_up: 0,
             rate_prev_down: 0,
+                                    rate_last: Instant::now(),
+                                    stall_prev_sq: 0,
+                                    stall_prev_up: 0,
+                                    stall_prev_down: 0,
+                                    stall_progress_at: Instant::now(),
+                                    stall_logged: false,
         };
         // 灌 2.24MB（140×16K），超过 2MB 上限；单轮最多搬 RELAY_DRAIN_BURST 块，
         // 循环搬到滞回暂停为止。
@@ -3675,7 +4177,7 @@ mod tests {
             stx.send(vec![7u8; 16384]).await.unwrap();
         }
         let mut moved = false;
-        while drain_relay_to_pending(&mut conn) {
+        while drain_relay_to_pending(&mut conn, &mut usize::MAX) {
             moved = true;
         }
         assert!(moved);
@@ -3691,19 +4193,19 @@ mod tests {
                 .is_ok()
         );
         // 暂停期间继续搬运无效：通道里还有数据但 pending 未到低水位。
-        assert!(!drain_relay_to_pending(&mut conn));
+        assert!(!drain_relay_to_pending(&mut conn, &mut usize::MAX));
         // 滞回：只排空到 1.5MB（高于 1MB 恢复水位）不得恢复搬运，
         // 单阈值实现会在这里立刻恢复→门槛处振荡。
         while conn.pending_bytes > 1_500_000 {
             let f = conn.pending.pop_front().unwrap();
             conn.pending_bytes -= f.len();
         }
-        assert!(!drain_relay_to_pending(&mut conn));
+        assert!(!drain_relay_to_pending(&mut conn, &mut usize::MAX));
         assert!(conn.relay_paused);
         // 模拟发送 loop 把 pending 写进 smoltcp 排空到低水位以下，下一轮恢复搬运。
         conn.pending.clear();
         conn.pending_bytes = 0;
-        assert!(drain_relay_to_pending(&mut conn));
+        assert!(drain_relay_to_pending(&mut conn, &mut usize::MAX));
         assert!(!conn.relay_paused);
         assert!(conn.pending_bytes > 0);
     }
@@ -3764,6 +4266,184 @@ mod tests {
         assert!(!is_probe_host("firebase.googleapis.com"));
         assert!(!is_probe_host("www.googleapis.com"));
         assert!(!is_probe_host("mtalk.google.com.example.com"));
+    }
+
+    #[tokio::test]
+    async fn relay_fin_flushes_upload_tail_before_shutdown() {
+        // 客户端 FIN（channel 关闭）后，已收到的上传末尾必须全部写到上游，
+        // 才能关写侧；随后服务端响应仍要完整送达（半关闭语义）。
+        let (upstream, relay_end) = tokio::io::duplex(64 * 1024);
+        let (ctx_tx, ctx_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (stx, mut srx) = mpsc::channel::<Vec<u8>>(8);
+        let h = tokio::spawn(relay_stream(
+            Box::new(relay_end),
+            ctx_rx,
+            stx,
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+        ));
+        let (mut up_r, mut up_w) = tokio::io::split(upstream);
+        ctx_tx.send(b"HEAD".to_vec()).await.unwrap();
+        ctx_tx.send(b"TAIL".to_vec()).await.unwrap();
+        drop(ctx_tx); // FIN
+        let mut buf = [0u8; 8];
+        tokio::time::timeout(Duration::from_secs(2), up_r.read_exact(&mut buf))
+            .await
+            .expect("FIN 后上传末尾丢失")
+            .unwrap();
+        assert_eq!(&buf, b"HEADTAIL");
+        // 写侧已关：上游读到 EOF。
+        let mut end = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), up_r.read(&mut end))
+            .await
+            .expect("FIN 后写侧未关闭")
+            .unwrap();
+        assert_eq!(n, 0);
+        // 服务端响应在 FIN 之后仍必须送达。
+        up_w.write_all(b"RESP").await.unwrap();
+        let got = tokio::time::timeout(Duration::from_secs(2), srx.recv())
+            .await
+            .expect("FIN 后响应丢失")
+            .unwrap();
+        assert_eq!(got, b"RESP".to_vec());
+        drop(up_w);
+        let _ = tokio::time::timeout(Duration::from_secs(2), h).await;
+    }
+
+    #[tokio::test]
+    async fn relay_upload_stall_does_not_block_download() {
+        // 上游写不动（duplex 写满、无人读）时，下行读取必须继续推进：
+        // 旧实现在 select 处理器里 write_all().await，上行一卡整个循环停摆。
+        let (upstream, relay_end) = tokio::io::duplex(1024);
+        let (ctx_tx, ctx_rx) = mpsc::channel::<Vec<u8>>(64);
+        let (stx, mut srx) = mpsc::channel::<Vec<u8>>(8);
+        let h = tokio::spawn(relay_stream(
+            Box::new(relay_end),
+            ctx_rx,
+            stx,
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+        ));
+        let (mut up_r, mut up_w) = tokio::io::split(upstream);
+        // 灌 8KB 上行：duplex 只有 1KB，写分支必然挂起。
+        ctx_tx.send(vec![7u8; 8192]).await.unwrap();
+        // 上游持续灌响应，下行必须照常进 channel。
+        tokio::spawn(async move {
+            let data = vec![3u8; 512];
+            for _ in 0..8 {
+                if up_w.write_all(&data).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let got = tokio::time::timeout(Duration::from_secs(2), srx.recv())
+            .await
+            .expect("上行写阻塞时下行被卡死")
+            .unwrap();
+        // duplex 可能把相邻写合并成一次读，只断言收到了数据且内容正确。
+        assert!(!got.is_empty() && got.iter().all(|&b| b == 3));
+        // 上游开始消费后，挂起的上行尾部也要继续写完。
+        let mut sink = vec![0u8; 8192];
+        tokio::time::timeout(Duration::from_secs(2), up_r.read_exact(&mut sink))
+            .await
+            .expect("上行恢复后尾部未写完")
+            .unwrap();
+        assert!(sink.iter().all(|&b| b == 7));
+        h.abort();
+    }
+
+    #[tokio::test]
+    async fn drain_budget_stops_within_round() {
+        // 单轮配额用完即停：通道里还有数据也不搬，下轮继续。
+        let (stx, srx) = mpsc::channel::<Vec<u8>>(64);
+        let mut conn = TcpConn {
+            handle: dummy_handle(),
+            snap: None,
+            to_relay: None,
+            from_relay: srx,
+            pending: VecDeque::new(),
+            pending_bytes: 0,
+            relay_paused: false,
+            read_wake: Arc::new(Notify::new()),
+            relay_closed: false,
+            client_closed: false,
+            closing: false,
+            last_active: Instant::now(),
+            meter: None,
+            recv_full: false,
+            send_stall_since: None,
+            send_stall_logged: false,
+            rate_prev_up: 0,
+            rate_prev_down: 0,
+            rate_last: Instant::now(),
+            stall_prev_sq: 0,
+            stall_prev_up: 0,
+            stall_prev_down: 0,
+            stall_progress_at: Instant::now(),
+            stall_logged: false,
+        };
+        for _ in 0..8 {
+            stx.send(vec![1u8; 16384]).await.unwrap();
+        }
+        let mut budget = 2usize;
+        assert!(drain_relay_to_pending(&mut conn, &mut budget));
+        assert_eq!(budget, 0);
+        assert_eq!(conn.pending.len(), 2);
+        assert!(!drain_relay_to_pending(&mut conn, &mut budget));
+        // 全局预算常量口径：恢复水位必须低于停搬水位（滞回），
+        // 单轮配额不能小于单连接 burst（否则一条流都搬不完整）。
+        assert!(TCP_PENDING_TOTAL_RESUME < TCP_PENDING_TOTAL_CAP);
+        assert!(ROUND_DRAIN_PER_CONN >= RELAY_DRAIN_BURST);
+    }
+
+    #[test]
+    fn drain_quota_is_per_connection_not_global() {
+        // 回归用例：配额曾是全局共享——11 条并发下载时前 4 条各吃满 128 块
+        // 就耗光整轮额度，其余连接每轮拿 0 块，极限下载速度掉档。
+        // 现在每连接独立发放，连接数再多也都能拿到自己的额度。
+        assert!(ROUND_DRAIN_TOTAL > ROUND_DRAIN_PER_CONN * 8);
+        // 全局软上限必须远大于常见的十几条并发连接的合计额度，
+        // 否则它就退化成了实际的逐连接配额。
+        assert!(ROUND_DRAIN_TOTAL >= ROUND_DRAIN_PER_CONN * 12);
+    }
+
+    #[tokio::test]
+    async fn upload_prefetch_pipelines_next_chunk() {
+        // 回归用例：上行曾是严格串行——写完一块才回 select 收下一块，
+        // TLS 写缓冲接近满时每块多次 Pending 往返，上传慢且抖。
+        // 现在预取槽让「写块 N」与「收块 N+1」并行，写完立即接续写。
+        use tokio::io::AsyncReadExt as _;
+        let (upstream, relay_end) = tokio::io::duplex(64 * 1024);
+        let (mut up_r, _up_w) = tokio::io::split(upstream);
+        let (ctx_tx, ctx_rx) = mpsc::channel::<Vec<u8>>(8);
+        let (stx, srx) = mpsc::channel::<Vec<u8>>(8);
+        let _keep = srx; // 下行无人消费，本用例只验证上行
+        let h = tokio::spawn(relay_stream(
+            Box::new(relay_end),
+            ctx_rx,
+            stx,
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+        ));
+        ctx_tx.send(vec![1u8; 4096]).await.unwrap();
+        ctx_tx.send(vec![2u8; 4096]).await.unwrap();
+        let mut got = vec![0u8; 8192];
+        let mut read = 0usize;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while read < 8192 {
+                let n = up_r.read(&mut got[read..]).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                read += n;
+            }
+        })
+        .await
+        .expect("预取流水下两块的字节没完整到达");
+        assert_eq!(read, 8192, "上行只写出 {} 字节", read);
+        assert!(got[..4096].iter().all(|&b| b == 1));
+        assert!(got[4096..].iter().all(|&b| b == 2));
+        h.abort();
     }
 
     #[test]
@@ -4084,7 +4764,7 @@ mod tests {
     #[test]
     fn transmit_returns_none_at_tx_high_water() {
         let stats = test_stats();
-        let mut device = TunDevice::new(1500, stats.clone());
+        let mut device = TunDevice::new(1500, stats.clone(), false);
         {
             let mut g = device.tx.lock().unwrap_or_else(|p| p.into_inner());
             for _ in 0..MAX_TX_QUEUE {
@@ -4121,7 +4801,7 @@ mod tests {
     #[test]
     fn drain_tx_into_respects_remaining_room() {
         let stats = test_stats();
-        let device = TunDevice::new(1500, stats);
+        let device = TunDevice::new(1500, stats, false);
         {
             let mut g = device.tx.lock().unwrap_or_else(|p| p.into_inner());
             for i in 0..5u8 {

@@ -9,6 +9,7 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import com.namu.dns.core.config.MitmConfig
 import com.namu.dns.core.config.ModuleOrder
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -299,12 +300,66 @@ object Actions {
         )
     }
 
+    private val builtInRoutingActions = setOf("direct", "dir", "proxy", "proxies", "block", "reject", "deny")
+
+    internal fun subscriptionGroupAliases(
+        groups: List<ProxyGroup>,
+        existingNames: Set<String> = emptySet(),
+    ): Map<String, String> {
+        val names = groups.mapTo(existingNames.toHashSet()) { it.name }
+        return buildMap {
+            for (group in groups) {
+                val needsAlias = group.name.lowercase() in builtInRoutingActions || group.name in existingNames
+                if (!needsAlias || containsKey(group.name)) continue
+                var alias = "${group.name}（策略组）"
+                var suffix = 2
+                while (!names.add(alias)) alias = "${group.name}（策略组 $suffix）".also { suffix++ }
+                put(group.name, alias)
+            }
+        }
+    }
+
+    internal fun subscriptionRuleTarget(
+        action: String,
+        groupAliases: Map<String, String>,
+        nodeAliases: Map<String, String>,
+    ): String {
+        if (action.startsWith("node:")) {
+            val name = action.removePrefix("node:")
+            return nodeAliases[name]?.let { "node:$it" } ?: action
+        }
+        return groupAliases[action] ?: action
+    }
+
+    internal fun nameSubscriptionNodes(nodes: List<NodeInfo>, existingNames: Set<String> = emptySet()): List<NodeInfo> {
+        val reserved = nodes.mapTo(existingNames.toHashSet()) { it.name }
+        val seen = existingNames.toHashSet()
+        val nextSuffix = HashMap<String, Int>()
+        return nodes.map { node ->
+            if (seen.add(node.name)) {
+                node
+            } else {
+                var suffix = nextSuffix.getOrDefault(node.name, 2)
+                var candidate: String
+                do {
+                    candidate = "${node.name} ($suffix)"
+                    suffix++
+                } while (!reserved.add(candidate))
+                nextSuffix[node.name] = suffix
+                node.copy(name = candidate)
+            }
+        }
+    }
+
     suspend fun importSubscription(
         rawInput: String,
         append: Boolean = false,
+        refresh: Boolean = false,
     ): ImportResult = withContext(Dispatchers.IO) {
-        val isUrl = rawInput.trim().startsWith("http://") || rawInput.trim().startsWith("https://")
-        val fetched = if (isUrl) fetchTextResult(rawInput.trim()) else null
+        val input = rawInput.trim()
+        val profile = settings.activeConfigName()
+        val isUrl = input.startsWith("http://") || input.startsWith("https://")
+        val fetched = if (isUrl) fetchTextResult(input) else null
         val raw = fetched?.text ?: rawInput
         val info = parseSubscriptionUserInfo(fetched?.headers?.get("subscription-userinfo"))
         val json = NativeCore.nativeParseSubscription(raw)
@@ -320,7 +375,8 @@ object Actions {
         } else {
             "手动导入"
         }
-        val imported = nodes.map { it.copy(group = groupName) }
+        val source = if (isUrl) subscriptionSourceId(input) else "local://manual"
+        val imported = nodes.map { it.copy(group = groupName, source = source) }
         val importedCount = imported.size
         val rulesArr = obj.optJSONArray("rules")
         val rules = mutableListOf<RuleItem>()
@@ -364,7 +420,7 @@ object Actions {
         }
         val totalLines = obj.optInt("total_lines", nodes.size + diagnostics.size)
         val routing = obj.optBoolean("routing", false)
-        val finalPolicy = obj.optString("final", "").ifBlank { null }
+        val finalPolicy = if (obj.isNull("final")) null else obj.optString("final").ifBlank { null }
         if (nodes.isEmpty()) {
             if (diagnostics.isEmpty()) throw RuntimeException("没有解析到节点")
             // 全部条目都被跳过时也返回诊断，UI 能显示逐项原因；不触碰现有节点。
@@ -382,33 +438,35 @@ object Actions {
             )
         }
         withContext(Dispatchers.Main) {
-            val oldSelected = settings.current().selected
-            val merged = if (append) {
-                // 追加导入：同名节点以新导入的为准，其余保留原分组
-                (settings.current().nodes.filterNot { old -> imported.any { it.name == old.name } } + imported)
-            } else {
-                imported
-            }
-            val keep = merged.any { it.name == oldSelected }
-            val mergedGroups = if (groups.isEmpty()) {
-                settings.current().proxyGroups
-            } else {
-                val base = settings.current().proxyGroups.filterNot { old -> groups.any { it.name == old.name } }
-                base + groups
-            }
             settings.update { current ->
-                current.copy(
+                if (settings.activeConfigName() != profile) {
+                    throw IllegalStateException("配置已切换，请重新导入订阅")
+                }
+                if (refresh && current.subscription.trim() != input) {
+                    throw IllegalStateException("订阅地址已变更，请重新刷新")
+                }
+                val kept = when {
+                    refresh -> nodesRetainedOnRefresh(current.nodes, source)
+                    append -> current.nodes
+                    else -> emptyList()
+                }
+                val retained = nameSubscriptionNodes(kept)
+                val renamed = nameSubscriptionNodes(imported, retained.mapTo(HashSet()) { it.name })
+                val merged = retained + renamed
+                val memberNames = imported.zip(renamed).distinctBy { it.first.name }
+                    .associate { (original, node) -> original.name to node.name }
+                mergeSubscriptionRouting(
+                    current, source, memberNames, groups, rules, finalPolicy,
+                    replaceRouting = isUrl || routing,
+                ).copy(
                     nodes = merged,
-                    selected = if (keep) oldSelected else merged.firstOrNull()?.name,
-                    rules = if (routing) rules else current.rules,
-                    finalPolicy = finalPolicy ?: current.finalPolicy,
-                    proxyGroups = mergedGroups,
-                    groupSelections = current.groupSelections.filterKeys { key ->
-                        mergedGroups.any { it.name == key }
-                    },
-                    subscriptionInfo = info ?: current.subscriptionInfo,
+                    selected = current.selected?.takeIf { selected -> merged.any { it.name == selected } }
+                        ?: merged.firstOrNull()?.name,
+                    subscription = if (isUrl) input else current.subscription,
+                    subscriptionInfo = if (isUrl && input != current.subscription) info else info ?: current.subscriptionInfo,
                 )
             }
+            if (runtime.current().connected) ApplyCoordinator.requestApply(App.context, "订阅更新")
         }
         ImportResult(
             nodes = importedCount,
@@ -425,13 +483,58 @@ object Actions {
         )
     }
 
-    /** 下拉刷新/周期任务：重新拉取订阅并保留已有节点（同名覆盖），同时刷新 userinfo。 */
+    internal fun mergeSubscriptionRouting(
+        current: AppConfig,
+        source: String,
+        nodeAliases: Map<String, String>,
+        groups: List<ProxyGroup>,
+        rules: List<RuleItem>,
+        finalPolicy: String?,
+        replaceRouting: Boolean,
+    ): AppConfig {
+        if (!replaceRouting) return current
+        val keptGroups = current.proxyGroups.filterNot { it.subscriptionSource == source }
+        val groupAliases = subscriptionGroupAliases(groups, keptGroups.mapTo(HashSet()) { it.name })
+        val mergedGroups = keptGroups + groups.map { group ->
+            group.copy(
+                name = groupAliases[group.name] ?: group.name,
+                members = group.members.map { groupAliases[it] ?: nodeAliases[it] ?: it },
+                subscriptionSource = source,
+            )
+        }
+        val mergedRules = current.rules.filterNot { it.subscriptionSource == source } + rules.map { rule ->
+            rule.copy(
+                action = subscriptionRuleTarget(rule.action, groupAliases, nodeAliases),
+                subscriptionSource = source,
+            )
+        }
+        val replacesFinal = current.finalPolicySource == source
+        return current.copy(
+            proxyGroups = mergedGroups,
+            rules = mergedRules,
+            finalPolicy = finalPolicy?.let { subscriptionRuleTarget(it, groupAliases, nodeAliases) }
+                ?: if (replacesFinal) AppConfig().finalPolicy else current.finalPolicy,
+            finalPolicySource = when {
+                finalPolicy != null -> source
+                replacesFinal -> ""
+                else -> current.finalPolicySource
+            },
+            groupSelections = current.groupSelections.filter { (group, member) ->
+                mergedGroups.any { it.name == group && member in it.members }
+            },
+        )
+    }
+
+    internal fun nodesRetainedOnRefresh(nodes: List<NodeInfo>, source: String): List<NodeInfo> =
+        nodes.filterNot { it.source == source }
+
+    /** 下拉和后台刷新只替换已标记为当前订阅的节点。 */
     suspend fun refreshSubscription(): ImportResult = withContext(Dispatchers.IO) {
         val url = settings.current().subscription.trim()
         if (!url.startsWith("http://") && !url.startsWith("https://")) {
             throw RuntimeException("当前配置没有订阅链接")
         }
-        importSubscription(url, append = true)
+        importSubscription(url, refresh = true)
     }
 
     /** 刷新结果必须带回 UI/后台：零节点不能再说「已刷新」。 */
@@ -1067,6 +1170,7 @@ object Actions {
                 },
                 cnDirect = routing?.optBoolean("cn_direct", current.cnDirect) ?: current.cnDirect,
                 finalPolicy = routing?.optString("final_policy", current.finalPolicy) ?: current.finalPolicy,
+                finalPolicySource = if (routing?.has("final_policy") == true) "" else current.finalPolicySource,
                 ruleSources = if (sources.isEmpty()) current.ruleSources else sources,
             )
         } ?: throw RuntimeException("远端配置保存失败")
@@ -1207,44 +1311,56 @@ object Actions {
         }
     }
 
-    /** 并发测速（最多 6 个），按需自动选择延迟最低的节点。 */
+    /** 端到端测速：内核经真实代理协议转发 GET，返回 name→延迟ms（失败 null）。
+     *  并发与超时都在内核侧控制；内核不可用时返回空表，调用方按未测速处理。 */
+    suspend fun probeNodes(nodes: List<NodeInfo>, url: String): List<Pair<String, Long?>> =
+        withContext(Dispatchers.IO) {
+            if (nodes.isEmpty()) return@withContext emptyList()
+            val payload = JSONObject().apply {
+                put("nodes", JSONArray().apply { nodes.forEach { put(it.toJson(includeSource = false)) } })
+                put("url", url.ifBlank { "https://www.gstatic.com/generate_204" })
+                put("timeoutMs", 5000)
+            }
+            val obj = runCatching { JSONObject(NativeCore.nativeProbeNodes(payload.toString())) }
+                .getOrNull() ?: return@withContext emptyList()
+            val arr = obj.optJSONArray("results") ?: return@withContext emptyList()
+            val map = HashMap<String, Long?>()
+            for (i in 0 until arr.length()) {
+                val r = arr.optJSONObject(i) ?: continue
+                val name = r.optString("name")
+                map[name] = if (r.optBoolean("ok")) r.optLong("ms") else null
+            }
+            nodes.map { it.name to map[it.name] }
+        }
+
+    /** 仅使用端到端探测成功的节点参加自动选择。 */
     suspend fun autoTestNodes(): Int = withContext(Dispatchers.IO) {
         val snapshot = settings.current()
         if (snapshot.nodes.isEmpty()) return@withContext 0
-        val semaphore = Semaphore(6)
-        val results = coroutineScope {
-            snapshot.nodes.map { node ->
-                async {
-                    semaphore.withPermit {
-                        node.name to ping(node.server, node.port, snapshot.pingMethod)
-                    }
-                }
-            }.awaitAll()
-        }
-        val best = results
-            .filter { it.second != null }
-            .minByOrNull { it.second!! }
-        withContext(Dispatchers.Main) {
+        val results = probeNodes(snapshot.nodes, snapshot.pingUrl).toMap()
+        val testedNodes = snapshot.nodes.associateBy { it.name }
+        withContext(Dispatchers.Main) applyResults@{
             val current = settings.current()
-            val bestName = best?.first
-            val nextSelected = if (current.autoSelectNode && bestName != null && current.nodes.any { it.name == bestName }) {
-                bestName
+            if (current.pingUrl != snapshot.pingUrl) return@applyResults
+            val matching = current.nodes.filter { node ->
+                val tested = testedNodes[node.name]
+                node.name in results && tested?.copy(latency = node.latency, testing = node.testing) == node
+            }.mapTo(HashSet()) { it.name }
+            val updated = current.nodes.map { node ->
+                if (node.name in matching) node.copy(latency = results[node.name]) else node
+            }
+            val best = updated.filter { it.name in matching && it.latency != null }.minByOrNull { it.latency!! }
+            val nextSelected = if (current.autoSelectNode && current.selected == snapshot.selected) {
+                best?.name ?: current.selected
             } else {
                 current.selected
             }
-            val changed = nextSelected != current.selected
-            settings.update { latest ->
-                latest.copy(
-                    nodes = latest.nodes.map { node ->
-                        val ms = results.firstOrNull { it.first == node.name }?.second
-                        if (ms != null) node.copy(latency = ms) else node
-                    },
-                    selected = nextSelected,
-                )
+            settings.update { it.copy(nodes = updated, selected = nextSelected) }
+            if (nextSelected != current.selected && runtime.current().connected) {
+                ApplyCoordinator.requestApply(App.context, "配置变更")
             }
-            if (changed && runtime.current().connected) ApplyCoordinator.requestApply(App.context, "配置变更")
         }
-        results.count { it.second != null }
+        results.count { it.value != null }
     }
 
     /** MITM 总开关（设备级）：写全局 → 重建合并 → 运行中热重载。 */

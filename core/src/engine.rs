@@ -688,6 +688,10 @@ pub fn classify_action(
         "direct" | "dir" => return Action::Direct,
         "proxy" | "proxies" => return Action::Proxy,
         "block" | "reject" | "deny" => return Action::Block,
+        // 空串 / 字面 "null" 是上游解析残留（org.json optString 对 JSON null
+        // 返回字符串 "null"），不是真实策略名。按直连兜底，绝不落成 Missing→Block
+        // 把正常流量误拦成重试风暴。
+        "" | "null" => return Action::Direct,
         _ => {}
     }
     if let Some(name) = t.strip_prefix("node:") {
@@ -845,7 +849,15 @@ impl RuleEngine {
             let action_name = rc.action.split(',').next().unwrap_or("").trim();
             let extended_match = rc.action.split(',').any(|v| v.trim().eq_ignore_ascii_case("extended-matching"));
             let pre_match = rc.action.split(',').any(|v| v.trim().eq_ignore_ascii_case("pre-matching"));
-            let action = classify_action(action_name, &group_names, &node_names);
+            // 显式 FINAL/MATCH 规则与顶层 final_policy 同为兜底入口：空/null
+            // 动作默认 proxy；明确写的 DIRECT/REJECT/策略组仍按 classify_action 生效。
+            let action = if matches!(kind, RuleKind::Final) {
+                let a = action_name.trim();
+                let a = if a.is_empty() || a.eq_ignore_ascii_case("null") { "proxy" } else { a };
+                classify_action(a, &group_names, &node_names)
+            } else {
+                classify_action(action_name, &group_names, &node_names)
+            };
             let action = if filter_only {
                 proxy_to_direct(action)
             } else {
@@ -862,7 +874,17 @@ impl RuleEngine {
                 meta: rc.meta.clone(),
             });
         }
-        let final_action = classify_action(&cfg.final_policy, &group_names, &node_names);
+        // FINAL 与规则动作语义不同：规则动作为空/null 是解析残留，按直连兜底
+        // （见 classify_action，避免误拦风暴）；但 FINAL 为空/null 表示「未显式
+        // 指定最终策略」，代理配置下应默认走当前选中节点（Proxy），而非直连。
+        // 否则未命中任何规则的境外域名（如 google）会落 DIRECT 直连被墙超时。
+        let final_raw = cfg.final_policy.trim();
+        let final_raw = if final_raw.is_empty() || final_raw.eq_ignore_ascii_case("null") {
+            "proxy"
+        } else {
+            final_raw
+        };
+        let final_action = classify_action(final_raw, &group_names, &node_names);
         let final_action = if filter_only {
             proxy_to_direct(final_action)
         } else {
@@ -1834,6 +1856,109 @@ mod tests {
         });
         // 对照：普通规则模式下 final=proxy 保持原样，由运行时无节点兜底处理。
         assert!(matches!(a, Action::Proxy), "实际 {:?}", a);
+    }
+
+    #[test]
+    fn empty_or_null_final_defaults_to_proxy_in_rule_mode() {
+        // 回归：把空/null 一律判直连会误伤 FINAL。代理配置无显式 FINAL 时，
+        // 未命中规则的境外域名（google）应默认走代理而非直连被墙。
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        for raw in ["", "null", "  ", "NULL"] {
+            let mut cfg = Config::default();
+            cfg.mode = "rule".into();
+            cfg.final_policy = raw.into();
+            let engine = RuleEngine::from_config(&cfg);
+            let (a, _) = engine.decide_input(&MatchInput {
+                domain: Some("www.google.com.hk"),
+                ip,
+                port: 443,
+                kind: ConnKind::Tcp,
+                uid: None,
+            });
+            assert!(matches!(a, Action::Proxy), "final={:?} 应默认走代理，实际 {:?}", raw, a);
+        }
+        // 规则动作为空/null 仍按直连兜底（不受 FINAL 修正影响）。
+        let mut cfg = Config::default();
+        cfg.mode = "rule".into();
+        cfg.final_policy = "proxy".into();
+        cfg.rules = vec![crate::config::RuleConf {
+            kind: "DOMAIN-SUFFIX".into(),
+            value: "null-action.example".into(),
+            action: "null".into(),
+            source: None,
+            meta: None,
+        }];
+        let engine = RuleEngine::from_config(&cfg);
+        let (a, _) = engine.decide_input(&MatchInput {
+            domain: Some("x.null-action.example"),
+            ip,
+            port: 443,
+            kind: ConnKind::Tcp,
+            uid: None,
+        });
+        assert!(matches!(a, Action::Direct), "规则空动作应直连，实际 {:?}", a);
+    }
+
+    #[test]
+    fn explicit_final_match_rule_empty_action_defaults_proxy() {
+        // 第二条兜底入口：规则列表里的显式 FINAL/MATCH。空/null 动作默认 proxy，
+        // 明确写的 DIRECT/REJECT/策略组仍生效；filter_only 下代理降级直连。
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        let input = MatchInput {
+            domain: Some("www.google.com.hk"),
+            ip,
+            port: 443,
+            kind: ConnKind::Tcp,
+            uid: None,
+        };
+        let final_rule = |kind: &str, action: &str| crate::config::RuleConf {
+            kind: kind.into(),
+            value: String::new(),
+            action: action.into(),
+            source: None,
+            meta: None,
+        };
+        for kind in ["FINAL", "MATCH"] {
+            for action in ["", "null"] {
+                let mut cfg = Config::default();
+                cfg.mode = "rule".into();
+                cfg.final_policy = "direct".into(); // 顶层故意写直连，显式规则应优先
+                cfg.rules = vec![final_rule(kind, action)];
+                let engine = RuleEngine::from_config(&cfg);
+                let (a, _) = engine.decide_input(&input);
+                assert!(matches!(a, Action::Proxy), "{} 空动作应 proxy，实际 {:?}", kind, a);
+            }
+        }
+        for (action, expect_direct) in [("DIRECT", true), ("REJECT", false)] {
+            let mut cfg = Config::default();
+            cfg.mode = "rule".into();
+            cfg.rules = vec![final_rule("FINAL", action)];
+            let engine = RuleEngine::from_config(&cfg);
+            let (a, _) = engine.decide_input(&input);
+            if expect_direct {
+                assert!(matches!(a, Action::Direct), "FINAL DIRECT 应直连，实际 {:?}", a);
+            } else {
+                assert!(matches!(a, Action::Block), "FINAL REJECT 应拦截，实际 {:?}", a);
+            }
+        }
+        let mut cfg = Config::default();
+        cfg.mode = "rule".into();
+        cfg.proxy_groups = vec![crate::config::ProxyGroup {
+            name: "GPT".into(),
+            kind: "select".into(),
+            members: vec!["n".into()],
+            ..Default::default()
+        }];
+        cfg.rules = vec![final_rule("FINAL", "GPT")];
+        let engine = RuleEngine::from_config(&cfg);
+        let (a, _) = engine.decide_input(&input);
+        assert!(matches!(a, Action::Group(ref g) if g == "GPT"), "FINAL 指定组应生效，实际 {:?}", a);
+        let mut cfg = Config::default();
+        cfg.mode = "filter_only".into();
+        cfg.rules = vec![final_rule("FINAL", "")];
+        let engine = RuleEngine::from_config(&cfg);
+        let (a, _) = engine.decide_input(&input);
+        assert!(matches!(a, Action::Direct), "filter_only 应降级直连，实际 {:?}", a);
     }
 
     #[test]

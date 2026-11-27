@@ -166,6 +166,8 @@ internal fun HttpsScopeSection(onOpenCertificate: () -> Unit) {
     val trust by vm.trust.collectAsStateWithLifecycle()
     val exists by vm.caExists.collectAsStateWithLifecycle()
     LaunchedEffect(Unit) { vm.refresh() }
+    // 从系统设置/模块管理器装完证书返回时，页面还停在旧状态，必须重新核验。
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.refresh() }
     val ready = RootCaManager.resolveTrustState(exists, trust) == RootCaManager.TrustState.ACTIVE
     var preparing by remember { mutableStateOf(false) }
     var field by remember { mutableStateOf<String?>(null) }
