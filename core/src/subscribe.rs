@@ -33,6 +33,18 @@ pub struct ParseResult {
     pub diagnostics: Vec<NodeDiagnostic>,
     pub diagnostic_counts: DiagnosticCounts,
     pub total_lines: usize,
+    /// Clash rule-providers：名称/地址/行为，Kotlin 侧负责下载、缓存和展开。
+    pub rule_providers: Vec<RuleProviderConf>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleProviderConf {
+    pub name: String,
+    pub kind: String,
+    pub url: String,
+    pub behavior: String,
+    pub path: String,
+    pub interval: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -67,6 +79,7 @@ impl ParseResult {
             "diagnostics": self.diagnostics,
             "diagnostic_counts": self.diagnostic_counts,
             "total_lines": self.total_lines,
+            "rule_providers": self.rule_providers,
         })
         .to_string()
     }
@@ -85,6 +98,7 @@ fn empty_result(routing: bool) -> ParseResult {
         diagnostics: vec![],
         diagnostic_counts: DiagnosticCounts::default(),
         total_lines: 0,
+        rule_providers: vec![],
     }
 }
 
@@ -329,6 +343,7 @@ pub fn parse_subscription(text: &str) -> ParseResult {
             diagnostics: vec![diagnostic],
             diagnostic_counts: counts,
             total_lines: trimmed.lines().count().max(1),
+            rule_providers: vec![],
         };
     }
     parse_uri_list(trimmed)
@@ -599,6 +614,32 @@ fn parse_clash(value: &serde_yaml::Value) -> ParseResult {
     }
     let mut rules = Vec::new();
     let mut final_policy = None;
+    let mut rule_providers = Vec::new();
+    if let Some(map) = value.get("rule-providers").and_then(|p| p.as_mapping()) {
+        for (key, item) in map {
+            let Some(name) = key.as_str() else {
+                continue;
+            };
+            let behavior = yaml_str(item, "behavior").unwrap_or_else(|| "classical".into());
+            if !matches!(
+                behavior.to_ascii_lowercase().as_str(),
+                "domain" | "ipcidr" | "classical"
+            ) {
+                warnings.push(format!(
+                    "规则集 {} 的 behavior={} 不支持（仅 domain/ipcidr/classical）",
+                    name, behavior
+                ));
+            }
+            rule_providers.push(RuleProviderConf {
+                name: name.trim().to_string(),
+                kind: yaml_str(item, "type").unwrap_or_else(|| "http".into()),
+                url: yaml_str(item, "url").unwrap_or_default(),
+                behavior,
+                path: yaml_str(item, "path").unwrap_or_default(),
+                interval: yaml_u64(item, "interval").unwrap_or(86_400),
+            });
+        }
+    }
     if let Some(list) = value.get("rules").and_then(|p| p.as_sequence()) {
         for r in list {
             if let Some(s) = r.as_str() {
@@ -615,11 +656,46 @@ fn parse_clash(value: &serde_yaml::Value) -> ParseResult {
                     final_policy = Some(action);
                     continue;
                 }
+                if kind_up == "RULE-SET" || kind_up == "DOMAIN-SET" {
+                    let lower = rest.to_ascii_lowercase();
+                    let no_resolve = lower.ends_with(",no-resolve");
+                    let clean = if no_resolve {
+                        &rest[..rest.len() - ",no-resolve".len()]
+                    } else {
+                        rest
+                    };
+                    let parts: Vec<&str> = clean.split(',').map(|p| p.trim()).collect();
+                    if parts.len() >= 2 && !parts[0].is_empty() {
+                        let (action, warning) =
+                            map_clash_target(parts[1], &node_names, &group_names);
+                        if let Some(w) = warning {
+                            warnings.push(format!(
+                                "规则集 {} 的策略 {} 未定义，展开后的规则按 proxy（当前选中节点）回落{}",
+                                parts[0],
+                                parts[1],
+                                if w.contains("未定义") { String::new() } else { format!("（{}）", w) }
+                            ));
+                        }
+                        rules.push(RuleConf {
+                            kind: kind_up,
+                            value: parts[0].to_string(),
+                            action,
+                            source: Some("订阅".into()),
+                            meta: None,
+                            no_resolve,
+                        });
+                    } else {
+                        warnings.push(format!("规则集引用格式无效: {}", s));
+                    }
+                    continue;
+                }
                 if !supported_clash_rule(&kind_up) {
                     warnings.push(format!("跳过不支持的规则: {}", s));
                     continue;
                 }
-                let rest = if rest.to_ascii_lowercase().ends_with(",no-resolve") {
+                let lower = rest.to_ascii_lowercase();
+                let no_resolve = lower.ends_with(",no-resolve");
+                let rest = if no_resolve {
                     &rest[..rest.len() - ",no-resolve".len()]
                 } else {
                     rest
@@ -637,6 +713,7 @@ fn parse_clash(value: &serde_yaml::Value) -> ParseResult {
                         action,
                         source: Some("订阅".into()),
                         meta: None,
+                        no_resolve,
                     });
                 }
             }
@@ -656,6 +733,7 @@ fn parse_clash(value: &serde_yaml::Value) -> ParseResult {
         diagnostic_counts: counts,
         diagnostics,
         total_lines,
+        rule_providers,
     }
 }
 
@@ -668,6 +746,7 @@ fn supported_clash_rule(kind: &str) -> bool {
             | "DOMAIN-REGEX"
             | "IP-CIDR"
             | "IP-CIDR6"
+            | "GEOIP"
             | "PORT"
     )
 }
@@ -906,6 +985,7 @@ fn parse_uri_list(text: &str) -> ParseResult {
         diagnostics,
         diagnostic_counts: counts,
         total_lines,
+        rule_providers: vec![],
     }
 }
 
@@ -1536,5 +1616,91 @@ mod tests {
         let parsed: Value = serde_json::from_str(&parse_to_json(&uri)).unwrap();
         assert_eq!(parsed["nodes"].as_array().unwrap().len(), 0);
         assert_eq!(parsed["diagnostics"][0]["category"], "unsupported_param");
+    }
+
+    #[test]
+    fn clash_rule_providers_and_rule_set_refs_are_parsed() {
+        let yaml = r#"
+proxies:
+  - name: HK
+    type: ss
+    server: hk.example.com
+    port: 8388
+    cipher: aes-128-gcm
+    password: pass
+rule-providers:
+  ads:
+    type: http
+    behavior: domain
+    url: https://example.com/ads.yaml
+  cnip:
+    type: http
+    behavior: ipcidr
+    url: https://example.com/cn.yaml
+rules:
+  - RULE-SET,ads,BLOCK
+  - RULE-SET,cnip,DIRECT,no-resolve
+  - MATCH,Proxy
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies: [HK]
+"#;
+        let parsed: Value = serde_json::from_str(&parse_to_json(yaml)).unwrap();
+        assert_eq!(parsed["rule_providers"].as_array().unwrap().len(), 2);
+        assert_eq!(parsed["rule_providers"][0]["name"], "ads");
+        assert_eq!(parsed["rule_providers"][0]["behavior"], "domain");
+        assert_eq!(parsed["rules"][0]["type"], "RULE-SET");
+        assert_eq!(parsed["rules"][0]["value"], "ads");
+        assert_eq!(parsed["rules"][1]["no_resolve"], true);
+        assert_eq!(parsed["final"], "Proxy");
+    }
+
+    #[test]
+    fn clash_geoip_rule_is_preserved_for_diagnostics() {
+        let yaml = r#"
+proxies:
+  - name: HK
+    type: ss
+    server: hk.example.com
+    port: 8388
+    cipher: aes-128-gcm
+    password: pass
+rules:
+  - GEOIP,JP,Proxy
+  - MATCH,DIRECT
+proxy-groups:
+  - name: Proxy
+    type: select
+    proxies: [HK]
+"#;
+        let parsed: Value = serde_json::from_str(&parse_to_json(yaml)).unwrap();
+        assert_eq!(parsed["rules"][0]["type"], "GEOIP");
+        assert_eq!(parsed["rules"][0]["value"], "JP");
+    }
+
+    #[test]
+    fn unknown_rule_set_policy_warns_with_fallback_target() {
+        let yaml = r#"
+proxies:
+  - name: HK
+    type: ss
+    server: hk.example.com
+    port: 8388
+    cipher: aes-128-gcm
+    password: pass
+rule-providers:
+  ads:
+    type: http
+    behavior: domain
+    url: https://example.com/ads.yaml
+rules:
+  - RULE-SET,ads,NoSuchGroup
+"#;
+        let parsed: Value = serde_json::from_str(&parse_to_json(yaml)).unwrap();
+        let warnings = parsed["warnings"].as_array().unwrap();
+        let text = warnings.iter().filter_map(|w| w.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("规则集 ads"), "warning={text}");
+        assert!(text.contains("proxy"), "warning={text}");
     }
 }

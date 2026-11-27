@@ -253,7 +253,81 @@ fun ChoiceChip(text: String, selected: Boolean, modifier: Modifier = Modifier, o
 }
 
 @Composable
-fun SubscriptionDialog(onDismiss: () -> Unit, onDone: () -> Unit, onManualAdd: () -> Unit) {
+fun SubscriptionSourceDialog(
+    source: com.namu.dns.SubscriptionSource,
+    onDismiss: () -> Unit,
+    onRefresh: () -> Unit,
+    onToggle: (Boolean) -> Unit,
+    onRemove: () -> Unit,
+) {
+    var confirmRemove by remember { mutableStateOf(false) }
+    if (confirmRemove) {
+        NamuDialog(
+            title = "移除 ${source.displayName}？",
+            message = "会删除该来源的节点、规则和策略组，其他订阅与手动组不受影响。",
+            confirmText = "移除",
+            confirmColor = NamuColors.Red,
+            onConfirm = onRemove,
+            onDismiss = { confirmRemove = false },
+        ) {}
+        return
+    }
+    NamuDialog(
+        title = source.displayName,
+        confirmText = "关闭",
+        showDismiss = false,
+        onConfirm = onDismiss,
+        onDismiss = onDismiss,
+    ) {
+        Text(
+            if (source.enabled) "自动刷新已启用" else "自动刷新已暂停",
+            fontSize = 13.sp,
+            color = NamuColors.TextSub,
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            buildString {
+                append("节点 ${source.nodeCount} 个")
+                if (source.lastSuccessAt > 0) {
+                    append(" · 上次成功 ")
+                    append(java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
+                        .format(java.util.Date(source.lastSuccessAt)))
+                }
+                if (source.lastError.isNotBlank()) {
+                    append("\n最近失败：")
+                    append(source.lastError)
+                    if (source.stale) append("\n当前仍在用上一份可用数据")
+                }
+            },
+            fontSize = 12.sp,
+            color = if (source.lastError.isBlank()) NamuColors.TextSub else NamuColors.Red,
+        )
+        Spacer(Modifier.height(10.dp))
+        SettingsRow(
+            title = "立即刷新此来源",
+            subtitle = "只替换这个来源的数据，失败时保留上一份",
+            onClick = onRefresh,
+        )
+        SettingsRow(
+            title = if (source.enabled) "暂停自动刷新" else "恢复自动刷新",
+            onClick = { onToggle(!source.enabled) },
+        )
+        SettingsRow(
+            title = "移除此来源",
+            subtitle = "删除其节点、规则、策略组与 FINAL 归属",
+            showDivider = false,
+            onClick = { confirmRemove = true },
+        )
+    }
+}
+
+@Composable
+fun SubscriptionDialog(
+    onDismiss: () -> Unit,
+    onDone: () -> Unit,
+    onManualAdd: () -> Unit,
+    onManageSources: (() -> Unit)? = null,
+) {
     var text by remember { mutableStateOf(uiSettings.current().subscription) }
     var append by remember { mutableStateOf(false) }
     var loading by remember { mutableStateOf(false) }
@@ -294,22 +368,28 @@ fun SubscriptionDialog(onDismiss: () -> Unit, onDone: () -> Unit, onManualAdd: (
         },
     ) {
         NamuTextField(text, { text = it; error = null }, "https://… 或订阅内容", maxLines = 4)
-        Row(
-            Modifier.fillMaxWidth().padding(top = 10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Column(Modifier.weight(1f)) {
-                Text("追加到现有节点", fontSize = 13.sp, color = NamuColors.TextMain)
-                Text(
-                    if (append) "保留已有节点，新导入的同名节点会自动加后缀" else "清空现有节点，只保留本次导入",
-                    fontSize = 11.sp,
-                    color = NamuColors.TextSub,
-                )
+        val input = text.trim()
+        if (!input.startsWith("http://") && !input.startsWith("https://")) {
+            Row(
+                Modifier.fillMaxWidth().padding(top = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("追加到现有节点", fontSize = 13.sp, color = NamuColors.TextMain)
+                    Text(
+                        if (append) "保留已有节点，新导入的同名节点会自动加后缀" else "清空现有节点，只保留本次导入",
+                        fontSize = 11.sp,
+                        color = NamuColors.TextSub,
+                    )
+                }
+                IosSwitch(checked = append, onCheckedChange = { append = it })
             }
-            IosSwitch(checked = append, onCheckedChange = { append = it })
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
             MiniTextAction("手动填写", enabled = !loading, onClick = onManualAdd)
+            if (onManageSources != null) {
+                MiniTextAction("管理订阅", enabled = !loading, onClick = onManageSources)
+            }
             MiniTextAction("粘贴", enabled = !loading) {
                 clipboard.getText()?.text?.let { text = it }
             }
@@ -329,12 +409,20 @@ fun SubscriptionDialog(onDismiss: () -> Unit, onDone: () -> Unit, onManualAdd: (
             "${it.line}. ${it.scheme} · ${diagnosticCategoryLabel(it.category)}：${it.reason}\n${it.raw}"
         }
         val more = if (result.diagnostics.size > 8) "\n…另有 ${result.diagnostics.size - 8} 条" else ""
-        val warningText = result.warnings.take(3).joinToString("\n")
+        val warningText = result.warnings.take(5).joinToString("\n")
+        val providerText = Actions.providerDiagnosticText(result)
         val message = buildString {
             append("有效节点 ${result.nodes} / 输入 ${result.totalLines}；跳过 ${result.skipped} 个")
+            if (result.rules > 0 || result.groups > 0) {
+                append("\n路由：${result.rules} 条规则、${result.groups} 个策略组")
+            }
             if (counts.isNotBlank()) append("\n$counts")
+            if (providerText.isNotBlank()) append("\n\n规则集：\n$providerText")
             if (shown.isNotBlank()) append("\n\n$shown$more")
-            if (warningText.isNotBlank()) append("\n\n$warningText")
+            if (warningText.isNotBlank()) {
+                append("\n\n$warningText")
+                if (result.warnings.size > 5) append("\n…另有 ${result.warnings.size - 5} 条提示")
+            }
         }
         NamuDialog(
             title = "订阅导入诊断",
@@ -1541,6 +1629,7 @@ fun RuleTestDialog(
 ) {
     var input by remember { mutableStateOf("") }
     var result by remember { mutableStateOf<String?>(null) }
+    var previewOnly by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     NamuDialog(
         title = "测试规则",
@@ -1551,6 +1640,7 @@ fun RuleTestDialog(
             val text = input.trim()
             scope.launch {
                 // 优先用内核算：与运行时同一套判定（含模块规则、CN 直连、模式覆盖）。
+                var nativeOk = false
                 val native = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
                     if (!useRuntimeAssets || !NativeCore.available) return@withContext null
                     runCatching {
@@ -1560,6 +1650,7 @@ fun RuleTestDialog(
                         )
                         val o = org.json.JSONObject(json)
                         val detail = o.optString("detail").ifBlank { return@runCatching null }
+                        nativeOk = true
                         buildString {
                             append(detail)
                             val chain = o.optJSONArray("chain")
@@ -1600,18 +1691,29 @@ fun RuleTestDialog(
                     }.getOrNull()
                 }
                 result = native ?: evaluateRule(config, text)
+                previewOnly = !nativeOk
             }
         },
         onDismiss = onDismiss,
     ) {
         NamuTextField(input, { input = it; result = null }, "example.com 或 1.2.3.4", singleLine = true)
         Text(
-            "分流规则按顺序匹配、命中即停，FINAL 永远最后；DNS 拦截白名单在过滤层单独生效，不在这张规则表里。",
+            "分流规则按顺序匹配、命中即停：预匹配拦截 → 普通规则 → 国内直连 → FINAL。\n" +
+                "GEOIP / IP-CIDR 带 no-resolve 时，域名目标不会先解析成 IP 再命中；DNS 拦截白名单在过滤层单独生效。",
             fontSize = 11.sp,
             color = NamuColors.TextSub,
             lineHeight = 16.sp,
             modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
         )
+        if (previewOnly) {
+            Text(
+                "简化预览：内核规则测试不可用，下面的结果仅按当前配置做静态匹配，不代表实际连接选中的节点。",
+                fontSize = 11.sp,
+                color = NamuColors.Orange,
+                lineHeight = 16.sp,
+                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
+            )
+        }
         result?.let {
             Spacer(Modifier.height(10.dp))
             Text(

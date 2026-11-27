@@ -16,6 +16,10 @@ data class LiveConn(
     val ageMs: Long,
     val upBytes: Long,
     val downBytes: Long,
+    /** 实际选中的出口节点与解析链；规则测试的「拟选节点」以此为准。 */
+    val node: String = "",
+    val chain: String = "",
+    val note: String = "",
 ) {
     /** 瞬时速率（B/s），由 LiveConnStore 每次刷新时按两次采样差分算好写入。 */
     var upBps: Long = 0L
@@ -101,6 +105,9 @@ internal class LiveConnStore {
                     ageMs = c.optLong("ageMs"),
                     upBytes = c.optLong("up"),
                     downBytes = c.optLong("down"),
+                    node = c.optString("node"),
+                    chain = c.optString("chain"),
+                    note = c.optString("note"),
                 ).also {
                     // 内核 10s 采样给出的速率优先；本地差分只在没有内核值时兜底。
                     it.upBps = c.optLong("upBps")

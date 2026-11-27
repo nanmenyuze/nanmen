@@ -228,6 +228,11 @@ data class RuleItem(
     /** D0 归因身份；模块规则在重建时生成，手写配置在 nativeJson 时补默认身份。 */
     @kotlinx.serialization.Transient val meta: RuleMeta? = null,
     val subscriptionSource: String = "",
+    /**
+     * Clash `no-resolve`：IP 类规则只在「目标没有域名、只能按 IP 判定」时生效。
+     * 业务域名命中时不得先解析成 IP 再套 IP 规则，否则域名规则与 IP 规则会互相截胡。
+     */
+    val noResolve: Boolean = false,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
         put("type", type)
@@ -239,6 +244,7 @@ data class RuleItem(
         if (preMatch) put("preMatch", true)
         meta?.let { put("meta", it.toJson()) }
         if (subscriptionSource.isNotBlank()) put("subscriptionSource", subscriptionSource)
+        if (noResolve) put("noResolve", true)
     }
 
     companion object {
@@ -248,18 +254,22 @@ data class RuleItem(
             // org.json optString 对 JSON null 返回字符串 "null"（fallback 只在键
             // 缺失时生效）。显式 null / 空串 / "null" 都是解析残留，按直连兜底，
             // 避免下发内核落成 Missing→Block 把正常流量误拦成重试风暴。
-            sanitizeRuleAction(o.optString("action", "proxy")),
+            sanitizeRuleAction(o.optString("action", "proxy"), o.optString("type")),
             o.optString("source", ""),
             o.optBoolean("enabled", true),
             o.optBoolean("extendedMatch", false),
             o.optBoolean("preMatch", false),
             if (o.has("meta") && !o.isNull("meta")) RuleMeta.fromJson(o.getJSONObject("meta")) else null,
             o.optString("subscriptionSource", ""),
+            o.optBoolean("noResolve", o.optBoolean("no_resolve", false)),
         )
 
-        private fun sanitizeRuleAction(raw: String): String {
-            val t = raw.trim()
-            return if (t.isEmpty() || t.equals("null", ignoreCase = true)) "direct" else t
+        private fun sanitizeRuleAction(raw: String, type: String): String {
+            val action = raw.trim()
+            if (action.isNotEmpty() && !action.equals("null", ignoreCase = true)) return action
+            return if (type.equals("FINAL", ignoreCase = true) || type.equals("MATCH", ignoreCase = true)) {
+                "proxy"
+            } else "direct"
         }
     }
 }
@@ -775,6 +785,58 @@ data class SubscriptionInfo(
     }
 }
 
+/**
+ * 一条订阅来源的设备侧状态。订阅地址不进入 .conf，只存在 DataStore 快照；
+ * id 用地址哈希，和节点/规则/策略组上的 `subscriptionSource` 对应。
+ */
+data class SubscriptionSource(
+    val id: String,
+    val url: String,
+    val name: String = "",
+    val enabled: Boolean = true,
+    val lastAttemptAt: Long = 0L,
+    val lastSuccessAt: Long = 0L,
+    val lastError: String = "",
+    val nodeCount: Int = 0,
+    /** 本次刷新失败但仍保留上一份节点/规则。 */
+    val stale: Boolean = false,
+) {
+    val displayName: String get() = name.ifBlank {
+        runCatching { java.net.URI(url).host }.getOrNull()?.ifBlank { "订阅" } ?: "订阅"
+    }
+
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("id", id)
+        put("url", url)
+        put("name", name)
+        put("enabled", enabled)
+        put("lastAttemptAt", lastAttemptAt)
+        put("lastSuccessAt", lastSuccessAt)
+        put("lastError", lastError)
+        put("nodeCount", nodeCount)
+        put("stale", stale)
+    }
+
+    companion object {
+        fun fromJson(o: JSONObject): SubscriptionSource? {
+            val url = o.optString("url", "").trim()
+            val id = o.optString("id", "").trim().ifBlank { subscriptionSourceId(url) }
+            if (url.isBlank() || id.isBlank()) return null
+            return SubscriptionSource(
+                id = id,
+                url = url,
+                name = o.optString("name", ""),
+                enabled = o.optBoolean("enabled", true),
+                lastAttemptAt = o.optLong("lastAttemptAt", 0L),
+                lastSuccessAt = o.optLong("lastSuccessAt", 0L),
+                lastError = o.optString("lastError", ""),
+                nodeCount = o.optInt("nodeCount", 0),
+                stale = o.optBoolean("stale", false),
+            )
+        }
+    }
+}
+
 data class AppConfig(
     var mode: String = "dns_only",
     var selected: String? = null,
@@ -869,6 +931,8 @@ data class AppConfig(
     var caLastRemovalFailed: Int = 0,
     var caLastRemovalFailedNs: String = "",
     var subscriptionInfo: SubscriptionInfo? = null,
+    /** 设备侧订阅来源清单；节点/规则/策略组按 id 归属到各自来源，互不覆盖。 */
+    var subscriptionSources: List<SubscriptionSource> = emptyList(),
     var rules: List<RuleItem> = defaultRules(),
     var proxyGroups: List<ProxyGroup> = emptyList(),
     /** 设备侧组选择；跨重启/配置切换保留，不写入 .conf。 */
@@ -942,6 +1006,7 @@ data class AppConfig(
         put("caLastRemovalFailed", caLastRemovalFailed)
         put("caLastRemovalFailedNs", caLastRemovalFailedNs)
         subscriptionInfo?.let { put("subscriptionInfo", it.toJson()) }
+        put("subscriptionSources", JSONArray().apply { subscriptionSources.forEach { put(it.toJson()) } })
         put("nodes", JSONArray().apply { nodes.forEach { put(it.toJson()) } })
         put("rules", JSONArray().apply { rules.forEach { put(it.toJson()) } })
         put("proxyGroups", JSONArray().apply { proxyGroups.forEach { put(it.toJson()) } })
@@ -970,11 +1035,15 @@ data class AppConfig(
             "customAds", "autoUpdateRules", "financeProtect", "rulesUpdatedAt", "allowDnsFallback", "blockWhenNoNode",
             "fakeIp", "blockAaaa", "ipv6", "preferIpv6", "alwaysRealIp", "sniff", "autoSelectNode", "autoClearLogs",
             "autoDisablePrivateDns", "themeMode", "autoConnect", "pingMethod", "pingUrl", "subscriptionInfo",
+            "subscriptionSources",
             "hitHistoryEnabled", "ssidTriggerEnabled", "ssidTriggerNames", "ssidLocationOptIn",
             "caLastRemovalAt", "caLastRemovalCleared", "caLastRemovalFailed", "caLastRemovalFailedNs",
             "rules", "proxyGroups", "groupSelections", "mitm", "mtu", "bbr", "quicFallback",
             "dnsOnlyFullRoute",
         )
+
+        /** Defaults for new or explicitly reset profiles. Existing files keep their decode defaults. */
+        fun freshDefaults(): AppConfig = AppConfig(fallbackFilter = false, cnDirect = false)
 
         fun defaultRules() = listOf(
             RuleItem("IP-CIDR", "10.0.0.0/8", "direct"),
@@ -1015,6 +1084,12 @@ data class AppConfig(
                     for (i in 0 until arr.length()) {
                         val m = ModuleSource.fromJson(arr.getJSONObject(i))
                         if (m.id.isNotBlank() && m.url.isNotBlank()) moduleSources.add(m)
+                    }
+                }
+                val subscriptionSources = mutableListOf<SubscriptionSource>()
+                o.optJSONArray("subscriptionSources")?.let { arr ->
+                    for (i in 0 until arr.length()) {
+                        SubscriptionSource.fromJson(arr.getJSONObject(i))?.let { subscriptionSources.add(it) }
                     }
                 }
                 val proxyGroups = mutableListOf<ProxyGroup>()
@@ -1114,6 +1189,21 @@ data class AppConfig(
                     caLastRemovalFailed = o.optInt("caLastRemovalFailed", 0),
                     caLastRemovalFailedNs = o.optString("caLastRemovalFailedNs", ""),
                     subscriptionInfo = o.optJSONObject("subscriptionInfo")?.let { SubscriptionInfo.fromJson(it) },
+                    subscriptionSources = subscriptionSources.ifEmpty {
+                        // 旧数据只有单个订阅地址：迁移成一条来源，但归属字段仍为空的
+                        // 规则/策略组保持「来源不确定」，等用户手动清理，避免首次刷新误删。
+                        val url = o.optString("subscription", "").trim()
+                        if (url.startsWith("http://") || url.startsWith("https://")) {
+                            listOf(
+                                SubscriptionSource(
+                                    id = subscriptionSourceId(url),
+                                    url = url,
+                                    nodeCount = nodes.count { it.source == subscriptionSourceId(url) },
+                                    lastSuccessAt = o.optJSONObject("subscriptionInfo")?.optLong("updatedAt", 0L) ?: 0L,
+                                ),
+                            )
+                        } else emptyList()
+                    },
                     // 缺 rules 键（旧配置/外部导入）时回退默认私网直连规则，而不是空表。
                     rules = if (o.has("rules")) rules else defaultRules(),
                     proxyGroups = proxyGroups,

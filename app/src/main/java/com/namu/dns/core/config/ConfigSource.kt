@@ -320,6 +320,16 @@ private object ClashConfigParser : ConfigSourceParser {
         var finalPolicy = "proxy"
         val nativeRules = mutableListOf<RuleItem>()
         var unsupportedRuleCount = 0
+        val ruleProviderNames = mutableListOf<String>()
+        var inProviders = false
+        for (line in text.lineSequence()) {
+            if (line.isNotBlank() && !line.first().isWhitespace() && !line.trimStart().startsWith("#")) {
+                inProviders = line.trim() == "rule-providers:"
+            } else if (inProviders && line.startsWith("  ") && !line.startsWith("    ")) {
+                val name = line.trim().removeSuffix(":")
+                if (name.isNotBlank() && !name.startsWith("#")) ruleProviderNames += name
+            }
+        }
         fun actionOf(raw: String, path: String): String {
             return when {
                 // 组名优先，兼容名为 Proxy 的默认策略组。
@@ -335,7 +345,9 @@ private object ClashConfigParser : ConfigSourceParser {
             }
         }
         rules.forEachIndexed { index, line ->
-            val parts = line.split(',')
+            val partsRaw = line.split(',')
+            val noResolve = partsRaw.lastOrNull()?.trim().equals("no-resolve", ignoreCase = true) == true
+            val parts = if (noResolve) partsRaw.dropLast(1) else partsRaw
             if (parts.size < 2) {
                 issues += ConfigIssue(ConfigIssueLevel.ERROR, "rules[$index]", "规则格式无效：$line")
                 return@forEachIndexed
@@ -343,6 +355,16 @@ private object ClashConfigParser : ConfigSourceParser {
             val kind = parts[0].trim().uppercase()
             if (kind == "MATCH" || kind == "FINAL") {
                 finalPolicy = actionOf(parts.getOrNull(1)?.trim().orEmpty(), "rules[$index]")
+                return@forEachIndexed
+            }
+            if (kind == "RULE-SET" || kind == "DOMAIN-SET") {
+                unsupportedRuleCount++
+                issues += ConfigIssue(
+                    ConfigIssueLevel.WARNING,
+                    "rules[$index]",
+                    "$kind ${parts.getOrNull(1)?.trim().orEmpty()} 需要规则集下载/展开，请通过订阅导入；" +
+                        "当前按未实现跳过，策略 ${parts.getOrNull(2)?.trim().orEmpty()} 不会生效",
+                )
                 return@forEachIndexed
             }
             val value = if (kind in ruleLogicKinds) parts.drop(1).dropLast(1).joinToString(",").trim() else parts.getOrNull(1)?.trim().orEmpty()
@@ -359,6 +381,7 @@ private object ClashConfigParser : ConfigSourceParser {
                     value = value,
                     action = actionOf(parts.getOrNull(2)?.trim().orEmpty(), "rules[$index]"),
                     source = "Clash 导入",
+                    noResolve = noResolve,
                 )
             }
         }
@@ -366,7 +389,15 @@ private object ClashConfigParser : ConfigSourceParser {
             issues += ConfigIssue(ConfigIssueLevel.ERROR, "rules", "没有可导入的受支持规则或策略组")
         }
         if (unsupportedRuleCount > 0) {
-            issues += ConfigIssue(ConfigIssueLevel.WARNING, "rules", "跳过 $unsupportedRuleCount 条未实现规则")
+            issues += ConfigIssue(ConfigIssueLevel.WARNING, "rules", "跳过 $unsupportedRuleCount 条未实现或需下载展开的规则")
+        }
+        if (ruleProviderNames.isNotEmpty()) {
+            issues += ConfigIssue(
+                ConfigIssueLevel.WARNING,
+                "rule-providers",
+                "发现 ${ruleProviderNames.size} 个规则集：${ruleProviderNames.take(6).joinToString("、")}；" +
+                    "规则集下载/缓存/展开只在订阅导入路径执行，配置文件导入不写缓存",
+            )
         }
         val canImport = issues.none { it.level == ConfigIssueLevel.ERROR }
         val config = if (canImport) {
@@ -388,9 +419,9 @@ private object ClashConfigParser : ConfigSourceParser {
                     "proxies(${proxies.size})",
                     "proxy-groups(${groupDefs.size})",
                     "rules(${nativeRules.size})",
-                ),
+                ) + if (ruleProviderNames.isNotEmpty()) listOf("rule-providers(${ruleProviderNames.size})") else emptyList(),
                 partial = listOf("dns", "tun", "节点仍走订阅导入；组目标已保留为策略组名"),
-                skipped = listOf("script", "rule-providers", "listeners", "experimental"),
+                skipped = listOf("script", "rule-providers 展开（订阅导入路径支持）", "listeners", "experimental"),
                 unknown = unknown,
                 issues = issues,
                 nodes = proxies.size,

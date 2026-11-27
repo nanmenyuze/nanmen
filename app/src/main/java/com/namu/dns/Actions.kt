@@ -9,6 +9,8 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import com.namu.dns.core.config.MitmConfig
 import com.namu.dns.core.config.ModuleOrder
+import com.namu.dns.core.config.ConfigIssueLevel
+import com.namu.dns.core.config.RoutingValidation
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
@@ -116,6 +118,8 @@ object Actions {
         val totalLines: Int = nodes,
         val skipped: Int = 0,
         val groups: Int = 0,
+        /** Clash rule-providers 的逐项状态（fresh/cached/pending/...）。 */
+        val providerStatuses: List<ClashRuleSets.ProviderStatus> = emptyList(),
     )
 
     /** 解析 `subscription-userinfo: upload=...; download=...; total=...; expire=...`。 */
@@ -355,6 +359,8 @@ object Actions {
         rawInput: String,
         append: Boolean = false,
         refresh: Boolean = false,
+        /** 指定来源刷新时传入其 id；普通导入为 null（当前订阅/剪贴板）。 */
+        expectedSourceId: String? = null,
     ): ImportResult = withContext(Dispatchers.IO) {
         val input = rawInput.trim()
         val profile = settings.activeConfigName()
@@ -437,16 +443,54 @@ object Actions {
                 skipped = obj.optInt("unsupported", diagnostics.size),
             )
         }
+        // Clash rule-providers：内核已把声明和 RULE-SET 引用带回来，这里下载/命中缓存后展开。
+        val groupNames = groups.mapTo(HashSet()) { it.name }
+        obj.optJSONArray("groups")?.let { parsedNames ->
+            val skipped = (0 until parsedNames.length()).map { parsedNames.optString(it).trim() }
+                .filter { it.isNotEmpty() && it !in groupNames }
+            require(skipped.isEmpty()) {
+                "策略组没有有效成员，已保留原配置：${skipped.joinToString("、").take(600)}"
+            }
+        }
+        warnings.firstOrNull { it.startsWith("重复策略组名 ") }?.let {
+            throw IllegalArgumentException("订阅包含同名策略组，已保留原配置：${it.take(600)}")
+        }
+        val providers = ClashRuleSets.parseProviderDefs(obj.optJSONArray("rule_providers"))
+        val expansion = if (rules.any { it.type == "RULE-SET" || it.type == "DOMAIN-SET" }) {
+            ClashRuleSets.expand(
+                rules = rules,
+                defs = providers,
+                cache = ClashRuleSets.FileCache(App.context),
+            ) { url, headers ->
+                fetchTextResult(url, maxBytes = 8 * 1024 * 1024, headers = headers)
+            }
+        } else {
+            ClashRuleSets.Expansion(rules, emptyList(), emptyList())
+        }
+        rules.clear()
+        rules.addAll(expansion.rules)
+        warnings.addAll(expansion.warnings)
+        // GEOIP 目前只有内置 CN 库；其他地区不能静默当作「已生效」，否则规则会直接落到后续规则/FINAL。
+        val nonCnGeo = rules.count { it.type.equals("GEOIP", true) && !it.value.equals("CN", true) }
+        if (nonCnGeo > 0) {
+            warnings += "GEOIP：$nonCnGeo 条非 CN 地区规则当前不会命中（仅内置 CN 库），将按后续规则或 FINAL 处理"
+        }
+
         withContext(Dispatchers.Main) {
             settings.update { current ->
                 if (settings.activeConfigName() != profile) {
                     throw IllegalStateException("配置已切换，请重新导入订阅")
                 }
-                if (refresh && current.subscription.trim() != input) {
+                if (refresh && expectedSourceId == null && current.subscription.trim() != input) {
                     throw IllegalStateException("订阅地址已变更，请重新刷新")
                 }
+                if (refresh && expectedSourceId != null &&
+                    current.subscriptionSources.none { it.id == expectedSourceId && it.url == input }
+                ) {
+                    throw IllegalStateException("订阅来源已被移除，请重新导入")
+                }
                 val kept = when {
-                    refresh -> nodesRetainedOnRefresh(current.nodes, source)
+                    refresh || isUrl -> nodesRetainedOnRefresh(current.nodes, source)
                     append -> current.nodes
                     else -> emptyList()
                 }
@@ -455,15 +499,64 @@ object Actions {
                 val merged = retained + renamed
                 val memberNames = imported.zip(renamed).distinctBy { it.first.name }
                     .associate { (original, node) -> original.name to node.name }
-                mergeSubscriptionRouting(
+                val replaceRouting = isUrl || routing
+                val routingMerged = mergeSubscriptionRouting(
                     current, source, memberNames, groups, rules, finalPolicy,
-                    replaceRouting = isUrl || routing,
-                ).copy(
+                    replaceRouting = replaceRouting,
+                )
+                // 策略组校验接在写入之前：空组、循环引用、失效成员、规则/FINAL 指向
+                // 已删除的组都会让本次刷新失败，DataStore/磁盘/运行内核继续用上一版。
+                if (replaceRouting) {
+                    val issues = RoutingValidation.validate(
+                        groups = routingMerged.proxyGroups,
+                        nodeNames = merged.map { it.name },
+                        rules = routingMerged.rules,
+                        finalPolicy = routingMerged.finalPolicy,
+                        finalPolicySource = routingMerged.finalPolicySource,
+                        selections = routingMerged.groupSelections,
+                    )
+                    if (issues.any { it.level == ConfigIssueLevel.ERROR }) {
+                        throw IllegalStateException(
+                            "订阅路由校验未通过，已保留上一版可用配置：\n" +
+                                RoutingValidation.errorText(issues).take(1200),
+                        )
+                    }
+                }
+                val currentSourceId = current.subscription.trim()
+                    .takeIf { it.startsWith("http://") || it.startsWith("https://") }
+                    ?.let { subscriptionSourceId(it) }
+                val becomesActive = isUrl && (
+                    expectedSourceId == null || current.subscription.isBlank() || currentSourceId == source
+                )
+                val now = System.currentTimeMillis()
+                val sourceMeta = if (isUrl) {
+                    SubscriptionSource(
+                        id = source,
+                        url = input,
+                        name = groupName,
+                        enabled = current.subscriptionSources.firstOrNull { it.id == source }?.enabled ?: true,
+                        lastAttemptAt = now,
+                        lastSuccessAt = now,
+                        lastError = "",
+                        nodeCount = importedCount,
+                        stale = false,
+                    )
+                } else null
+                routingMerged.copy(
                     nodes = merged,
                     selected = current.selected?.takeIf { selected -> merged.any { it.name == selected } }
                         ?: merged.firstOrNull()?.name,
-                    subscription = if (isUrl) input else current.subscription,
-                    subscriptionInfo = if (isUrl && input != current.subscription) info else info ?: current.subscriptionInfo,
+                    subscription = if (becomesActive) input else current.subscription,
+                    subscriptionInfo = if (becomesActive) {
+                        if (input != current.subscription) info else info ?: current.subscriptionInfo
+                    } else {
+                        current.subscriptionInfo
+                    },
+                    subscriptionSources = if (sourceMeta == null) {
+                        current.subscriptionSources
+                    } else {
+                        current.subscriptionSources.filterNot { it.id == source } + sourceMeta
+                    },
                 )
             }
             if (runtime.current().connected) ApplyCoordinator.requestApply(App.context, "订阅更新")
@@ -480,6 +573,7 @@ object Actions {
             totalLines = totalLines,
             skipped = obj.optInt("unsupported", diagnostics.size),
             groups = groups.size,
+            providerStatuses = expansion.statuses,
         )
     }
 
@@ -528,13 +622,174 @@ object Actions {
     internal fun nodesRetainedOnRefresh(nodes: List<NodeInfo>, source: String): List<NodeInfo> =
         nodes.filterNot { it.source == source }
 
-    /** 下拉和后台刷新只替换已标记为当前订阅的节点。 */
-    suspend fun refreshSubscription(): ImportResult = withContext(Dispatchers.IO) {
-        val url = settings.current().subscription.trim()
+    /**
+     * 按来源刷新；sourceId 为空时刷新「当前订阅」。
+     * 失败只更新该来源的失败状态，节点/规则/策略组保持上一份可用数据。
+     */
+    suspend fun refreshSubscription(sourceId: String? = null): ImportResult = withContext(Dispatchers.IO) {
+        val profile = settings.activeConfigName()
+        val current = settings.current()
+        val meta = sourceId?.let { id -> subscriptionSourceRows(current).firstOrNull { it.id == id } }
+        if (sourceId != null && meta == null) throw RuntimeException("订阅来源已移除")
+        val url = meta?.url?.trim().orEmpty().ifBlank { current.subscription.trim() }
         if (!url.startsWith("http://") && !url.startsWith("https://")) {
             throw RuntimeException("当前配置没有订阅链接")
         }
-        importSubscription(url, refresh = true)
+        val expectedId = meta?.id?.takeIf { id -> current.subscriptionSources.any { it.id == id } }
+        try {
+            val result = importSubscription(url, refresh = true, expectedSourceId = expectedId)
+            if (result.nodes == 0 && settings.activeConfigName() == profile) {
+                recordSourceFailure(meta?.id ?: subscriptionSourceId(url), subscriptionRefreshMessage(result))
+            }
+            result
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (settings.activeConfigName() == profile) {
+                recordSourceFailure(meta?.id ?: subscriptionSourceId(url), e.message ?: "刷新失败")
+            }
+            throw e
+        }
+    }
+
+    private fun recordSourceFailure(sourceId: String, reason: String) {
+        settings.update { current ->
+            val now = System.currentTimeMillis()
+            val currentUrl = current.subscription.trim()
+            val existing = current.subscriptionSources
+            val meta = existing.firstOrNull { it.id == sourceId }
+            val next = if (meta == null && currentUrl.isNotBlank() && subscriptionSourceId(currentUrl) == sourceId) {
+                // 旧数据没有来源元数据：失败也要在「订阅来源」里留下状态，而不是静默失败。
+                existing + SubscriptionSource(
+                    id = sourceId,
+                    url = currentUrl,
+                    name = runCatching { java.net.URI(currentUrl).host }.getOrNull().orEmpty(),
+                    lastAttemptAt = now,
+                    lastError = reason.take(300),
+                    stale = current.nodes.any { it.source == sourceId },
+                )
+            } else if (meta != null) {
+                existing.map { source ->
+                    if (source.id != sourceId) source else source.copy(
+                        lastAttemptAt = now,
+                        lastError = reason.take(300),
+                        // 有节点/规则留在设备上就是「仍在使用上一份」；没有数据才算彻底失败。
+                        stale = current.nodes.any { it.source == sourceId } ||
+                            current.rules.any { it.subscriptionSource == sourceId } ||
+                            current.proxyGroups.any { it.subscriptionSource == sourceId },
+                    )
+                }
+            } else existing
+            current.copy(subscriptionSources = next)
+        }
+    }
+
+    data class SourceRefreshOutcome(
+        val sourceId: String,
+        val name: String,
+        val ok: Boolean,
+        val message: String,
+        val nodes: Int = 0,
+    )
+
+    /** 后台任务/「全部刷新」入口：逐条来源刷新，单个失败不影响其他来源。 */
+    suspend fun refreshAllSubscriptions(): List<SourceRefreshOutcome> = withContext(Dispatchers.IO) {
+        val profile = settings.activeConfigName()
+        val sources = subscriptionSourceRows().filter { it.enabled && it.url.isNotBlank() }
+        sources.map { source ->
+            try {
+                check(settings.activeConfigName() == profile) { "配置已切换" }
+                val result = refreshSubscription(source.id)
+                SourceRefreshOutcome(
+                    source.id, source.displayName, result.nodes > 0, subscriptionRefreshMessage(result), result.nodes,
+                )
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                SourceRefreshOutcome(
+                    source.id, source.displayName, false, e.message ?: "刷新失败",
+                )
+            }
+        }
+    }
+
+    fun setSubscriptionSourceEnabled(sourceId: String, enabled: Boolean) {
+        settings.update { current ->
+            current.copy(
+                subscriptionSources = subscriptionSourceRows(current).map {
+                    if (it.id == sourceId) it.copy(enabled = enabled) else it
+                },
+            )
+        }
+    }
+
+    /** 移除一个来源的节点/规则/策略组与 FINAL 归属；其他来源与手动组不受影响。 */
+    fun removeSubscriptionSource(sourceId: String): Int {
+        var removedNodes = 0
+        var removedRules = 0
+        var removedGroups = 0
+        settings.update { current ->
+            val nodes = current.nodes.filterNot { it.source == sourceId }.also {
+                removedNodes = current.nodes.size - it.size
+            }
+            val rules = current.rules.filterNot { it.subscriptionSource == sourceId }.also {
+                removedRules = current.rules.size - it.size
+            }
+            val groups = current.proxyGroups.filterNot { it.subscriptionSource == sourceId }.also {
+                removedGroups = current.proxyGroups.size - it.size
+            }
+            val ownsFinal = current.finalPolicySource == sourceId
+            val activeRemoved = current.subscription.trim()
+                .takeIf { it.startsWith("http://") || it.startsWith("https://") }
+                ?.let { subscriptionSourceId(it) } == sourceId
+            val proposed = current.copy(
+                nodes = nodes,
+                selected = current.selected?.takeIf { name -> nodes.any { it.name == name } }
+                    ?: nodes.firstOrNull()?.name,
+                rules = rules,
+                proxyGroups = groups,
+                finalPolicy = if (ownsFinal) "proxy" else current.finalPolicy,
+                finalPolicySource = if (ownsFinal) "" else current.finalPolicySource,
+                groupSelections = current.groupSelections.filter { (group, member) ->
+                    groups.any { it.name == group && member in it.members }
+                },
+                subscription = if (activeRemoved) "" else current.subscription,
+                subscriptionInfo = if (activeRemoved) null else current.subscriptionInfo,
+                subscriptionSources = current.subscriptionSources.filterNot { it.id == sourceId },
+            )
+            fun routeErrors(config: AppConfig) = RoutingValidation.validate(
+                groups = config.proxyGroups,
+                nodeNames = config.nodes.map { it.name },
+                rules = config.rules,
+                finalPolicy = config.finalPolicy,
+                finalPolicySource = config.finalPolicySource,
+                selections = config.groupSelections,
+            ).filter { it.level == ConfigIssueLevel.ERROR }
+            val existing = routeErrors(current).mapTo(HashSet()) { it.message }
+            val broken = routeErrors(proposed).filterNot { it.message in existing }
+            check(broken.isEmpty()) {
+                "仍有配置引用这个订阅，请先调整对应规则或策略组。\n" +
+                    RoutingValidation.errorText(broken).take(1000)
+            }
+            proposed
+        }
+        if (runtime.current().connected) ApplyCoordinator.requestApply(App.context, "移除订阅来源")
+        return removedNodes + removedRules + removedGroups
+    }
+
+    fun subscriptionSourceRows(cfg: AppConfig = settings.current()): List<SubscriptionSource> {
+        val sources = cfg.subscriptionSources.toMutableList()
+        val currentUrl = cfg.subscription.trim()
+        if (currentUrl.startsWith("http") && sources.none { it.url == currentUrl }) {
+            sources += SubscriptionSource(
+                id = subscriptionSourceId(currentUrl),
+                url = currentUrl,
+                name = runCatching { java.net.URI(currentUrl).host }.getOrNull().orEmpty(),
+                nodeCount = cfg.nodes.count { it.source == subscriptionSourceId(currentUrl) },
+                lastSuccessAt = cfg.subscriptionInfo?.updatedAt ?: 0L,
+            )
+        }
+        return sources
     }
 
     /** 刷新结果必须带回 UI/后台：零节点不能再说「已刷新」。 */
@@ -545,7 +800,33 @@ object Actions {
                 (reason?.let { "：$it" } ?: "")
         }
         val skipped = if (result.skipped > 0) "，跳过 ${result.skipped} 个" else ""
-        return "订阅已刷新：可用 ${result.nodes} 个$skipped"
+        val providers = if (result.providerStatuses.isNotEmpty()) {
+            val fresh = result.providerStatuses.count { it.state == "fresh" }
+            val cached = result.providerStatuses.count { it.state == "cached" }
+            val pending = result.providerStatuses.count { it.state == "pending" || it.state == "missing" || it.state == "unsupported" }
+            buildString {
+                append("；规则集 ")
+                append("${fresh} 个已更新")
+                if (cached > 0) append("，${cached} 个用缓存")
+                if (pending > 0) append("，${pending} 个待下载/不可用")
+            }
+        } else ""
+        return "订阅已刷新：可用 ${result.nodes} 个$skipped$providers"
+    }
+
+    /** 导入/刷新后的逐项规则集状态，给预览弹窗展开。 */
+    internal fun providerDiagnosticText(result: ImportResult): String {
+        if (result.providerStatuses.isEmpty()) return ""
+        return result.providerStatuses.joinToString("\n") { status ->
+            val tag = when (status.state) {
+                "fresh" -> "已更新"
+                "cached" -> "缓存可用"
+                "pending" -> "待下载"
+                "missing" -> "未声明"
+                else -> "不支持"
+            }
+            "· ${status.name}：$tag，${status.rules} 条规则；${status.message}"
+        }
     }
 
     data class RuleSyncResult(

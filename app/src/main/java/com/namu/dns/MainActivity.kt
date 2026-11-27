@@ -20,6 +20,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.namu.dns.core.NamuAppShell
+import com.namu.dns.core.repository.AppForeground
 import com.namu.dns.ui.NamuTheme
 
 class MainActivity : ComponentActivity() {
@@ -74,6 +75,17 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         openNodes = intent.getBooleanExtra("open_nodes", false)
+    }
+
+    // A1 统计轮询自适应：UI 可见=前台 1s，不可见=后台 5s；回前台仓库立即补帧。
+    override fun onStart() {
+        super.onStart()
+        AppForeground.state.value = true
+    }
+
+    override fun onStop() {
+        super.onStop()
+        AppForeground.state.value = false
     }
 
     private fun askNotificationPermission() {

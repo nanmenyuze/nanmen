@@ -408,6 +408,9 @@ pub struct RuleConf {
     /// D0 稳定身份；旧配置缺省时由 source/规则序号兜底。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta: Option<crate::hits::RuleMeta>,
+    /// Clash `no-resolve`：目标带域名时 IP/GEOIP 规则不参与匹配。
+    #[serde(default, alias = "noResolve", skip_serializing_if = "std::ops::Not::not")]
+    pub no_resolve: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -618,6 +621,14 @@ mod lenient_tests {
         assert_eq!(cfg.nodes[0].port, 443);
         assert_eq!(cfg.mtu, 9000);
         assert_eq!(cfg.dns.hosts.get("a.example.com").map(String::as_str), Some("16648"));
+    }
+
+    #[test]
+    fn rules_accept_android_no_resolve_flag() {
+        let cfg = parse_lenient(
+            r#"{"rules":[{"type":"IP-CIDR","value":"192.0.2.0/24","action":"direct","noResolve":true}]}"#,
+        ).unwrap();
+        assert!(cfg.rules[0].no_resolve);
     }
 
     #[test]

@@ -103,7 +103,7 @@ class DefaultConfigRepository(
     override fun create(name: String): Boolean {
         val n = ConfigFileStore.sanitize(name)
         if (files.exists(n)) return false
-        return files.save(n, AppConfig(dnsUpstream = "system", dnsFallback = "system"))
+        return files.save(n, AppConfig.freshDefaults())
     }
 
     override fun copyProfile(from: String, name: String): Boolean {

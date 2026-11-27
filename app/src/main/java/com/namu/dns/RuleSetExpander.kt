@@ -191,7 +191,15 @@ object RuleSetExpander {
             return false
         }
         if (line.type == "DOMAIN-REGEX" && runCatching { Regex(line.value) }.isFailure) return false
-        out.add(RuleItem(line.type, line.value, action, source))
+        out.add(
+            RuleItem(
+                line.type,
+                line.value,
+                action,
+                source,
+                noResolve = line.trailing.any { it.equals("no-resolve", ignoreCase = true) },
+            ),
+        )
         return true
     }
 

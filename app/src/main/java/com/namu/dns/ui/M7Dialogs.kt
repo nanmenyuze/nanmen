@@ -354,7 +354,8 @@ fun LiveConnectionsDialog(
                 else -> {
                     Text(
                         "按建立时间倒序，显示前 ${rows.take(60).size} 条（内核共 $total 条）。" +
-                            "关闭项按内核推送的连接 id 精确删除；仍在传输的长连会继续按字节和速率更新。",
+                            "「实际出站」来自连接建立时的策略组解析，和规则测试的拟选节点可能因健康状态不同而不同；" +
+                            "解析失败/回退原因会一并显示。",
                         fontSize = 11.sp, color = NamuColors.TextSub, lineHeight = 16.sp,
                     )
                     Spacer(Modifier.height(6.dp))
@@ -384,8 +385,10 @@ fun LiveConnectionsDialog(
 @Composable
 private fun LiveConnRow(ctx: android.content.Context, c: LiveConn) {
     val actionColor = when {
-        c.action.contains("拦截") || c.action.contains("拒绝") -> NamuColors.Red
-        c.action.contains("节点") || c.action.contains("代理") || c.action.contains("全局") -> NamuColors.Blue
+        c.action.contains("BLOCK") || c.action.contains("拦截") || c.action.contains("拒绝") -> NamuColors.Red
+        c.action == "DIRECT" -> NamuColors.TextSub
+        c.action.contains("节点") || c.action.contains("代理") || c.action.contains("全局") ||
+            c.node.isNotBlank() -> NamuColors.Blue
         else -> NamuColors.TextSub
     }
     Column(Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
@@ -431,6 +434,30 @@ private fun LiveConnRow(ctx: android.content.Context, c: LiveConn) {
                 fontSize = 10.sp,
                 color = NamuColors.TextSub,
                 maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.fillMaxWidth().padding(top = 1.dp),
+            )
+        }
+        if (c.node.isNotBlank() || c.chain.isNotBlank()) {
+            Text(
+                buildString {
+                    append("实际出站：")
+                    append(c.node.ifBlank { c.action })
+                    if (c.chain.isNotBlank()) append("　策略链：").append(c.chain)
+                },
+                fontSize = 10.sp,
+                color = NamuColors.TextSub,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.fillMaxWidth().padding(top = 1.dp),
+            )
+        }
+        if (c.note.isNotBlank()) {
+            Text(
+                "选路：${c.note}",
+                fontSize = 10.sp,
+                color = NamuColors.TextSub,
+                maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.fillMaxWidth().padding(top = 1.dp),
             )

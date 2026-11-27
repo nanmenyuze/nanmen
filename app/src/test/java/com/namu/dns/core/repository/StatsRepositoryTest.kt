@@ -2,6 +2,8 @@ package com.namu.dns.core.repository
 
 import com.namu.dns.StatsData
 import com.namu.dns.core.runtime.DefaultRuntimeRepository
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -10,6 +12,14 @@ import org.junit.Test
 class StatsRepositoryTest {
     private class FakeSource(var next: StatsData = StatsData()) : StatsSource {
         override fun read(): StatsData = next
+    }
+
+    private class CountingSource : StatsSource {
+        @Volatile var reads = 0
+        override fun read(): StatsData {
+            reads++
+            return StatsData(up = reads.toLong(), down = reads.toLong())
+        }
     }
 
     @Test
@@ -55,5 +65,32 @@ class StatsRepositoryTest {
         assertEquals(StatsData(), repo.current().stats)
         assertEquals(0L, repo.current().upRate)
         assertTrue(repo.current().sessionActive)
+    }
+
+    @Test
+    fun `returning to foreground refreshes immediately regardless of interval`() = runBlocking {
+        // A1：轮询间隔设得极大（模拟后台 5s 档），回前台仍应立即补一帧，
+        // 证明补帧不依赖轮询周期；速率按实际采样间隔差分不受影响。
+        val prevFg = AppForeground.state.value
+        try {
+            AppForeground.state.value = false
+            val runtime = DefaultRuntimeRepository()
+            runtime.markConnected(0)
+            val source = CountingSource()
+            DefaultStatsRepository(
+                runtime, source,
+                pollIntervalMs = 3_600_000L,
+                backgroundPollIntervalMs = 3_600_000L,
+                autoPoll = true,
+            )
+            // 回前台 → 收集器立即 poll()。
+            AppForeground.state.value = true
+            withTimeout(3_000L) {
+                while (source.reads == 0) kotlinx.coroutines.delay(10)
+            }
+            assertTrue("回前台应立即补帧", source.reads >= 1)
+        } finally {
+            AppForeground.state.value = prevFg
+        }
     }
 }

@@ -1724,6 +1724,7 @@ mod tests {
                 action: "组A".into(),
                 source: Some("测试".into()),
                 meta: None,
+                no_resolve: false,
             },
             RuleConf {
                 kind: "DOMAIN".into(),
@@ -1731,6 +1732,7 @@ mod tests {
                 action: "组B".into(),
                 source: Some("测试".into()),
                 meta: None,
+                no_resolve: false,
             },
         ];
         let engine = RuleEngine::from_config(&cfg);

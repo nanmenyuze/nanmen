@@ -1,6 +1,7 @@
 package com.namu.dns
 
 import com.namu.dns.core.config.ConfigDnsInput
+import com.namu.dns.core.config.ConfigFile
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -35,6 +36,33 @@ class AppConfigDnsRouteTest {
         val cfg = AppConfig().copy(dnsOnlyFullRoute = false)
         val back = AppConfig.fromJson(cfg.toJson().toString())
         assertFalse(back.dnsOnlyFullRoute)
+    }
+
+    @Test
+    fun `fresh defaults disable special DNS review and domestic direct routing`() {
+        val cfg = AppConfig.freshDefaults()
+        assertFalse(cfg.fallbackFilter)
+        assertFalse(cfg.fallbackGeoCheck)
+        assertFalse(cfg.cnDirect)
+        assertTrue(cfg.allowDnsFallback)
+        assertEquals(null, cfg.dnsHijack)
+        assertEquals("proxy", cfg.finalPolicy)
+        assertTrue(cfg.dnsOnlyFullRoute)
+
+        val restored = ConfigFile.fromJson(ConfigFile.fromAppConfig(cfg).toJson()).toAppConfig()
+        assertFalse(restored.fallbackFilter)
+        assertFalse(restored.cnDirect)
+    }
+
+    @Test
+    fun `old profiles keep their implicit options and explicit values`() {
+        val old = AppConfig.fromJson("""{"mode":"dns_only"}""")
+        assertTrue(old.fallbackFilter)
+        assertTrue(old.cnDirect)
+        val explicit = AppConfig.fromJson("""{"fallbackFilter":true,"cnDirect":true,"dnsHijack":false}""")
+        assertTrue(explicit.fallbackFilter)
+        assertTrue(explicit.cnDirect)
+        assertEquals(false, explicit.dnsHijack)
     }
 
     @Test

@@ -4,10 +4,11 @@
   "dnsUpstream": "system",
   "dnsFallback": "system",
   "allowDnsFallback": true,
+  "fallbackFilter": false,
   "blockEnabled": true,
   "blockMode": "nxdomain",
-  "cnDirect": true,
-  "finalPolicy": "direct",
+  "cnDirect": false,
+  "finalPolicy": "proxy",
   "rules": [
     { "type": "IP-CIDR", "value": "10.0.0.0/8", "action": "direct" },
     { "type": "IP-CIDR", "value": "172.16.0.0/12", "action": "direct" },

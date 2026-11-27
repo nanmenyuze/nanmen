@@ -85,6 +85,8 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
     val haptic = LocalHapticFeedback.current
     var showSub by remember { mutableStateOf(false) }
     var showAddNode by remember { mutableStateOf(false) }
+    var showSources by remember { mutableStateOf(false) }
+    var sourceId by remember { mutableStateOf<String?>(null) }
     var query by remember { mutableStateOf("") }
     var refreshing by remember { mutableStateOf(false) }
     var selectionMode by remember { mutableStateOf(false) }
@@ -138,6 +140,7 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
     val duplicateNames = remember(cfg.nodes) {
         cfg.nodes.groupingBy { it.name }.eachCount().filterValues { it > 1 }.keys
     }
+    val sources = Actions.subscriptionSourceRows(cfg)
     val groups = remember(filtered) {
         filtered.groupBy { it.group.ifBlank { "未分组" } }
     }
@@ -159,8 +162,12 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
                     scope.launch {
                         refreshing = true
                         try {
-                            val result = Actions.refreshSubscription()
-                            messages.show(Actions.subscriptionRefreshMessage(result))
+                            val results = Actions.refreshAllSubscriptions()
+                            val failed = results.count { !it.ok }
+                            messages.show(
+                                if (results.isEmpty()) "没有启用自动刷新的订阅"
+                                else "订阅已刷新 ${results.size - failed} 个，失败 $failed 个",
+                            )
                         } catch (e: Exception) {
                             messages.show(e.message ?: "订阅刷新失败")
                         } finally {
@@ -293,9 +300,70 @@ fun NodesScreen(onRestart: () -> Unit, onBack: () -> Unit = {}) {
         SubscriptionDialog(
             onDismiss = { showSub = false },
             onDone = { showSub = false },
+            onManageSources = if (sources.isEmpty()) null else ({
+                showSub = false
+                showSources = true
+            }),
             onManualAdd = {
                 showSub = false
                 showAddNode = true
+            },
+        )
+    }
+    if (showSources && sourceId == null) {
+        NamuDialog(
+            title = "管理订阅",
+            confirmText = "关闭",
+            showDismiss = false,
+            onConfirm = { showSources = false },
+            onDismiss = { showSources = false },
+            scrollContent = true,
+        ) {
+            sources.forEachIndexed { index, source ->
+                val status = when {
+                    !source.enabled -> "已暂停自动刷新"
+                    source.lastError.isNotBlank() -> "刷新失败"
+                    else -> null
+                }
+                SettingsRow(
+                    title = source.displayName,
+                    subtitle = status,
+                    chevron = true,
+                    showDivider = index != sources.lastIndex,
+                    onClick = { sourceId = source.id },
+                )
+            }
+        }
+    }
+    sources.firstOrNull { it.id == sourceId }?.let { source ->
+        SubscriptionSourceDialog(
+            source = source,
+            onDismiss = { sourceId = null },
+            onRefresh = {
+                if (!refreshing) {
+                    scope.launch {
+                        refreshing = true
+                        try {
+                            messages.show(Actions.subscriptionRefreshMessage(Actions.refreshSubscription(source.id)))
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            messages.show(e.message ?: "订阅刷新失败")
+                        } finally {
+                            refreshing = false
+                        }
+                    }
+                }
+            },
+            onToggle = { enabled -> Actions.setSubscriptionSourceEnabled(source.id, enabled) },
+            onRemove = {
+                try {
+                    Actions.removeSubscriptionSource(source.id)
+                    sourceId = null
+                    messages.show("已移除 ${source.displayName}")
+                } catch (e: IllegalStateException) {
+                    messages.show(e.message ?: "移除失败")
+                }
             },
         )
     }

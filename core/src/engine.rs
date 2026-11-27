@@ -766,6 +766,8 @@ struct RouteRule {
     pre_match: bool,
     source: Option<String>,
     meta: Option<crate::hits::RuleMeta>,
+    /// Clash `no-resolve`：目标已有域名时，IP/GEOIP 规则不参与匹配。
+    no_resolve: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -872,6 +874,7 @@ impl RuleEngine {
                 pre_match,
                 source: rc.source.clone(),
                 meta: rc.meta.clone(),
+                no_resolve: rc.no_resolve,
             });
         }
         // FINAL 与规则动作语义不同：规则动作为空/null 是解析残留，按直连兜底
@@ -899,6 +902,7 @@ impl RuleEngine {
                 pre_match: false,
                 source: None,
                 meta: None,
+                no_resolve: false,
             });
         }
 
@@ -1135,11 +1139,34 @@ impl RuleEngine {
             }
         }
         // 预匹配拦截规则先于普通顺序规则，其余规则保持配置顺序。
+        let mut no_resolve_skipped: Option<String> = None;
         for (idx, r) in self.rules.iter().enumerate()
             .filter(|(_, r)| r.pre_match && matches!(r.action, Action::Block))
             .chain(self.rules.iter().enumerate().filter(|(_, r)| !(r.pre_match && matches!(r.action, Action::Block)))) {
             if matches!(r.kind, RuleKind::Final) {
                 continue;
+            }
+            if r.no_resolve && dom.is_some() {
+                let would_match = match &r.kind {
+                    RuleKind::IpCidr(net) => net.contains(&input.ip),
+                    RuleKind::GeoIp(code) => {
+                        code == "CN"
+                            && match input.ip {
+                                IpAddr::V4(v4) => self.cn_ip_contains(v4),
+                                IpAddr::V6(_) => false,
+                            }
+                    }
+                    _ => false,
+                };
+                if would_match && no_resolve_skipped.is_none() {
+                    no_resolve_skipped = Some(format!(
+                        "第 {} 条 {} {} 带 no-resolve，目标 {} 是域名，未按解析后的 IP 命中",
+                        idx + 1,
+                        kind_name(&r.kind),
+                        r.value,
+                        dom.as_deref().unwrap_or("")
+                    ));
+                }
             }
             let matched = match &r.kind {
                 RuleKind::Domain => dom.as_ref().map(|d| d == &r.value).unwrap_or(false),
@@ -1163,13 +1190,19 @@ impl RuleEngine {
                     dom.as_ref().map(|d| re.is_match(d)).unwrap_or(false)
                 }
                 RuleKind::GeoIp(code) => {
-                    code == "CN"
-                        && match input.ip {
-                            IpAddr::V4(v4) => self.cn_ip_contains(v4),
-                            IpAddr::V6(_) => false,
-                        }
+                    if r.no_resolve && dom.is_some() {
+                        false
+                    } else {
+                        code == "CN"
+                            && match input.ip {
+                                IpAddr::V4(v4) => self.cn_ip_contains(v4),
+                                IpAddr::V6(_) => false,
+                            }
+                    }
                 }
-                RuleKind::IpCidr(net) => net.contains(&input.ip),
+                RuleKind::IpCidr(net) => {
+                    !(r.no_resolve && dom.is_some()) && net.contains(&input.ip)
+                }
                 RuleKind::Port(p) => input.port == *p,
                 RuleKind::Protocol(k) => input.kind == *k,
                 // 归属未知时 UID 规则不命中：不能把 None 当成 0（0 是 root）去比。
@@ -1241,11 +1274,12 @@ impl RuleEngine {
         if self.cn_direct {
             if let Some(d) = &dom {
                 if self.cn_domains.contains(d) {
-                    return (
-                        Action::Direct,
-                        format!("国内直连：域名 {} 命中 CN 域名库", d),
-                        None,
-                    );
+                    let mut detail = format!("国内直连：域名 {} 命中 CN 域名库", d);
+                    if let Some(note) = &no_resolve_skipped {
+                        detail.push_str("\n注意：");
+                        detail.push_str(note);
+                    }
+                    return (Action::Direct, detail, None);
                 }
             }
             if let IpAddr::V4(v4) = input.ip {
@@ -1261,19 +1295,22 @@ impl RuleEngine {
         for r in &self.rules {
             if matches!(r.kind, RuleKind::Final) {
                 let label = self.decision_label(&r.action);
-                return (
-                    r.action.clone(),
-                    format!("未命中任何规则，走最终策略：{}\n来源：final_policy", label),
-                    None,
-                );
+                let mut detail =
+                    format!("未命中任何规则，走最终策略：{}\n来源：final_policy", label);
+                if let Some(note) = &no_resolve_skipped {
+                    detail.push_str("\n注意：");
+                    detail.push_str(note);
+                }
+                return (r.action.clone(), detail, None);
             }
         }
         let label = self.decision_label(&self.final_action);
-        (
-            self.final_action.clone(),
-            format!("未命中任何规则，走最终策略：{}", label),
-            None,
-        )
+        let mut detail = format!("未命中任何规则，走最终策略：{}", label);
+        if let Some(note) = &no_resolve_skipped {
+            detail.push_str("\n注意：");
+            detail.push_str(note);
+        }
+        (self.final_action.clone(), detail, None)
     }
 
     fn cn_ip_contains(&self, ip: Ipv4Addr) -> bool {
@@ -1686,6 +1723,7 @@ mod tests {
                 action: "BLOCK".into(),
                 source: None,
                 meta: None,
+                no_resolve: false,
             },
             crate::config::RuleConf {
                 kind: "DOMAIN-SUFFIX".into(),
@@ -1693,6 +1731,7 @@ mod tests {
                 action: "BLOCK".into(),
                 source: None,
                 meta: None,
+                no_resolve: false,
             },
         ];
         cfg
@@ -1772,6 +1811,7 @@ mod tests {
             action: "BLOCK".into(),
             source: None,
                 meta: None,
+                no_resolve: false,
             }];
         let engine = RuleEngine::from_config(&cfg);
         // 包名误写成 UID 时该条规则必须被丢弃，否则会匹配不到任何连接却让人以为生效
@@ -1791,6 +1831,7 @@ mod tests {
                 action: "proxy".into(),
                 source: None,
                 meta: None,
+                no_resolve: false,
             },
             crate::config::RuleConf {
                 kind: "DOMAIN-SUFFIX".into(),
@@ -1798,6 +1839,7 @@ mod tests {
                 action: "block".into(),
                 source: None,
                 meta: None,
+                no_resolve: false,
             },
         ];
         let engine = RuleEngine::from_config(&cfg);
@@ -1887,6 +1929,7 @@ mod tests {
             action: "null".into(),
             source: None,
             meta: None,
+                    no_resolve: false,
         }];
         let engine = RuleEngine::from_config(&cfg);
         let (a, _) = engine.decide_input(&MatchInput {
@@ -1917,6 +1960,7 @@ mod tests {
             action: action.into(),
             source: None,
             meta: None,
+                    no_resolve: false,
         };
         for kind in ["FINAL", "MATCH"] {
             for action in ["", "null"] {
@@ -1971,6 +2015,7 @@ mod tests {
                 action: "block".into(),
                 source: None,
                 meta: None,
+                no_resolve: false,
             },
             crate::config::RuleConf {
                 kind: "DOMAIN-SUFFIX".into(),
@@ -1978,6 +2023,7 @@ mod tests {
                 action: "BLOCK".into(),
                 source: None,
                 meta: None,
+                no_resolve: false,
             },
             crate::config::RuleConf {
                 kind: "DOMAIN-KEYWORD".into(),
@@ -1985,6 +2031,7 @@ mod tests {
                 action: "reject".into(),
                 source: None,
                 meta: None,
+                no_resolve: false,
             },
             crate::config::RuleConf {
                 kind: "DOMAIN-REGEX".into(),
@@ -1992,6 +2039,7 @@ mod tests {
                 action: "block".into(),
                 source: None,
                 meta: None,
+                no_resolve: false,
             },
             crate::config::RuleConf {
                 kind: "DOMAIN-WILDCARD".into(),
@@ -1999,6 +2047,7 @@ mod tests {
                 action: "block".into(),
                 source: None,
                 meta: None,
+                no_resolve: false,
             },
             crate::config::RuleConf {
                 kind: "DOMAIN".into(),
@@ -2006,6 +2055,7 @@ mod tests {
                 action: "direct".into(),
                 source: None,
                 meta: None,
+                no_resolve: false,
             },
         ];
         let f = build_filter(&cfg);
@@ -2035,6 +2085,7 @@ mod tests {
             action: "block".into(),
             source: None,
                 meta: None,
+                no_resolve: false,
             }];
         let f = build_filter(&cfg);
         // 分流拦截是用户明确指令，不能被广告过滤总开关一起关掉。
@@ -2050,6 +2101,7 @@ mod tests {
             action: "block".into(),
             source: None,
                 meta: None,
+                no_resolve: false,
             }];
         let f = build_filter(&cfg);
         // 非法正则不能让内核 panic 或误匹配任何域名
@@ -2064,8 +2116,9 @@ mod tests {
             value: "com.bilibili.app".into(),
             action: "BLOCK".into(),
             source: None,
-                meta: None,
-            }];
+            meta: None,
+            no_resolve: false,
+        }];
         let engine = RuleEngine::from_config(&cfg);
         // 包名类规则由壳层展开成 UID 后下发；内核直接收到时应拒绝而不是误匹配
         assert_eq!(engine.rule_count, 1, "只剩自动补的 FINAL");
@@ -2073,7 +2126,12 @@ mod tests {
 
     fn flagged_rule(value: &str, action: &str) -> crate::config::RuleConf {
         crate::config::RuleConf {
-            kind: "DOMAIN-SUFFIX".into(), value: value.into(), action: action.into(), source: None, meta: None,
+            kind: "DOMAIN-SUFFIX".into(),
+            value: value.into(),
+            action: action.into(),
+            source: None,
+            meta: None,
+            no_resolve: false,
         }
     }
 
@@ -2118,6 +2176,7 @@ mod tests {
                 action: "BLOCK".into(),
                 source: None,
                 meta: None,
+                no_resolve: false,
             },
             crate::config::RuleConf {
                 kind: "OR".into(),
@@ -2125,6 +2184,7 @@ mod tests {
                 action: "BLOCK".into(),
                 source: None,
                 meta: None,
+                no_resolve: false,
             },
             crate::config::RuleConf {
                 kind: "NOT".into(),
@@ -2132,6 +2192,7 @@ mod tests {
                 action: "DIRECT".into(),
                 source: None,
                 meta: None,
+                no_resolve: false,
             },
         ];
         cfg
@@ -2161,7 +2222,8 @@ mod tests {
             action: "BLOCK".into(),
             source: None,
             meta: None,
-        }];
+                no_resolve: false,
+            }];
         let engine = RuleEngine::from_config(&cfg);
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         let hit = MatchInput { domain: Some("x.b.com"), ip, port: 443, kind: ConnKind::Tcp, uid: None };
@@ -2179,7 +2241,8 @@ mod tests {
             action: "BLOCK".into(),
             source: None,
             meta: None,
-        }];
+                no_resolve: false,
+            }];
         let engine = RuleEngine::from_config(&cfg);
         assert_eq!(engine.rule_count, 1, "非法逻辑表达式整条跳过，只留自动 FINAL");
     }
@@ -2197,7 +2260,8 @@ mod tests {
             action: "BLOCK".into(),
             source: None,
             meta: None,
-        }];
+                no_resolve: false,
+            }];
         let engine = RuleEngine::from_config(&cfg);
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
         let hit = MatchInput { domain: Some("x.ads.io"), ip, port: 443, kind: ConnKind::Tcp, uid: None };
@@ -2211,4 +2275,25 @@ mod tests {
         assert!(!matches!(engine2.decide_input(&no_script).0, Action::Block), "脚本缺失时 SCRIPT 规则不命中");
     }
 
+
+    #[test]
+    fn no_resolve_ip_rule_skips_domain_target_but_matches_ip_target() {
+        let cfg = Config {
+            rules: vec![crate::config::RuleConf {
+                kind: "IP-CIDR".into(),
+                value: "1.2.3.0/24".into(),
+                action: "BLOCK".into(),
+                source: Some("订阅".into()),
+                meta: None,
+                no_resolve: true,
+            }],
+            ..Config::default()
+        };
+        let engine = RuleEngine::from_config(&cfg);
+        let via_domain = engine.decide_detail(Some("example.com"), "1.2.3.4".parse().unwrap(), 443, ConnKind::Tcp);
+        assert!(!matches!(via_domain.0, Action::Block), "域名目标不能被 no-resolve IP 规则截胡");
+        assert!(via_domain.1.contains("no-resolve"), "详情应说明跳过原因：{}", via_domain.1);
+        let via_ip = engine.decide_detail(None, "1.2.3.4".parse().unwrap(), 443, ConnKind::Tcp);
+        assert!(matches!(via_ip.0, Action::Block), "纯 IP 目标仍应命中 no-resolve 规则");
+    }
 }

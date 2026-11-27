@@ -86,6 +86,74 @@ impl Ctx {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
+
+    /// 把规则动作展开成「实际出站 + 解析链 + 原因」，供实时连接与日志展示。
+    /// 规则测试展示的是拟选节点；这里必须与真正 dial 的解析路径一致。
+    fn describe_route(
+        &self,
+        action: &Action,
+        kind: ConnKind,
+        target: Option<&str>,
+    ) -> (String, String, String, String) {
+        let transport = match kind {
+            ConnKind::Tcp => Transport::Tcp,
+            ConnKind::Udp => Transport::Udp,
+        };
+        match action {
+            Action::Group(name) => {
+                let strategy = self.strategy.read().unwrap_or_else(|p| p.into_inner()).clone();
+                match strategy.resolve_group_with_target(name, transport, &self.health, target) {
+                    Ok(r) => {
+                        let chain = r.chain.join(" → ");
+                        (
+                            r.node.clone(),
+                            r.node,
+                            chain.clone(),
+                            format!("策略组 {} 解析：{}", name, chain),
+                        )
+                    }
+                    Err(e) => {
+                        let policy = e.policy.chosen(self.block_when_no_node());
+                        let label = match policy {
+                            NoNodePolicy::Direct => "DIRECT",
+                            _ => "BLOCK",
+                        };
+                        let chain = e.chain.join(" → ");
+                        (
+                            label.to_string(),
+                            label.to_string(),
+                            chain.clone(),
+                            format!(
+                                "策略组 {} 解析失败：{}；链：{}；回退 {}",
+                                name,
+                                e.message,
+                                if chain.is_empty() { "无".into() } else { chain },
+                                label
+                            ),
+                        )
+                    }
+                }
+            }
+            Action::Node(n) => (n.clone(), n.clone(), String::new(), "规则指定节点".into()),
+            Action::Proxy => match self.selected_snapshot() {
+                Some(n) => (n.clone(), n, String::new(), "跟随当前选中节点".into()),
+                None => (
+                    "BLOCK".into(),
+                    "BLOCK".into(),
+                    String::new(),
+                    "代理动作但没有选中节点，按 BLOCK 处理".into(),
+                ),
+            },
+            Action::Missing(n) => (
+                "BLOCK".into(),
+                "BLOCK".into(),
+                format!("MISSING:{}", n),
+                format!("引用失效：{} 不存在，按 BLOCK 处理", n),
+            ),
+            Action::Direct => ("DIRECT".into(), "DIRECT".into(), String::new(), "规则直连".into()),
+            Action::Block => ("BLOCK".into(), "BLOCK".into(), String::new(), "规则拦截".into()),
+        }
+    }
     pub fn strategy_snapshot(&self) -> Arc<StrategySet> {
         self.strategy
             .read()
@@ -2697,11 +2765,8 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                     };
                     let conn_id = ctx.stats.new_conn_id();
                     let target_label = route_domain.clone().unwrap_or_else(|| local_ip.to_string());
-                    let action_label = ctx
-                        .rules
-                        .read()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .decision_label(&action);
+                    let (action_label, route_node, route_chain, route_note) =
+                        ctx.describe_route(&action, ConnKind::Tcp, Some(&target_label));
                     drop(decision_guard);
                     logging::info(
                         "conn",
@@ -2873,6 +2938,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 port,
                                 action_label.clone(),
                                 rule_detail.split('\n').next().unwrap_or("").to_string(),
+                                route_node.clone(),
+                                route_chain.clone(),
+                                route_note.clone(),
                                 true,
                             );
                         conns.push(TcpConn {
@@ -3068,6 +3136,9 @@ pub async fn run(fd: RawFd, ctx: Arc<Ctx>) -> io::Result<()> {
                                 port,
                                 action_label.clone(),
                                 rule_detail.split('\n').next().unwrap_or("").to_string(),
+                                route_node.clone(),
+                                route_chain.clone(),
+                                route_note.clone(),
                                 false,
                             );
                         conns.push(TcpConn {

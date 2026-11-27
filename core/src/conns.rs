@@ -30,6 +30,12 @@ pub struct ConnInfo {
     pub dst_port: u16,
     pub action: String,
     pub rule: String,
+    /// 实际选中的出口节点（策略组已展开）；DIRECT/BLOCK 等也写最终动作。
+    pub node: String,
+    /// 策略组解析链，例如 Proxy → HK。
+    pub chain: String,
+    /// 选路说明：解析成功、无可用节点回落、引用失效等。
+    pub note: String,
     pub mitm: bool,
     pub started: Instant,
     pub meter: Arc<ConnMeter>,
@@ -53,6 +59,12 @@ pub struct ConnOut {
     pub dst_port: u16,
     pub action: String,
     pub rule: String,
+    /// 实际选中的出口节点（策略组已展开）；DIRECT/BLOCK 等也写最终动作。
+    pub node: String,
+    /// 策略组解析链，例如 Proxy → HK。
+    pub chain: String,
+    /// 选路说明：解析成功、无可用节点回落、引用失效等。
+    pub note: String,
     pub mitm: bool,
     pub age_ms: u64,
     pub up_bytes: u64,
@@ -94,6 +106,9 @@ impl ConnTable {
         dst_port: u16,
         action: String,
         rule: String,
+        node: String,
+        chain: String,
+        note: String,
         mitm: bool,
     ) -> (u64, Arc<ConnMeter>) {
         if self.items.len() >= MAX_ENTRIES {
@@ -120,6 +135,9 @@ impl ConnTable {
                 dst_port,
                 action,
                 rule,
+                node,
+                chain,
+                note,
                 mitm,
                 started: Instant::now(),
                 meter: meter.clone(),
@@ -172,6 +190,9 @@ impl ConnTable {
                 dst_port: c.dst_port,
                 action: c.action.clone(),
                 rule: c.rule.clone(),
+                node: c.node.clone(),
+                chain: c.chain.clone(),
+                note: c.note.clone(),
                 mitm: c.mitm,
                 age_ms: now.duration_since(c.started).as_millis() as u64,
                 up_bytes: c.meter.up.load(Ordering::Relaxed),
@@ -215,6 +236,9 @@ impl ConnTable {
                 dst_port: c.dst_port,
                 action: c.action.clone(),
                 rule: c.rule.clone(),
+                node: c.node.clone(),
+                chain: c.chain.clone(),
+                note: c.note.clone(),
                 mitm: c.mitm,
                 age_ms: now.duration_since(c.started).as_millis() as u64,
                 up_bytes: up,
@@ -273,7 +297,7 @@ impl ConnOut {
             None => "null".to_string(),
         };
         format!(
-            "{{\"id\":{},\"uid\":{},\"domain\":{},\"ip\":\"{}\",\"port\":{},\"action\":\"{}\",\"rule\":\"{}\",\"mitm\":{},\"ageMs\":{},\"up\":{},\"down\":{},\"upBps\":{},\"downBps\":{}}}",
+            "{{\"id\":{},\"uid\":{},\"domain\":{},\"ip\":\"{}\",\"port\":{},\"action\":\"{}\",\"rule\":\"{}\",\"node\":\"{}\",\"chain\":\"{}\",\"note\":\"{}\",\"mitm\":{},\"ageMs\":{},\"up\":{},\"down\":{},\"upBps\":{},\"downBps\":{}}}",
             self.id,
             uid,
             domain,
@@ -281,6 +305,9 @@ impl ConnOut {
             self.dst_port,
             escape(&self.action),
             escape(&self.rule),
+            escape(&self.node),
+            escape(&self.chain),
+            escape(&self.note),
             self.mitm,
             self.age_ms,
             self.up_bytes,
@@ -313,6 +340,9 @@ mod tests {
             443,
             action.into(),
             "命中第 3 条规则 DOMAIN-SUFFIX ads.com → 拦截".into(),
+            "DIRECT".into(),
+            String::new(),
+            "规则直接直连".into(),
             false,
         )
         .0
@@ -349,6 +379,9 @@ mod tests {
             80,
             "直连".into(),
             String::new(),
+            "DIRECT".into(),
+            String::new(),
+            "规则直连".into(),
             false,
         );
         let json = to_json_array(&t.snapshot(10));
@@ -396,6 +429,9 @@ mod tests {
             443,
             "直连".into(),
             "规则 A".into(),
+            "DIRECT".into(),
+            String::new(),
+            "规则直连".into(),
             false,
         );
         let b = add(&mut t, 2, "short.example.com", "直连");
@@ -433,6 +469,9 @@ mod tests {
             443,
             "直连\n换行".into(),
             "来源：\"模块\"".into(),
+            "DIRECT".into(),
+            String::new(),
+            "规则直连".into(),
             true,
         );
         let json = to_json_array(&t.snapshot(10));

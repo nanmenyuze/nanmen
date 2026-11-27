@@ -15,18 +15,22 @@ class SubscriptionUpdateWorker(
     params: WorkerParameters,
 ) : CoroutineWorker(appContext, params) {
     override suspend fun doWork(): Result {
-        val url = runCatching { App.container.settings.current().subscription }.getOrDefault("")
-        if (url.isBlank()) return Result.success()
+        val cfg = runCatching { App.container.settings.current() }.getOrNull() ?: return Result.success()
+        if (Actions.subscriptionSourceRows(cfg).none { it.enabled && it.url.isNotBlank() }) {
+            return Result.success()
+        }
         return try {
-            val result = Actions.refreshSubscription()
-            if (result.nodes == 0) {
-                // 后台没有 UI 提示，至少把零节点原因写进日志，避免「已刷新」假成功。
-                android.util.Log.w(
-                    "NamuSubscription",
-                    Actions.subscriptionRefreshMessage(result),
-                )
+            val outcomes = Actions.refreshAllSubscriptions()
+            for (o in outcomes) {
+                if (!o.ok || o.nodes == 0) {
+                    android.util.Log.w("NamuSubscription", "${o.name}: ${o.message}")
+                }
             }
-            Result.success()
+            // 全部来源都没有成功且存在网络类失败时交给 WorkManager 重试；
+            // 单个来源失败不影响其他来源的结果。
+            if (outcomes.isNotEmpty() && outcomes.none { it.ok }) Result.retry() else Result.success()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
         } catch (_: Exception) {
             Result.retry()
         }

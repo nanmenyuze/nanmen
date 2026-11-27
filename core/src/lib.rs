@@ -1098,6 +1098,8 @@ pub extern "system" fn Java_com_namu_dns_NativeCore_nativeTestRule<'local>(
             .map(|i| format!("{}：{}", if i.group.is_empty() { "全局" } else { i.group.as_str() }, i.message))
             .collect();
         serde_json::json!({
+            "source": "kernel",
+            "order": "预匹配拦截 → 普通规则 → 国内直连 → FINAL",
             "action": tcp.label,
             "ruleAction": rule_action,
             "detail": detail,

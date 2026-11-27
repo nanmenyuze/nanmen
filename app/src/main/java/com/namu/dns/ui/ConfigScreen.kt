@@ -366,7 +366,7 @@ fun ConfigDetailScreen(
             confirmColor = NamuColors.Orange,
             onConfirm = {
                 showResetDefault = false
-                if (editor.update { AppConfig(dnsUpstream = "system", dnsFallback = "system") }) {
+                if (editor.update { AppConfig.freshDefaults() }) {
                     container.messages.show("已恢复默认配置")
                 } else {
                     container.messages.show("恢复失败，已保留原配置")

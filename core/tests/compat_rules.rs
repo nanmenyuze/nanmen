@@ -21,6 +21,7 @@ fn rule(kind: &str, value: &str, action: &str) -> RuleConf {
         action: action.into(),
         source: None,
         meta: None,
+        no_resolve: false,
     }
 }
 

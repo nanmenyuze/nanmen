@@ -81,7 +81,7 @@ class DataStoreSettingsRepository(private val context: Context) : SettingsReposi
                     context.assets.open("default.json").bufferedReader().use { it.readText() }
                 }.getOrNull()
             val stored = if (text.isNullOrBlank()) {
-                AppConfig()
+                AppConfig.freshDefaults()
             } else {
                 runCatching { AppConfig.fromJson(text) }.getOrElse { AppConfig() }
             }

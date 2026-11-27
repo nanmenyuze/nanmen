@@ -60,7 +60,7 @@ object ConfigStore {
         isSubscriptionRoutingRule(rule) || rule.source in PROFILE_RULE_SOURCES
 
     private fun routingRuleKey(rule: RuleItem): String =
-        "${rule.type}|${rule.value}|${rule.action}|${rule.extendedMatch}|${rule.preMatch}"
+        "${rule.type}|${rule.value}|${rule.action}|${rule.extendedMatch}|${rule.preMatch}|${rule.noResolve}"
 
     private fun prepareRoutingRule(
         rule: RuleItem,
@@ -423,7 +423,7 @@ object ConfigStore {
                         android.util.Log.w("NamuRules", "规则集尚无本地缓存：${rule.value}")
                         emptyList()
                     } else RuleSetExpander.expand(rule.type, content, rule.action, "规则集 ${rule.value}")
-                        .map { it.copy(extendedMatch = rule.extendedMatch, preMatch = rule.preMatch) }
+                        .map { it.copy(extendedMatch = rule.extendedMatch, preMatch = rule.preMatch, noResolve = it.noResolve || rule.noResolve) }
                 }
                 val (expanded, unresolved) = AppUidResolver.expand(context, routed)
                 if (unresolved.isNotEmpty()) {

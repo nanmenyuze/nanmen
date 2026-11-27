@@ -38,6 +38,12 @@ interface StatsSource {
     fun read(): StatsData
 }
 
+/** App 前后台标志：由 MainActivity onStart/onStop 驱动，供统计轮询自适应。
+ *  默认 true（进程刚起、UI 未上报时按前台对待，避免漏刷）。 */
+object AppForeground {
+    val state = MutableStateFlow(true)
+}
+
 object NativeStatsSource : StatsSource {
     override fun read(): StatsData = StatsData.fromJson(NativeCore.nativeStats())
 }
@@ -47,6 +53,7 @@ class DefaultStatsRepository(
     private val source: StatsSource = NativeStatsSource,
     private val now: () -> Long = { SystemClock.elapsedRealtime() },
     private val pollIntervalMs: Long = 1000L,
+    private val backgroundPollIntervalMs: Long = 5000L,
     autoPoll: Boolean = true,
 ) : StatsRepository {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -59,10 +66,18 @@ class DefaultStatsRepository(
     private val sampler = SpeedSampler()
 
     init {
-        if (autoPoll) scope.launch {
-            while (isActive) {
-                if (runtime.current().connected) poll()
-                delay(pollIntervalMs)
+        if (autoPoll) {
+            scope.launch {
+                while (isActive) {
+                    if (runtime.current().connected) poll()
+                    // A1 自适应：前台 1s 保 UI 流畅，后台 5s 降 JNI/序列化/耗电。
+                    // 速率在 poll() 内按实际采样间隔差分，间隔变化不影响口径。
+                    delay(if (AppForeground.state.value) pollIntervalMs else backgroundPollIntervalMs)
+                }
+            }
+            // 回前台立即补一帧，避免从 5s 档切回时 UI 滞后最多一秒。
+            scope.launch {
+                AppForeground.state.collect { fg -> if (fg) poll() }
             }
         }
     }

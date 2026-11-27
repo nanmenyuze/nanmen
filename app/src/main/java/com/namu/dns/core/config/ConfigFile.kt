@@ -85,13 +85,13 @@ data class ConfigFile(
         private val DEVICE_GENERAL_KEYS = setOf(
             "themeMode", "autoConnect", "pingMethod", "pingUrl", "autoDisablePrivateDns",
             "ssidTriggerEnabled", "ssidTriggerNames", "ssidLocationOptIn",
-            "financeProtect", "nodes", "selected", "subscription",
+            "financeProtect", "nodes", "selected", "subscription", "subscriptionSources",
         )
 
         private val KNOWN_ROOT_KEYS = setOf(
             "version", "general", "rules", "proxyGroups", "ruleSources", "modules", "groupSelections", "customAds", "mitm",
             // 设备侧字段不属于配置文件；即使外部文件带进来，也不能写回 .conf。
-            "nodes", "selected", "subscription", "configUnknown",
+            "nodes", "selected", "subscription", "subscriptionSources", "configUnknown",
         )
 
         /** 判断磁盘文件是否已经是带 general 分区的新格式（不要求 version 已是最新）。 */
@@ -142,7 +142,7 @@ data class ConfigFile(
             val merged = fallback.toJson()
             val old = JSONObject(text)
             // S1 起 groupSelections 属于 Profile；旧扁平文件里的同名键要保留给这份 Profile。
-            val deviceOnly = setOf("nodes", "selected", "subscription")
+            val deviceOnly = setOf("nodes", "selected", "subscription", "subscriptionSources")
             old.keys().forEach { key ->
                 if (key !in deviceOnly) merged.put(key, old.get(key))
             }
